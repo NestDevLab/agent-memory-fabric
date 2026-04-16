@@ -1,0 +1,25 @@
+{
+  "actors": {
+    "main-openclaw": {
+      "mode": "allow_all"
+    },
+    "openclaw-tirrenia": {
+      "mode": "scoped",
+      "allowedScopes": ["tirrenia"]
+    }
+  },
+  "scopes": {
+    "main-lab": {
+      "backendUserId": "openmemory"
+    },
+    "tirrenia": {
+      "backendUserId": "openclaw_tirrenia"
+    },
+    "scope-a": {
+      "backendUserId": "oc_scope_a"
+    },
+    "scope-b": {
+      "backendUserId": "oc_scope_b"
+    }
+  }
+}

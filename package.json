@@ -1,0 +1,20 @@
+{
+  "name": "mem0-gateway",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Custom REST/MCP gateway for scoped Mem0 access",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "check": "node src/server.mjs --check"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.1.40",
+    "@supabase/supabase-js": "^2.103.2",
+    "better-sqlite3": "^12.9.0",
+    "mem0ai": "^2.4.6",
+    "ollama": "^0.6.3",
+    "pg": "^8.20.0"
+  }
+}
