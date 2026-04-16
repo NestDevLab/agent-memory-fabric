@@ -25,6 +25,27 @@ function json(res, status, body) {
   res.end(JSON.stringify(body, null, 2));
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function safeError(error) {
+  if (!error) return null;
+  return {
+    message: error?.message || String(error),
+    status: error?.status,
+    data: error?.data || error?.body || null
+  };
+}
+
+function logEvent(event, payload = {}) {
+  try {
+    console.log(JSON.stringify({ ts: nowIso(), event, ...payload }));
+  } catch {
+    console.log(JSON.stringify({ ts: nowIso(), event, payload_error: true }));
+  }
+}
+
 function getScopeConfig(scope, policies) {
   return policies.scopes?.[scope] || null;
 }
@@ -195,6 +216,7 @@ async function authenticateRequest(req) {
 async function performScopedSearch({ actor, scope, scopes, query, policy, policies, backend }) {
   const resolvedScopes = normalizeRequestedScopes(scope, scopes, policy, policies);
   const searchResults = [];
+  const startedAt = Date.now();
 
   for (const resolvedScope of resolvedScopes) {
     const scopeConfig = getScopeConfig(resolvedScope, policies);
@@ -204,6 +226,7 @@ async function performScopedSearch({ actor, scope, scopes, query, policy, polici
       err.data = { scope: resolvedScope };
       throw err;
     }
+    const scopeStartedAt = Date.now();
     const result = await backend.search({ backendUserId: scopeConfig.backendUserId, query, scope: resolvedScope });
     const items = (result?.items || []).map(item => ({ ...item, scope: resolvedScope }));
     searchResults.push({
@@ -211,7 +234,8 @@ async function performScopedSearch({ actor, scope, scopes, query, policy, polici
       backendUserId: scopeConfig.backendUserId,
       items,
       total: result?.total || items.length,
-      source: result?.source || backend.kind
+      source: result?.source || backend.kind,
+      latencyMs: Date.now() - scopeStartedAt
     });
   }
 
@@ -229,7 +253,8 @@ async function performScopedSearch({ actor, scope, scopes, query, policy, polici
       items: aggregatedItems,
       total: aggregatedItems.length,
       source: sources.length === 1 ? sources[0] : sources,
-      perScope: searchResults.map(({ scope, backendUserId, total, source }) => ({ scope, backendUserId, total, source }))
+      perScope: searchResults.map(({ scope, backendUserId, total, source, latencyMs }) => ({ scope, backendUserId, total, source, latencyMs })),
+      latencyMs: Date.now() - startedAt
     }
   };
 }
@@ -266,11 +291,18 @@ async function performScopedAdd({ actor, scope, text, metadata, infer, policy, p
 const backend = createBackendAdapter();
 
 const server = http.createServer(async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const requestStartedAt = Date.now();
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathnameParts = url.pathname.split('/').filter(Boolean);
   const policies = loadPolicies();
+  const sourceIp = String(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown');
+  const isMcpMessagePost = url.pathname === '/mcp/messages/' && req.method === 'POST';
+  const requestSessionId = isMcpMessagePost ? (url.searchParams.get('session_id') || '') : '';
+  const requestSession = requestSessionId ? sessions.get(requestSessionId) : null;
 
   if (url.pathname === '/health') {
+    logEvent('health_check', { requestId, method: req.method, path: url.pathname, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
     return json(res, 200, {
       ok: true,
       service: 'mem0-gateway',
@@ -286,8 +318,20 @@ const server = http.createServer(async (req, res) => {
 
   let authContext;
   try {
-    authContext = await authenticateRequest(req);
+    if (requestSession) {
+      authContext = {
+        token: 'session',
+        actor: requestSession.actor,
+        policy: requestSession.policy,
+        viaSession: true
+      };
+      logEvent('auth_ok', { requestId, method: req.method, path: url.pathname, sourceIp, actor: authContext.actor, viaSession: true, sessionId: requestSessionId });
+    } else {
+      authContext = await authenticateRequest(req);
+      logEvent('auth_ok', { requestId, method: req.method, path: url.pathname, sourceIp, actor: authContext.actor });
+    }
   } catch (error) {
+    logEvent('auth_failed', { requestId, method: req.method, path: url.pathname, sourceIp, error: safeError(error), latencyMs: Date.now() - requestStartedAt });
     return json(res, error?.status || 401, { error: error?.message || 'unauthorized' });
   }
 
@@ -296,13 +340,15 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === '/v1/policies/resolve') {
     const scope = url.searchParams.get('scope') || '';
-    return json(res, 200, {
+    const response = {
       actor,
       scope,
       allowed: canReadScope(policy, scope),
       policy,
       scopeConfig: getScopeConfig(scope, policies)
-    });
+    };
+    logEvent('resolve_policy', { requestId, actor, path: url.pathname, scope, allowed: response.allowed, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
+    return json(res, 200, response);
   }
 
   if (url.pathname === '/v1/memory/search' && req.method === 'POST') {
@@ -313,9 +359,11 @@ const server = http.createServer(async (req, res) => {
     const query = String(body.query || '');
     try {
       const response = await performScopedSearch({ actor, scope, scopes, query, policy, policies, backend });
+      logEvent('memory_search', { requestId, actor, path: url.pathname, requestedScope: scope || null, requestedScopes: scopes, resolvedScopes: response.scopes, total: response.result?.total, perScope: response.result?.perScope, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
       return json(res, 200, response);
     } catch (error) {
       const status = error?.status === 403 ? 403 : error?.status === 400 ? 400 : 502;
+      logEvent('memory_search_failed', { requestId, actor, path: url.pathname, requestedScope: scope || null, requestedScopes: scopes, sourceIp, statusCode: status, error: safeError(error), latencyMs: Date.now() - requestStartedAt });
       return json(res, status, {
         error: error?.message || 'backend_error',
         details: error?.data || error?.body || null
@@ -332,9 +380,11 @@ const server = http.createServer(async (req, res) => {
     const infer = Boolean(body.infer);
     try {
       const response = await performScopedAdd({ actor, scope, text, metadata, infer, policy, policies, backend });
+      logEvent('memory_add', { requestId, actor, path: url.pathname, scope, infer, metadataKeys: Object.keys(metadata || {}), sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
       return json(res, 200, response);
     } catch (error) {
       const status = error?.status === 403 ? 403 : error?.status === 400 ? 400 : 502;
+      logEvent('memory_add_failed', { requestId, actor, path: url.pathname, scope, infer, sourceIp, statusCode: status, error: safeError(error), latencyMs: Date.now() - requestStartedAt });
       return json(res, status, {
         error: error?.message || 'backend_error',
         details: error?.data || error?.body || null
@@ -360,8 +410,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/mcp/messages/' && req.method === 'POST') {
-    const sessionId = url.searchParams.get('session_id') || '';
-    const session = sessions.get(sessionId);
+    const sessionId = requestSessionId;
+    const session = requestSession;
     if (!session) return json(res, 404, { error: 'unknown_session' });
     const body = await parseBody(req).catch(() => null);
     if (!body) return json(res, 400, { error: 'invalid_json' });
@@ -423,6 +473,7 @@ const server = http.createServer(async (req, res) => {
         const args = body.params?.arguments || {};
         if (name === 'list_scopes') {
           const scopes = getAllowedScopes(currentPolicy, policies);
+          logEvent('mcp_tools_call', { requestId, actor: currentActor, tool: 'list_scopes', sessionId, clientName: session.clientName, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
           sendSse(session.res, 'message', createRpcResult(id, {
             content: [{ type: 'text', text: JSON.stringify({ actor: currentActor, scopes }, null, 2) }]
           }));
@@ -430,6 +481,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         if (name === 'gateway_health') {
+          logEvent('mcp_tools_call', { requestId, actor: currentActor, tool: 'gateway_health', sessionId, clientName: session.clientName, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
           sendSse(session.res, 'message', createRpcResult(id, {
             content: [{ type: 'text', text: JSON.stringify({ backend: backend.kind, configured: backend.configured }, null, 2) }]
           }));
@@ -441,6 +493,7 @@ const server = http.createServer(async (req, res) => {
           const scopes = Array.isArray(args.scopes) ? args.scopes : [];
           const query = String(args.query || '');
           const searchResult = await performScopedSearch({ actor: currentActor, scope, scopes, query, policy: currentPolicy, policies, backend });
+          logEvent('mcp_tools_call', { requestId, actor: currentActor, tool: 'memory_search', sessionId, clientName: session.clientName, requestedScope: scope || null, requestedScopes: scopes, resolvedScopes: searchResult.scopes, perScope: searchResult.result?.perScope, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
           sendSse(session.res, 'message', createRpcResult(id, {
             content: [{ type: 'text', text: JSON.stringify(searchResult, null, 2) }]
           }));
@@ -456,6 +509,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200).end();
       return;
     } catch (error) {
+      logEvent('mcp_tools_call_failed', { requestId, actor: currentActor, sessionId, clientName: session.clientName, sourceIp, statusCode: 500, error: safeError(error), latencyMs: Date.now() - requestStartedAt });
       sendSse(session.res, 'message', createRpcError(id, -32000, error?.message || 'gateway_error', error?.data || error?.body || null));
       res.writeHead(200).end();
       return;

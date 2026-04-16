@@ -10,3 +10,8 @@ services:
       - ./:/app
     ports:
       - "8787:8787"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

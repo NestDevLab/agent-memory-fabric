@@ -97,17 +97,19 @@ function buildMem0OssAdapter() {
     return memoryInstance;
   }
 
-  function rankItems(items, query) {
-    if (!query) return items;
-    const q = query.trim().toLowerCase();
-    return [...items].sort((a, b) => {
-      const av = String(a.memory || '').toLowerCase();
-      const bv = String(b.memory || '').toLowerCase();
-      const as = av.includes(q) ? 1 : 0;
-      const bs = bv.includes(q) ? 1 : 0;
-      if (as !== bs) return bs - as;
-      return bv.localeCompare(av);
-    }).filter((item) => String(item.memory || '').toLowerCase().includes(q));
+  function normalizeItems(items = []) {
+    return items.map((item) => ({
+      id: item.id,
+      memory: item.memory,
+      hash: item.hash,
+      metadata: item.metadata || {},
+      score: item.score,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      userId: item.userId,
+      agentId: item.agentId,
+      runId: item.runId
+    }));
   }
 
   return {
@@ -116,18 +118,27 @@ function buildMem0OssAdapter() {
     async search({ backendUserId, query }) {
       if (!configured) throw new Error('mem0_oss_backend_unconfigured');
       const memory = getMemory();
-      const data = await memory.getAll({ filters: { user_id: backendUserId }, limit: 100 });
-      const items = rankItems(data?.results || [], query).map((item) => ({
-        id: item.id,
-        memory: item.memory,
-        hash: item.hash,
-        metadata: item.metadata || {},
-        score: item.score
-      }));
+      const normalizedQuery = String(query || '').trim();
+
+      if (normalizedQuery) {
+        const data = await memory.search(normalizedQuery, {
+          userId: backendUserId,
+          limit: 20
+        });
+        const items = normalizeItems(data?.results || []);
+        return {
+          items,
+          total: items.length,
+          source: 'mem0-oss-vector-search'
+        };
+      }
+
+      const data = await memory.getAll({ userId: backendUserId, limit: 20 });
+      const items = normalizeItems(data?.results || []);
       return {
         items,
         total: items.length,
-        source: 'mem0-oss'
+        source: 'mem0-oss-get-all'
       };
     },
     async add({ backendUserId, text, metadata = {}, infer = false }) {
