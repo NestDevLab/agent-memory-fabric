@@ -40,6 +40,9 @@ function buildMem0OssAdapter() {
   const mem0Path = path.resolve(process.cwd(), 'node_modules/mem0ai/dist/oss/index.js');
   const { Memory } = require(mem0Path);
 
+  let sharedMemoryPromise = null;
+  let shutdownHookInstalled = false;
+
   const config = {
     version: 'v1.1',
     embedder: {
@@ -91,10 +94,103 @@ function buildMem0OssAdapter() {
     config.llm.config.baseURL
   );
 
-  let memoryInstance = null;
-  function getMemory() {
-    if (!memoryInstance) memoryInstance = new Memory(config);
-    return memoryInstance;
+  function isConnectionScopedError(error) {
+    const text = String(error?.message || error || '').toLowerCase();
+    return [
+      'connection terminated unexpectedly',
+      'terminating connection',
+      'client has encountered a connection error',
+      'connection ended unexpectedly',
+      'econnreset',
+      'econnrefused',
+      '57p01',
+      '57p02',
+      '08006',
+      '08003'
+    ].some((needle) => text.includes(needle));
+  }
+
+  async function closeMemory(memory) {
+    if (!memory) return;
+    const closeTargets = [
+      memory?.vectorStore,
+      memory?.db,
+      memory?.historyStore,
+      memory?.graphMemory
+    ];
+
+    for (const target of closeTargets) {
+      if (typeof target?.close !== 'function') continue;
+      try {
+        await target.close();
+      } catch {}
+    }
+  }
+
+  function installShutdownHook() {
+    if (shutdownHookInstalled) return;
+    shutdownHookInstalled = true;
+
+    const cleanup = async () => {
+      if (!sharedMemoryPromise) return;
+      try {
+        const memory = await sharedMemoryPromise;
+        await closeMemory(memory);
+      } catch {}
+    };
+
+    process.once('SIGINT', () => {
+      cleanup().finally(() => process.exit(130));
+    });
+    process.once('SIGTERM', () => {
+      cleanup().finally(() => process.exit(143));
+    });
+    process.once('beforeExit', () => {
+      void cleanup();
+    });
+  }
+
+  function createMemory() {
+    return new Memory(config);
+  }
+
+  async function getMemory({ forceRefresh = false } = {}) {
+    if (!configured) throw new Error('mem0_oss_backend_unconfigured');
+    installShutdownHook();
+
+    if (!sharedMemoryPromise || forceRefresh) {
+      const currentPromise = Promise.resolve().then(() => createMemory());
+      sharedMemoryPromise = currentPromise;
+      currentPromise.catch(() => {
+        if (sharedMemoryPromise === currentPromise) sharedMemoryPromise = null;
+      });
+    }
+
+    return sharedMemoryPromise;
+  }
+
+  async function withSharedMemory(operation) {
+    let memory = await getMemory();
+    try {
+      return await operation(memory);
+    } catch (error) {
+      if (!isConnectionScopedError(error)) throw error;
+      await closeMemory(memory);
+      memory = await getMemory({ forceRefresh: true });
+      return await operation(memory);
+    }
+  }
+
+  async function withBackendTimeout(operation) {
+    const timeoutMs = Number(process.env.MEM0_BACKEND_TIMEOUT_MS || '20000');
+    return await Promise.race([
+      operation(),
+      new Promise((_, reject) => {
+        const err = new Error('backend_timeout');
+        err.status = 504;
+        setTimeout(() => reject(err), timeoutMs);
+      })
+    ]);
   }
 
   function normalizeItems(items = []) {
@@ -117,44 +213,48 @@ function buildMem0OssAdapter() {
     configured,
     async search({ backendUserId, query }) {
       if (!configured) throw new Error('mem0_oss_backend_unconfigured');
-      const memory = getMemory();
-      const normalizedQuery = String(query || '').trim();
+      return withBackendTimeout(async () => {
+        const normalizedQuery = String(query || '').trim();
 
-      if (normalizedQuery) {
-        const data = await memory.search(normalizedQuery, {
-          userId: backendUserId,
-          limit: 20
+        return withSharedMemory(async (memory) => {
+          if (normalizedQuery) {
+            const data = await memory.search(normalizedQuery, {
+              userId: backendUserId,
+              limit: 20
+            });
+            const items = normalizeItems(data?.results || []);
+            return {
+              items,
+              total: items.length,
+              source: 'mem0-oss-vector-search'
+            };
+          }
+
+          const data = await memory.getAll({ userId: backendUserId, limit: 20 });
+          const items = normalizeItems(data?.results || []);
+          return {
+            items,
+            total: items.length,
+            source: 'mem0-oss-get-all'
+          };
         });
-        const items = normalizeItems(data?.results || []);
-        return {
-          items,
-          total: items.length,
-          source: 'mem0-oss-vector-search'
-        };
-      }
-
-      const data = await memory.getAll({ userId: backendUserId, limit: 20 });
-      const items = normalizeItems(data?.results || []);
-      return {
-        items,
-        total: items.length,
-        source: 'mem0-oss-get-all'
-      };
+      });
     },
     async add({ backendUserId, text, metadata = {}, infer = false }) {
       if (!configured) throw new Error('mem0_oss_backend_unconfigured');
       if (!text || !String(text).trim()) throw new Error('memory_text_required');
-      const memory = getMemory();
-      const result = await memory.add(String(text), {
-        userId: backendUserId,
-        infer,
-        metadata
-      });
-      return {
-        results: result?.results || [],
-        relations: result?.relations || [],
-        source: 'mem0-oss'
-      };
+      return withBackendTimeout(() => withSharedMemory(async (memory) => {
+        const result = await memory.add(String(text), {
+          userId: backendUserId,
+          infer,
+          metadata
+        });
+        return {
+          results: result?.results || [],
+          relations: result?.relations || [],
+          source: 'mem0-oss'
+        };
+      }));
     }
   };
 }
