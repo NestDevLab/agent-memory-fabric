@@ -102,6 +102,103 @@ function createRpcError(id, code, message, data = undefined) {
   return { jsonrpc: '2.0', id, error: { code, message, data } };
 }
 
+function createMcpSessionId() {
+  return crypto.randomUUID().replace(/-/g, '');
+}
+
+function getMcpSessionHeader(req) {
+  return String(req.headers['mcp-session-id'] || req.headers['Mcp-Session-Id'] || '').trim();
+}
+
+function buildInitializeResult(protocolVersion) {
+  return {
+    protocolVersion: protocolVersion || '2024-11-05',
+    capabilities: { tools: {} },
+    serverInfo: { name: 'mem0-gateway', version: '0.1.0' }
+  };
+}
+
+function buildToolsListResult() {
+  return {
+    tools: [
+      {
+        name: 'memory_search',
+        description: 'Search memory within an allowed scope through the custom Mem0 gateway.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            scope: { type: 'string' },
+            query: { type: 'string' }
+          },
+          required: ['scope', 'query']
+        }
+      },
+      {
+        name: 'list_scopes',
+        description: 'List scopes visible to the current actor.',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'gateway_health',
+        description: 'Return health and backend information for the custom gateway.',
+        inputSchema: { type: 'object', properties: {} }
+      }
+    ]
+  };
+}
+
+async function executeMcpMethod({ body, actor, policy, policies, backend, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
+  const method = body.method;
+  const id = body.id ?? null;
+
+  if (method === 'initialize') {
+    return createRpcResult(id, buildInitializeResult(body.params?.protocolVersion));
+  }
+
+  if (method === 'notifications/initialized') {
+    return null;
+  }
+
+  if (method === 'tools/list') {
+    return createRpcResult(id, buildToolsListResult());
+  }
+
+  if (method === 'tools/call') {
+    const name = body.params?.name;
+    const args = body.params?.arguments || {};
+
+    if (name === 'list_scopes') {
+      const scopes = getAllowedScopes(policy, policies);
+      logEvent('mcp_tools_call', { requestId, actor, tool: 'list_scopes', sessionId, clientName, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
+      return createRpcResult(id, {
+        content: [{ type: 'text', text: JSON.stringify({ actor, scopes }, null, 2) }]
+      });
+    }
+
+    if (name === 'gateway_health') {
+      logEvent('mcp_tools_call', { requestId, actor, tool: 'gateway_health', sessionId, clientName, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
+      return createRpcResult(id, {
+        content: [{ type: 'text', text: JSON.stringify({ backend: backend.kind, configured: backend.configured }, null, 2) }]
+      });
+    }
+
+    if (name === 'memory_search') {
+      const scope = typeof args.scope === 'string' ? args.scope : '';
+      const scopes = Array.isArray(args.scopes) ? args.scopes : [];
+      const query = String(args.query || '');
+      const searchResult = await performScopedSearch({ actor, scope, scopes, query, policy, policies, backend });
+      logEvent('mcp_tools_call', { requestId, actor, tool: 'memory_search', sessionId, clientName, requestedScope: scope || null, requestedScopes: scopes, resolvedScopes: searchResult.scopes, perScope: searchResult.result?.perScope, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
+      return createRpcResult(id, {
+        content: [{ type: 'text', text: JSON.stringify(searchResult, null, 2) }]
+      });
+    }
+
+    return createRpcError(id, -32601, 'Unknown tool');
+  }
+
+  return createRpcError(id, -32601, `Unsupported method: ${method}`);
+}
+
 function getAllowedScopes(policy, policies) {
   if (policy.mode === 'allow_all') return Object.keys(policies.scopes || {});
   if (policy.mode === 'scoped' || policy.mode === 'read_only_scoped') return policy.allowedScopes || [];
@@ -298,7 +395,8 @@ const server = http.createServer(async (req, res) => {
   const policies = loadPolicies();
   const sourceIp = String(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown');
   const isMcpMessagePost = url.pathname === '/mcp/messages/' && req.method === 'POST';
-  const requestSessionId = isMcpMessagePost ? (url.searchParams.get('session_id') || '') : '';
+  const isStreamableMcpPath = pathnameParts[0] === 'mcp' && pathnameParts.length === 3 && pathnameParts[1] && pathnameParts[2] && pathnameParts[2] !== 'messages';
+  const requestSessionId = isMcpMessagePost ? (url.searchParams.get('session_id') || '') : (isStreamableMcpPath ? getMcpSessionHeader(req) : '');
   const requestSession = requestSessionId ? sessions.get(requestSessionId) : null;
 
   if (url.pathname === '/health') {
@@ -395,7 +493,7 @@ const server = http.createServer(async (req, res) => {
   if (pathnameParts[0] === 'mcp' && pathnameParts[2] === 'sse' && pathnameParts[3] && req.method === 'GET') {
     const clientName = String(pathnameParts[1]);
     const identity = String(pathnameParts[3]);
-    const sessionId = crypto.randomUUID().replace(/-/g, '');
+    const sessionId = createMcpSessionId();
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache, no-transform',
@@ -409,6 +507,73 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (isStreamableMcpPath && req.method === 'POST') {
+    const clientName = String(pathnameParts[1]);
+    const identity = String(pathnameParts[2]);
+    const body = await parseBody(req).catch(() => null);
+    if (!body) return json(res, 400, { error: 'invalid_json' });
+
+    let sessionId = requestSessionId;
+    let session = requestSession;
+    if (!session) {
+      if (body.method !== 'initialize') {
+        return json(res, 404, { error: 'unknown_session' });
+      }
+      sessionId = createMcpSessionId();
+      session = { actor, policy, clientName, identity, transport: 'streamable-http' };
+      sessions.set(sessionId, session);
+    }
+
+    try {
+      const responseBody = await executeMcpMethod({
+        body,
+        actor: session.actor,
+        policy: session.policy,
+        policies,
+        backend,
+        requestId,
+        requestStartedAt,
+        sourceIp,
+        sessionId,
+        clientName: session.clientName
+      });
+
+      if (responseBody === null) {
+        res.writeHead(202, {
+          'cache-control': 'no-cache',
+          'mcp-session-id': sessionId
+        });
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-cache',
+        'mcp-session-id': sessionId
+      });
+      res.end(JSON.stringify(responseBody, null, 2));
+      return;
+    } catch (error) {
+      logEvent('mcp_tools_call_failed', { requestId, actor: session.actor, sessionId, clientName: session.clientName, sourceIp, statusCode: 500, error: safeError(error), latencyMs: Date.now() - requestStartedAt });
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-cache',
+        'mcp-session-id': sessionId
+      });
+      res.end(JSON.stringify(createRpcError(body.id ?? null, -32000, error?.message || 'gateway_error', error?.data || error?.body || null), null, 2));
+      return;
+    }
+  }
+
+  if (isStreamableMcpPath && req.method === 'DELETE') {
+    if (!requestSession) return json(res, 404, { error: 'unknown_session' });
+    sessions.delete(requestSessionId);
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   if (url.pathname === '/mcp/messages/' && req.method === 'POST') {
     const sessionId = requestSessionId;
     const session = requestSession;
@@ -418,94 +583,23 @@ const server = http.createServer(async (req, res) => {
 
     const currentActor = session.actor;
     const currentPolicy = session.policy;
-    const method = body.method;
-    const id = body.id ?? null;
 
     try {
-      if (method === 'initialize') {
-        sendSse(session.res, 'message', createRpcResult(id, {
-          protocolVersion: body.params?.protocolVersion || '2024-11-05',
-          capabilities: { tools: {} },
-          serverInfo: { name: 'mem0-gateway', version: '0.1.0' }
-        }));
-        res.writeHead(200).end();
-        return;
+      const responseBody = await executeMcpMethod({
+        body,
+        actor: currentActor,
+        policy: currentPolicy,
+        policies,
+        backend,
+        requestId,
+        requestStartedAt,
+        sourceIp,
+        sessionId,
+        clientName: session.clientName
+      });
+      if (responseBody !== null) {
+        sendSse(session.res, 'message', responseBody);
       }
-
-      if (method === 'notifications/initialized') {
-        res.writeHead(200).end();
-        return;
-      }
-
-      if (method === 'tools/list') {
-        sendSse(session.res, 'message', createRpcResult(id, {
-          tools: [
-            {
-              name: 'memory_search',
-              description: 'Search memory within an allowed scope through the custom Mem0 gateway.',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  scope: { type: 'string' },
-                  query: { type: 'string' }
-                },
-                required: ['scope', 'query']
-              }
-            },
-            {
-              name: 'list_scopes',
-              description: 'List scopes visible to the current actor.',
-              inputSchema: { type: 'object', properties: {} }
-            },
-            {
-              name: 'gateway_health',
-              description: 'Return health and backend information for the custom gateway.',
-              inputSchema: { type: 'object', properties: {} }
-            }
-          ]
-        }));
-        res.writeHead(200).end();
-        return;
-      }
-
-      if (method === 'tools/call') {
-        const name = body.params?.name;
-        const args = body.params?.arguments || {};
-        if (name === 'list_scopes') {
-          const scopes = getAllowedScopes(currentPolicy, policies);
-          logEvent('mcp_tools_call', { requestId, actor: currentActor, tool: 'list_scopes', sessionId, clientName: session.clientName, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
-          sendSse(session.res, 'message', createRpcResult(id, {
-            content: [{ type: 'text', text: JSON.stringify({ actor: currentActor, scopes }, null, 2) }]
-          }));
-          res.writeHead(200).end();
-          return;
-        }
-        if (name === 'gateway_health') {
-          logEvent('mcp_tools_call', { requestId, actor: currentActor, tool: 'gateway_health', sessionId, clientName: session.clientName, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
-          sendSse(session.res, 'message', createRpcResult(id, {
-            content: [{ type: 'text', text: JSON.stringify({ backend: backend.kind, configured: backend.configured }, null, 2) }]
-          }));
-          res.writeHead(200).end();
-          return;
-        }
-        if (name === 'memory_search') {
-          const scope = typeof args.scope === 'string' ? args.scope : '';
-          const scopes = Array.isArray(args.scopes) ? args.scopes : [];
-          const query = String(args.query || '');
-          const searchResult = await performScopedSearch({ actor: currentActor, scope, scopes, query, policy: currentPolicy, policies, backend });
-          logEvent('mcp_tools_call', { requestId, actor: currentActor, tool: 'memory_search', sessionId, clientName: session.clientName, requestedScope: scope || null, requestedScopes: scopes, resolvedScopes: searchResult.scopes, perScope: searchResult.result?.perScope, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
-          sendSse(session.res, 'message', createRpcResult(id, {
-            content: [{ type: 'text', text: JSON.stringify(searchResult, null, 2) }]
-          }));
-          res.writeHead(200).end();
-          return;
-        }
-        sendSse(session.res, 'message', createRpcError(id, -32601, 'Unknown tool'));
-        res.writeHead(200).end();
-        return;
-      }
-
-      sendSse(session.res, 'message', createRpcError(id, -32601, `Unsupported method: ${method}`));
       res.writeHead(200).end();
       return;
     } catch (error) {

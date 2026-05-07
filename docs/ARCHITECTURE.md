@@ -10,6 +10,7 @@ Target shape:
 Planned surfaces:
 - REST: /v1/*
 - MCP SSE: /mcp/:clientName/sse/:identity and /mcp/messages/
+- MCP Streamable HTTP: /mcp/:clientName/:identity (JSON-RPC over POST with `Mcp-Session-Id`)
 
 Important rule:
 - OpenMemory is not the security boundary

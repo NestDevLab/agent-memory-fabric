@@ -14,12 +14,6 @@
     },
     "tirrenia": {
       "backendUserId": "openclaw_tirrenia"
-    },
-    "scope-a": {
-      "backendUserId": "oc_scope_a"
-    },
-    "scope-b": {
-      "backendUserId": "oc_scope_b"
     }
   }
 }

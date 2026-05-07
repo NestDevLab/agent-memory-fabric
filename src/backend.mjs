@@ -42,6 +42,7 @@ function buildMem0OssAdapter() {
 
   let sharedMemoryPromise = null;
   let shutdownHookInstalled = false;
+  let operationQueue = Promise.resolve();
 
   const config = {
     version: 'v1.1',
@@ -169,16 +170,24 @@ function buildMem0OssAdapter() {
     return sharedMemoryPromise;
   }
 
+  function queueSharedMemoryOperation(operation) {
+    const run = operationQueue.catch(() => {}).then(operation);
+    operationQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
   async function withSharedMemory(operation) {
-    let memory = await getMemory();
-    try {
-      return await operation(memory);
-    } catch (error) {
-      if (!isConnectionScopedError(error)) throw error;
-      await closeMemory(memory);
-      memory = await getMemory({ forceRefresh: true });
-      return await operation(memory);
-    }
+    return queueSharedMemoryOperation(async () => {
+      let memory = await getMemory();
+      try {
+        return await operation(memory);
+      } catch (error) {
+        if (!isConnectionScopedError(error)) throw error;
+        await closeMemory(memory);
+        memory = await getMemory({ forceRefresh: true });
+        return await operation(memory);
+      }
+    });
   }
 
   async function withBackendTimeout(operation) {
