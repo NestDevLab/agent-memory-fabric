@@ -15,3 +15,9 @@ Planned surfaces:
 Important rule:
 - OpenMemory is not the security boundary
 - policy lives here
+
+Auth registry:
+- preferred source is a local JSON file selected with `MEM0_AUTH_REGISTRY_PATH`
+- local auth registry files may be mounted Docker secrets or files under `config/`
+- if the local path is set, the gateway does not call n8n
+- n8n Data Table auth remains a fallback only when the local path is unset

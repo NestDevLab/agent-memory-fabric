@@ -3,6 +3,7 @@ import http from 'node:http';
 import { URL } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createBackendAdapter } from './backend.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
@@ -10,7 +11,7 @@ const POLICY_PATH = process.env.MEM0_GATEWAY_POLICY_PATH || path.join(ROOT, 'con
 const PORT = Number(process.env.PORT || 8787);
 const sessions = new Map();
 const AUTH_CACHE_TTL_MS = Number(process.env.MEM0_AUTH_CACHE_TTL_MS || '15000');
-const authCache = { loadedAt: 0, rows: [] };
+const authCache = { loadedAt: 0, rows: [], sourceKey: '', mtimeMs: 0 };
 
 function loadPolicies() {
   try {
@@ -239,10 +240,66 @@ function normalizeRequestedScopes(inputScope, inputScopes, policy, policies) {
 }
 
 function parseCsvList(value) {
+  if (Array.isArray(value)) return value.map(x => String(x).trim()).filter(Boolean);
   const raw = String(value || '').trim();
   if (!raw) return [];
   if (raw === '*') return ['*'];
   return raw.split(',').map(x => x.trim()).filter(Boolean);
+}
+
+function parseActive(value) {
+  if (value === true) return true;
+  if (value === false || value == null) return false;
+  const raw = String(value).trim().toLowerCase();
+  return raw === 'true' || raw === '1' || raw === 'yes';
+}
+
+function getAuthRegistrySource() {
+  const localPath = String(process.env.MEM0_AUTH_REGISTRY_PATH || '').trim();
+  if (localPath) {
+    return {
+      kind: 'local-json',
+      path: path.resolve(ROOT, localPath),
+      cacheKey: `local:${path.resolve(ROOT, localPath)}`
+    };
+  }
+
+  if (process.env.N8N_API_BASE_URL && process.env.N8N_API_KEY && process.env.N8N_AUTH_TABLE_ID) {
+    return {
+      kind: 'n8n-data-table',
+      cacheKey: `n8n:${process.env.N8N_API_BASE_URL}:${process.env.N8N_AUTH_TABLE_ID}`
+    };
+  }
+
+  return { kind: 'unconfigured', cacheKey: 'unconfigured' };
+}
+
+function extractAuthRows(data, sourceKind) {
+  const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : Array.isArray(data?.data) ? data.data : null;
+  if (!rows) {
+    const err = new Error(sourceKind === 'local-json' ? 'auth_registry_invalid_json_shape' : 'auth_registry_invalid_response_shape');
+    err.status = 500;
+    throw err;
+  }
+  return rows;
+}
+
+function validateAuthRows(rows, sourceKind) {
+  if (!Array.isArray(rows)) {
+    const err = new Error('auth_registry_rows_not_array');
+    err.status = 500;
+    throw err;
+  }
+
+  return rows.map((row, index) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      const err = new Error('auth_registry_invalid_row');
+      err.status = 500;
+      err.data = { source: sourceKind, index };
+      throw err;
+    }
+    return row;
+  });
 }
 
 function getBearerToken(req) {
@@ -255,15 +312,58 @@ function getBearerToken(req) {
 
 async function loadAuthRegistry() {
   const now = Date.now();
-  if (now - authCache.loadedAt < AUTH_CACHE_TTL_MS && Array.isArray(authCache.rows) && authCache.rows.length) {
+  const source = getAuthRegistrySource();
+
+  if (source.kind === 'unconfigured') {
+    const err = new Error('auth_registry_unconfigured');
+    err.status = 500;
+    throw err;
+  }
+
+  if (source.kind === 'local-json') {
+    let stat;
+    try {
+      stat = fs.statSync(source.path);
+    } catch (error) {
+      const err = new Error('auth_registry_file_unreadable');
+      err.status = 500;
+      err.data = { path: source.path, cause: error?.code || error?.message || String(error) };
+      throw err;
+    }
+
+    if (
+      authCache.sourceKey === source.cacheKey &&
+      authCache.mtimeMs === stat.mtimeMs &&
+      now - authCache.loadedAt < AUTH_CACHE_TTL_MS &&
+      Array.isArray(authCache.rows)
+    ) {
+      return authCache.rows;
+    }
+
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(source.path, 'utf8'));
+    } catch (error) {
+      const err = new Error('auth_registry_file_invalid_json');
+      err.status = 500;
+      err.data = { path: source.path, cause: error?.message || String(error) };
+      throw err;
+    }
+
+    authCache.rows = validateAuthRows(extractAuthRows(data, source.kind), source.kind);
+    authCache.loadedAt = now;
+    authCache.sourceKey = source.cacheKey;
+    authCache.mtimeMs = stat.mtimeMs;
     return authCache.rows;
   }
+
+  if (now - authCache.loadedAt < AUTH_CACHE_TTL_MS && authCache.sourceKey === source.cacheKey && Array.isArray(authCache.rows)) {
+    return authCache.rows;
+  }
+
   const baseUrl = process.env.N8N_API_BASE_URL;
   const apiKey = process.env.N8N_API_KEY;
   const tableId = process.env.N8N_AUTH_TABLE_ID;
-  if (!baseUrl || !apiKey || !tableId) {
-    throw new Error('auth_registry_unconfigured');
-  }
   const url = new URL(`/api/v1/data-tables/${tableId}/rows`, baseUrl);
   const res = await fetch(url, {
     headers: {
@@ -280,8 +380,10 @@ async function loadAuthRegistry() {
     err.body = data ?? text;
     throw err;
   }
-  authCache.rows = data?.data || [];
+  authCache.rows = validateAuthRows(extractAuthRows(data, source.kind), source.kind);
   authCache.loadedAt = now;
+  authCache.sourceKey = source.cacheKey;
+  authCache.mtimeMs = 0;
   return authCache.rows;
 }
 
@@ -293,7 +395,7 @@ async function authenticateRequest(req) {
     throw err;
   }
   const rows = await loadAuthRegistry();
-  const row = rows.find(r => String(r.token || '') === token && Boolean(r.active));
+  const row = rows.find(r => String(r.token || '') === token && parseActive(r.active));
   if (!row) {
     const err = new Error('invalid_token');
     err.status = 401;
@@ -409,7 +511,7 @@ const server = http.createServer(async (req, res) => {
         configured: backend.configured
       },
       auth: {
-        registry: process.env.N8N_AUTH_TABLE_ID ? 'n8n-data-table' : 'unconfigured'
+        registry: getAuthRegistrySource().kind
       }
     });
   }
@@ -614,12 +716,25 @@ const server = http.createServer(async (req, res) => {
 });
 
 if (process.argv.includes('--check')) {
-  console.log(JSON.stringify({ ok: true, policyPath: POLICY_PATH, port: PORT, backend: backend.kind, configured: backend.configured, authRegistry: process.env.N8N_AUTH_TABLE_ID || null }, null, 2));
+  console.log(JSON.stringify({ ok: true, policyPath: POLICY_PATH, port: PORT, backend: backend.kind, configured: backend.configured, authRegistry: getAuthRegistrySource().kind }, null, 2));
   process.exit(0);
 }
 
-server.listen(PORT, () => {
-  console.log(`mem0-gateway listening on :${PORT}`);
-  console.log(`policy path: ${POLICY_PATH}`);
-  console.log(`backend kind: ${backend.kind}`);
-});
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+
+if (isMain) {
+  server.listen(PORT, () => {
+    console.log(`mem0-gateway listening on :${PORT}`);
+    console.log(`policy path: ${POLICY_PATH}`);
+    console.log(`backend kind: ${backend.kind}`);
+    console.log(`auth registry: ${getAuthRegistrySource().kind}`);
+  });
+}
+
+export {
+  authenticateRequest,
+  getAuthRegistrySource,
+  loadAuthRegistry,
+  parseActive,
+  parseCsvList
+};

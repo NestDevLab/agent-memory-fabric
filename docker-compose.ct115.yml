@@ -8,6 +8,9 @@ services:
       - .env.runtime
     volumes:
       - ./:/app
+      # Production deployments should mount a secret file and set:
+      # MEM0_AUTH_REGISTRY_PATH=/run/secrets/mem0-auth-registry.json
+      # - /root/.openclaw/secrets/mem0-auth-registry.json:/run/secrets/mem0-auth-registry.json:ro
     ports:
       - "8787:8787"
     logging:

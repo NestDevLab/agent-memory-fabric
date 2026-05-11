@@ -1,0 +1,20 @@
+{
+  "rows": [
+    {
+      "token": "replace-with-a-random-secret-token",
+      "active": true,
+      "actor": "main-openclaw",
+      "mode": "allow_all",
+      "allowedScopes": "*",
+      "permissions": "memory:search,memory:add"
+    },
+    {
+      "token": "replace-with-another-random-secret-token",
+      "active": true,
+      "actor": "openclaw-tirrenia",
+      "mode": "scoped",
+      "allowedScopes": ["tirrenia"],
+      "permissions": ["memory:search"]
+    }
+  ]
+}

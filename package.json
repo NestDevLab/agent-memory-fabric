@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
-    "check": "node src/server.mjs --check"
+    "check": "node src/server.mjs --check",
+    "test:auth": "node --test scripts/test-auth-registry.mjs"
   },
   "dependencies": {
     "@langchain/core": "^1.1.40",
