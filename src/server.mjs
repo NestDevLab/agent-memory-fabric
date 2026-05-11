@@ -516,12 +516,12 @@ const server = http.createServer(async (req, res) => {
     let sessionId = requestSessionId;
     let session = requestSession;
     if (!session) {
-      if (body.method !== 'initialize') {
-        return json(res, 404, { error: 'unknown_session' });
-      }
       sessionId = createMcpSessionId();
       session = { actor, policy, clientName, identity, transport: 'streamable-http' };
       sessions.set(sessionId, session);
+      if (body.method !== 'initialize') {
+        logEvent('mcp_session_recreated', { requestId, actor, clientName, identity, sourceIp, oldSessionId: requestSessionId || null, sessionId });
+      }
     }
 
     try {

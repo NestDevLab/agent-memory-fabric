@@ -180,12 +180,12 @@ function buildMem0OssAdapter() {
     return queueSharedMemoryOperation(async () => {
       let memory = await getMemory();
       try {
-        return await operation(memory);
+        return await withBackendTimeout(() => operation(memory));
       } catch (error) {
-        if (!isConnectionScopedError(error)) throw error;
+        if (!isConnectionScopedError(error) && String(error?.message || '') !== 'backend_timeout') throw error;
         await closeMemory(memory);
         memory = await getMemory({ forceRefresh: true });
-        return await operation(memory);
+        return await withBackendTimeout(() => operation(memory));
       }
     });
   }
@@ -222,10 +222,9 @@ function buildMem0OssAdapter() {
     configured,
     async search({ backendUserId, query }) {
       if (!configured) throw new Error('mem0_oss_backend_unconfigured');
-      return withBackendTimeout(async () => {
-        const normalizedQuery = String(query || '').trim();
+      const normalizedQuery = String(query || '').trim();
 
-        return withSharedMemory(async (memory) => {
+      return withSharedMemory(async (memory) => {
           if (normalizedQuery) {
             const data = await memory.search(normalizedQuery, {
               userId: backendUserId,
@@ -247,12 +246,11 @@ function buildMem0OssAdapter() {
             source: 'mem0-oss-get-all'
           };
         });
-      });
     },
     async add({ backendUserId, text, metadata = {}, infer = false }) {
       if (!configured) throw new Error('mem0_oss_backend_unconfigured');
       if (!text || !String(text).trim()) throw new Error('memory_text_required');
-      return withBackendTimeout(() => withSharedMemory(async (memory) => {
+      return withSharedMemory(async (memory) => {
         const result = await memory.add(String(text), {
           userId: backendUserId,
           infer,
@@ -263,7 +261,7 @@ function buildMem0OssAdapter() {
           relations: result?.relations || [],
           source: 'mem0-oss'
         };
-      }));
+      });
     }
   };
 }
