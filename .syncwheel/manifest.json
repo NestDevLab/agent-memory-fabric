@@ -18,12 +18,12 @@
     {
       "id": "amf-fabric-core",
       "branch": "amf/fabric-core",
-      "base": "origin/main",
+      "base": "d9f5ae753d0507b35d4ab7ce807df199acb68448",
       "target_remote": "origin",
       "target_branch": "main",
       "integration_branch": "main-integration",
       "commits": [
-        "8fe2a277cfdc6c0d097db55441933c81bea514cd"
+        "4ab9c621204fbc0668f8ef4a0ab423bc6ea520b8"
       ],
       "meta": {}
     }
