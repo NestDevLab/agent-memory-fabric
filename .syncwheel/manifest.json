@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "defaults": {
+    "canonical_remote": "origin",
+    "publication_remote": "origin",
+    "base_branch": "main",
+    "base_ref": "origin/main"
+  },
+  "integration": {
+    "branch": "main-integration",
+    "base": "origin/main",
+    "strategy": "cherry-pick",
+    "stacks": [
+      "amf-fabric-core"
+    ]
+  },
+  "stacks": [
+    {
+      "id": "amf-fabric-core",
+      "branch": "amf/fabric-core",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": []
+    }
+  ],
+  "syncwheel_tracking": "git-tracked",
+  "syncwheel_worktree_root": "var/syncwheel"
+}
