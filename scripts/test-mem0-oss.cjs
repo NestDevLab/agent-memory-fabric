@@ -1,5 +1,5 @@
 const path = require('path');
-const { Memory } = require(path.resolve(__dirname, '../node_modules/mem0ai/dist/oss/index.js'));
+const { Memory } = require('mem0ai/oss');
 
 async function buildMemory() {
   return new Memory({
@@ -49,9 +49,9 @@ async function main() {
   const memory = await buildMemory();
   let result;
   if (action === 'search') {
-    result = await memory.search(value, { userId, limit: 5 });
+    result = await memory.search(value, { filters: { user_id: userId }, topK: 5, threshold: 0 });
   } else if (action === 'getAll') {
-    result = await memory.getAll({ userId, limit: 10 });
+    result = await memory.getAll({ filters: { user_id: userId }, topK: 10 });
   } else {
     throw new Error(`unknown action: ${action}`);
   }
