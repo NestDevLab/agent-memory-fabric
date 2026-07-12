@@ -1,9 +1,8 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { normalizeOpaqueTagMap } from './access-contract.mjs';
 
 const TOKEN_FIELDS = ['actor', 'runtime', 'profile', 'conversationKind', 'contextTags', 'purpose', 'policyRevision', 'issuedAt', 'expiresAt', 'nonce', 'keyVersion', 'requestDigest'];
-const OPAQUE_TAG = /^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$/;
-const CONTEXT_KEYS = new Set(['actor', 'sender', 'conversation', 'room', 'person', 'relationship', 'thread']);
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
@@ -69,7 +68,7 @@ export class ContextTokenVerifier {
     if (!Number.isFinite(issuedAt) || !Number.isFinite(expiresAt) || issuedAt > now + this.maxClockSkewMs || expiresAt <= now || expiresAt - issuedAt > this.maxTtlMs) throw Object.assign(new Error('context_invalid'), { status: 403 });
     if (payload.actor !== actor || payload.purpose !== purpose || payload.policyRevision !== this.policyRevision || payload.requestDigest !== requestDigest(request)) throw Object.assign(new Error('context_invalid'), { status: 403 });
     if (!/^[A-Za-z0-9._-]{1,128}$/.test(payload.runtime) || !/^[A-Za-z0-9._-]{1,128}$/.test(payload.profile) || !/^[A-Za-z0-9_-]{16,128}$/.test(payload.nonce) || !['dm', 'group', 'channel', 'thread', 'session'].includes(payload.conversationKind)) throw Object.assign(new Error('context_invalid'), { status: 403 });
-    for (const [name, values] of Object.entries(payload.contextTags || {})) if (!CONTEXT_KEYS.has(name) || !Array.isArray(values) || values.length === 0 || values.some(value => !OPAQUE_TAG.test(value))) throw Object.assign(new Error('context_invalid'), { status: 403 });
+    try { normalizeOpaqueTagMap(payload.contextTags); } catch { throw Object.assign(new Error('context_invalid'), { status: 403 }); }
     const seen = this.nonces.get(payload.nonce);
     const tokenDigest = crypto.createHash('sha256').update(String(token), 'utf8').digest('hex');
     if (seen && (seen.requestDigest !== payload.requestDigest || seen.expiresAt !== expiresAt || seen.tokenDigest !== tokenDigest)) throw Object.assign(new Error('context_invalid'), { status: 403 });

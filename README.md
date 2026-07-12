@@ -15,6 +15,9 @@ legacy product alias while clients migrate to `agent-memory-fabric`.
 - canonical PAM read/search through an internal stdio adapter; proposal queue
   status remains a separate surface
 - request-bound conversation context tokens and monotonic curator/apply receipts
+- purpose-specific authorization and exact HMAC context intersection across PAM records and v2 sessions
+- one Fabric transaction for receipt state, proposal lifecycle and durable audit
+- authoritative REST/MCP/v1 schemas and Principia fixture under `config/contracts/` and `scripts/fixtures/contracts/`
 
 ## Auth registry
 

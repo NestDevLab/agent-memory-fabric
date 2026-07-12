@@ -15,6 +15,12 @@
     "domain:main-lab": {
       "backendUserId": "openmemory"
     },
+    "room:team": {
+      "backendUserId": "openmemory"
+    },
+    "person:alice": {
+      "backendUserId": "openmemory"
+    },
     "tirrenia": {
       "backendUserId": "openclaw_tirrenia"
     },

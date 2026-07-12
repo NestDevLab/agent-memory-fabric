@@ -9,8 +9,16 @@ import { FabricStore, MemoryCatalog, MemoryRawStore } from '../src/fabric-store.
 import { aadSha256For } from '../src/amf-memory-record-validator.mjs';
 import { createAgentMemoryFabricServer } from '../src/server.mjs';
 import { ContextTokenVerifier, issueContextToken, requestDigest } from '../src/context-token.mjs';
+import { buildContextRequest } from '../src/access-contract.mjs';
 
 const testPolicyPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'config', 'policies.example.json');
+const CONTEXT_RING = { currentKeyVersion: 'ctx-v1', keys: { 'ctx-v1': Buffer.alloc(32, 7).toString('base64') } };
+const CONTEXT_NOW = Date.parse('2026-07-12T12:00:00Z');
+const ROOM_A = `hmac-sha256:routing-v1:${'a'.repeat(64)}`;
+const ROOM_B = `hmac-sha256:routing-v1:${'b'.repeat(64)}`;
+function contextTokenFor({ actor = 'test-actor', purpose, operation, input, room = ROOM_A, conversationKind = 'group', contextTags = null }) {
+  return issueContextToken({ actor, runtime: 'principia', profile: 'test', conversationKind, contextTags: contextTags || { conversation: [room], room: [room] }, purpose, policyRevision: 'policy-test', issuedAt: new Date(CONTEXT_NOW - 1000).toISOString(), expiresAt: new Date(CONTEXT_NOW + 60_000).toISOString(), nonce: crypto.randomBytes(16).toString('base64url'), requestDigest: requestDigest(buildContextRequest(operation, input)) }, CONTEXT_RING);
+}
 
 function makeStore() {
   return new FabricStore({
@@ -40,7 +48,7 @@ function canonicalProposal(text, scope = 'main-lab', revision = 1) {
   return { record: canonicalRecord(text, scope, revision), rationale: 'test_evidence', expectedRevision: revision - 1 };
 }
 
-async function withServer(run, { sessionOptions, clock, configuredSessionReader = true, fabricStore: fabricStoreOverride, backend: backendOverride, canonicalStore, contextVerifier, receiptCoordinator } = {}) {
+async function withServer(run, { sessionOptions, clock, configuredSessionReader = true, sessionReader: sessionReaderOverride, fabricStore: fabricStoreOverride, backend: backendOverride, canonicalStore, contextVerifier, receiptCoordinator } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-server-'));
   const registryPath = path.join(dir, 'auth.json');
   const registry = {
@@ -59,7 +67,7 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
         actor: 'limited-actor',
         mode: 'scoped',
         allowedScopes: 'main-lab',
-        permissions: 'memory:search,memory:read,sessions:read'
+        permissions: 'memory:search,memory:read,sessions:read,purpose:continuity_resume,purpose:incident_debug,purpose:operator_review'
       },
       {
         tokenSha256: '556510a5888bb3f061617bfec75649cbe0d04f8c5efe6a2807a9ca3ef231f382',
@@ -67,7 +75,7 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
         actor: 'search-only',
         mode: 'scoped',
         allowedScopes: 'main-lab',
-        permissions: 'memory:search'
+        permissions: 'memory:search,purpose:operator_review'
       },
       {
         token: 'tirrenia-token',
@@ -75,7 +83,7 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
         actor: 'tirrenia-actor',
         mode: 'scoped',
         allowedScopes: 'tirrenia',
-        permissions: 'memory:read,sessions:read'
+        permissions: 'memory:read,sessions:read,purpose:operator_review'
       }
     ]
   };
@@ -101,14 +109,15 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
     }
   };
   const fabricStore = fabricStoreOverride || makeStore();
-  const sessionReader = {
+  const sessionReader = sessionReaderOverride || {
     kind: 'test-session-reader',
     configured: true,
-    async search({ query }) { return { items: [{ id: 'session-1', title: query, scope: 'main-lab', ownerActor: 'test-actor' }] }; },
-    async get({ id }) { return { id, title: 'Session', scope: 'main-lab', ownerActor: 'test-actor' }; },
-    async transcript({ id, view }) { return { id, view, messages: [] }; }
+    async search({ query }) { return { items: [{ id: 'session-1', title: query, scope: 'main-lab', ownerActor: 'test-actor', conversationKind: 'group', contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }] }; },
+    async get({ id }) { return { id, title: 'Session', scope: 'main-lab', ownerActor: 'test-actor', conversationKind: 'group', contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }; },
+    async transcript({ id, view }) { return { id, view, items: [], nextCursor: null }; }
   };
-  const server = createAgentMemoryFabricServer({ backend, fabricStore, canonicalStore, contextVerifier, receiptCoordinator, sessionReader: configuredSessionReader ? sessionReader : undefined, sessionOptions, clock, policyPath: testPolicyPath });
+  const effectiveContextVerifier = contextVerifier || new ContextTokenVerifier({ keyRing: CONTEXT_RING, policyRevision: 'policy-test', clock: () => CONTEXT_NOW });
+  const server = createAgentMemoryFabricServer({ backend, fabricStore, canonicalStore, contextVerifier: effectiveContextVerifier, receiptCoordinator, sessionReader: configuredSessionReader ? sessionReader : undefined, sessionOptions, clock, policyPath: testPolicyPath });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const api = async (pathname, options = {}) => {
@@ -157,10 +166,21 @@ test('v2 REST queues idempotently while canonical read never exposes proposal pa
     const status = await api(`/v2/memory/proposals/${first.body.data.proposalId}`);
     assert.equal(status.body.data.status, 'queued');
     assert.equal(status.body.data.record, undefined);
-    const read = await api(`/v2/memory/${first.body.data.proposalId}`);
-    assert.equal(read.response.status, 404);
-    assert.equal(read.body.error.code, 'memory_not_found');
+    const read = await api(`/v2/memory/${first.body.data.proposalId}?purpose=operator_review`);
+    assert.equal(read.response.status, 503);
+    assert.equal(read.body.error.code, 'canonical_store_unconfigured');
     assert.equal(JSON.stringify(read.body).includes('Remember the appointment'), false);
+  });
+});
+
+test('canonical search fails closed across v2 and v1 when PAM is unconfigured', async () => {
+  await withServer(async ({ api }) => {
+    const input = { query: 'appointment', scopes: ['domain:main-lab'], purpose: 'operator_review' };
+    for (const [path, expectedEnvelope] of [['/v2/memory/search', true], ['/v1/memory/search', false]]) {
+      const result = await api(path, { method: 'POST', body: JSON.stringify(input) });
+      assert.equal(result.response.status, 503);
+      assert.equal(expectedEnvelope ? result.body.error.code : result.body.error, 'canonical_store_unconfigured');
+    }
   });
 });
 
@@ -173,29 +193,71 @@ test('canonical PAM search/read and conversation recall bind the exact signed co
     async search() { return { items: [canonical], nextCursor: null }; },
     async read({ id }) { if (id !== canonical.id) throw Object.assign(new Error('memory_not_found'), { status: 404 }); return canonical; }
   };
-  const keyRing = { currentKeyVersion: 'ctx-v1', keys: { 'ctx-v1': Buffer.alloc(32, 7).toString('base64') } };
+  const keyRing = CONTEXT_RING;
   const now = Date.now();
   const contextVerifier = new ContextTokenVerifier({ keyRing, policyRevision: 'policy-test', clock: () => now });
-  const request = { operation: 'memory_search', query: 'appointment', scope: 'domain:main-lab', scopes: [] };
+  const request = buildContextRequest('memory_search', { query: 'appointment', scopes: ['domain:main-lab'] });
   const contextToken = issueContextToken({
     actor: 'test-actor', runtime: 'principia', profile: 'test', conversationKind: 'group',
-    contextTags: { room: [`hmac-sha256:routing-v1:${'a'.repeat(64)}`] }, purpose: 'conversation_recall', policyRevision: 'policy-test',
+    contextTags: { conversation: [ROOM_A], room: [ROOM_A] }, purpose: 'conversation_recall', policyRevision: 'policy-test',
     issuedAt: new Date(now - 1000).toISOString(), expiresAt: new Date(now + 60_000).toISOString(), nonce: 'nonce_1234567890abcdef', requestDigest: requestDigest(request)
   }, keyRing);
   await withServer(async ({ api }) => {
-    const missing = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ scope: 'domain:main-lab', query: 'appointment', purpose: 'conversation_recall' }) });
+    const missing = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ scopes: ['domain:main-lab'], query: 'appointment', purpose: 'conversation_recall' }) });
     assert.equal(missing.response.status, 403);
     assert.equal(missing.body.error.code, 'context_required');
-    const found = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ scope: 'domain:main-lab', query: 'appointment', purpose: 'conversation_recall', contextToken }) });
+    const found = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ scopes: ['domain:main-lab'], query: 'appointment', purpose: 'conversation_recall', contextToken }) });
     assert.equal(found.response.status, 200);
     assert.deepEqual(found.body.data.items.map(item => item.id), [canonical.id]);
-    const replayChanged = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ scope: 'domain:main-lab', query: 'different', purpose: 'conversation_recall', contextToken }) });
+    const replayChanged = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ scopes: ['domain:main-lab'], query: 'different', purpose: 'conversation_recall', contextToken }) });
     assert.equal(replayChanged.response.status, 403);
     assert.equal(replayChanged.body.error.code, 'context_invalid');
     const read = await api(`/v2/memory/${canonical.id}?purpose=operator_review`);
     assert.equal(read.response.status, 200);
     assert.equal(read.body.data.record.id, canonical.id);
   }, { canonicalStore, contextVerifier });
+});
+
+test('room and person canonical recall require exact context intersection across token and PAM index routing', async () => {
+  const roomRecord = canonicalRecord('Room appointment', 'main-lab');
+  roomRecord.scope = { type: 'room', id: 'room:team' }; roomRecord.visibility = 'shared'; roomRecord.claim.aadSha256 = aadSha256For(roomRecord);
+  const canonicalStore = {
+    configured: true,
+    routingContext() { return { conversation: [ROOM_B], room: [ROOM_B] }; },
+    async search() { return { items: [roomRecord], nextCursor: null }; },
+    async read() { return roomRecord; }
+  };
+  await withServer(async ({ api }) => {
+    const input = { query: 'appointment', scopes: ['room:team'], purpose: 'conversation_recall' };
+    const wrongToken = contextTokenFor({ purpose: input.purpose, operation: 'memory_search', input, room: ROOM_A });
+    const wrong = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ ...input, contextToken: wrongToken }) });
+    assert.equal(wrong.response.status, 200);
+    assert.deepEqual(wrong.body.data.items, [], 'Room-A token must not read a Room-B record');
+    const rightToken = contextTokenFor({ purpose: input.purpose, operation: 'memory_search', input, room: ROOM_B });
+    const right = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ ...input, contextToken: rightToken }) });
+    assert.deepEqual(right.body.data.items.map(item => item.id), [roomRecord.id]);
+
+    const personWithoutContext = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ query: 'appointment', scopes: ['person:alice'], purpose: 'operator_review' }) });
+    assert.equal(personWithoutContext.response.status, 403);
+    assert.equal(personWithoutContext.body.error.code, 'context_required');
+  }, { canonicalStore });
+});
+
+test('session context and purpose permission cannot be bypassed by caller-selected purpose or another room token', async () => {
+  const canonicalStore = { configured: true, async search() { return { items: [], nextCursor: null }; }, async read() { throw Object.assign(new Error('memory_not_found'), { status: 404 }); } };
+  await withServer(async ({ api }) => {
+    const input = { query: 'Session', purpose: 'continuity_resume' };
+    const wrongToken = contextTokenFor({ purpose: input.purpose, operation: 'sessions_search', input, room: ROOM_B });
+    const wrong = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ ...input, contextToken: wrongToken }) });
+    assert.equal(wrong.response.status, 200); assert.deepEqual(wrong.body.data.items, []);
+    const rightToken = contextTokenFor({ purpose: input.purpose, operation: 'sessions_search', input, room: ROOM_A });
+    const right = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ ...input, contextToken: rightToken }) });
+    assert.deepEqual(right.body.data.items.map(item => item.id), ['session-1']);
+    const missing = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify(input) });
+    assert.equal(missing.response.status, 403); assert.equal(missing.body.error.code, 'context_required');
+    const purposeBypass = await api('/v2/memory/search', { method: 'POST', headers: { authorization: 'Bearer limited-token' }, body: JSON.stringify({ query: 'x', scopes: ['main-lab'], purpose: 'memory_curation' }) });
+    assert.equal(purposeBypass.response.status, 403); assert.equal(purposeBypass.body.error.code, 'forbidden');
+  }, { canonicalStore });
 });
 
 test('internal identity and retention APIs enforce the existing auth, ACL and audit envelope', async () => {
@@ -238,7 +300,7 @@ test('internal identity and retention APIs enforce the existing auth, ACL and au
   });
 });
 
-test('memory search performs lifecycle filtering after the backend and leaks no revoked result or count', async () => {
+test('explicit non-canonical candidate search filters lifecycle state and never masquerades as canonical memory', async () => {
   const fabricStore = makeStore();
   const proposal = await fabricStore.propose({ actor: 'test-actor', scope: 'main-lab', text: 'must disappear', metadata: { originalTimestamp: '2020-01-01T00:00:00.000Z' }, idempotencyKey: 'search-filter-source' });
   await fabricStore.applyRetention({ actor: 'test-actor', idempotencyKey: 'search-filter-revoke', candidateIds: [proposal.contentId], expectedPlanAsOf: new Date().toISOString(), reason: 'revoked' }, { allowedScopes: ['main-lab'] });
@@ -247,11 +309,10 @@ test('memory search performs lifecycle filtering after the backend and leaks no 
     async search() { return { items: [{ id: 'safe', memory: 'safe' }, { id: 'secret', memory: 'must disappear', proposalId: proposal.id }], total: 2, source: 'test' }; }
   };
   await withServer(async ({ api }) => {
-    const result = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ scope: 'main-lab', query: 'anything' }) });
+    const result = await api('/v2/memory/candidates/search', { method: 'POST', body: JSON.stringify({ scope: 'main-lab', query: 'anything', purpose: 'memory_curation' }) });
     assert.equal(result.response.status, 200);
-    assert.deepEqual(result.body.data.result.items.map(item => item.id), ['safe']);
-    assert.equal(result.body.data.result.total, 1);
-    assert.equal(result.body.data.result.perScope[0].total, 1);
+    assert.equal(result.body.data.canonical, false);
+    assert.deepEqual(result.body.data.candidates.map(item => item.id), ['safe']);
     assert.equal(JSON.stringify(result.body).includes('must disappear'), false);
   }, { fabricStore, backend });
 });
@@ -299,13 +360,15 @@ test('legacy memory add queues instead of writing directly to Mem0', async () =>
 });
 
 test('legacy v1 search and MCP SSE endpoint remain available', async () => {
+  const canonical = canonicalRecord('appointment', 'main-lab'); canonical.visibility = 'shared'; canonical.claim.aadSha256 = aadSha256For(canonical);
+  const canonicalStore = { configured: true, async search() { return { items: [canonical], nextCursor: null }; }, async read() { return canonical; } };
   await withServer(async ({ api, baseUrl }) => {
     const search = await api('/v1/memory/search', {
       method: 'POST',
-      body: JSON.stringify({ scope: 'main-lab', query: 'appointment' })
+      body: JSON.stringify({ scope: 'domain:main-lab', query: 'appointment', purpose: 'operator_review' })
     });
     assert.equal(search.response.status, 200);
-    assert.equal(search.body.result.items[0].memory, 'appointment');
+    assert.equal(search.body.items[0].id, canonical.id);
 
     const controller = new AbortController();
     const response = await fetch(`${baseUrl}/mcp/test-client/sse/test-identity`, {
@@ -319,7 +382,27 @@ test('legacy v1 search and MCP SSE endpoint remain available', async () => {
     assert.match(firstEvent, /event: endpoint/);
     assert.match(firstEvent, /\/mcp\/messages\/\?session_id=/);
     controller.abort();
-  });
+  }, { canonicalStore });
+});
+
+test('REST, MCP and v1 canonical search share scopes, pagination shape and durable audit semantics', async () => {
+  const canonical = canonicalRecord('Cross transport', 'main-lab'); canonical.visibility = 'shared'; canonical.claim.aadSha256 = aadSha256For(canonical);
+  const canonicalStore = { configured: true, async search() { return { items: [canonical], nextCursor: null }; }, async read() { return canonical; } };
+  await withServer(async ({ api, fabricStore }) => {
+    const input = { query: 'cross', scopes: ['domain:main-lab'], purpose: 'operator_review', limit: 20, cursor: null, from: null, to: null };
+    const rest = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify(input) });
+    const legacy = await api('/v1/memory/search', { method: 'POST', body: JSON.stringify(input) });
+    const initialized = await api('/mcp/test-client/cross', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } }) });
+    const mcp = await api('/mcp/test-client/cross', { method: 'POST', headers: { 'mcp-session-id': initialized.response.headers.get('mcp-session-id') }, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'memory_search', arguments: input } }) });
+    const mcpData = JSON.parse(mcp.body.result.content[0].text);
+    assert.deepEqual(rest.body.data.items.map(item => item.id), [canonical.id]);
+    assert.deepEqual(legacy.body.items.map(item => item.id), [canonical.id]);
+    assert.deepEqual(mcpData.items.map(item => item.id), [canonical.id]);
+    assert.deepEqual(rest.body.data.scopes, legacy.body.scopes);
+    assert.deepEqual(rest.body.data.scopes, mcpData.scopes);
+    assert.equal(rest.body.data.nextCursor, null); assert.equal(legacy.body.nextCursor, null); assert.equal(mcpData.nextCursor, null);
+    assert.ok(fabricStore.catalog.auditEvents.filter(event => event.action === 'memory_search').length >= 2);
+  }, { canonicalStore });
 });
 
 test('v2 validates idempotency and query limits with stable error envelopes', async () => {
@@ -375,7 +458,7 @@ test('v2 validates idempotency and query limits with stable error envelopes', as
 
     const tooLarge = await api('/v2/memory/search', {
       method: 'POST',
-      body: JSON.stringify({ scope: 'main-lab', query: 'x'.repeat(4097) })
+      body: JSON.stringify({ scope: 'main-lab', query: 'x'.repeat(4097), purpose: 'operator_review' })
     });
     assert.equal(tooLarge.response.status, 413);
     assert.equal(tooLarge.body.error.code, 'query_too_large');
@@ -484,7 +567,9 @@ test('session reader capability is explicit and unconfigured access returns 503'
   await withServer(async ({ api }) => {
     const initialized = await api('/mcp/test-client/test-identity', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } }) });
     assert.equal(initialized.body.result.capabilities.experimental.sessionReader, false);
-    const unavailable = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ query: 'x', purpose: 'continuity_resume' }) });
+    const input = { query: 'x', purpose: 'continuity_resume' };
+    const contextToken = contextTokenFor({ purpose: input.purpose, operation: 'sessions_search', input });
+    const unavailable = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ ...input, contextToken }) });
     assert.equal(unavailable.response.status, 503);
     assert.equal(unavailable.body.error.code, 'session_reader_unconfigured');
   }, { configuredSessionReader: false });
@@ -492,18 +577,21 @@ test('session reader capability is explicit and unconfigured access returns 503'
 
 test('session transcript defaults redacted and requires raw decrypt permission for original', async () => {
   await withServer(async ({ api }) => {
-    const transcript = await api('/v2/sessions/session-1/transcript?purpose=continuity_resume');
+    const redactedToken = contextTokenFor({ purpose: 'continuity_resume', operation: 'session_transcript', input: { sessionId: 'session-1', view: 'redacted' } });
+    const transcript = await api(`/v2/sessions/session-1/transcript?purpose=continuity_resume&contextToken=${encodeURIComponent(redactedToken)}`);
     assert.equal(transcript.response.status, 200);
     assert.equal(transcript.body.data.view, 'redacted');
     assert.match(transcript.response.headers.get('cache-control'), /no-store/);
 
-    const forbidden = await api('/v2/sessions/session-1/transcript?view=original&purpose=incident_debug', {
+    const limitedToken = contextTokenFor({ actor: 'limited-actor', purpose: 'incident_debug', operation: 'session_transcript', input: { sessionId: 'session-1', view: 'original' } });
+    const forbidden = await api(`/v2/sessions/session-1/transcript?view=original&purpose=incident_debug&contextToken=${encodeURIComponent(limitedToken)}`, {
       headers: { authorization: 'Bearer limited-token' }
     });
     assert.equal(forbidden.response.status, 403);
     assert.equal(forbidden.body.error.code, 'raw_decrypt_forbidden');
 
-    const hidden = await api('/v2/sessions/session-1?purpose=operator_review', {
+    const tirreniaContext = contextTokenFor({ actor: 'tirrenia-actor', purpose: 'operator_review', operation: 'session_get', input: { sessionId: 'session-1' } });
+    const hidden = await api(`/v2/sessions/session-1?purpose=operator_review&contextToken=${encodeURIComponent(tirreniaContext)}`, {
       headers: { authorization: 'Bearer tirrenia-token' }
     });
     assert.equal(hidden.response.status, 404);
@@ -513,6 +601,24 @@ test('session transcript defaults redacted and requires raw decrypt permission f
     assert.equal(missingPurpose.response.status, 400);
     assert.equal(missingPurpose.body.error.code, 'purpose_required');
   });
+});
+
+test('durable decrypt-intent audit failure prevents the session reader from decrypting RAW', async () => {
+  const fabricStore = makeStore();
+  const originalAudit = fabricStore.audit.bind(fabricStore);
+  fabricStore.audit = async event => { if (event.action === 'raw_decrypt_intent') throw new Error('audit offline'); return originalAudit(event); };
+  let transcriptCalls = 0;
+  const sessionReader = {
+    configured: true, kind: 'decrypt-spy',
+    async search() { return { items: [] }; },
+    async get({ id }) { return { id, scope: 'main-lab', ownerActor: 'test-actor', conversationKind: 'group', contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }; },
+    async transcript() { transcriptCalls += 1; return { id: 'session-1', view: 'original', items: [], nextCursor: null }; }
+  };
+  await withServer(async ({ api }) => {
+    const contextToken = contextTokenFor({ purpose: 'incident_debug', operation: 'session_transcript', input: { sessionId: 'session-1', view: 'original' } });
+    const result = await api(`/v2/sessions/session-1/transcript?view=original&purpose=incident_debug&contextToken=${encodeURIComponent(contextToken)}`);
+    assert.equal(result.response.status, 503); assert.equal(result.body.error.code, 'audit_unavailable'); assert.equal(transcriptCalls, 0);
+  }, { fabricStore, sessionReader });
 });
 
 test('v2 authentication failures and unknown routes retain the v2 envelope', async () => {
@@ -528,7 +634,7 @@ test('v2 authentication failures and unknown routes retain the v2 envelope', asy
     assert.equal(missing.body.error.code, 'not_found');
     assert.equal(JSON.stringify(missing.body).includes('/v2/unknown'), false);
 
-    const providerFailure = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ scope: 'main-lab', query: 'explode' }) });
+    const providerFailure = await api('/v2/memory/candidates/search', { method: 'POST', body: JSON.stringify({ scope: 'main-lab', query: 'explode', purpose: 'memory_curation' }) });
     assert.equal(providerFailure.response.status, 500);
     assert.equal(providerFailure.body.error.code, 'internal_error');
     assert.equal(JSON.stringify(providerFailure.body).includes('/secret/path'), false);
@@ -544,9 +650,9 @@ test('audit and catalog outages return controlled 503 responses for auth, search
     assert.equal(auth.response.status, 503);
     assert.equal(auth.body.error.code, 'audit_unavailable');
 
-    const search = await api('/v2/memory/search', {
+    const search = await api('/v2/memory/candidates/search', {
       method: 'POST',
-      body: JSON.stringify({ scope: 'main-lab', query: 'appointment' })
+      body: JSON.stringify({ scope: 'main-lab', query: 'appointment', purpose: 'memory_curation' })
     });
     assert.equal(search.response.status, 503);
     assert.equal(search.body.error.code, 'audit_unavailable');
@@ -590,8 +696,8 @@ test('memory read and proposal status apply current policy before ownership with
       const paths = [
         `/v2/memory/proposals/${id}`,
         '/v2/memory/proposals/00000000-0000-0000-0000-000000000000',
-        `/v2/memory/${id}`,
-        '/v2/memory/00000000-0000-0000-0000-000000000000'
+        `/v2/memory/${id}?purpose=operator_review`,
+        '/v2/memory/00000000-0000-0000-0000-000000000000?purpose=operator_review'
       ];
       const results = await Promise.all(paths.map(pathname => api(pathname)));
       for (const result of results) {
@@ -612,7 +718,7 @@ test('memory read and proposal status apply current policy before ownership with
     writeRegistry();
     await assertHiddenByCurrentPolicy();
     assert.equal(decryptions, 0, 'deny mode must deny before decrypting RAW');
-  });
+  }, { canonicalStore: { configured: true, async read() { throw Object.assign(new Error('memory_not_found'), { status: 404 }); }, async search() { return { items: [], nextCursor: null }; } } });
 });
 
 test('v2 rejects unregistered scopes and malformed or oversized JSON with envelopes', async () => {

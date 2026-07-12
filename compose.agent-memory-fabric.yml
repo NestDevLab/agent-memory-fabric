@@ -1,6 +1,6 @@
 services:
   agent-memory-fabric:
-    image: agent-memory-fabric:0.4.0
+    image: agent-memory-fabric:0.5.0
     build:
       context: .
       dockerfile: Dockerfile
@@ -19,11 +19,9 @@ services:
       AMF_PAM_MCP_SERVER_PATH: /opt/portable-agent-memory/tools/pam-mcp-server.mjs
       AMF_PAM_WORKSPACE: /srv/brain-shared
       AMF_PAM_RECORD_INDEX_PATH: /run/config/amf-pam-record-index.json
-      AMF_RECEIPT_LEDGER_PATH: /var/lib/agent-memory-fabric/curator-receipts.sqlite
       AMF_DATA_PATH: /var/lib/agent-memory-fabric
-      AMF_CATALOG_KIND: "${AMF_CATALOG_KIND:-sqlite}"
-      AMF_CATALOG_PATH: /var/lib/agent-memory-fabric/catalog.sqlite
-      AMF_CATALOG_DATABASE_URL: "${AMF_CATALOG_DATABASE_URL:-}"
+      AMF_CATALOG_KIND: postgres
+      AMF_CATALOG_DATABASE_URL: "${AMF_CATALOG_DATABASE_URL:?set the dedicated production PostgreSQL URL}"
       AMF_CATALOG_SSL_MODE: "${AMF_CATALOG_SSL_MODE:-verify-full}"
       AMF_CATALOG_POOL_MAX: "${AMF_CATALOG_POOL_MAX:-10}"
       AMF_CATALOG_CONNECT_TIMEOUT_MS: "${AMF_CATALOG_CONNECT_TIMEOUT_MS:-5000}"

@@ -410,6 +410,7 @@ export class MemoryCatalog {
     this.retention = new Map();
     this.retentionTombstones = new Map();
     this.retentionOperations = new Map();
+    this.curatorReceipts = new Map();
   }
   findProposal(ownerTags, idempotencyTags) {
     for (const ownerTag of ownerTags) for (const idempotencyTag of idempotencyTags) {
@@ -445,6 +446,34 @@ export class MemoryCatalog {
     return true;
   }
   appendAudit(event) { this.auditEvents.push({ ...event }); }
+  recordCuratorReceipt(receipt, auditEvent) {
+    const current = this.curatorReceipts.get(receipt.proposalId);
+    const proposal = this.proposals.get(receipt.proposalId);
+    if (!proposal) throw createError('receipt_proposal_unverified', 409);
+    if (receipt.kind === 'decision') {
+      if (current?.decision) {
+        if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
+        this.auditEvents.push({ ...auditEvent, outcome: 'duplicate' });
+        return { ...structuredClone(current), duplicate: true };
+      }
+      const row = { proposalId: receipt.proposalId, status: receipt.status, decision: structuredClone(receipt), apply: null };
+      this.curatorReceipts.set(receipt.proposalId, row);
+      proposal.status = receipt.status === 'rejected' ? 'rejected' : 'review';
+      this.auditEvents.push({ ...auditEvent, outcome: 'recorded' });
+      return { ...structuredClone(row), duplicate: false };
+    }
+    if (!current?.decision || current.decision.status !== 'approved_pending_apply') throw createError('receipt_transition_invalid', 409);
+    if (current.apply) {
+      if (canonicalJson(current.apply) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
+      this.auditEvents.push({ ...auditEvent, outcome: 'duplicate' });
+      return { ...structuredClone(current), duplicate: true };
+    }
+    current.status = 'promoted'; current.apply = structuredClone(receipt); proposal.status = 'promoted';
+    this.auditEvents.push({ ...auditEvent, outcome: 'recorded' });
+    return { ...structuredClone(current), duplicate: false };
+  }
+  getCuratorReceipt(proposalId) { const row = this.curatorReceipts.get(proposalId); return row ? structuredClone(row) : null; }
+  listCuratorReceipts() { return [...this.curatorReceipts.values()].map(row => structuredClone(row)); }
   ingestRawEvent(record, rawRecord, auditEvent) {
     const existing = this.rawEvents.get(record.eventId);
     if (existing) { this.auditEvents.push({ ...auditEvent, outcome: 'duplicate' }); return { record: existing, duplicate: true }; }
@@ -613,6 +642,21 @@ function compareSessions(a, b) {
 
 function escapedLike(value) { return `%${String(value).replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_')}%`; }
 
+function pageBinding(value) { return crypto.createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex'); }
+function decodePageCursor(cursor, binding) {
+  if (!cursor) return 0;
+  let value;
+  try { value = JSON.parse(Buffer.from(String(cursor), 'base64url').toString('utf8')); } catch { throw createError('invalid_request', 400); }
+  if (!value || Object.keys(value).sort().join('\0') !== 'binding\0offset' || value.binding !== binding || !Number.isSafeInteger(value.offset) || value.offset < 0 || value.offset > 10000) throw createError('invalid_request', 400);
+  return value.offset;
+}
+function encodePageCursor(offset, binding) { return Buffer.from(JSON.stringify({ binding, offset }), 'utf8').toString('base64url'); }
+function inTimeWindow(timestamp, from, to) {
+  if (!timestamp) return !from && !to;
+  const value = Date.parse(timestamp);
+  return (!from || value >= Date.parse(from)) && (!to || value <= Date.parse(to));
+}
+
 export class SqliteCatalog {
   constructor({ databasePath }) {
     this.databasePath = path.resolve(databasePath);
@@ -640,6 +684,7 @@ export class SqliteCatalog {
       CREATE TABLE IF NOT EXISTS retention_tombstones_v2 (id TEXT PRIMARY KEY, content_id TEXT NOT NULL, content_checksum TEXT NOT NULL, source_pointer_tag TEXT, reason_code TEXT NOT NULL CHECK(reason_code IN ('retention_expired','revoked','forgotten')), original_created_at TEXT NOT NULL, expired_at TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS retention_operations_v2 (id TEXT PRIMARY KEY, idempotency_tag TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL, response_json TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS raw_projection_v2_migration_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, verified_at TEXT NOT NULL, v1_count INTEGER NOT NULL, v2_count INTEGER NOT NULL, alias_count INTEGER NOT NULL, alias_orphan_count INTEGER NOT NULL, legacy_field_count INTEGER NOT NULL, literal_scan_count INTEGER NOT NULL, backend TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS curator_receipt_state_v1 (proposal_id TEXT PRIMARY KEY REFERENCES fabric_proposals(id), status TEXT NOT NULL, decision_json TEXT NOT NULL, apply_json TEXT);
     `);
     const sessionColumns = new Set(this.db.prepare('PRAGMA table_info(raw_sessions_v1)').all().map(row => row.name));
     if (!sessionColumns.has('conversation_kind')) this.db.exec('ALTER TABLE raw_sessions_v1 ADD COLUMN conversation_kind TEXT');
@@ -655,6 +700,32 @@ export class SqliteCatalog {
       return { record, duplicate: false };
     });
     this.insertAudit = this.db.prepare('INSERT INTO audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES (@id,@ts,@actorTag,@action,@outcome,@requestId,@targetId,@scopeTag,@detailsJson)');
+    this.recordCuratorReceiptTransaction = this.db.transaction((receipt, auditEvent) => {
+      const proposal = this.db.prepare('SELECT * FROM fabric_proposals WHERE id=?').get(receipt.proposalId);
+      if (!proposal) throw createError('receipt_proposal_unverified', 409);
+      const current = this.getCuratorReceipt(receipt.proposalId);
+      let duplicate = false;
+      if (receipt.kind === 'decision') {
+        if (current) {
+          if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
+          duplicate = true;
+        } else {
+          this.db.prepare('INSERT INTO curator_receipt_state_v1(proposal_id,status,decision_json,apply_json) VALUES (?,?,?,NULL)').run(receipt.proposalId, receipt.status, JSON.stringify(receipt));
+          this.db.prepare('UPDATE fabric_proposals SET status=? WHERE id=?').run(receipt.status === 'rejected' ? 'rejected' : 'review', receipt.proposalId);
+        }
+      } else {
+        if (!current?.decision || current.decision.status !== 'approved_pending_apply') throw createError('receipt_transition_invalid', 409);
+        if (current.apply) {
+          if (canonicalJson(current.apply) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
+          duplicate = true;
+        } else {
+          this.db.prepare("UPDATE curator_receipt_state_v1 SET status='promoted',apply_json=? WHERE proposal_id=? AND apply_json IS NULL").run(JSON.stringify(receipt), receipt.proposalId);
+          this.db.prepare("UPDATE fabric_proposals SET status='promoted' WHERE id=?").run(receipt.proposalId);
+        }
+      }
+      this.db.prepare('INSERT INTO audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES (?,?,?,?,?,?,?,?,?)').run(auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, duplicate ? 'duplicate' : 'recorded', auditEvent.requestId || null, receipt.proposalId, null, JSON.stringify(auditEvent.details || {}));
+      return { ...this.getCuratorReceipt(receipt.proposalId), duplicate };
+    });
     this.insertRawEvent = this.db.transaction((record, raw, auditEvent) => {
       const existing = this.db.prepare('SELECT * FROM raw_events_v1 WHERE event_id=?').get(record.eventId);
       if (existing) {
@@ -791,6 +862,9 @@ export class SqliteCatalog {
   appendAudit(event) {
     this.insertAudit.run({ id: event.id, ts: event.ts, actorTag: event.actorTag, action: event.action, outcome: event.outcome, requestId: event.requestId || null, targetId: event.targetId || null, scopeTag: event.scopeTag || null, detailsJson: JSON.stringify(event.details || {}) });
   }
+  recordCuratorReceipt(receipt, auditEvent) { return this.recordCuratorReceiptTransaction(receipt, auditEvent); }
+  getCuratorReceipt(proposalId) { const row = this.db.prepare('SELECT * FROM curator_receipt_state_v1 WHERE proposal_id=?').get(proposalId); return row ? { proposalId: row.proposal_id, status: row.status, decision: JSON.parse(row.decision_json), apply: row.apply_json ? JSON.parse(row.apply_json) : null } : null; }
+  listCuratorReceipts() { return this.db.prepare('SELECT * FROM curator_receipt_state_v1 ORDER BY proposal_id').all().map(row => ({ proposalId: row.proposal_id, status: row.status, decision: JSON.parse(row.decision_json), apply: row.apply_json ? JSON.parse(row.apply_json) : null })); }
   mapRawEvent(row) { return row ? { eventId: row.event_id, sessionId: row.session_id, logicalMessageId: row.logical_message_id || null, contentId: row.content_id, payloadDigest: row.payload_digest, projection: JSON.parse(row.projection_json), ownerTag: row.owner_tag, sourceTag: row.source_tag, createdAt: row.created_at } : null; }
   ingestRawEvent(record, rawRecord, auditEvent) { return this.insertRawEvent(record, rawRecord, auditEvent); }
   ingestRawEventV2(record, rawRecord, auditEvent) { return this.insertRawEventV2(record, rawRecord, auditEvent); }
@@ -861,7 +935,7 @@ export class SqliteCatalog {
 }
 
 const POSTGRES_SCHEMA = 'agent_memory_fabric';
-const POSTGRES_SCHEMA_VERSION = 5;
+const POSTGRES_SCHEMA_VERSION = 6;
 const POSTGRES_SCHEMA_SQL = [
   `CREATE SCHEMA IF NOT EXISTS ${POSTGRES_SCHEMA}`,
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.schema_migrations (
@@ -1016,6 +1090,10 @@ const POSTGRES_SCHEMA_SQL = [
     singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, verified_at TIMESTAMPTZ NOT NULL,
     v1_count BIGINT NOT NULL, v2_count BIGINT NOT NULL, alias_count BIGINT NOT NULL, alias_orphan_count BIGINT NOT NULL,
     legacy_field_count BIGINT NOT NULL, literal_scan_count BIGINT NOT NULL, backend TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.curator_receipt_state_v1 (
+    proposal_id TEXT PRIMARY KEY REFERENCES ${POSTGRES_SCHEMA}.fabric_proposals(id), status TEXT NOT NULL,
+    decision_json JSONB NOT NULL, apply_json JSONB
   )`
 ];
 
@@ -1502,6 +1580,58 @@ export class PostgresCatalog {
     );
   }
 
+  async getCuratorReceipt(proposalId, queryable = this.pool) {
+    await this.ready();
+    const result = await this._query(queryable, `SELECT * FROM ${POSTGRES_SCHEMA}.curator_receipt_state_v1 WHERE proposal_id=$1`, [proposalId]);
+    const row = result.rows[0];
+    return row ? { proposalId: row.proposal_id, status: row.status, decision: typeof row.decision_json === 'string' ? JSON.parse(row.decision_json) : row.decision_json, apply: row.apply_json ? (typeof row.apply_json === 'string' ? JSON.parse(row.apply_json) : row.apply_json) : null } : null;
+  }
+
+  async listCuratorReceipts() {
+    await this.ready();
+    const result = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.curator_receipt_state_v1 ORDER BY proposal_id`);
+    return Promise.all(result.rows.map(row => this.getCuratorReceipt(row.proposal_id)));
+  }
+
+  async recordCuratorReceipt(receipt, auditEvent) {
+    await this.ready();
+    const client = await this._connect();
+    let destroyClient = false;
+    try {
+      await this._begin(client);
+      await this._query(client, 'SELECT pg_advisory_xact_lock(hashtextextended($1, 6))', [receipt.proposalId]);
+      const proposal = await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.fabric_proposals WHERE id=$1 FOR UPDATE`, [receipt.proposalId]);
+      if (!proposal.rows[0]) throw createError('receipt_proposal_unverified', 409);
+      const current = await this.getCuratorReceipt(receipt.proposalId, client);
+      let duplicate = false;
+      if (receipt.kind === 'decision') {
+        if (current) {
+          if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
+          duplicate = true;
+        } else {
+          await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.curator_receipt_state_v1(proposal_id,status,decision_json,apply_json) VALUES ($1,$2,$3::jsonb,NULL)`, [receipt.proposalId, receipt.status, JSON.stringify(receipt)]);
+          await this._query(client, `UPDATE ${POSTGRES_SCHEMA}.fabric_proposals SET status=$1 WHERE id=$2`, [receipt.status === 'rejected' ? 'rejected' : 'review', receipt.proposalId]);
+        }
+      } else {
+        if (!current?.decision || current.decision.status !== 'approved_pending_apply') throw createError('receipt_transition_invalid', 409);
+        if (current.apply) {
+          if (canonicalJson(current.apply) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
+          duplicate = true;
+        } else {
+          await this._query(client, `UPDATE ${POSTGRES_SCHEMA}.curator_receipt_state_v1 SET status='promoted',apply_json=$1::jsonb WHERE proposal_id=$2 AND apply_json IS NULL`, [JSON.stringify(receipt), receipt.proposalId]);
+          await this._query(client, `UPDATE ${POSTGRES_SCHEMA}.fabric_proposals SET status='promoted' WHERE id=$1`, [receipt.proposalId]);
+        }
+      }
+      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,$8::jsonb)`, [auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, duplicate ? 'duplicate' : 'recorded', auditEvent.requestId || null, receipt.proposalId, JSON.stringify(auditEvent.details || {})]);
+      const result = await this.getCuratorReceipt(receipt.proposalId, client);
+      await this._query(client, 'COMMIT');
+      return { ...result, duplicate };
+    } catch (error) {
+      try { await this._query(client, 'ROLLBACK'); } catch { destroyClient = true; }
+      throw error;
+    } finally { client.release(destroyClient ? new Error('catalog_client_discarded') : undefined); }
+  }
+
   async createIdentity(record, event, rawRecord) {
     await this.ready();
     const client = await this._connect();
@@ -1882,6 +2012,22 @@ export class FabricStore {
 
   async readProposal(id) { return this.readProposalAuthorized(id, { actor: '', allowAll: true }); }
 
+  async assertPromotionEligible(proposalId, { actor = 'curator', requestId = null } = {}) {
+    const proposal = await this.readProposal(proposalId);
+    const eventIds = proposal?.payload?.record?.provenance?.map(item => item.eventId).filter(id => /^evt_[a-f0-9]{64}$/.test(String(id))) || [];
+    for (const eventId of eventIds) {
+      const event = await this._catalogOperation(() => this.catalog.getRawEvent(eventId));
+      if (!event) continue;
+      const logical = event.logicalMessageId ? await this._catalogOperation(() => this.catalog.findLogicalMessage([event.logicalMessageId])) : null;
+      if (logical?.payloadConflict || logical?.tombstoned) {
+        await this.audit({ actor, action: 'raw_reconcile', outcome: 'blocked', requestId, targetId: proposalId, details: { code: logical.tombstoned ? 'logical_message_tombstoned' : 'logical_message_conflict' } });
+        throw createError('raw_reconcile_required', 409);
+      }
+    }
+    await this.audit({ actor, action: 'raw_reconcile', outcome: 'eligible', requestId, targetId: proposalId, details: { resultCount: eventIds.length } });
+    return true;
+  }
+
   async ingestRawEvent(input, { requestId = null } = {}) {
     if (!this.ingestKeys) throw createError('raw_ingest_unconfigured', 503);
     validateClientCiphertext({ ...input, actorId: input.actor }, { allowedKeyIds: new Set(this.ingestKeys.keys.keys()), authorizations: this.ingestKeys.authorizations });
@@ -1945,27 +2091,36 @@ export class FabricStore {
     return {
       configured: true,
       kind: 'fabric-ciphertext-catalog',
-      async search({ actor, query, limit }) {
-        const sessions = await store._catalogOperation(() => store.catalog.searchSessions({ ownerTags: store.rawStore.opaqueTags('raw-owner', actor), query, limit }));
-        return { items: sessions.map(publicSession), total: sessions.length };
+      async search({ actor, query, cursor = null, limit, from = null, to = null }) {
+        const binding = pageBinding({ actor, query, from, to, operation: 'sessions_search' });
+        const offset = decodePageCursor(cursor, binding);
+        const sessions = await store._catalogOperation(() => store.catalog.searchSessions({ ownerTags: store.rawStore.opaqueTags('raw-owner', actor), query, limit: Math.min(offset + limit + 1, 10001) }));
+        const filtered = sessions.filter(session => inTimeWindow(session.lastOccurredAt || session.createdAt, from, to));
+        const page = filtered.slice(offset, offset + limit);
+        return { items: page.map(publicSession), total: page.length, nextCursor: offset + page.length < filtered.length ? encodePageCursor(offset + page.length, binding) : null };
       },
       async get({ actor, id }) {
         return publicSession(await ownedSession(actor, id));
       },
-      async transcript({ actor, id, view }) {
+      async transcript({ actor, id, view, cursor = null, limit = 100, from = null, to = null }) {
         await ownedSession(actor, id);
-        const events = await store._catalogOperation(() => store.catalog.listSessionEvents(id));
-        if (view !== 'original') return { id, view: 'redacted', items: events.map(event => ({ eventId: event.eventId, occurredAt: event.projection.occurredAt, role: event.projection.role, content: { redacted: true, contentType: event.projection.contentType, parts: event.projection.contentParts } })) };
+        const allEvents = await store._catalogOperation(() => store.catalog.listSessionEvents(id));
+        const binding = pageBinding({ actor, id, view, from, to, operation: 'session_transcript' });
+        const offset = decodePageCursor(cursor, binding);
+        const filtered = allEvents.filter(event => inTimeWindow(event.projection.occurredAt || event.createdAt, from, to));
+        const events = filtered.slice(offset, offset + limit);
+        const nextCursor = offset + events.length < filtered.length ? encodePageCursor(offset + events.length, binding) : null;
+        if (view !== 'original') return { id, view: 'redacted', items: events.map(event => ({ eventId: event.eventId, occurredAt: event.projection.occurredAt, role: event.projection.role, content: { redacted: true, contentType: event.projection.contentType, parts: event.projection.contentParts } })), nextCursor };
         await store._catalogOperation(() => store.catalog.appendAudit({ id: store.idFactory(), ts: store.clock().toISOString(), actorTag: store.rawStore.opaqueTag('audit-actor', actor), action: 'raw_decrypt_intent', outcome: 'authorized', requestId: null, targetId: id, scopeTag: null, details: { view: 'original' } }));
-        const messages = [];
+        const items = [];
         for (const event of events) {
           const envelope = await store.rawStore.getClientCiphertext(event.contentId);
           if (envelope.actorId !== actor || !store.rawStore.opaqueTags('raw-owner', actor).includes(event.ownerTag)
             || !store.rawStore.opaqueTags('raw-source', envelope.sourceInstanceId).includes(event.sourceTag)) throw createError('catalog_binding_mismatch', 500);
           const item = decryptClientCiphertext({ actorId: actor, sourceInstanceId: envelope.sourceInstanceId, projection: event.projection, envelope }, store.ingestKeys);
-          messages.push({ eventId: event.eventId, occurredAt: event.projection.occurredAt, role: event.projection.role, raw: item.event.raw });
+          items.push({ eventId: event.eventId, occurredAt: event.projection.occurredAt, role: event.projection.role, raw: item.event.raw });
         }
-        return { id, view: 'original', items: messages };
+        return { id, view: 'original', items, nextCursor };
       }
     };
   }
@@ -2181,6 +2336,12 @@ export class FabricStore {
     const safeDetails = Object.fromEntries(Object.entries(details).filter(([key]) => SAFE_AUDIT_DETAIL_KEYS.has(key)));
     await this._catalogOperation(() => this.catalog.appendAudit({ id: this.idFactory(), ts: this.clock().toISOString(), actorTag: this.rawStore.opaqueTag('audit-actor', actor), action, outcome, requestId, targetId, scopeTag: scope ? this.rawStore.opaqueTag('audit-scope', scope) : null, details: safeDetails }));
   }
+  async recordCuratorReceiptAtomic(receipt, { actor = 'curator', requestId = null } = {}) {
+    const auditEvent = { id: this.idFactory(), ts: this.clock().toISOString(), actorTag: this.rawStore.opaqueTag('audit-actor', actor), action: receipt.kind === 'apply' ? 'curation_apply_receipt' : 'curation_decision_receipt', outcome: 'recorded', requestId, targetId: receipt.proposalId, scopeTag: null, details: { transport: 'internal' } };
+    return this._catalogOperation(() => this.catalog.recordCuratorReceipt(receipt, auditEvent));
+  }
+  async getCuratorReceipt(proposalId) { return this._catalogOperation(() => this.catalog.getCuratorReceipt(proposalId)); }
+  async listCuratorReceipts() { return this._catalogOperation(() => this.catalog.listCuratorReceipts()); }
   async _refreshRawV2Readiness() {
     if (this.legacyV1Writes) { this._rawV2Scan = { safe: false, reason: 'legacy_v1_writes_enabled' }; return this._rawV2Scan; }
     this._rawV2Scan = await this._catalogOperation(() => this.catalog.rawV2Readiness?.() || { safe: false, reason: 'literal_routing_scan_unavailable' });

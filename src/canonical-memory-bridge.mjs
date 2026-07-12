@@ -2,8 +2,8 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import Database from 'better-sqlite3';
 import { validateAmfMemoryRecord } from './amf-memory-record-validator.mjs';
+import { normalizeOpaqueTagMap } from './access-contract.mjs';
 
 const ACTIVE = new Set(['active']);
 const DECISION_STATUSES = new Set(['review_required', 'approved_pending_apply', 'rejected']);
@@ -25,6 +25,17 @@ function exactFields(value, fields) {
 function digest(value) { return crypto.createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex'); }
 function validDigest(value) { return /^[a-f0-9]{64}$/.test(String(value || '')); }
 function validTimestamp(value) { return typeof value === 'string' && Number.isFinite(Date.parse(value)); }
+
+function decodeCursor(cursor, binding) {
+  if (!cursor) return 0;
+  if (typeof cursor !== 'string' || !cursor.startsWith('amf-cur-v1.')) throw Object.assign(new Error('invalid_request'), { status: 400 });
+  let parsed;
+  try { parsed = JSON.parse(Buffer.from(cursor.slice(11), 'base64url').toString('utf8')); } catch { throw Object.assign(new Error('invalid_request'), { status: 400 }); }
+  if (!exactFields(parsed, ['offset', 'binding']) || !Number.isSafeInteger(parsed.offset) || parsed.offset < 0 || parsed.binding !== binding) throw Object.assign(new Error('invalid_request'), { status: 400 });
+  return parsed.offset;
+}
+
+function encodeCursor(offset, binding) { return `amf-cur-v1.${Buffer.from(JSON.stringify({ offset, binding })).toString('base64url')}`; }
 
 export function validateCuratorReceipt(receipt) {
   const fields = RECEIPT_FIELDS[receipt?.kind];
@@ -63,60 +74,39 @@ export class MemoryReceiptLedger {
   list() { return [...this.records.values()].map(item => structuredClone(item)); }
 }
 
-export class SqliteReceiptLedger {
-  constructor({ databasePath }) {
-    fs.mkdirSync(path.dirname(path.resolve(databasePath)), { recursive: true, mode: 0o700 });
-    this.db = new Database(path.resolve(databasePath));
-    this.db.pragma('journal_mode = WAL');
-    this.db.exec('CREATE TABLE IF NOT EXISTS curator_receipt_state_v1 (proposal_id TEXT PRIMARY KEY, status TEXT NOT NULL, decision_json TEXT NOT NULL, apply_json TEXT)');
-    this.insertDecision = this.db.transaction(receipt => {
-      const current = this.get(receipt.proposalId);
-      if (current) {
-        if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw new Error('receipt_conflict');
-        return { ...current, duplicate: true };
-      }
-      this.db.prepare('INSERT INTO curator_receipt_state_v1(proposal_id,status,decision_json,apply_json) VALUES (?,?,?,NULL)').run(receipt.proposalId, receipt.status, JSON.stringify(receipt));
-      return { ...this.get(receipt.proposalId), duplicate: false };
-    });
-    this.insertApply = this.db.transaction(receipt => {
-      const current = this.get(receipt.proposalId);
-      if (!current?.decision || current.decision.status !== 'approved_pending_apply') throw new Error('receipt_transition_invalid');
-      if (current.apply) {
-        if (canonicalJson(current.apply) !== canonicalJson(receipt)) throw new Error('receipt_conflict');
-        return { ...current, duplicate: true };
-      }
-      this.db.prepare("UPDATE curator_receipt_state_v1 SET status='promoted',apply_json=? WHERE proposal_id=? AND apply_json IS NULL").run(JSON.stringify(receipt), receipt.proposalId);
-      return { ...this.get(receipt.proposalId), duplicate: false };
-    });
-  }
-  get(proposalId) { const row = this.db.prepare('SELECT * FROM curator_receipt_state_v1 WHERE proposal_id=?').get(proposalId); return row ? { proposalId: row.proposal_id, status: row.status, decision: JSON.parse(row.decision_json), apply: row.apply_json ? JSON.parse(row.apply_json) : null } : null; }
-  recordDecision(receipt) { return this.insertDecision(receipt); }
-  recordApply(receipt) { return this.insertApply(receipt); }
-  list() { return this.db.prepare('SELECT * FROM curator_receipt_state_v1 ORDER BY proposal_id').all().map(row => ({ proposalId: row.proposal_id, status: row.status, decision: JSON.parse(row.decision_json), apply: row.apply_json ? JSON.parse(row.apply_json) : null })); }
-  close() { this.db.close(); }
+export class FabricReceiptLedger {
+  constructor({ fabricStore }) { this.fabricStore = fabricStore; }
+  get(proposalId) { return this.fabricStore.getCuratorReceipt(proposalId); }
+  list() { return this.fabricStore.listCuratorReceipts(); }
+  recordDecision(receipt, context) { return this.fabricStore.recordCuratorReceiptAtomic(receipt, context); }
+  recordApply(receipt, context) { return this.fabricStore.recordCuratorReceiptAtomic(receipt, context); }
 }
 
 export class CuratorReceiptCoordinator {
   constructor({ ledger, canonicalStore, proposalStore = null }) { this.ledger = ledger; this.canonicalStore = canonicalStore; this.proposalStore = proposalStore; }
-  async record(receipt) {
+  async record(receipt, context = {}) {
     const valid = validateCuratorReceipt(receipt);
     if (valid.kind === 'decision') {
       if (this.proposalStore) {
         const proposal = await this.proposalStore.readProposal(valid.proposalId);
         if (!proposal?.payload || digest(proposal.payload) !== valid.proposalDigest) throw new Error('receipt_proposal_unverified');
       }
-      return this.ledger.recordDecision(valid);
+      return this.ledger.recordDecision(valid, context);
     }
-    const current = this.ledger.get(valid.proposalId);
+    const current = await this.ledger.get(valid.proposalId);
     if (!current?.decision || current.decision.decisionId !== valid.decisionId || current.decision.decisionDigest !== valid.decisionDigest || current.decision.proposalDigest !== valid.proposalDigest || current.decision.policyDigest !== valid.policyDigestAtApply) throw new Error('receipt_transition_invalid');
+    if (typeof this.proposalStore?.assertPromotionEligible !== 'function') throw new Error('canonical_apply_unverified');
+    await this.proposalStore.assertPromotionEligible(valid.proposalId, context);
     const record = await this.canonicalStore.read({ id: valid.canonicalRecordId });
     if (!record || record.id !== valid.canonicalRecordId || record.revision !== valid.revision || record.lifecycle?.status !== valid.canonicalLifecycleAtDecision || digest(record) !== valid.targetDigest) throw new Error('canonical_apply_unverified');
-    if (this.canonicalStore.verifyApplyReceipt && !(await this.canonicalStore.verifyApplyReceipt(valid))) throw new Error('canonical_apply_unverified');
-    return this.ledger.recordApply(valid);
+    if (typeof this.canonicalStore.verifyApplyReceipt !== 'function') throw new Error('canonical_apply_unverified');
+    const verification = await this.canonicalStore.verifyApplyReceipt(valid);
+    if (!verification || verification.verified !== true || verification.archiveDigest !== valid.archiveDigest || verification.targetDigest !== valid.targetDigest || verification.revision !== valid.revision) throw new Error('canonical_apply_unverified');
+    return this.ledger.recordApply(valid, context);
   }
   async reconcile() {
     const findings = [];
-    for (const row of this.ledger.list()) {
+    for (const row of await this.ledger.list()) {
       if (row.status === 'promoted') {
         try { await this.canonicalStore.read({ id: row.apply.canonicalRecordId }); }
         catch { findings.push({ proposalId: row.proposalId, code: 'canonical_target_missing' }); }
@@ -173,7 +163,14 @@ export class PamMcpProcessClient {
 }
 
 export class CanonicalPamBridge {
-  constructor({ callTool, index }) { this.callTool = callTool; this.index = index || { records: {} }; this.configured = true; }
+  constructor({ callTool, index }) {
+    this.callTool = callTool; this.index = index || { records: {} }; this.configured = true;
+    for (const entry of Object.values(this.index.records || {})) if (entry.contextTags) normalizeOpaqueTagMap(entry.contextTags);
+  }
+  routingContext(id) {
+    const tags = this.index.records?.[id]?.contextTags;
+    return tags ? structuredClone(tags) : null;
+  }
   async read({ id }) {
     const entry = this.index.records?.[id];
     if (!entry?.path) throw Object.assign(new Error('memory_not_found'), { status: 404 });
@@ -182,7 +179,7 @@ export class CanonicalPamBridge {
     if (!record || record.id !== id || !validateAmfMemoryRecord(record).ok) throw new Error('pam_record_binding_invalid');
     return structuredClone(record);
   }
-  async search({ query, scopes, limit = 20 }) {
+  async search({ query, scopes, limit = 20, cursor = null, from = null, to = null }) {
     const allowed = new Set(scopes);
     const entries = Object.entries(this.index.records || {}).filter(([, entry]) => allowed.has(entry.scope)).slice(0, 1000);
     const paths = [...new Set(entries.map(([, entry]) => entry.path))];
@@ -193,10 +190,17 @@ export class CanonicalPamBridge {
     for (const id of ids) {
       const record = await this.read({ id });
       const now = Date.now(); const validFrom = Date.parse(record.lifecycle?.validFrom || '1970-01-01T00:00:00Z'); const validTo = record.lifecycle?.validTo ? Date.parse(record.lifecycle.validTo) : Infinity;
-      if (ACTIVE.has(record.lifecycle?.status) && validFrom <= now && validTo > now) records.push(record);
-      if (records.length >= limit) break;
+      const updatedAt = Date.parse(record.updatedAt);
+      if (ACTIVE.has(record.lifecycle?.status) && validFrom <= now && validTo > now && (!from || updatedAt >= Date.parse(from)) && (!to || updatedAt <= Date.parse(to))) records.push(record);
     }
-    return { items: records, nextCursor: null };
+    const binding = digest({ query, scopes: [...scopes].sort(), from: from || null, to: to || null });
+    const offset = decodeCursor(cursor, binding);
+    const items = records.slice(offset, offset + limit);
+    return { items, nextCursor: offset + items.length < records.length ? encodeCursor(offset + items.length, binding) : null };
+  }
+  async verifyApplyReceipt(receipt) {
+    const result = await this.callTool('memory_verify_apply_receipt', { receipt });
+    return { verified: result?.verified === true, archiveDigest: result?.archiveDigest, targetDigest: result?.targetDigest, revision: result?.revision };
   }
 }
 
@@ -221,10 +225,6 @@ export function createCanonicalPamBridgeFromEnv(env = process.env) {
 }
 
 export function createReceiptCoordinatorFromEnv({ env = process.env, canonicalStore, proposalStore }) {
-  const databasePath = String(env.AMF_RECEIPT_LEDGER_PATH || '').trim();
-  if (!databasePath) return null;
-  const ledger = new SqliteReceiptLedger({ databasePath });
-  const coordinator = new CuratorReceiptCoordinator({ ledger, canonicalStore, proposalStore });
-  coordinator.close = () => ledger.close();
-  return coordinator;
+  if (!proposalStore?.recordCuratorReceiptAtomic) return null;
+  return new CuratorReceiptCoordinator({ ledger: new FabricReceiptLedger({ fabricStore: proposalStore }), canonicalStore, proposalStore });
 }
