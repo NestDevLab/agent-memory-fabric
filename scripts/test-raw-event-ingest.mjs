@@ -30,11 +30,11 @@ async function withRawServer(run, { bodyReadTimeoutMs } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-raw-server-'));
   const registryPath = path.join(root, 'auth.json');
   fs.writeFileSync(registryPath, JSON.stringify({ rows: [
-    { token: 'ingest-token', active: true, actor: 'raw-owner', mode: 'allow_all', allowedScopes: '*', permissions: 'raw:ingest,sessions:read,raw:decrypt' },
-    { token: 'reader-token', active: true, actor: 'raw-owner', mode: 'allow_all', allowedScopes: '*', permissions: 'sessions:read' },
-    { token: 'denied-token', active: true, actor: 'raw-owner', mode: 'allow_all', allowedScopes: '*', permissions: 'sessions:read' },
+    { token: 'ingest-token', active: true, actor: 'raw-owner', mode: 'allow_all', allowedScopes: '*', permissions: 'raw:ingest,sessions:read,raw:decrypt,purpose:conversation_recall,purpose:incident_debug' },
+    { token: 'reader-token', active: true, actor: 'raw-owner', mode: 'allow_all', allowedScopes: '*', permissions: 'sessions:read,purpose:conversation_recall,purpose:incident_debug' },
+    { token: 'denied-token', active: true, actor: 'raw-owner', mode: 'allow_all', allowedScopes: '*', permissions: 'sessions:read,purpose:conversation_recall' },
     { token: 'attacker-token', active: true, actor: 'other-owner', mode: 'allow_all', allowedScopes: '*', permissions: 'raw:ingest' },
-    { token: 'attacker-reader-token', active: true, actor: 'other-owner', mode: 'allow_all', allowedScopes: '*', permissions: 'sessions:read,raw:decrypt' }
+    { token: 'attacker-reader-token', active: true, actor: 'other-owner', mode: 'allow_all', allowedScopes: '*', permissions: 'sessions:read,raw:decrypt,purpose:conversation_recall,purpose:incident_debug' }
   ] }));
   const previous = process.env.MEM0_AUTH_REGISTRY_PATH;
   process.env.MEM0_AUTH_REGISTRY_PATH = registryPath;
@@ -124,32 +124,25 @@ test('raw ingest rejects permission, projection/AAD drift, unavailable keys and 
   });
 });
 
-test('catalog session reader returns placeholders/redaction and decrypts original only after server permission', async () => {
-  await withRawServer(async ({ root, api, catalog }) => {
+test('legacy sessions fail closed at context authorization while direct owner decrypt is durably intent-audited', async () => {
+  await withRawServer(async ({ root, api, catalog, store }) => {
     const outbox = new EncryptedOutbox({ rootPath: path.join(root, 'outbox'), ...RAW_OUTBOX });
     const item = syntheticItem();
     const body = { sourceInstanceId: 'synthetic-host', projection: item.projection, envelope: outbox.encrypt(item) };
     await api('/v2/ingest/raw-events', { method: 'POST', body: JSON.stringify(body) });
 
     const search = await api('/v2/sessions/search', { token: 'reader-token', method: 'POST', body: JSON.stringify({ query: 'claude', purpose: 'conversation_recall' }) });
-    assert.equal(search.response.status, 200);
-    assert.equal(search.body.data.items[0].title, 'claude session');
+    assert.equal(search.response.status, 403);
+    assert.equal(search.body.error.code, 'context_required');
     const sessionId = item.projection.sessionId;
-    const redacted = await api(`/v2/sessions/${sessionId}/transcript?purpose=conversation_recall`, { token: 'reader-token' });
-    assert.equal(redacted.body.data.items[0].content.redacted, true);
-    assert.equal(JSON.stringify(redacted.body).includes('SYNTHETIC_RAW_PRIVATE_TEXT'), false);
-    const forbidden = await api(`/v2/sessions/${sessionId}/transcript?view=original&purpose=incident_debug`, { token: 'reader-token' });
-    assert.equal(forbidden.body.error.code, 'raw_decrypt_forbidden');
-    const original = await api(`/v2/sessions/${sessionId}/transcript?view=original&purpose=incident_debug`);
-    assert.equal(Buffer.from(original.body.data.items[0].raw.line, 'base64').toString('utf8').includes('SYNTHETIC_RAW_PRIVATE_TEXT'), true);
-    const attackerSearch = await api('/v2/sessions/search', { token: 'attacker-reader-token', method: 'POST', body: JSON.stringify({ query: '', purpose: 'conversation_recall' }) });
-    assert.deepEqual(attackerSearch.body.data.items, []);
-    const attackerGet = await api(`/v2/sessions/${sessionId}?purpose=incident_debug`, { token: 'attacker-reader-token' });
-    assert.equal(attackerGet.response.status, 404);
-    const attackerOriginal = await api(`/v2/sessions/${sessionId}/transcript?view=original&purpose=incident_debug`, { token: 'attacker-reader-token' });
-    assert.equal(attackerOriginal.response.status, 404);
-    assert.ok(catalog.auditEvents.some(event => event.action === 'session_transcript' && event.outcome === 'denied'));
-    assert.ok(catalog.auditEvents.some(event => event.action === 'session_transcript' && event.outcome === 'allowed'));
+    const reader = store.createSessionReader();
+    const redacted = await reader.transcript({ actor: 'raw-owner', id: sessionId, view: 'redacted' });
+    assert.equal(redacted.items[0].content.redacted, true);
+    assert.equal(JSON.stringify(redacted).includes('SYNTHETIC_RAW_PRIVATE_TEXT'), false);
+    const original = await reader.transcript({ actor: 'raw-owner', id: sessionId, view: 'original' });
+    assert.equal(Buffer.from(original.items[0].raw.line, 'base64').toString('utf8').includes('SYNTHETIC_RAW_PRIVATE_TEXT'), true);
+    assert.ok(catalog.auditEvents.some(event => event.action === 'raw_decrypt_intent' && event.outcome === 'authorized'));
+    await assert.rejects(reader.get({ actor: 'other-owner', id: sessionId }), /session_not_found/);
   });
 });
 

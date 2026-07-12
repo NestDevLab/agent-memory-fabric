@@ -39,12 +39,26 @@ test('real PostgreSQL catalog integration in an explicitly isolated test databas
   try {
     await catalog.ready();
     catalogReady = true;
+    const readinessStore = new FabricStore({ rawStore, catalog, clock, idFactory, legacyV1Writes: false });
+    await readinessStore.ready();
+    assert.equal(readinessStore.status().rawProjectionV2Ready, true);
+    assert.equal(readinessStore.status().rawProjectionV2ReadinessReason, null);
+    const migrationProof = await catalog.pool.query('SELECT schema_version,backend,alias_orphan_count,legacy_field_count,literal_scan_count FROM agent_memory_fabric.raw_projection_v2_migration_state WHERE singleton=1');
+    assert.deepEqual({ schemaVersion: Number(migrationProof.rows[0].schema_version), backend: migrationProof.rows[0].backend, aliasOrphans: Number(migrationProof.rows[0].alias_orphan_count), legacyFields: Number(migrationProof.rows[0].legacy_field_count), literalTags: Number(migrationProof.rows[0].literal_scan_count) }, { schemaVersion: 6, backend: 'postgres', aliasOrphans: 0, legacyFields: 0, literalTags: 0 });
 
     // Existing proposal transaction/idempotency baseline.
     const results = await Promise.all(Array.from({ length: 8 }, (_, index) => catalog.enqueueProposalWithRaw({ ...record, id: `${record.id}-${index}` }, raw)));
     assert.equal(results.filter((result) => result.duplicate === false).length, 1);
     assert.equal(new Set(results.map((result) => result.record.id)).size, 1);
     assert.equal((await catalog.getProposal(results[0].record.id)).contentId, contentId);
+    const receipt = { kind: 'decision', proposalId: results[0].record.id, decisionId: `decision-${suffix}`, status: 'review_required', decisionDigest: crypto.createHash('sha256').update(`decision-${suffix}`).digest('hex'), proposalDigest: crypto.createHash('sha256').update(`proposal-${suffix}`).digest('hex'), policyDigest: crypto.createHash('sha256').update(`policy-${suffix}`).digest('hex'), timestamp: clock().toISOString() };
+    const receiptResults = await Promise.all([
+      catalog.recordCuratorReceipt(receipt, { id: `${suffix}-receipt-audit-1`, ts: clock().toISOString(), actorTag: `actor-${suffix}`, action: 'curation_decision_receipt', requestId: `request-${suffix}-1`, targetId: receipt.proposalId, details: {} }),
+      catalog.recordCuratorReceipt(receipt, { id: `${suffix}-receipt-audit-2`, ts: clock().toISOString(), actorTag: `actor-${suffix}`, action: 'curation_decision_receipt', requestId: `request-${suffix}-2`, targetId: receipt.proposalId, details: {} })
+    ]);
+    assert.equal(receiptResults.filter(result => result.duplicate === false).length, 1);
+    assert.equal(receiptResults.filter(result => result.duplicate === true).length, 1);
+    assert.equal((await catalog.getProposal(receipt.proposalId)).status, 'review');
 
     // Identity evidence is encrypted outside the catalog; actual PostgreSQL
     // rows carry only opaque tags, references, revisions and response snapshots.
@@ -134,6 +148,7 @@ test('real PostgreSQL catalog integration in an explicitly isolated test databas
         const ids = [...cleanupContentIds];
         cleanupClient = await catalog.pool.connect();
         await cleanupClient.query('BEGIN');
+        await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.curator_receipt_state_v1 WHERE proposal_id LIKE $1`, values: [`%${suffix}%`] });
         await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.retention_operations_v2 WHERE id LIKE $1`, values: [`${suffix}-%`] });
         await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.retention_tombstones_v2 WHERE content_id = ANY($1::text[])`, values: [ids] });
         await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.raw_retention_v2 WHERE content_id = ANY($1::text[])`, values: [ids] });

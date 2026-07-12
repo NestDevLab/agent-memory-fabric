@@ -130,6 +130,7 @@ export function validateProjectionV2(projection) {
   if (projection.nativeRevision !== null && (!Number.isSafeInteger(projection.nativeRevision) || projection.nativeRevision < 0)) throw new Error('raw_projection_invalid');
   if (projection.sourceSequence !== null && (!Number.isSafeInteger(projection.sourceSequence) || projection.sourceSequence < 0)) throw new Error('raw_projection_invalid');
   if (typeof projection.authoritativeDeletion !== 'boolean' || !ROLES.has(projection.role) || !CONTENT_TYPES.has(projection.contentType)) throw new Error('raw_projection_invalid');
+  if (projection.authoritativeDeletion && !(projection.observationClass === 'native' && ['codex', 'claude', 'hermes', 'openclaw'].includes(projection.sourceKind))) throw new Error('raw_projection_invalid');
   if (!Number.isSafeInteger(projection.contentParts) || projection.contentParts < 0 || projection.contentParts > 10000 || projection.hasContent !== (projection.contentParts > 0)) throw new Error('raw_projection_invalid');
   if (projection.normalizationVersion !== OBSERVATION_NORMALIZATION_VERSION || !/^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$/.test(projection.normalizedPayloadDigest)) throw new Error('raw_projection_invalid');
   return projection;

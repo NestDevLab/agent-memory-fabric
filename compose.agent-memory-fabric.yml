@@ -1,6 +1,6 @@
 services:
   agent-memory-fabric:
-    image: agent-memory-fabric:0.2.0
+    image: agent-memory-fabric:0.5.0
     build:
       context: .
       dockerfile: Dockerfile
@@ -13,10 +13,15 @@ services:
       AMF_AUTH_REGISTRY_PATH: /run/secrets/agent-memory-fabric-auth.json
       AMF_RAW_KEY_RING_PATH: /run/secrets/agent-memory-fabric-key-ring.json
       AMF_INGEST_KEY_RING_PATH: /run/secrets/agent-memory-fabric-ingest-key-ring.json
+      AMF_CONTEXT_KEY_RING_PATH: /run/secrets/agent-memory-fabric-context-key-ring.json
+      AMF_POLICY_REVISION: "${AMF_POLICY_REVISION:?set the reviewed policy revision}"
+      AMF_RAW_V2_CUTOVER: "${AMF_RAW_V2_CUTOVER:-false}"
+      AMF_PAM_MCP_SERVER_PATH: /opt/portable-agent-memory/tools/pam-mcp-server.mjs
+      AMF_PAM_WORKSPACE: /srv/brain-shared
+      AMF_PAM_RECORD_INDEX_PATH: /run/config/amf-pam-record-index.json
       AMF_DATA_PATH: /var/lib/agent-memory-fabric
-      AMF_CATALOG_KIND: "${AMF_CATALOG_KIND:-sqlite}"
-      AMF_CATALOG_PATH: /var/lib/agent-memory-fabric/catalog.sqlite
-      AMF_CATALOG_DATABASE_URL: "${AMF_CATALOG_DATABASE_URL:-}"
+      AMF_CATALOG_KIND: postgres
+      AMF_CATALOG_DATABASE_URL: "${AMF_CATALOG_DATABASE_URL:?set the dedicated production PostgreSQL URL}"
       AMF_CATALOG_SSL_MODE: "${AMF_CATALOG_SSL_MODE:-verify-full}"
       AMF_CATALOG_POOL_MAX: "${AMF_CATALOG_POOL_MAX:-10}"
       AMF_CATALOG_CONNECT_TIMEOUT_MS: "${AMF_CATALOG_CONNECT_TIMEOUT_MS:-5000}"
@@ -35,6 +40,10 @@ services:
       - ${AMF_AUTH_REGISTRY_SECRET_PATH:?mount the CT113 auth registry secret}:/run/secrets/agent-memory-fabric-auth.json:ro
       - ${AMF_KEY_RING_SECRET_PATH:?mount the CT113 key-ring secret}:/run/secrets/agent-memory-fabric-key-ring.json:ro
       - ${AMF_INGEST_KEY_RING_SECRET_PATH:?mount the CT113 ingest key-ring secret}:/run/secrets/agent-memory-fabric-ingest-key-ring.json:ro
+      - ${AMF_CONTEXT_KEY_RING_SECRET_PATH:?mount the context-token key-ring secret}:/run/secrets/agent-memory-fabric-context-key-ring.json:ro
+      - ${AMF_PAM_SOURCE_PATH:?mount the reviewed portable-agent-memory source}:/opt/portable-agent-memory:ro
+      - ${AMF_PAM_WORKSPACE_PATH:?mount the canonical PAM workspace}:/srv/brain-shared:ro
+      - ${AMF_PAM_RECORD_INDEX_PATH:?mount the canonical PAM record index}:/run/config/amf-pam-record-index.json:ro
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
     ports:

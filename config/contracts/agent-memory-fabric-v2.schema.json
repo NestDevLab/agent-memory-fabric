@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-memory-fabric.local/contracts/v2.schema.json",
+  "title": "Agent Memory Fabric v2 canonical transport contract",
+  "$defs": {
+    "opaqueTag": { "type": "string", "pattern": "^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$" },
+    "tagArray": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/opaqueTag" } },
+    "contextTags": {
+      "type": "object", "minProperties": 1, "additionalProperties": false,
+      "properties": {
+        "actor": { "$ref": "#/$defs/tagArray" }, "sender": { "$ref": "#/$defs/tagArray" },
+        "conversation": { "$ref": "#/$defs/tagArray" }, "room": { "$ref": "#/$defs/tagArray" },
+        "person": { "$ref": "#/$defs/tagArray" }, "relationship": { "$ref": "#/$defs/tagArray" },
+        "thread": { "$ref": "#/$defs/tagArray" }
+      }
+    },
+    "purpose": { "enum": ["conversation_recall", "continuity_resume", "incident_debug", "operator_review", "memory_curation"] },
+    "meta": {
+      "type": "object", "additionalProperties": false, "required": ["requestId", "service", "version"],
+      "properties": {
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "service": { "const": "agent-memory-fabric" },
+        "version": { "type": "string", "pattern": "^0\\.[0-9]+\\.[0-9]+$" }
+      }
+    },
+    "successEnvelope": {
+      "type": "object", "additionalProperties": false, "required": ["ok", "data", "meta"],
+      "properties": { "ok": { "const": true }, "data": {}, "meta": { "$ref": "#/$defs/meta" } }
+    },
+    "errorEnvelope": {
+      "type": "object", "additionalProperties": false, "required": ["ok", "error", "meta"],
+      "properties": {
+        "ok": { "const": false },
+        "error": {
+          "type": "object", "additionalProperties": false, "required": ["code", "message", "details"],
+          "properties": { "code": { "type": "string" }, "message": { "type": "string" }, "details": { "type": ["object", "array", "string", "number", "boolean", "null"] } }
+        },
+        "meta": { "$ref": "#/$defs/meta" }
+      }
+    },
+    "contextTokenPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["actor", "runtime", "profile", "conversationKind", "contextTags", "purpose", "policyRevision", "issuedAt", "expiresAt", "nonce", "keyVersion", "requestDigest"],
+      "properties": {
+        "actor": { "type": "string", "minLength": 1 }, "runtime": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$" },
+        "profile": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$" },
+        "conversationKind": { "enum": ["dm", "group", "channel", "thread", "session"] },
+        "contextTags": { "$ref": "#/$defs/contextTags" }, "purpose": { "$ref": "#/$defs/purpose" },
+        "policyRevision": { "type": "string", "minLength": 1 }, "issuedAt": { "type": "string", "format": "date-time" },
+        "expiresAt": { "type": "string", "format": "date-time" }, "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$" },
+        "keyVersion": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+        "requestDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "pageRequest": {
+      "type": "object",
+      "properties": {
+        "cursor": { "type": ["string", "null"], "maxLength": 512 }, "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "from": { "type": ["string", "null"], "format": "date-time" }, "to": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "memorySearchRequest": {
+      "type": "object", "additionalProperties": false, "required": ["query", "scopes", "purpose"],
+      "properties": {
+        "query": { "type": "string", "maxLength": 4096 }, "scopes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+        "purpose": { "$ref": "#/$defs/purpose" }, "contextToken": { "type": "string" },
+        "cursor": { "type": ["string", "null"], "maxLength": 512 }, "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "from": { "type": ["string", "null"], "format": "date-time" }, "to": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "memorySearchData": {
+      "type": "object", "additionalProperties": false, "required": ["items", "nextCursor", "scopes"],
+      "properties": { "items": { "type": "array", "items": { "type": "object" } }, "nextCursor": { "type": ["string", "null"] }, "scopes": { "type": "array", "items": { "type": "string" } } }
+    },
+    "memoryReadRequest": {
+      "type": "object", "additionalProperties": false, "required": ["id", "purpose"],
+      "properties": { "id": { "type": "string", "pattern": "^mem_[A-Za-z0-9_-]{8,128}$" }, "purpose": { "$ref": "#/$defs/purpose" }, "contextToken": { "type": "string" } }
+    },
+    "memoryReadData": {
+      "type": "object", "additionalProperties": false, "required": ["record"],
+      "properties": { "record": { "type": "object" } }
+    },
+    "sessionsSearchRequest": {
+      "type": "object", "additionalProperties": false, "required": ["query", "purpose"],
+      "properties": {
+        "query": { "type": "string", "maxLength": 4096 }, "purpose": { "$ref": "#/$defs/purpose" }, "contextToken": { "type": "string" },
+        "cursor": { "type": ["string", "null"], "maxLength": 512 }, "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "from": { "type": ["string", "null"], "format": "date-time" }, "to": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "sessionItem": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "runtime", "firstOccurredAt", "lastOccurredAt", "eventCount", "createdAt", "title", "scope", "ownerSelf", "conversationKind", "contextTags"],
+      "properties": {
+        "id": { "type": "string" }, "runtime": { "type": "string" }, "firstOccurredAt": { "type": ["string", "null"], "format": "date-time" },
+        "lastOccurredAt": { "type": ["string", "null"], "format": "date-time" }, "eventCount": { "type": "integer", "minimum": 0 },
+        "createdAt": { "type": "string", "format": "date-time" }, "title": { "type": "string" }, "scope": { "type": "string" },
+        "ownerSelf": { "type": "boolean" }, "conversationKind": { "type": "string" }, "contextTags": { "$ref": "#/$defs/contextTags" }
+      }
+    },
+    "sessionsSearchData": {
+      "type": "object", "additionalProperties": false, "required": ["items", "nextCursor", "total"],
+      "properties": { "items": { "type": "array", "items": { "$ref": "#/$defs/sessionItem" } }, "nextCursor": { "type": ["string", "null"] }, "total": { "type": "integer", "minimum": 0 } }
+    },
+    "sessionGetData": { "$ref": "#/$defs/sessionItem" },
+    "redactedTranscriptItem": {
+      "type": "object", "additionalProperties": false, "required": ["eventId", "occurredAt", "role", "content"],
+      "properties": {
+        "eventId": { "type": "string" }, "occurredAt": { "type": ["string", "null"], "format": "date-time" }, "role": { "type": "string" },
+        "content": {
+          "type": "object", "additionalProperties": false, "required": ["redacted", "contentType", "parts"],
+          "properties": { "redacted": { "const": true }, "contentType": { "type": "string" }, "parts": { "type": "integer", "minimum": 0 } }
+        }
+      }
+    },
+    "originalTranscriptItem": {
+      "type": "object", "additionalProperties": false, "required": ["eventId", "occurredAt", "role", "raw"],
+      "properties": { "eventId": { "type": "string" }, "occurredAt": { "type": ["string", "null"], "format": "date-time" }, "role": { "type": "string" }, "raw": { "type": "object" } }
+    },
+    "transcriptData": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["id", "view", "items", "nextCursor"],
+          "properties": { "id": { "type": "string" }, "view": { "const": "redacted" }, "items": { "type": "array", "items": { "$ref": "#/$defs/redactedTranscriptItem" } }, "nextCursor": { "type": ["string", "null"] } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["id", "view", "items", "nextCursor"],
+          "properties": { "id": { "type": "string" }, "view": { "const": "original" }, "items": { "type": "array", "items": { "$ref": "#/$defs/originalTranscriptItem" } }, "nextCursor": { "type": ["string", "null"] } }
+        }
+      ]
+    }
+  }
+}

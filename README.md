@@ -12,6 +12,12 @@ legacy product alias while clients migrate to `agent-memory-fabric`.
 - encrypted transcript-event ingestion with a persistent outbox and session reader
 - local JSON auth registry, with optional n8n Data Table fallback
 - legacy REST v1, MCP SSE and MCP Streamable HTTP compatibility
+- canonical PAM read/search through an internal stdio adapter; proposal queue
+  status remains a separate surface
+- request-bound conversation context tokens and monotonic curator/apply receipts
+- purpose-specific authorization and exact HMAC context intersection across PAM records and v2 sessions
+- one Fabric transaction for receipt state, proposal lifecycle and durable audit
+- authoritative REST/MCP/v1 schemas and Principia fixture under `config/contracts/` and `scripts/fixtures/contracts/`
 
 ## Auth registry
 

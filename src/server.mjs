@@ -7,6 +7,9 @@ import { fileURLToPath } from 'node:url';
 import { createBackendAdapter } from './backend.mjs';
 import { createFabricStoreFromEnv, createUnconfiguredFabricStore } from './fabric-store.mjs';
 import { validateAmfMemoryRecord } from './amf-memory-record-validator.mjs';
+import { createCanonicalPamBridgeFromEnv, createReceiptCoordinatorFromEnv, createUnconfiguredCanonicalStore } from './canonical-memory-bridge.mjs';
+import { createContextVerifierFromEnv, createUnconfiguredContextVerifier } from './context-token.mjs';
+import { PURPOSES, buildContextRequest, exactContextIntersection, normalizeScopeList, scopeRequiresContext } from './access-contract.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
@@ -21,7 +24,7 @@ function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } =
 const POLICY_PATH = process.env.AMF_POLICY_PATH || process.env.MEM0_GATEWAY_POLICY_PATH || '';
 const PORT = envInteger('PORT', 8787, { min: 1, max: 65535 });
 const SERVICE_NAME = 'agent-memory-fabric';
-const SERVICE_VERSION = '0.2.0';
+const SERVICE_VERSION = '0.5.0';
 const LEGACY_SERVICE_ALIASES = ['mem0-gateway'];
 const LIMITS = Object.freeze({
   bodyBytes: envInteger('AMF_MAX_BODY_BYTES', 262144, { min: 1024, max: 16 * 1024 * 1024 }),
@@ -56,7 +59,7 @@ const PUBLIC_ERRORS = new Map([
   ['scope_unmapped', [400, 'scope_unmapped']], ['memory_text_required', [400, 'memory_text_required']], ['memory_id_required', [400, 'memory_id_required']],
   ['canonical_record_required', [400, 'canonical_record_required']], ['canonical_record_invalid', [400, 'canonical_record_invalid']], ['rationale_required', [400, 'rationale_required']],
   ['revision_invalid', [400, 'revision_invalid']], ['idempotency_key_required', [400, 'idempotency_key_required']], ['purpose_required', [400, 'purpose_required']],
-  ['purpose_invalid', [400, 'purpose_invalid']], ['session_limit_invalid', [400, 'session_limit_invalid']], ['raw_content_id_invalid', [400, 'raw_content_id_invalid']],
+  ['purpose_invalid', [400, 'purpose_invalid']], ['context_required', [403, 'context_required']], ['context_invalid', [403, 'context_invalid']], ['session_limit_invalid', [400, 'session_limit_invalid']], ['raw_content_id_invalid', [400, 'raw_content_id_invalid']],
   ['missing_token', [401, 'missing_token']], ['invalid_token', [401, 'invalid_token']], ['session_expired', [401, 'session_expired']], ['session_revoked', [401, 'session_revoked']],
   ['forbidden', [403, 'forbidden']], ['scope_forbidden', [403, 'scope_forbidden']], ['memory_search_forbidden', [403, 'memory_search_forbidden']],
   ['sessions_forbidden', [403, 'sessions_forbidden']], ['raw_decrypt_forbidden', [403, 'raw_decrypt_forbidden']],
@@ -73,12 +76,14 @@ const PUBLIC_ERRORS = new Map([
   ['identity_auto_merge_forbidden', [403, 'identity_auto_merge_forbidden']], ['identity_not_found', [404, 'identity_not_found']], ['retention_not_found', [404, 'retention_not_found']],
   ['identity_already_exists', [409, 'identity_already_exists']], ['identity_state_conflict', [409, 'identity_state_conflict']], ['revision_conflict', [409, 'revision_conflict']],
   ['retention_plan_in_future', [409, 'retention_plan_in_future']],
+  ['receipt_invalid', [400, 'invalid_request']], ['receipt_transition_invalid', [409, 'conflict']], ['receipt_conflict', [409, 'conflict']], ['receipt_proposal_unverified', [409, 'conflict']], ['canonical_apply_unverified', [409, 'conflict']],
+  ['raw_reconcile_required', [409, 'raw_reconcile_required']],
   ['session_capacity_exceeded', [429, 'session_capacity_exceeded']], ['fabric_store_unconfigured', [503, 'fabric_store_unconfigured']],
   ['raw_projection_invalid', [400, 'raw_projection_invalid']], ['raw_envelope_invalid', [400, 'raw_envelope_invalid']], ['raw_envelope_binding_invalid', [400, 'raw_envelope_binding_invalid']],
   ['source_instance_invalid', [400, 'source_instance_invalid']], ['raw_event_conflict', [409, 'raw_event_conflict']], ['raw_ingest_key_unavailable', [503, 'raw_ingest_key_unavailable']],
   ['raw_session_binding_conflict', [409, 'raw_session_binding_conflict']], ['raw_envelope_authentication_failed', [400, 'raw_envelope_authentication_failed']],
   ['raw_ingest_unconfigured', [503, 'raw_ingest_unconfigured']],
-  ['session_reader_unconfigured', [503, 'session_reader_unconfigured']], ['backend_not_configured', [503, 'backend_not_configured']],
+  ['session_reader_unconfigured', [503, 'session_reader_unconfigured']], ['canonical_store_unconfigured', [503, 'canonical_store_unconfigured']], ['backend_not_configured', [503, 'backend_not_configured']],
   ['audit_unavailable', [503, 'audit_unavailable']], ['catalog_unavailable', [503, 'catalog_unavailable']], ['service_unavailable', [503, 'service_unavailable']]
 ]);
 
@@ -373,18 +378,29 @@ function buildToolsListResult() {
           properties: {
             scope: { type: 'string' },
             scopes: { type: 'array', items: { type: 'string' } },
-            query: { type: 'string' }
+            query: { type: 'string' },
+            purpose: { type: 'string' },
+            contextToken: { type: 'string' }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 }, from: { type: ['string', 'null'] }, to: { type: ['string', 'null'] }
           },
-          required: ['scope', 'query']
+          required: ['query', 'purpose']
+        }
+      },
+      {
+        name: 'memory_candidates_search',
+        description: 'Explicitly rank non-canonical Mem0 candidates for memory curation; results are never canonical records.',
+        inputSchema: {
+          type: 'object', additionalProperties: false,
+          properties: { scope: { type: 'string' }, scopes: { type: 'array', items: { type: 'string' } }, query: { type: 'string' }, purpose: { const: 'memory_curation' }, contextToken: { type: 'string' } },
+          required: ['query', 'purpose']
         }
       },
       {
         name: 'memory_read',
-        description: 'Read a queued memory proposal and its encrypted RAW payload when allowed.',
+        description: 'Read an authorized canonical PAM record by canonical record id.',
         inputSchema: {
           type: 'object',
-          properties: { id: { type: 'string' } },
-          required: ['id']
+          properties: { id: { type: 'string' }, purpose: { type: 'string' }, contextToken: { type: 'string' } },
+          required: ['id', 'purpose']
         }
       },
       {
@@ -411,21 +427,21 @@ function buildToolsListResult() {
         description: 'Search native session metadata through the configured session reader.',
         inputSchema: {
           type: 'object',
-          properties: { query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 100 }, purpose: { type: 'string', enum: ['conversation_recall', 'continuity_resume', 'incident_debug', 'operator_review', 'memory_curation'] } },
+          properties: { query: { type: 'string' }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 }, from: { type: ['string', 'null'] }, to: { type: ['string', 'null'] }, purpose: { type: 'string', enum: ['conversation_recall', 'continuity_resume', 'incident_debug', 'operator_review', 'memory_curation'] }, contextToken: { type: 'string' } },
           required: ['query', 'purpose']
         }
       },
       {
         name: 'session_get',
         description: 'Read one session metadata record.',
-        inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, purpose: { type: 'string' } }, required: ['sessionId', 'purpose'] }
+        inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, purpose: { type: 'string' }, contextToken: { type: 'string' } }, required: ['sessionId', 'purpose'] }
       },
       {
         name: 'session_transcript',
         description: 'Read a redacted transcript by default; original requires raw:decrypt.',
         inputSchema: {
           type: 'object',
-          properties: { sessionId: { type: 'string' }, view: { type: 'string', enum: ['redacted', 'original'] }, purpose: { type: 'string' } },
+          properties: { sessionId: { type: 'string' }, view: { type: 'string', enum: ['redacted', 'original'] }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 }, from: { type: ['string', 'null'] }, to: { type: ['string', 'null'] }, purpose: { type: 'string' }, contextToken: { type: 'string' } },
           required: ['sessionId', 'purpose']
         }
       },
@@ -448,7 +464,7 @@ function buildToolsListResult() {
   };
 }
 
-async function executeMcpMethod({ body, actor, policy, policies, backend, fabricStore, sessionReader, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
+async function executeMcpMethod({ body, actor, policy, policies, backend, fabricStore, canonicalStore, contextVerifier, sessionReader, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
   const method = body.method;
   const id = body.id ?? null;
 
@@ -486,7 +502,7 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
     if (name === 'memory_status') {
       requirePermission(policy, 'memory:status');
       await healthRequired(fabricStore);
-      const status = buildStatus({ backend, fabricStore, sessionReader });
+      const status = buildStatus({ backend, fabricStore, canonicalStore, contextVerifier, sessionReader });
       await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] });
     }
@@ -495,11 +511,26 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       const scope = typeof args.scope === 'string' ? args.scope : '';
       const scopes = Array.isArray(args.scopes) ? args.scopes : [];
       const query = String(args.query || '');
-      const searchResult = await performScopedSearch({ actor, scope, scopes, query, policy, policies, backend, fabricStore });
+      validateSearchInput(query);
+      const purpose = requirePurpose(args.purpose);
+      if (!canonicalStore.configured) throw Object.assign(new Error('canonical_store_unconfigured'), { status: 503 });
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: args.contextToken, request: buildContextRequest('memory_search', args), required: purpose === 'conversation_recall' || scopeRequiresContext(normalizeScopeList(scope, scopes)) });
+      const searchResult = await performCanonicalSearch({ actor, scope, scopes, query, policy, policies, canonicalStore, context, limit: args.limit, cursor: args.cursor, from: args.from, to: args.to });
+      await auditRequired(fabricStore, { actor, action: 'memory_search', outcome: 'allowed', requestId, details: { resultCount: searchResult.items.length, transport: 'mcp' } });
       logEvent('mcp_tools_call', { requestId, actor, tool: 'memory_search', sessionId, clientName, requestedScope: scope || null, requestedScopes: scopes, resolvedScopes: searchResult.scopes, perScope: searchResult.result?.perScope, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
       return createRpcResult(id, {
         content: [{ type: 'text', text: JSON.stringify(searchResult, null, 2) }]
       });
+    }
+
+    if (name === 'memory_candidates_search') {
+      requirePermission(policy, 'memory:candidates:search');
+      const purpose = requirePurpose(args.purpose);
+      if (purpose !== 'memory_curation') throw Object.assign(new Error('purpose_invalid'), { status: 400 });
+      requirePurposePermission(policy, purpose);
+      const result = await performScopedSearch({ actor, scope: String(args.scope || ''), scopes: Array.isArray(args.scopes) ? args.scopes : [], query: String(args.query || ''), policy, policies, backend, fabricStore });
+      await auditRequired(fabricStore, { actor, action: 'memory_candidates_search', outcome: 'allowed', requestId, details: { resultCount: result.result.total, transport: 'mcp' } });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify({ canonical: false, candidates: result.result.items, scopes: result.scopes }, null, 2) }] });
     }
 
     if (name === 'memory_propose') {
@@ -528,7 +559,10 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
     }
 
     if (name === 'memory_read') {
-      const memory = await performMemoryRead({ actor, policy, policies, fabricStore, id: String(args.id || ''), requestId });
+      const purpose = requirePurpose(args.purpose);
+      const targetId = String(args.id || '');
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: args.contextToken, request: buildContextRequest('memory_read', { id: targetId }), required: purpose === 'conversation_recall' });
+      const memory = await performMemoryRead({ actor, policy, policies, fabricStore, canonicalStore, context, id: targetId, requestId });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(memory, null, 2) }] });
     }
 
@@ -536,9 +570,10 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       requireSessionPermission(policy);
       const purpose = requirePurpose(args.purpose);
       const query = String(args.query || '');
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: args.contextToken, request: buildContextRequest('sessions_search', args), required: true });
       validateSearchInput(query);
-      const raw = await sessionReader.search({ actor, query, limit: normalizeSessionLimit(args.limit), purpose });
-      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy, policies)) };
+      const raw = await sessionReader.search({ actor, query, cursor: args.cursor || null, limit: normalizeSessionLimit(args.limit), from: args.from || null, to: args.to || null, purpose, context });
+      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy, policies, context)), nextCursor: raw?.nextCursor || null };
       await auditRequired(fabricStore, { actor, action: 'sessions_search', outcome: 'allowed', requestId, details: { resultCount: result.items.length, purpose } });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
     }
@@ -547,7 +582,8 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       requireSessionPermission(policy);
       const purpose = requirePurpose(args.purpose);
       const sessionTargetId = String(args.sessionId || args.id || '');
-      const result = await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionTargetId, purpose });
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: args.contextToken, request: buildContextRequest('session_get', { sessionId: sessionTargetId }), required: true });
+      const result = await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionTargetId, purpose, context });
       await auditRequired(fabricStore, { actor, action: 'session_get', outcome: 'allowed', requestId, targetId: sessionTargetId, details: { purpose } });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
     }
@@ -556,15 +592,18 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       requireSessionPermission(policy);
       const purpose = requirePurpose(args.purpose);
       const sessionTargetId = String(args.sessionId || args.id || '');
-      await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionTargetId, purpose });
       const view = args.view === 'original' ? 'original' : 'redacted';
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: args.contextToken, request: buildContextRequest('session_transcript', { ...args, sessionId: sessionTargetId, view }), required: true });
+      await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionTargetId, purpose, context });
       if (view === 'original' && !hasPermission(policy, 'raw:decrypt')) {
         await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'denied', requestId, targetId: sessionTargetId, details: { view, purpose } });
         const error = new Error('raw_decrypt_forbidden');
         error.status = 403;
         throw error;
       }
-      const result = await sessionReader.transcript({ actor, id: sessionTargetId, view, purpose });
+      if (view === 'original') await auditRequired(fabricStore, { actor, action: 'raw_decrypt_intent', outcome: 'authorized', requestId, targetId: sessionTargetId, details: { view, purpose, transport: 'mcp' } });
+      const transcript = await sessionReader.transcript({ actor, id: sessionTargetId, view, cursor: args.cursor || null, limit: normalizeSessionLimit(args.limit || 100), from: args.from || null, to: args.to || null, purpose, context });
+      const result = { ...transcript, nextCursor: transcript?.nextCursor || null };
       await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'allowed', requestId, targetId: sessionTargetId, details: { view, purpose } });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
     }
@@ -607,13 +646,28 @@ function requirePurpose(value) {
     error.status = 400;
     throw error;
   }
-  const allowed = new Set(['conversation_recall', 'continuity_resume', 'incident_debug', 'operator_review', 'memory_curation']);
+  const allowed = new Set(PURPOSES);
   if (!allowed.has(purpose)) throw Object.assign(new Error('purpose_invalid'), { status: 400 });
   return purpose;
 }
 
-function sessionVisible(session, actor, policy, policies) {
+function requirePurposePermission(policy, purpose) {
+  if (hasPermission(policy, `purpose:${purpose}`)) return;
+  throw Object.assign(new Error('forbidden'), { status: 403 });
+}
+
+function requireAccessContext(contextVerifier, { actor, policy, purpose, token, request, required = false }) {
+  requirePurposePermission(policy, purpose);
+  if (!token) {
+    if (required) throw Object.assign(new Error('context_required'), { status: 403 });
+    return null;
+  }
+  return contextVerifier.verify(token, { actor, purpose, request });
+}
+
+function sessionVisible(session, actor, policy, policies, context) {
   if (!session || typeof session !== 'object') return false;
+  if (!context || !session.contextTags || !exactContextIntersection(session.contextTags, context.contextTags)) return false;
   if (session.ownerSelf === true) return true;
   if (String(session.ownerActor || '') === actor) return true;
   const scope = String(session.scope || '');
@@ -621,9 +675,9 @@ function sessionVisible(session, actor, policy, policies) {
   return canReadScope(policy, scope);
 }
 
-async function getAuthorizedSession(sessionReader, { actor, policy, policies, id, purpose }) {
+async function getAuthorizedSession(sessionReader, { actor, policy, policies, id, purpose, context = null }) {
   let session;
-  try { session = await sessionReader.get({ actor, id, purpose }); } catch (error) {
+  try { session = await sessionReader.get({ actor, id, purpose, context }); } catch (error) {
     if (error?.status === 404) {
       const hidden = new Error('session_not_found');
       hidden.status = 404;
@@ -631,7 +685,7 @@ async function getAuthorizedSession(sessionReader, { actor, policy, policies, id
     }
     throw error;
   }
-  if (!sessionVisible(session, actor, policy, policies)) {
+  if (!sessionVisible(session, actor, policy, policies, context)) {
     const error = new Error('session_not_found');
     error.status = 404;
     throw error;
@@ -648,13 +702,15 @@ function createUnconfiguredSessionReader() {
   return { configured: false, kind: 'unconfigured', search: fail, get: fail, transcript: fail };
 }
 
-function buildStatus({ backend, fabricStore, sessionReader }) {
+function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalStore, contextVerifier = defaultContextVerifier, sessionReader }) {
   return {
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
     aliases: LEGACY_SERVICE_ALIASES,
     backend: { kind: backend.kind, configured: backend.configured },
     fabricStore: fabricStore.status(),
+    canonicalStore: { kind: canonicalStore.kind || 'unconfigured', configured: Boolean(canonicalStore.configured) },
+    contextTokens: { configured: Boolean(contextVerifier.configured), conversationRecallRequired: true },
     sessionReader: { kind: sessionReader.kind || 'custom', configured: Boolean(sessionReader.configured) },
     compatibility: { restV1: true, mcpSse: true, mcpStreamableHttp: true },
     limits: LIMITS
@@ -960,6 +1016,31 @@ async function performScopedSearch({ actor, scope, scopes, query, policy, polici
   };
 }
 
+async function performCanonicalSearch({ actor, scope, scopes, query, policy, policies, canonicalStore, context, limit = 20, cursor = null, from = null, to = null }) {
+  if (!hasPermission(policy, 'memory:search')) throw Object.assign(new Error('memory_search_forbidden'), { status: 403 });
+  validateSearchInput(query);
+  const resolvedScopes = normalizeRequestedScopes(scope, scopes, policy, policies);
+  const result = await canonicalStore.search({ query, scopes: resolvedScopes, limit: normalizeSessionLimit(limit), cursor, from, to, actor, context });
+  const items = (result?.items || []).filter(record => resolvedScopes.includes(record?.scope?.id) && recordActiveNow(record) && contextAllowsRecord(record, context, canonicalStore));
+  return { items, nextCursor: result?.nextCursor || null, scopes: resolvedScopes };
+}
+
+function recordActiveNow(record) {
+  if (record?.lifecycle?.status !== 'active') return false;
+  const now = Date.now();
+  return (!record.lifecycle.validFrom || Date.parse(record.lifecycle.validFrom) <= now) && (!record.lifecycle.validTo || Date.parse(record.lifecycle.validTo) > now);
+}
+
+function contextAllowsRecord(record, context, canonicalStore) {
+  const sensitiveScope = /^(?:person|relationship|room):/.test(String(record?.scope?.id || ''));
+  let routingContext = null;
+  try { routingContext = canonicalStore?.routingContext?.(record.id) || null; } catch { return false; }
+  if (sensitiveScope && !routingContext) return false;
+  if (routingContext && (!context || !exactContextIntersection(routingContext, context.contextTags))) return false;
+  if (context && ['group', 'channel'].includes(context.conversationKind) && record.visibility !== 'shared') return false;
+  return true;
+}
+
 async function performMemoryProposal({ actor, policy, policies, fabricStore, scope, text = '', metadata = {}, infer = false, record = null, rationale = null, expectedRevision = null, idempotencyKey, source, requestId, requireIdempotencyKey }) {
   if (record) validateCanonicalProposal(record, rationale, expectedRevision);
   else validateProposalInput({ scope, text, metadata, idempotencyKey, requireIdempotencyKey });
@@ -1012,7 +1093,7 @@ async function performMemoryProposalStatus({ actor, policy, policies, fabricStor
   return status;
 }
 
-async function performMemoryRead({ actor, policy, policies, fabricStore, id, requestId }) {
+async function performMemoryRead({ actor, policy, policies, fabricStore, canonicalStore, context = null, id, requestId }) {
   if (!id) {
     const error = new Error('memory_id_required');
     error.status = 400;
@@ -1024,18 +1105,25 @@ async function performMemoryRead({ actor, policy, policies, fabricStore, id, req
     error.status = 404;
     throw error;
   }
-  const memory = await fabricStore.readProposalAuthorized(id, authorizationFor(actor, policy, policies));
-  await auditRequired(fabricStore, { actor, action: 'memory_read', outcome: 'allowed', requestId, targetId: id, scope: memory.scope });
-  if (memory.payload?.type === 'canonical-memory-proposal') {
-    return { id: memory.id, proposalStatus: memory.status, contentId: memory.contentId, createdAt: memory.createdAt, record: memory.payload.record, rationale: memory.payload.rationale, expectedRevision: memory.payload.expectedRevision };
+  if (canonicalStore?.configured) {
+    let record;
+    try { record = await canonicalStore.read({ id, actor, context }); } catch (error) {
+      if (error?.status === 404 || error?.message === 'memory_not_found') throw Object.assign(new Error('memory_not_found'), { status: 404 });
+      throw error;
+    }
+    if (!record || !canReadScope(policy, record.scope?.id) || !recordActiveNow(record) || !contextAllowsRecord(record, context, canonicalStore)) throw Object.assign(new Error('memory_not_found'), { status: 404 });
+    await auditRequired(fabricStore, { actor, action: 'memory_read', outcome: 'allowed', requestId, targetId: id, scope: record.scope.id });
+    return { record };
   }
-  return memory;
+  throw Object.assign(new Error('memory_not_found'), { status: 404 });
 }
 
 const defaultBackend = createBackendAdapter();
 const defaultSessionReader = createUnconfiguredSessionReader();
+const defaultCanonicalStore = createUnconfiguredCanonicalStore();
+const defaultContextVerifier = createUnconfiguredContextVerifier();
 
-function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, clock = () => Date.now(), policyPath = POLICY_PATH } = {}) {
+function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, clock = () => Date.now(), policyPath = POLICY_PATH } = {}) {
 sessionReader = sessionReader || fabricStore.createSessionReader?.() || defaultSessionReader;
 const sessions = new Map();
 const sessionPolicy = { ...MCP_SESSION_DEFAULTS, ...sessionOptions };
@@ -1129,7 +1217,7 @@ const requestHandler = async (req, res) => {
     try {
       requirePermission(policy, 'memory:status');
       await healthRequired(fabricStore);
-      const response = buildStatus({ backend, fabricStore, sessionReader });
+      const response = buildStatus({ backend, fabricStore, canonicalStore, contextVerifier, sessionReader });
       await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
       return json(res, 200, v2Envelope(requestId, response));
     } catch (error) {
@@ -1218,21 +1306,65 @@ const requestHandler = async (req, res) => {
     }
   }
 
+  if (url.pathname === '/v2/internal/curation/receipts' && req.method === 'POST') {
+    try {
+      if (!receiptCoordinator) throw Object.assign(new Error('service_unavailable'), { status: 503 });
+      const body = await parseBody(req);
+      requirePermission(policy, body?.kind === 'apply' ? 'memory:apply-receipt' : 'memory:curate');
+      const result = await receiptCoordinator.record(body, { actor, requestId });
+      return jsonNoStore(res, result.duplicate ? 200 : 201, v2Envelope(requestId, result));
+    } catch (error) {
+      const reported = await auditInternalFailure(fabricStore, { actor, action: 'curation_receipt', requestId, error });
+      const failure = v2Error(requestId, reported, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/internal/curation/reconcile' && req.method === 'POST') {
+    try {
+      requirePermission(policy, 'memory:apply-receipt');
+      if (!receiptCoordinator) throw Object.assign(new Error('service_unavailable'), { status: 503 });
+      const result = await receiptCoordinator.reconcile();
+      await auditRequired(fabricStore, { actor, action: 'curation_reconcile', outcome: result.ok ? 'clean' : 'findings', requestId, details: { resultCount: result.findings.length } });
+      return jsonNoStore(res, result.ok ? 200 : 409, v2Envelope(requestId, result));
+    } catch (error) {
+      const reported = await auditInternalFailure(fabricStore, { actor, action: 'curation_reconcile', requestId, error });
+      const failure = v2Error(requestId, reported, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/memory/candidates/search' && req.method === 'POST') {
+    try {
+      requirePermission(policy, 'memory:candidates:search');
+      const body = await parseBody(req);
+      const purpose = requirePurpose(body.purpose);
+      if (purpose !== 'memory_curation') throw Object.assign(new Error('purpose_invalid'), { status: 400 });
+      requirePurposePermission(policy, purpose);
+      const result = await performScopedSearch({ actor, scope: String(body.scope || ''), scopes: Array.isArray(body.scopes) ? body.scopes : [], query: String(body.query || ''), policy, policies, backend, fabricStore });
+      const data = { canonical: false, candidates: result.result.items, scopes: result.scopes, nextCursor: null };
+      await auditRequired(fabricStore, { actor, action: 'memory_candidates_search', outcome: 'allowed', requestId, details: { resultCount: data.candidates.length, transport: 'rest' } });
+      return jsonNoStore(res, 200, v2Envelope(requestId, data));
+    } catch (error) {
+      const reported = await auditInternalFailure(fabricStore, { actor, action: 'memory_candidates_search', requestId, error });
+      const failure = v2Error(requestId, reported, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
   if (url.pathname === '/v2/memory/search' && req.method === 'POST') {
     let body;
     try {
       body = await parseBody(req);
-      const response = await performScopedSearch({
-        actor,
-        scope: typeof body.scope === 'string' ? body.scope : '',
-        scopes: Array.isArray(body.scopes) ? body.scopes : [],
-        query: String(body.query || ''),
-        policy,
-        policies,
-        backend,
-        fabricStore
-      });
-      await auditRequired(fabricStore, { actor, action: 'memory_search', outcome: 'allowed', requestId, details: { scopes: response.scopes, total: response.result?.total || 0 } });
+      const scope = typeof body.scope === 'string' ? body.scope : '';
+      const scopes = Array.isArray(body.scopes) ? body.scopes : [];
+      const query = String(body.query || '');
+      validateSearchInput(query);
+      const purpose = requirePurpose(body.purpose);
+      if (!canonicalStore.configured) throw Object.assign(new Error('canonical_store_unconfigured'), { status: 503 });
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: body.contextToken, request: buildContextRequest('memory_search', body), required: purpose === 'conversation_recall' || scopeRequiresContext(normalizeScopeList(scope, scopes)) });
+      const response = await performCanonicalSearch({ actor, scope, scopes, query, policy, policies, canonicalStore, context, limit: body.limit, cursor: body.cursor, from: body.from, to: body.to });
+      await auditRequired(fabricStore, { actor, action: 'memory_search', outcome: 'allowed', requestId, details: { scopes: response.scopes, total: response.result?.total ?? response.items?.length ?? 0 } });
       return json(res, 200, v2Envelope(requestId, response));
     } catch (error) {
       if (error?.message !== 'audit_unavailable') {
@@ -1298,7 +1430,10 @@ const requestHandler = async (req, res) => {
 
   if (pathnameParts[0] === 'v2' && pathnameParts[1] === 'memory' && pathnameParts[2] && pathnameParts.length === 3 && req.method === 'GET') {
     try {
-      const memory = await performMemoryRead({ actor, policy, policies, fabricStore, id: pathnameParts[2], requestId });
+      const purpose = requirePurpose(url.searchParams.get('purpose'));
+      if (!canonicalStore.configured) throw Object.assign(new Error('canonical_store_unconfigured'), { status: 503 });
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: url.searchParams.get('contextToken'), request: buildContextRequest('memory_read', { id: pathnameParts[2] }), required: purpose === 'conversation_recall' });
+      const memory = await performMemoryRead({ actor, policy, policies, fabricStore, canonicalStore, context, id: pathnameParts[2], requestId });
       return jsonNoStore(res, 200, v2Envelope(requestId, memory));
     } catch (error) {
       const failure = v2Error(requestId, error, 500);
@@ -1312,9 +1447,11 @@ const requestHandler = async (req, res) => {
       const body = await parseBody(req);
       const purpose = requirePurpose(body.purpose);
       const query = String(body.query || '');
+      const limit = normalizeSessionLimit(body.limit);
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: body.contextToken, request: buildContextRequest('sessions_search', body), required: true });
       validateSearchInput(query);
-      const raw = await sessionReader.search({ actor, query, limit: normalizeSessionLimit(body.limit), purpose });
-      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy, policies)) };
+      const raw = await sessionReader.search({ actor, query, cursor: body.cursor || null, limit, from: body.from || null, to: body.to || null, purpose, context });
+      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy, policies, context)), nextCursor: raw?.nextCursor || null };
       await auditRequired(fabricStore, { actor, action: 'sessions_search', outcome: 'allowed', requestId, details: { resultCount: result.items.length, purpose } });
       return jsonNoStore(res, 200, v2Envelope(requestId, result));
     } catch (error) {
@@ -1331,18 +1468,23 @@ const requestHandler = async (req, res) => {
       const purpose = requirePurpose(url.searchParams.get('purpose'));
       let result;
       if (isTranscript) {
-        await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionId, purpose });
         const view = url.searchParams.get('view') === 'original' ? 'original' : 'redacted';
+        const transcriptInput = { sessionId, view, cursor: url.searchParams.get('cursor'), limit: url.searchParams.get('limit'), from: url.searchParams.get('from'), to: url.searchParams.get('to') };
+        const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: url.searchParams.get('contextToken'), request: buildContextRequest('session_transcript', transcriptInput), required: true });
+        await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionId, purpose, context });
         if (view === 'original' && !hasPermission(policy, 'raw:decrypt')) {
           await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'denied', requestId, targetId: sessionId, details: { view, purpose } });
           const error = new Error('raw_decrypt_forbidden');
           error.status = 403;
           throw error;
         }
-        result = await sessionReader.transcript({ actor, id: sessionId, view, purpose });
+        if (view === 'original') await auditRequired(fabricStore, { actor, action: 'raw_decrypt_intent', outcome: 'authorized', requestId, targetId: sessionId, details: { view, purpose, transport: 'rest' } });
+        const transcript = await sessionReader.transcript({ actor, id: sessionId, view, cursor: transcriptInput.cursor, limit: normalizeSessionLimit(transcriptInput.limit || 100), from: transcriptInput.from, to: transcriptInput.to, purpose, context });
+        result = { ...transcript, nextCursor: transcript?.nextCursor || null };
         await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'allowed', requestId, targetId: sessionId, details: { view, purpose } });
       } else if (pathnameParts.length === 3) {
-        result = await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionId, purpose });
+        const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: url.searchParams.get('contextToken'), request: buildContextRequest('session_get', { sessionId }), required: true });
+        result = await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionId, purpose, context });
         await auditRequired(fabricStore, { actor, action: 'session_get', outcome: 'allowed', requestId, targetId: sessionId, details: { purpose } });
       } else {
         const error = new Error('not_found');
@@ -1354,6 +1496,54 @@ const requestHandler = async (req, res) => {
       const failure = v2Error(requestId, error, 500);
       return json(res, failure.status, failure.body);
     }
+  }
+
+  if (url.pathname === '/v1/memory/read' && req.method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const purpose = requirePurpose(body.purpose);
+      if (!canonicalStore.configured) throw Object.assign(new Error('canonical_store_unconfigured'), { status: 503 });
+      const id = String(body.id || '');
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: body.contextToken, request: buildContextRequest('memory_read', { id }), required: purpose === 'conversation_recall' });
+      return jsonV1(res, 200, await performMemoryRead({ actor, policy, policies, fabricStore, canonicalStore, context, id, requestId }));
+    } catch (error) {
+      const failure = publicError(error, 500); return jsonV1(res, failure.status, { error: failure.code });
+    }
+  }
+
+  if (url.pathname === '/v1/sessions/search' && req.method === 'POST') {
+    try {
+      requireSessionPermission(policy);
+      const body = await parseBody(req); const purpose = requirePurpose(body.purpose); const query = String(body.query || ''); const limit = normalizeSessionLimit(body.limit);
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: body.contextToken, request: buildContextRequest('sessions_search', body), required: true });
+      validateSearchInput(query);
+      const raw = await sessionReader.search({ actor, query, cursor: body.cursor || null, limit, from: body.from || null, to: body.to || null, purpose, context });
+      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy, policies, context)), nextCursor: raw?.nextCursor || null };
+      await auditRequired(fabricStore, { actor, action: 'sessions_search', outcome: 'allowed', requestId, details: { resultCount: result.items.length, purpose, transport: 'v1' } });
+      return jsonV1(res, 200, result);
+    } catch (error) { const failure = publicError(error, 500); return jsonV1(res, failure.status, { error: failure.code }); }
+  }
+
+  if (pathnameParts[0] === 'v1' && pathnameParts[1] === 'sessions' && pathnameParts[2] && req.method === 'GET') {
+    try {
+      requireSessionPermission(policy); const id = pathnameParts[2]; const purpose = requirePurpose(url.searchParams.get('purpose')); const transcript = pathnameParts[3] === 'transcript';
+      if (transcript) {
+        const view = url.searchParams.get('view') === 'original' ? 'original' : 'redacted';
+        const input = { sessionId: id, view, cursor: url.searchParams.get('cursor'), limit: url.searchParams.get('limit'), from: url.searchParams.get('from'), to: url.searchParams.get('to') };
+        const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: url.searchParams.get('contextToken'), request: buildContextRequest('session_transcript', input), required: true });
+        await getAuthorizedSession(sessionReader, { actor, policy, policies, id, purpose, context });
+        if (view === 'original' && !hasPermission(policy, 'raw:decrypt')) throw Object.assign(new Error('raw_decrypt_forbidden'), { status: 403 });
+        if (view === 'original') await auditRequired(fabricStore, { actor, action: 'raw_decrypt_intent', outcome: 'authorized', requestId, targetId: id, details: { view, purpose, transport: 'v1' } });
+        const result = await sessionReader.transcript({ actor, id, view, cursor: input.cursor, limit: normalizeSessionLimit(input.limit || 100), from: input.from, to: input.to, purpose, context });
+        await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'allowed', requestId, targetId: id, details: { view, purpose, transport: 'v1' } });
+        return jsonV1(res, 200, result);
+      }
+      if (pathnameParts.length !== 3) throw Object.assign(new Error('not_found'), { status: 404 });
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: url.searchParams.get('contextToken'), request: buildContextRequest('session_get', { sessionId: id }), required: true });
+      const result = await getAuthorizedSession(sessionReader, { actor, policy, policies, id, purpose, context });
+      await auditRequired(fabricStore, { actor, action: 'session_get', outcome: 'allowed', requestId, targetId: id, details: { purpose, transport: 'v1' } });
+      return jsonV1(res, 200, result);
+    } catch (error) { const failure = publicError(error, 500); return jsonV1(res, failure.status, { error: failure.code }); }
   }
 
   if (url.pathname === '/v1/policies/resolve') {
@@ -1376,8 +1566,13 @@ const requestHandler = async (req, res) => {
     const scopes = Array.isArray(body.scopes) ? body.scopes : [];
     const query = String(body.query || '');
     try {
-      const response = await performScopedSearch({ actor, scope, scopes, query, policy, policies, backend, fabricStore });
-      logEvent('memory_search', { requestId, actor, path: url.pathname, requestedScope: scope || null, requestedScopes: scopes, resolvedScopes: response.scopes, total: response.result?.total, perScope: response.result?.perScope, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
+      validateSearchInput(query);
+      const purpose = requirePurpose(body.purpose);
+      if (!canonicalStore.configured) throw Object.assign(new Error('canonical_store_unconfigured'), { status: 503 });
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: body.contextToken, request: buildContextRequest('memory_search', body), required: purpose === 'conversation_recall' || scopeRequiresContext(normalizeScopeList(scope, scopes)) });
+      const response = await performCanonicalSearch({ actor, scope, scopes, query, policy, policies, canonicalStore, context, limit: body.limit, cursor: body.cursor, from: body.from, to: body.to });
+      await auditRequired(fabricStore, { actor, action: 'memory_search', outcome: 'allowed', requestId, details: { total: response.items.length, transport: 'v1' } });
+      logEvent('memory_search', { requestId, actor, path: url.pathname, requestedScope: scope || null, requestedScopes: scopes, resolvedScopes: response.scopes, total: response.items.length, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
       return jsonV1(res, 200, response);
     } catch (error) {
       const status = error?.status === 403 ? 403 : error?.status === 400 ? 400 : 502;
@@ -1494,6 +1689,8 @@ const requestHandler = async (req, res) => {
         policies,
         backend,
         fabricStore,
+        canonicalStore,
+        contextVerifier,
         sessionReader,
         requestId,
         requestStartedAt,
@@ -1557,6 +1754,8 @@ const requestHandler = async (req, res) => {
         policies,
         backend,
         fabricStore,
+        canonicalStore,
+        contextVerifier,
         sessionReader,
         requestId,
         requestStartedAt,
@@ -1616,6 +1815,12 @@ applicationServer.on('close', () => {
   Promise.resolve(fabricStore.close?.()).catch((error) => {
     logEvent('fabric_store_close_failed', { error: safeError(error) });
   });
+  Promise.resolve(canonicalStore.close?.()).catch((error) => {
+    logEvent('canonical_store_close_failed', { error: safeError(error) });
+  });
+  Promise.resolve(receiptCoordinator?.close?.()).catch((error) => {
+    logEvent('receipt_coordinator_close_failed', { error: safeError(error) });
+  });
 });
 return applicationServer;
 }
@@ -1637,10 +1842,15 @@ if (isMain) {
     process.exitCode = 78;
   } else {
     let runtimeFabricStore;
+    let runtimeCanonicalStore;
+    let runtimeReceiptCoordinator;
     let runtimeServer;
     try {
       runtimeFabricStore = createFabricStoreFromEnv({ rootPath: ROOT });
-      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore });
+      runtimeCanonicalStore = createCanonicalPamBridgeFromEnv(process.env);
+      const runtimeContextVerifier = createContextVerifierFromEnv(process.env);
+      runtimeReceiptCoordinator = createReceiptCoordinatorFromEnv({ canonicalStore: runtimeCanonicalStore, proposalStore: runtimeFabricStore });
+      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore, canonicalStore: runtimeCanonicalStore, contextVerifier: runtimeContextVerifier, receiptCoordinator: runtimeReceiptCoordinator });
     } catch (error) {
       console.error(`agent-memory-fabric disabled: configuration failed: ${safeError(error)?.code || 'internal_error'}`);
       process.exitCode = 78;
@@ -1656,6 +1866,8 @@ if (isMain) {
     }).catch(async (error) => {
       console.error(`agent-memory-fabric disabled: catalog initialization failed: ${safeError(error)?.code || 'internal_error'}`);
       try { await runtimeFabricStore?.close?.(); } catch {}
+      try { await runtimeCanonicalStore?.close?.(); } catch {}
+      try { await runtimeReceiptCoordinator?.close?.(); } catch {}
       process.exitCode = 78;
     });
   }

@@ -1,0 +1,28 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import test from 'node:test';
+
+import { buildContextRequest, normalizeOpaqueTagMap } from '../src/access-contract.mjs';
+
+const schema = JSON.parse(fs.readFileSync(new URL('../config/contracts/agent-memory-fabric-v2.schema.json', import.meta.url), 'utf8'));
+const fixture = JSON.parse(fs.readFileSync(new URL('./fixtures/contracts/principia-canonical-contract.json', import.meta.url), 'utf8'));
+
+test('published canonical contract exposes every authoritative transport definition', () => {
+  const required = ['successEnvelope', 'errorEnvelope', 'contextTokenPayload', 'memorySearchRequest', 'memorySearchData', 'memoryReadRequest', 'memoryReadData', 'sessionsSearchRequest', 'sessionsSearchData', 'sessionGetData', 'transcriptData'];
+  for (const name of required) assert.ok(schema.$defs[name], `missing schema definition: ${name}`);
+  assert.equal(schema.$defs.successEnvelope.additionalProperties, false);
+  assert.equal(schema.$defs.transcriptData.oneOf.length, 2);
+  assert.equal(JSON.stringify(schema.$defs.transcriptData).includes('"messages"'), false);
+});
+
+test('Principia fixture uses the executable request-digest shapes and canonical transcript items', () => {
+  assert.deepEqual(fixture.context.memorySearchDigestInput, buildContextRequest('memory_search', fixture.memorySearch.request));
+  assert.deepEqual(fixture.context.sessionsSearchDigestInput, buildContextRequest('sessions_search', fixture.sessionsSearch.request));
+  assert.deepEqual(normalizeOpaqueTagMap(fixture.context.payload.contextTags), fixture.context.payload.contextTags);
+  assert.ok(Array.isArray(fixture.transcript.redacted.data.items));
+  assert.equal(Object.hasOwn(fixture.transcript.redacted.data, 'messages'), false);
+  for (const response of [fixture.memorySearch.response, fixture.memoryRead.response, fixture.sessionsSearch.response, fixture.transcript.redacted]) {
+    assert.deepEqual(Object.keys(response).sort(), ['data', 'meta', 'ok']);
+    assert.equal(response.meta.service, 'agent-memory-fabric');
+  }
+});
