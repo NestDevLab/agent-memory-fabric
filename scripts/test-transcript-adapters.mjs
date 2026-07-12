@@ -13,7 +13,7 @@ import { CursorStore, sourceCursorKey } from '../src/ingest/transcripts/cursor-s
 import { stableEventId, stableSessionId } from '../src/ingest/transcripts/identity.mjs';
 import { TranscriptIngestor } from '../src/ingest/transcripts/ingestor.mjs';
 import { BackfillLease, discoverTranscriptFiles, runTranscriptBackfill } from '../src/ingest/transcripts/backfill.mjs';
-import { decodeJsonLine, readCompleteJsonl } from '../src/ingest/transcripts/jsonl-tail.mjs';
+import { decodeJsonLine, readCompleteJsonl, tailBootstrapOffset } from '../src/ingest/transcripts/jsonl-tail.mjs';
 
 const fixtures = path.join(import.meta.dirname, 'fixtures', 'transcripts');
 const KEY = crypto.createHash('sha256').update('synthetic-test-key').digest('hex');
@@ -245,6 +245,51 @@ test('partial final line remains unread until completed and does not advance the
   } finally { tree.cleanup(); }
 });
 
+test('tail bootstrap namespaces realtime from backfill, preserves Codex session identity and a partial line across rotation', async () => {
+  const tree = tempTree();
+  const file = path.join(tree.root, 'codex-active.jsonl');
+  const lines = fs.readFileSync(path.join(fixtures, 'codex-synthetic.jsonl'), 'utf8').trimEnd().split('\n');
+  const completePrefix = `${lines[0]}\n${lines[1]}\n`;
+  const partial = lines[2].slice(0, -1);
+  fs.writeFileSync(file, `${completePrefix}${partial}`);
+  const sink = new FakeRawEventSink();
+  const ingestor = new TranscriptIngestor({ outbox: tree.outbox, cursorStore: tree.cursors, sink });
+  try {
+    assert.equal(tailBootstrapOffset(file), Buffer.byteLength(completePrefix));
+    const seeded = await ingestor.ingestFile({
+      runtime: 'codex', filePath: file, logicalSource: 'codex:host:active', cursorNamespace: 'realtime', bootstrapTail: true, requireExistingCursor: true
+    });
+    assert.equal(seeded.bootstrapped, true);
+    assert.equal(seeded.results.length, 0);
+    assert.equal(seeded.partialBytes, Buffer.byteLength(partial));
+    const realtimeKey = sourceCursorKey('codex', 'codex:host:active', 'realtime');
+    const cursorDisk = fs.readFileSync(tree.cursors.file(realtimeKey), 'utf8');
+    assert.equal(cursorDisk.includes('codex-session-synthetic'), false);
+    await assert.rejects(ingestor.ingestFile({
+      runtime: 'codex', filePath: file, logicalSource: 'codex:host:active', cursorNamespace: 'realtime', requireExistingCursor: true, fullAudit: true
+    }), /transcript_full_audit_requires_backfill_cursor/);
+
+    fs.appendFileSync(file, '}\n');
+    const appended = await ingestor.ingestFile({
+      runtime: 'codex', filePath: file, logicalSource: 'codex:host:active', cursorNamespace: 'realtime', requireExistingCursor: true
+    });
+    assert.equal(appended.results.length, 1, 'the partial line present during bootstrap is not skipped');
+
+    fs.renameSync(file, `${file}.old`);
+    fs.copyFileSync(path.join(fixtures, 'codex-synthetic.jsonl'), file);
+    const rotated = await ingestor.ingestFile({
+      runtime: 'codex', filePath: file, logicalSource: 'codex:host:active', cursorNamespace: 'realtime', requireExistingCursor: true
+    });
+    assert.equal(rotated.rotated, true);
+    assert.equal(rotated.generation, 1);
+    assert.equal(rotated.results.length, 3);
+
+    const historical = await ingestor.ingestFile({ runtime: 'codex', filePath: file, logicalSource: 'codex:host:active', cursorNamespace: 'backfill' });
+    assert.equal(historical.results.length, 3);
+    assert.notEqual(realtimeKey, sourceCursorKey('codex', 'codex:host:active', 'backfill'));
+  } finally { tree.cleanup(); }
+});
+
 test('active/archive copies deduplicate by path-independent event ids', async () => {
   const tree = tempTree();
   const active = path.join(tree.root, 'active.jsonl');
@@ -391,7 +436,7 @@ test('CLI is fixtures-only by default and rejects symlinks or unallowlisted live
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('CLI live opt-in requires both an allowlisted real root and source instance', async () => {
+test('CLI live opt-in requires allowlists, an isolated realtime cursor and explicit tail bootstrap', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-cli-live-'));
   const file = path.join(root, 'synthetic-live.jsonl');
   fs.copyFileSync(path.join(fixtures, 'claude-synthetic.jsonl'), file);
@@ -407,12 +452,18 @@ test('CLI live opt-in requires both an allowlisted real root and source instance
     AMF_TRANSCRIPT_SOURCE_INSTANCES: JSON.stringify(['synthetic-host'])
   };
   try {
-    const result = await ingestCli(args, env, { sink: new FakeRawEventSink() });
-    assert.equal(result.results.length, 2);
-    const wrongInstance = [...args];
-    wrongInstance[6] = 'other-host';
+    await assert.rejects(ingestCli(args, env, { sink: new FakeRawEventSink() }), /realtime_cursor_namespace_required/);
+    const realtimeArgs = [...args, '--cursor-namespace', 'realtime'];
+    await assert.rejects(ingestCli(realtimeArgs, env, { sink: new FakeRawEventSink() }), /realtime_cursor_uninitialized/);
+    const seeded = await ingestCli([...realtimeArgs, '--bootstrap-tail'], env, { sink: new FakeRawEventSink() });
+    assert.equal(seeded.bootstrapped, true);
+    assert.equal(seeded.results.length, 0);
+    fs.appendFileSync(file, '{"type":"user","uuid":"after-bootstrap","sessionId":"claude-session-synthetic","message":{"role":"user","content":"synthetic"}}\n');
+    const result = await ingestCli(realtimeArgs, env, { sink: new FakeRawEventSink() });
+    assert.equal(result.results.length, 1);
+    const wrongInstance = realtimeArgs.map(value => value === 'synthetic-host' ? 'other-host' : value);
     await assert.rejects(ingestCli(wrongInstance, env, { sink: new FakeRawEventSink() }), /source_instance_not_allowlisted/);
-    await assert.rejects(ingestCli([...args, '--test-mode', '--sink-module', path.join(fixtures, 'fake-sink.mjs')], env), /sink_module_test_mode_only/);
+    await assert.rejects(ingestCli([...realtimeArgs, '--test-mode', '--sink-module', path.join(fixtures, 'fake-sink.mjs')], env), /sink_module_test_mode_only/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -573,7 +624,7 @@ test('CLI backfill requires allowlisted source, lease root and source instance',
   try {
     const result = await ingestCli([
       '--backfill', '--allow-live-source', '--runtime', 'claude', '--root', sources, '--lease', path.join(leases, 'run.lease'),
-      '--source-instance-id', 'synthetic-host', '--spool', path.join(root, 'spool'), '--cursors', path.join(root, 'cursors')
+      '--source-instance-id', 'synthetic-host', '--spool', path.join(root, 'spool'), '--cursors', path.join(root, 'cursors'), '--cursor-namespace', 'backfill'
     ], {
       AMF_OUTBOX_ENCRYPTION_KEY: KEY,
       AMF_INGEST_DIGEST_KEY: KEY,
@@ -682,18 +733,23 @@ test('CLI builds the production HTTPS ciphertext sink only from explicit environ
     return { ok: true, async json() { return { ok: true, data: { status: 'stored', eventId: body.projection.eventId, idempotencyKey: body.projection.eventId } }; } };
   };
   try {
-    const result = await ingestCli([
+    const baseArgs = [
       '--runtime', 'claude', '--file', file, '--allow-live-source',
-      '--spool', path.join(root, 'spool'), '--cursors', path.join(root, 'cursors')
-    ], {
+      '--spool', path.join(root, 'spool'), '--cursors', path.join(root, 'cursors'), '--cursor-namespace', 'realtime'
+    ];
+    const env = {
       AMF_OUTBOX_KEY_RING_PATH: outboxRing, AMF_CURSOR_KEY_RING_PATH: cursorRing,
       AMF_INGEST_DIGEST_KEY: KEY, AMF_INGEST_CHECKPOINT_KEY: CHECKPOINT_KEY, AMF_INGEST_ACTOR_ID: 'synthetic-actor',
       AMF_INGEST_SOURCE_INSTANCE_ID: 'synthetic-host',
       AMF_INGEST_ENDPOINT: 'https://fabric.example.test/v2/ingest/raw-events', AMF_INGEST_TOKEN: 'synthetic-token',
       AMF_TRANSCRIPT_ALLOWED_ROOTS: JSON.stringify([root]), AMF_TRANSCRIPT_SOURCE_INSTANCES: JSON.stringify(['synthetic-host'])
-    });
-    assert.equal(result.results.length, 2);
-    assert.equal(requests.length, 2);
+    };
+    const seeded = await ingestCli([...baseArgs, '--bootstrap-tail'], env);
+    assert.equal(seeded.results.length, 0);
+    fs.appendFileSync(file, '{"type":"user","uuid":"http-after-bootstrap","sessionId":"claude-session-synthetic","message":{"role":"user","content":"SYNTHETIC_PRIVATE_CLAUDE_TEXT"}}\n');
+    const result = await ingestCli(baseArgs, env);
+    assert.equal(result.results.length, 1);
+    assert.equal(requests.length, 1);
     assert.equal(requests[0].options.redirect, 'error');
     assert.equal(requests[0].body.envelope.actorId, 'synthetic-actor');
     assert.equal(requests[0].body.envelope.sourceInstanceId, 'synthetic-host');

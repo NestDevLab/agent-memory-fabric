@@ -153,7 +153,7 @@ export class BackfillLease {
   }
 }
 
-export async function runTranscriptBackfill({ rootPath, runtime, sourceInstanceId, ingestor, leasePath, fullAudit = false }) {
+export async function runTranscriptBackfill({ rootPath, runtime, sourceInstanceId, ingestor, leasePath, cursorNamespace = 'default', fullAudit = false }) {
   if (!['codex', 'claude'].includes(runtime)) throw new Error('transcript_runtime_unsupported');
   sourceInstanceId = safeInstance(sourceInstanceId);
   const root = fs.realpathSync(rootPath);
@@ -169,7 +169,7 @@ export async function runTranscriptBackfill({ rootPath, runtime, sourceInstanceI
       let previousOffset = -1;
       let latest;
       do {
-        latest = await ingestor.ingestFile({ runtime, filePath, logicalSource: `${runtime}:${sourceInstanceId}:${relative}`, fullAudit });
+        latest = await ingestor.ingestFile({ runtime, filePath, logicalSource: `${runtime}:${sourceInstanceId}:${relative}`, cursorNamespace, fullAudit });
         chunks.push({ offset: latest.offset, partialBytes: latest.partialBytes, events: latest.results.length });
         events.push(...latest.results);
         if (latest.offset === previousOffset) break;
@@ -179,6 +179,6 @@ export async function runTranscriptBackfill({ rootPath, runtime, sourceInstanceI
       results.push({ file: relative, result: { ...latest, results: events, chunks } });
       lease.heartbeat();
     }
-    return { runtime, sourceInstanceId, fullAudit, files: results, totalEvents: results.reduce((sum, entry) => sum + entry.result.results.length, 0) };
+    return { runtime, sourceInstanceId, cursorNamespace, fullAudit, files: results, totalEvents: results.reduce((sum, entry) => sum + entry.result.results.length, 0) };
   } finally { lease.release(); }
 }

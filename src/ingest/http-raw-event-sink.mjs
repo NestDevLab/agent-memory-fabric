@@ -1,4 +1,4 @@
-import { validateClientCiphertext } from './raw-event-contract.mjs';
+import { RAW_EVENT_HTTP_MAX_BODY_BYTES, validateClientCiphertext } from './raw-event-contract.mjs';
 
 function abortRace(promise, signal) {
   if (signal.aborted) return Promise.reject(new Error('raw_event_http_timeout'));
@@ -50,13 +50,14 @@ async function readBoundedJson(response, { maxBytes, signal }) {
 }
 
 export class HttpRawEventSink {
-  constructor({ endpoint = '', token = '', sourceInstanceId = '', actorId = '', timeoutMs = 10000, maxResponseBytes = 64 * 1024, fetchImpl = globalThis.fetch, allowInsecureTest = false } = {}) {
+  constructor({ endpoint = '', token = '', sourceInstanceId = '', actorId = '', timeoutMs = 10000, maxRequestBytes = RAW_EVENT_HTTP_MAX_BODY_BYTES, maxResponseBytes = 64 * 1024, fetchImpl = globalThis.fetch, allowInsecureTest = false } = {}) {
     this.configured = Boolean(endpoint && token && sourceInstanceId && actorId);
     this.endpoint = endpoint;
     this.token = token;
     this.sourceInstanceId = sourceInstanceId;
     this.actorId = actorId;
     this.timeoutMs = timeoutMs;
+    this.maxRequestBytes = maxRequestBytes;
     this.maxResponseBytes = maxResponseBytes;
     this.fetchImpl = fetchImpl;
     this.allowInsecureTest = allowInsecureTest;
@@ -64,6 +65,7 @@ export class HttpRawEventSink {
       const url = new URL(endpoint);
       if (url.pathname !== '/v2/ingest/raw-events' || url.username || url.password || url.search || url.hash || (url.protocol !== 'https:' && !allowInsecureTest)) throw new Error('raw_event_http_endpoint_invalid');
       if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120000) throw new Error('raw_event_http_timeout_invalid');
+      if (!Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1024 || maxRequestBytes > 16 * 1024 * 1024) throw new Error('raw_event_http_request_limit_invalid');
       if (!Number.isSafeInteger(maxResponseBytes) || maxResponseBytes < 256 || maxResponseBytes > 1024 * 1024) throw new Error('raw_event_http_response_limit_invalid');
     }
   }
@@ -76,10 +78,13 @@ export class HttpRawEventSink {
     let response;
     let body;
     try {
+      const requestBody = JSON.stringify({ sourceInstanceId: this.sourceInstanceId, projection, envelope });
+      const requestBytes = Buffer.byteLength(requestBody, 'utf8');
+      if (requestBytes > this.maxRequestBytes) throw new Error('raw_event_http_request_too_large');
       response = await this.fetchImpl(this.endpoint, {
         method: 'POST', signal: controller.signal, redirect: 'error',
-        headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json', 'idempotency-key': idempotencyKey },
-        body: JSON.stringify({ sourceInstanceId: this.sourceInstanceId, projection, envelope })
+        headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json', 'content-length': String(requestBytes), 'idempotency-key': idempotencyKey },
+        body: requestBody
       });
       body = await readBoundedJson(response, { maxBytes: this.maxResponseBytes, signal: controller.signal });
     } catch (cause) {

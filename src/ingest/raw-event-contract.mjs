@@ -5,6 +5,7 @@ import { OBSERVATION_NORMALIZATION_VERSION, deriveEventIdV2, deriveLogicalMessag
 
 export const RAW_EVENT_CIPHERTEXT_VERSION = 3;
 export const RAW_EVENT_CIPHERTEXT_SCHEMA = 'amf.raw-event-ciphertext/v1';
+export const RAW_EVENT_HTTP_MAX_BODY_BYTES = 8 * 1024 * 1024;
 const SAFE_EVENT_ID = /^evt_[a-f0-9]{64}$/;
 const SAFE_SESSION_ID = /^ses_[a-f0-9]{64}$/;
 const SAFE_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -95,7 +96,17 @@ export function rawEventAad({ eventId, sessionId, keyId, projectionSha256, paylo
 }
 
 function canonicalBase64(value, bytes = null) {
-  if (typeof value !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return false;
+  if (typeof value !== 'string' || value.length === 0 || value.length % 4 !== 0) return false;
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0;
+  const contentLength = value.length - padding;
+  for (let index = 0; index < contentLength; index += 1) {
+    const code = value.charCodeAt(index);
+    const allowed = (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a)
+      || (code >= 0x30 && code <= 0x39) || code === 0x2b || code === 0x2f;
+    if (!allowed) return false;
+  }
+  for (let index = contentLength; index < value.length; index += 1) if (value.charCodeAt(index) !== 0x3d) return false;
+  if ((padding === 1 && contentLength % 4 !== 3) || (padding === 2 && contentLength % 4 !== 2) || (padding === 0 && contentLength % 4 !== 0)) return false;
   const decoded = Buffer.from(value, 'base64');
   return decoded.toString('base64') === value && (bytes === null || decoded.length === bytes);
 }
