@@ -26,7 +26,7 @@ const POLICY_PATH = process.env.AMF_POLICY_PATH || process.env.MEM0_GATEWAY_POLI
 const SESSION_ROUTE_MANIFEST_PATH = process.env.AMF_SESSION_ROUTE_MANIFEST_PATH || '';
 const PORT = envInteger('PORT', 8787, { min: 1, max: 65535 });
 const SERVICE_NAME = 'agent-memory-fabric';
-const SERVICE_VERSION = '0.5.4';
+const SERVICE_VERSION = '0.5.5';
 const LEGACY_SERVICE_ALIASES = ['mem0-gateway'];
 const LIMITS = Object.freeze({
   bodyBytes: envInteger('AMF_MAX_BODY_BYTES', 262144, { min: 1024, max: 16 * 1024 * 1024 }),
@@ -167,6 +167,73 @@ function jsonV1(res, status, body) {
 
 function v2Envelope(requestId, data) {
   return { ok: true, data, meta: { requestId, service: SERVICE_NAME, version: SERVICE_VERSION } };
+}
+
+function curationCursorMac(key, value) {
+  return crypto.createHmac('sha256', key).update(JSON.stringify({ binding: value.binding, createdAt: value.createdAt, id: value.id }), 'utf8').digest('hex');
+}
+
+function decodeCurationCursor(value, binding, key) {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(String(value), 'base64url').toString('utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+        || Object.keys(parsed).sort().join(',') !== 'binding,createdAt,id,mac'
+        || parsed.binding !== binding
+        || typeof parsed.createdAt !== 'string' || !Number.isFinite(Date.parse(parsed.createdAt))
+        || typeof parsed.id !== 'string' || parsed.id.length < 1 || parsed.id.length > 128
+        || !/^[a-f0-9]{64}$/.test(String(parsed.mac || ''))) throw new Error('invalid');
+    const expected = curationCursorMac(key, parsed);
+    if (!crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(parsed.mac, 'hex'))) throw new Error('invalid');
+    return parsed;
+  } catch {
+    throw Object.assign(new Error('invalid_request'), { status: 400 });
+  }
+}
+
+function encodeCurationCursor(value, binding, key) {
+  if (!value) return null;
+  const payload = { ...value, binding };
+  return Buffer.from(JSON.stringify({ ...payload, mac: curationCursorMac(key, payload) }), 'utf8').toString('base64url');
+}
+
+function reconcileCursorMac(key, value) {
+  return crypto.createHmac('sha256', key).update(JSON.stringify({ offset: value.offset, binding: value.binding }), 'utf8').digest('hex');
+}
+
+function decodeReconcileCursor(cursor, binding, key) {
+  if (!cursor) return 0;
+  try {
+    if (typeof cursor !== 'string' || cursor.length > 2048) throw new Error('invalid');
+    const decoded = Buffer.from(cursor, 'base64url');
+    if (decoded.toString('base64url') !== cursor) throw new Error('invalid');
+    const parsed = JSON.parse(decoded.toString('utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+        || Object.keys(parsed).sort().join(',') !== 'binding,mac,offset'
+        || parsed.binding !== binding || !Number.isSafeInteger(parsed.offset) || parsed.offset < 0
+        || !/^[a-f0-9]{64}$/.test(String(parsed.mac || ''))) throw new Error('invalid');
+    const expected = reconcileCursorMac(key, parsed);
+    if (!crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(parsed.mac, 'hex'))) throw new Error('invalid');
+    return parsed.offset;
+  } catch {
+    throw Object.assign(new Error('invalid_request'), { status: 400 });
+  }
+}
+
+function encodeReconcileCursor(offset, binding, key) {
+  if (offset === null) return null;
+  const payload = { offset, binding };
+  return Buffer.from(JSON.stringify({ ...payload, mac: reconcileCursorMac(key, payload) }), 'utf8').toString('base64url');
+}
+
+function curationCursorBinding(actor, statuses, authorization) {
+  const value = {
+    actor,
+    statuses: [...new Set(statuses)].sort(),
+    allowAll: authorization.allowAll,
+    allowedScopes: [...authorization.allowedScopes].sort()
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
 }
 
 function v2Error(requestId, error, fallbackStatus = 500) {
@@ -1330,7 +1397,8 @@ const defaultSessionReader = createUnconfiguredSessionReader();
 const defaultCanonicalStore = createUnconfiguredCanonicalStore();
 const defaultContextVerifier = createUnconfiguredContextVerifier();
 
-function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH } = {}) {
+function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH } = {}) {
+  if (!Buffer.isBuffer(curationCursorKey) || curationCursorKey.length < 32) throw new Error('curation_cursor_key_invalid');
 if (!Number.isSafeInteger(rawIngestBodyBytes) || rawIngestBodyBytes < 1024 || rawIngestBodyBytes > 16 * 1024 * 1024) throw new Error('raw_ingest_body_limit_invalid');
 sessionReader = sessionReader || fabricStore.createSessionReader?.() || defaultSessionReader;
 const sessions = new Map();
@@ -1515,12 +1583,56 @@ const requestHandler = async (req, res) => {
     }
   }
 
+  if (url.pathname === '/v2/internal/curation/proposals' && req.method === 'GET') {
+    try {
+      requirePermission(policy, 'memory:curate');
+      const statuses = url.searchParams.getAll('status');
+      const limit = Number(url.searchParams.get('limit') || 50);
+      const requestedStatuses = statuses.length ? statuses : ['queued'];
+      const authorization = authorizationFor(actor, policy, policies);
+      const binding = curationCursorBinding(actor, requestedStatuses, authorization);
+      const result = await fabricStore.listProposalsForCuration({
+        statuses: requestedStatuses,
+        after: decodeCurationCursor(url.searchParams.get('cursor'), binding, curationCursorKey),
+        limit
+      }, authorization);
+      await auditRequired(fabricStore, { actor, action: 'curation_proposal_list', outcome: 'allowed', requestId, details: { resultCount: result.items.length } });
+      return jsonNoStore(res, 200, v2Envelope(requestId, { items: result.items, nextCursor: encodeCurationCursor(result.next, binding, curationCursorKey) }));
+    } catch (error) {
+      const reported = await auditInternalFailure(fabricStore, { actor, action: 'curation_proposal_list', requestId, error });
+      const failure = v2Error(requestId, reported, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (pathnameParts[0] === 'v2' && pathnameParts[1] === 'internal' && pathnameParts[2] === 'curation'
+      && pathnameParts[3] === 'proposals' && pathnameParts.length === 5 && req.method === 'GET') {
+    const proposalId = pathnameParts[4];
+    try {
+      requirePermission(policy, 'memory:curate');
+      await auditRequired(fabricStore, { actor, action: 'curation_proposal_decrypt_intent', outcome: 'authorized', requestId, targetId: proposalId, details: { transport: 'rest' } });
+      const proposal = await fabricStore.readProposalAuthorized(proposalId, authorizationFor(actor, policy, policies));
+      await auditRequired(fabricStore, { actor, action: 'curation_proposal_read', outcome: 'allowed', requestId, targetId: proposalId });
+      return jsonNoStore(res, 200, v2Envelope(requestId, {
+        proposalId: proposal.id,
+        status: proposal.status,
+        createdAt: proposal.createdAt,
+        payload: proposal.payload,
+        proposalDigest: proposal.proposalDigest
+      }));
+    } catch (error) {
+      const reported = await auditInternalFailure(fabricStore, { actor, action: 'curation_proposal_read', requestId, error });
+      const failure = v2Error(requestId, reported, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
   if (url.pathname === '/v2/internal/curation/receipts' && req.method === 'POST') {
     try {
       if (!receiptCoordinator) throw Object.assign(new Error('service_unavailable'), { status: 503 });
       const body = await parseBody(req);
       requirePermission(policy, body?.kind === 'apply' ? 'memory:apply-receipt' : 'memory:curate');
-      const result = await receiptCoordinator.record(body, { actor, requestId });
+      const result = await receiptCoordinator.record(body, { actor, requestId, authorization: authorizationFor(actor, policy, policies) });
       return jsonNoStore(res, result.duplicate ? 200 : 201, v2Envelope(requestId, result));
     } catch (error) {
       const reported = await auditInternalFailure(fabricStore, { actor, action: 'curation_receipt', requestId, error });
@@ -1533,9 +1645,17 @@ const requestHandler = async (req, res) => {
     try {
       requirePermission(policy, 'memory:apply-receipt');
       if (!receiptCoordinator) throw Object.assign(new Error('service_unavailable'), { status: 503 });
-      const result = await receiptCoordinator.reconcile();
+      const body = await parseBody(req);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !['cursor', 'limit'].includes(key))) throw Object.assign(new Error('invalid_request'), { status: 400 });
+      const limit = body.limit === undefined ? 50 : body.limit;
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100
+          || (body.cursor !== undefined && (typeof body.cursor !== 'string' || body.cursor.length < 1 || body.cursor.length > 2048))) throw Object.assign(new Error('invalid_request'), { status: 400 });
+      const authorization = authorizationFor(actor, policy, policies);
+      const binding = curationCursorBinding(actor, ['reconcile'], authorization);
+      const result = await receiptCoordinator.reconcile({ authorization, offset: decodeReconcileCursor(body.cursor, binding, curationCursorKey), limit });
+      const response = { ok: result.ok, findings: result.findings, scanned: result.scanned, complete: result.complete, nextCursor: encodeReconcileCursor(result.nextOffset, binding, curationCursorKey) };
       await auditRequired(fabricStore, { actor, action: 'curation_reconcile', outcome: result.ok ? 'clean' : 'findings', requestId, details: { resultCount: result.findings.length } });
-      return jsonNoStore(res, result.ok ? 200 : 409, v2Envelope(requestId, result));
+      return jsonNoStore(res, result.ok ? 200 : 409, v2Envelope(requestId, response));
     } catch (error) {
       const reported = await auditInternalFailure(fabricStore, { actor, action: 'curation_reconcile', requestId, error });
       const failure = v2Error(requestId, reported, 500);

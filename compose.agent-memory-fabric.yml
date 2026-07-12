@@ -1,6 +1,6 @@
 services:
   agent-memory-fabric:
-    image: agent-memory-fabric:0.5.4
+    image: agent-memory-fabric:0.5.5
     build:
       context: .
       dockerfile: Dockerfile
@@ -19,7 +19,11 @@ services:
       AMF_RAW_V2_CUTOVER: "${AMF_RAW_V2_CUTOVER:-false}"
       AMF_PAM_MCP_SERVER_PATH: /opt/portable-agent-memory/tools/pam-mcp-server.mjs
       AMF_PAM_WORKSPACE: /srv/brain-shared
-      AMF_PAM_RECORD_INDEX_PATH: /run/config/amf-pam-record-index.json
+      AMF_PAM_RECORD_INDEX_PATH: /srv/brain-shared/memory/amf/record-index.json
+      AMF_PAM_ROUTING_KEY_RING_PATH: /run/secrets/agent-memory-fabric-routing-key-ring.json
+      AMF_PAM_ALLOW_LEGACY_CONTEXT_TAGS_SHADOW: "false"
+      PAM_WORKSPACE_CONFIG: /run/config/pam-workspace-config.json
+      PAM_APPLICATOR_STATE_KEY_FILE: /run/secrets/pam-applicator-state-key
       AMF_DATA_PATH: /var/lib/agent-memory-fabric
       AMF_CATALOG_KIND: postgres
       AMF_CATALOG_DATABASE_URL: "${AMF_CATALOG_DATABASE_URL:?set the dedicated production PostgreSQL URL}"
@@ -44,9 +48,11 @@ services:
       - ${AMF_INGEST_KEY_RING_SECRET_PATH:?mount the CT113 ingest key-ring secret}:/run/secrets/agent-memory-fabric-ingest-key-ring.json:ro
       - ${AMF_CONTEXT_KEY_RING_SECRET_PATH:?mount the context-token key-ring secret}:/run/secrets/agent-memory-fabric-context-key-ring.json:ro
       - ${AMF_SESSION_ROUTE_DIR:?mount the private signed session-route directory}:/run/amf-session-routes:ro
+      - ${AMF_ROUTING_KEY_RING_SECRET_PATH:?mount the dedicated routing-tag key-ring secret}:/run/secrets/agent-memory-fabric-routing-key-ring.json:ro
+      - ${PAM_WORKSPACE_CONFIG_PATH:?mount the reviewed PAM workspace config}:/run/config/pam-workspace-config.json:ro
+      - ${PAM_APPLICATOR_STATE_KEY_SECRET_PATH:?mount the verifier-only applicator state key}:/run/secrets/pam-applicator-state-key:ro
       - ${AMF_PAM_SOURCE_PATH:?mount the reviewed portable-agent-memory source}:/opt/portable-agent-memory:ro
       - ${AMF_PAM_WORKSPACE_PATH:?mount the canonical PAM workspace}:/srv/brain-shared:ro
-      - ${AMF_PAM_RECORD_INDEX_PATH:?mount the canonical PAM record index}:/run/config/amf-pam-record-index.json:ro
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
     ports:

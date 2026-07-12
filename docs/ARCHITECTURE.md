@@ -11,6 +11,10 @@ Target shape:
 - proposal RAW is content-addressed and encrypted independently from catalog metadata
 - transcript RAW is encrypted at the source and ingested through a durable outbox
 - downstream workers perform curation and PAM promotion outside the request path
+- curator discovery is bounded and metadata-only; exact reads and receipts are
+  least-privilege, audited, and proposal-digest-bound
+- PAM refreshes its record index atomically; Fabric hot-reloads it and derives
+  sensitive routing tags from non-secret refs with a server-only key ring
 
 Surfaces:
 
@@ -44,6 +48,17 @@ Trust rules:
 - proposal status is a catalog-only read; canonical record reads use `GET /v2/memory/:id`
 - proposal acknowledgements echo the authoritative idempotency key on REST and MCP
 - catalog identity/routing values are opaque keyed tags
+- canonical sensitive routing is derived from PAM `contextRefs` with the
+  mandatory server-side routing ring; client-supplied/precomputed tags are not
+  authoritative
+- curation receipts bind proposal scope and digest and are accepted only under
+  the submitting actor's current scope ACL
+- rejected/revoked proposals are terminal at both receipt preflight and catalog
+  transaction boundaries; only an identical persisted receipt can replay
+- curation pagination cursors are server-HMAC-authenticated
+- receipt reconciliation filters by opaque proposal scope in the catalog before
+  pagination; its cursor is HMAC-bound to the actor and current scope grant, and
+  malformed receipt bindings return only a generic integrity finding
 - auth registries and encryption keys are runtime secrets, never tracked files
 - ingest keys are authorized per actor/source before decryption; those bindings and
   the stable logical digest are authenticated as AES-GCM AAD
@@ -60,7 +75,8 @@ an explicit full-history audit mode.
 
 Compatibility:
 
-- recall hardening release identity is `0.5.4`
+- integrated recall + curation release identity is `0.5.5` (recall hardening
+  originated in `0.5.4`)
 - product identity is `agent-memory-fabric`; `mem0-gateway` is a legacy alias
 - `AMF_AUTH_REGISTRY_PATH` supersedes `MEM0_AUTH_REGISTRY_PATH`
 - `AMF_POLICY_PATH` supersedes `MEM0_GATEWAY_POLICY_PATH`

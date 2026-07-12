@@ -10,12 +10,18 @@ import { aadSha256For } from '../src/amf-memory-record-validator.mjs';
 import { createAgentMemoryFabricServer } from '../src/server.mjs';
 import { ContextTokenVerifier, issueContextToken, issueSessionRouteBinding, requestDigest } from '../src/context-token.mjs';
 import { buildContextRequest } from '../src/access-contract.mjs';
+import { CanonicalPamBridge, CuratorReceiptCoordinator, MemoryReceiptLedger } from '../src/canonical-memory-bridge.mjs';
 
 const testPolicyPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'config', 'policies.example.json');
 const CONTEXT_RING = { currentKeyVersion: 'ctx-v1', keys: { 'ctx-v1': Buffer.alloc(32, 7).toString('base64') } };
 const CONTEXT_NOW = Date.parse('2026-07-12T12:00:00Z');
 const ROOM_A = `hmac-sha256:routing-v1:${'a'.repeat(64)}`;
 const ROOM_B = `hmac-sha256:routing-v1:${'b'.repeat(64)}`;
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
 function contextTokenFor({ actor = 'test-actor', purpose, operation, input, room = ROOM_A,
   conversationKind = 'group', contextTags = null, canonicalScopes = ['room:team'] }) {
   return issueContextToken({ actor, runtime: 'principia', profile: 'test', conversationKind,
@@ -75,6 +81,26 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
         mode: 'scoped',
         allowedScopes: 'main-lab,room:team',
         permissions: 'memory:search,memory:read,sessions:read,purpose:continuity_resume,purpose:incident_debug,purpose:operator_review'
+      },
+      {
+        token: 'curator-token',
+        active: true,
+        actor: 'curator-actor',
+        mode: 'scoped',
+        allowedScopes: 'domain:main-lab',
+        permissions: 'memory:curate'
+      },
+      {
+        token: 'applicator-token',
+        active: true,
+        actor: 'applicator-actor',
+        mode: 'scoped',
+        allowedScopes: 'domain:main-lab',
+        permissions: 'memory:apply-receipt'
+      },
+      {
+        token: 'curator-two-token', active: true, actor: 'curator-two', mode: 'scoped',
+        allowedScopes: 'domain:main-lab', permissions: 'memory:curate'
       },
       {
         tokenSha256: '556510a5888bb3f061617bfec75649cbe0d04f8c5efe6a2807a9ca3ef231f382',
@@ -193,6 +219,201 @@ test('v2 REST queues idempotently while canonical read never exposes proposal pa
     assert.equal(read.response.status, 503);
     assert.equal(read.body.error.code, 'canonical_store_unconfigured');
     assert.equal(JSON.stringify(read.body).includes('Remember the appointment'), false);
+  });
+});
+
+test('least-privilege curator polls bounded metadata and reads one digest-bound proposal', async () => {
+  await withServer(async ({ api }) => {
+    const proposalIds = [];
+    for (let index = 0; index < 3; index += 1) {
+      const queued = await api('/v2/memory/proposals', {
+        method: 'POST', headers: { 'idempotency-key': `curation-poll-${index}` },
+        body: JSON.stringify(canonicalProposal(`curation candidate ${index}`))
+      });
+      proposalIds.push(queued.body.data.proposalId);
+    }
+    const curatorHeaders = { authorization: 'Bearer curator-token' };
+    const first = await api('/v2/internal/curation/proposals?status=queued&limit=2', { headers: curatorHeaders });
+    assert.equal(first.response.status, 200);
+    assert.equal(first.body.data.items.length, 2);
+    assert.equal(typeof first.body.data.nextCursor, 'string');
+    assert.equal(JSON.stringify(first.body).includes('curation candidate'), false);
+    const crossFilter = await api(`/v2/internal/curation/proposals?status=review&limit=2&cursor=${encodeURIComponent(first.body.data.nextCursor)}`, { headers: curatorHeaders });
+    assert.equal(crossFilter.response.status, 400);
+    const crossActor = await api(`/v2/internal/curation/proposals?status=queued&limit=2&cursor=${encodeURIComponent(first.body.data.nextCursor)}`, { headers: { authorization: 'Bearer curator-two-token' } });
+    assert.equal(crossActor.response.status, 400);
+    const tamperedCursor = `${first.body.data.nextCursor.slice(0, -1)}${first.body.data.nextCursor.endsWith('A') ? 'B' : 'A'}`;
+    const tampered = await api(`/v2/internal/curation/proposals?status=queued&limit=2&cursor=${encodeURIComponent(tamperedCursor)}`, { headers: curatorHeaders });
+    assert.equal(tampered.response.status, 400);
+    const decoded = JSON.parse(Buffer.from(first.body.data.nextCursor, 'base64url').toString('utf8'));
+    decoded.id = `${decoded.id.slice(0, -1)}${decoded.id.endsWith('0') ? '1' : '0'}`;
+    const semanticForgery = Buffer.from(JSON.stringify(decoded), 'utf8').toString('base64url');
+    const forged = await api(`/v2/internal/curation/proposals?status=queued&limit=2&cursor=${encodeURIComponent(semanticForgery)}`, { headers: curatorHeaders });
+    assert.equal(forged.response.status, 400);
+    const second = await api(`/v2/internal/curation/proposals?status=queued&limit=2&cursor=${encodeURIComponent(first.body.data.nextCursor)}`, { headers: curatorHeaders });
+    assert.equal(second.response.status, 200);
+    assert.equal(second.body.data.items.length, 1);
+    assert.equal(second.body.data.nextCursor, null);
+    assert.deepEqual(new Set([...first.body.data.items, ...second.body.data.items].map(item => item.proposalId)), new Set(proposalIds));
+
+    const selected = await api(`/v2/internal/curation/proposals/${proposalIds[0]}`, { headers: curatorHeaders });
+    assert.equal(selected.response.status, 200);
+    assert.equal(selected.body.data.proposalId, proposalIds[0]);
+    assert.equal(selected.body.data.status, 'queued');
+    assert.equal(selected.body.data.proposalDigest, crypto.createHash('sha256').update(canonicalJson(selected.body.data.payload)).digest('hex'));
+    assert.equal(selected.body.data.payload.record.claim.encoding, 'sealed');
+  });
+});
+
+test('0.5.5 composes signed session routes, canonicalScopes, PAM contextRefs and scope-bound curation receipts', async () => {
+  const routingKey = Buffer.alloc(32, 21); const literal = 'room:team';
+  const tag = namespace => `hmac-sha256:routing-v1:${crypto.createHmac('sha256', routingKey).update(canonicalJson([namespace, literal])).digest('hex')}`;
+  const contextTags = { conversation: [tag('conversation')], room: [tag('room')] };
+  const record = canonicalRecord('Integrated recall', 'main-lab');
+  record.scope = { type: 'room', id: literal }; record.visibility = 'shared'; record.claim.aadSha256 = aadSha256For(record);
+  const recordPath = `memory/amf/records/${record.id}.md`;
+  const canonicalStore = new CanonicalPamBridge({
+    index: { records: { [record.id]: { path: recordPath, scope: literal, contextRefs: { conversation: [literal], room: [literal] } } } },
+    routingKeys: { currentKeyVersion: 'routing-v1', keys: new Map([['routing-v1', routingKey]]) },
+    async callTool(name) {
+      if (name === 'memory_search') return { results: [{ path: recordPath }] };
+      if (name === 'memory_record_validate') return { status: 'valid', metadata: record };
+      throw new Error('unexpected_tool');
+    }
+  });
+  const fabricStore = makeStore();
+  const receiptCoordinator = new CuratorReceiptCoordinator({ ledger: new MemoryReceiptLedger(), canonicalStore, proposalStore: fabricStore });
+  const sessionReader = {
+    configured: true, kind: 'integrated-route-reader',
+    async search() { return { items: [{ id: 'session-integrated', scope: 'main-lab', ownerActor: 'test-actor', conversationKind: 'group', contextTags }] }; },
+    async get({ id }) { return { id, scope: 'main-lab', ownerActor: 'test-actor', conversationKind: 'group', contextTags }; },
+    async transcript({ id, view }) { return { id, view, items: [], nextCursor: null }; }
+  };
+  await withServer(async ({ api }) => {
+    const sessionInput = { query: 'integrated', purpose: 'continuity_resume' };
+    const sessionToken = contextTokenFor({ purpose: sessionInput.purpose, operation: 'sessions_search', input: sessionInput, contextTags, canonicalScopes: [literal] });
+    const sessions = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ ...sessionInput, contextToken: sessionToken }) });
+    assert.deepEqual(sessions.body.data.items.map(item => [item.id, item.scope]), [['session-integrated', literal]]);
+
+    const recallInput = { query: 'Integrated', scopes: [literal], purpose: 'conversation_recall' };
+    const recallToken = contextTokenFor({ purpose: recallInput.purpose, operation: 'memory_search', input: recallInput, contextTags, canonicalScopes: [literal] });
+    const recalled = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ ...recallInput, contextToken: recallToken }) });
+    assert.deepEqual(recalled.body.data.items.map(item => item.id), [record.id]);
+
+    const queued = await api('/v2/memory/proposals', { method: 'POST', headers: { 'idempotency-key': 'integrated-curation-0001' }, body: JSON.stringify(canonicalProposal('Integrated curation')) });
+    const persisted = await fabricStore.readProposal(queued.body.data.proposalId);
+    const digest = value => crypto.createHash('sha256').update(canonicalJson(value)).digest('hex');
+    const base = { proposalId: persisted.id, proposalScope: persisted.scope, decisionId: 'decision-integrated-0001', status: 'approved_pending_apply', proposalDigest: persisted.proposalDigest, policyDigest: digest('integrated-policy') };
+    const receipt = { kind: 'decision', ...base, decisionDigest: digest(base), timestamp: '2026-07-12T12:00:00Z' };
+    const accepted = await api('/v2/internal/curation/receipts', { method: 'POST', headers: { authorization: 'Bearer curator-token' }, body: JSON.stringify(receipt) });
+    assert.equal(accepted.response.status, 201); assert.equal(accepted.body.data.status, 'approved_pending_apply');
+  }, {
+    canonicalStore, fabricStore, receiptCoordinator, sessionReader,
+    routeManifestSetup({ routeManifestPath }) {
+      fs.writeFileSync(routeManifestPath, JSON.stringify({ schema: 'amf.session-route-manifest/v1', bindings: [
+        issueSessionRouteBinding({ actor: 'test-actor', canonicalScope: literal, conversationKind: 'group', contextTags }, CONTEXT_RING)
+      ] }), { mode: 0o600 });
+      fs.chmodSync(routeManifestPath, 0o600); return routeManifestPath;
+    }
+  });
+});
+
+test('receipt actors cannot advance cross-scope or unknown proposals and receive no existence oracle', async () => {
+  const store = makeStore();
+  const coordinator = new CuratorReceiptCoordinator({
+    ledger: new MemoryReceiptLedger(), proposalStore: store,
+    canonicalStore: { async read() { throw new Error('must_not_read'); }, async verifyApplyReceipt() { throw new Error('must_not_verify'); } }
+  });
+  await withServer(async ({ api }) => {
+    const queued = await api('/v2/memory/proposals', {
+      method: 'POST', headers: { 'idempotency-key': 'cross-scope-receipt-0001' },
+      body: JSON.stringify(canonicalProposal('private other domain', 'tirrenia'))
+    });
+    const persisted = await store.readProposal(queued.body.data.proposalId);
+    const digest = value => crypto.createHash('sha256').update(canonicalJson(value)).digest('hex');
+    const makeReceipt = (proposalId, proposalScope, proposalDigest) => {
+      const base = { proposalId, proposalScope, decisionId: 'decision-cross-scope', status: 'approved_pending_apply', proposalDigest, policyDigest: digest('policy') };
+      return { kind: 'decision', ...base, decisionDigest: digest(base), timestamp: '2026-07-12T12:00:00Z' };
+    };
+    let decryptions = 0; const originalGet = store.rawStore.get.bind(store.rawStore);
+    store.rawStore.get = async (...args) => { decryptions += 1; return originalGet(...args); };
+    const denied = await api('/v2/internal/curation/receipts', { method: 'POST', headers: { authorization: 'Bearer curator-token' }, body: JSON.stringify(makeReceipt(persisted.id, persisted.scope, persisted.proposalDigest)) });
+    const missing = await api('/v2/internal/curation/receipts', { method: 'POST', headers: { authorization: 'Bearer curator-token' }, body: JSON.stringify(makeReceipt('proposal-does-not-exist', persisted.scope, persisted.proposalDigest)) });
+    assert.equal(denied.response.status, 404); assert.equal(missing.response.status, 404);
+    assert.equal(denied.body.error.code, 'memory_not_found'); assert.equal(missing.body.error.code, 'memory_not_found');
+    assert.equal(decryptions, 0);
+  }, { fabricStore: store, receiptCoordinator: coordinator });
+});
+
+test('curation reconcile pages only actor-authorized receipts and binds cursors without cross-scope leaks', async () => {
+  const ledger = new MemoryReceiptLedger();
+  const digest = value => crypto.createHash('sha256').update(canonicalJson(value)).digest('hex');
+  const addPending = (proposalId, proposalScope) => {
+    const base = { proposalId, proposalScope, decisionId: `decision-${proposalId}`, status: 'approved_pending_apply', proposalDigest: digest(`payload-${proposalId}`), policyDigest: digest(`policy-${proposalId}`) };
+    ledger.recordDecision({ kind: 'decision', ...base, decisionDigest: digest(base), timestamp: '2026-07-12T12:00:00Z' });
+  };
+  addPending('proposal-main-a', 'domain:main-lab');
+  addPending('proposal-private-secret', 'domain:tirrenia');
+  addPending('proposal-main-b', 'domain:main-lab');
+  const coordinator = new CuratorReceiptCoordinator({ ledger, canonicalStore: { async read() { throw new Error('not_used'); } } });
+  await withServer(async ({ api }) => {
+    const denied = await api('/v2/internal/curation/reconcile', { method: 'POST', headers: { authorization: 'Bearer curator-token' }, body: '{}' });
+    assert.equal(denied.response.status, 403);
+
+    const first = await api('/v2/internal/curation/reconcile', { method: 'POST', headers: { authorization: 'Bearer applicator-token' }, body: JSON.stringify({ limit: 1 }) });
+    assert.equal(first.response.status, 409); assert.equal(first.body.data.scanned, 1); assert.equal(first.body.data.complete, false);
+    assert.deepEqual(first.body.data.findings, [{ proposalId: 'proposal-main-a', code: 'apply_receipt_pending' }]);
+    assert.equal(typeof first.body.data.nextCursor, 'string');
+    assert.doesNotMatch(JSON.stringify(first.body), /proposal-private-secret|domain:tirrenia/);
+
+    const second = await api('/v2/internal/curation/reconcile', { method: 'POST', headers: { authorization: 'Bearer applicator-token' }, body: JSON.stringify({ limit: 1, cursor: first.body.data.nextCursor }) });
+    assert.deepEqual(second.body.data.findings, [{ proposalId: 'proposal-main-b', code: 'apply_receipt_pending' }]);
+    assert.equal(second.body.data.complete, true); assert.equal(second.body.data.nextCursor, null);
+    assert.doesNotMatch(JSON.stringify(second.body), /proposal-private-secret|domain:tirrenia/);
+
+    const wrongActorCursor = await api('/v2/internal/curation/reconcile', { method: 'POST', body: JSON.stringify({ limit: 1, cursor: first.body.data.nextCursor }) });
+    assert.equal(wrongActorCursor.response.status, 400); assert.equal(wrongActorCursor.body.error.code, 'invalid_request');
+    const all = await api('/v2/internal/curation/reconcile', { method: 'POST', body: JSON.stringify({ limit: 100 }) });
+    assert.deepEqual(all.body.data.findings.map(item => item.proposalId), ['proposal-main-a', 'proposal-main-b', 'proposal-private-secret']);
+    const oversized = await api('/v2/internal/curation/reconcile', { method: 'POST', body: JSON.stringify({ limit: 101 }) });
+    assert.equal(oversized.response.status, 400);
+    const forged = await api('/v2/internal/curation/reconcile', { method: 'POST', headers: { authorization: 'Bearer applicator-token' }, body: JSON.stringify({ cursor: `${first.body.data.nextCursor}x` }) });
+    assert.equal(forged.response.status, 400);
+  }, { receiptCoordinator: coordinator });
+});
+
+test('curation exact read permits retry states but denies terminal rejected/revoked before decrypt', async () => {
+  await withServer(async ({ api, fabricStore }) => {
+    const ids = [];
+    for (const key of ['review', 'promoted', 'rejected', 'revoked']) {
+      const queued = await api('/v2/memory/proposals', { method: 'POST', headers: { 'idempotency-key': `curation-state-${key}` }, body: JSON.stringify(canonicalProposal(`state ${key}`)) });
+      ids.push([key, queued.body.data.proposalId]); fabricStore.catalog.proposals.get(queued.body.data.proposalId).status = key;
+    }
+    let decryptions = 0; const originalGet = fabricStore.rawStore.get.bind(fabricStore.rawStore);
+    fabricStore.rawStore.get = async (...args) => { decryptions += 1; return originalGet(...args); };
+    for (const [status, id] of ids) {
+      const result = await api(`/v2/internal/curation/proposals/${id}`, { headers: { authorization: 'Bearer curator-token' } });
+      assert.equal(result.response.status, ['review', 'promoted'].includes(status) ? 200 : 404);
+    }
+    assert.equal(decryptions, 2);
+  });
+});
+
+test('curation payload denial happens before proposal decryption', async () => {
+  await withServer(async ({ api, fabricStore }) => {
+    const queued = await api('/v2/memory/proposals', {
+      method: 'POST', headers: { 'idempotency-key': 'curation-deny-0001' },
+      body: JSON.stringify(canonicalProposal('curation deny candidate'))
+    });
+    let decryptions = 0;
+    const originalGet = fabricStore.rawStore.get.bind(fabricStore.rawStore);
+    fabricStore.rawStore.get = async (...args) => { decryptions += 1; return originalGet(...args); };
+    const denied = await api(`/v2/internal/curation/proposals/${queued.body.data.proposalId}`, { headers: { authorization: 'Bearer applicator-token' } });
+    assert.equal(denied.response.status, 403);
+    assert.equal(decryptions, 0);
+    const deniedList = await api('/v2/internal/curation/proposals?limit=1', { headers: { authorization: 'Bearer limited-token' } });
+    assert.equal(deniedList.response.status, 403);
+    assert.equal(decryptions, 0);
   });
 });
 
