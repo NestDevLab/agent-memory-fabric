@@ -22,7 +22,18 @@ function fixture() {
 test('PAM runtime private directory accepts one service-owned 0700 parent with fixed 0600 files', () => {
   const sample = fixture();
   try {
-    assert.deepEqual(validatePamRuntimePrivateDir({ directory: sample.directory, environment: sample.environment }), { ok: true, uid: process.geteuid(), files: 3 });
+    assert.deepEqual(validatePamRuntimePrivateDir({ directory: sample.directory, environment: sample.environment }), { ok: true, uid: process.geteuid(), gid: process.getegid(), files: 3 });
+  } finally { fs.rmSync(sample.root, { recursive: true, force: true }); }
+});
+
+test('PAM runtime preflight rejects parent and file GID mismatches', (t) => {
+  const sample = fixture();
+  try {
+    const alternateGid = process.getgroups().find(gid => gid !== process.getegid());
+    if (alternateGid === undefined) return t.skip('no supplemental group available for a real GID mismatch');
+    assert.throws(() => validatePamRuntimePrivateDir({ directory: sample.directory, environment: sample.environment, expectedGid: alternateGid }), /pam_runtime_private_dir_invalid:parent/);
+    fs.chownSync(sample.directory, process.geteuid(), alternateGid);
+    assert.throws(() => validatePamRuntimePrivateDir({ directory: sample.directory, environment: sample.environment, expectedGid: alternateGid }), /pam_runtime_private_dir_invalid:file/);
   } finally { fs.rmSync(sample.root, { recursive: true, force: true }); }
 });
 

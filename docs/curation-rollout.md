@@ -50,7 +50,7 @@ Curation page cursors carry a server-side HMAC and become invalid after process
 restart. Restart pagination from the first page instead of persisting cursors.
 
 The PAM runtime parent is exactly mode `0700`; its three files are regular,
-single-link, service-owned mode-`0600` files. Startup and the explicit container
+single-link, service-UID-and-GID-owned mode-`0600` files. Startup and the explicit container
 preflight verify the fixed path bindings and read through a no-follow parent
 dirfd. A root-owned parent fails closed before the catalog or listener starts.
 
