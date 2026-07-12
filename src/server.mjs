@@ -33,6 +33,7 @@ const LIMITS = Object.freeze({
 const AUTH_CACHE_TTL_MS = envInteger('MEM0_AUTH_CACHE_TTL_MS', 15000, { min: 0, max: 3600000 });
 const AUDIT_TIMEOUT_MS = envInteger('AMF_AUDIT_TIMEOUT_MS', 2000, { min: 100, max: 30000 });
 const CATALOG_HEALTH_TIMEOUT_MS = envInteger('AMF_CATALOG_HEALTH_TIMEOUT_MS', 3000, { min: 100, max: 30000 });
+const BODY_READ_TIMEOUT_MS = envInteger('AMF_BODY_READ_TIMEOUT_MS', 10000, { min: 100, max: 120000 });
 const MCP_SESSION_DEFAULTS = Object.freeze({
   ttlMs: envInteger('AMF_MCP_SESSION_TTL_MS', 900000, { min: 1000, max: 86400000 }),
   maxGlobal: envInteger('AMF_MCP_MAX_SESSIONS', 1000, { min: 1, max: 100000 }),
@@ -61,8 +62,13 @@ const PUBLIC_ERRORS = new Map([
   ['sessions_forbidden', [403, 'sessions_forbidden']], ['raw_decrypt_forbidden', [403, 'raw_decrypt_forbidden']],
   ['not_found', [404, 'not_found']], ['memory_not_found', [404, 'memory_not_found']], ['session_not_found', [404, 'session_not_found']], ['unknown_session', [404, 'unknown_session']],
   ['idempotency_key_conflict', [409, 'idempotency_key_conflict']], ['body_too_large', [413, 'body_too_large']], ['query_too_large', [413, 'query_too_large']],
+  ['body_read_timeout', [408, 'body_read_timeout']],
   ['proposal_too_large', [413, 'proposal_too_large']], ['metadata_too_large', [413, 'metadata_too_large']], ['idempotency_key_too_large', [413, 'idempotency_key_too_large']],
   ['session_capacity_exceeded', [429, 'session_capacity_exceeded']], ['fabric_store_unconfigured', [503, 'fabric_store_unconfigured']],
+  ['raw_projection_invalid', [400, 'raw_projection_invalid']], ['raw_envelope_invalid', [400, 'raw_envelope_invalid']], ['raw_envelope_binding_invalid', [400, 'raw_envelope_binding_invalid']],
+  ['source_instance_invalid', [400, 'source_instance_invalid']], ['raw_event_conflict', [409, 'raw_event_conflict']], ['raw_ingest_key_unavailable', [503, 'raw_ingest_key_unavailable']],
+  ['raw_session_binding_conflict', [409, 'raw_session_binding_conflict']], ['raw_envelope_authentication_failed', [400, 'raw_envelope_authentication_failed']],
+  ['raw_ingest_unconfigured', [503, 'raw_ingest_unconfigured']],
   ['session_reader_unconfigured', [503, 'session_reader_unconfigured']], ['backend_not_configured', [503, 'backend_not_configured']],
   ['audit_unavailable', [503, 'audit_unavailable']], ['catalog_unavailable', [503, 'catalog_unavailable']], ['service_unavailable', [503, 'service_unavailable']]
 ]);
@@ -186,11 +192,17 @@ function canReadSessions(policy) {
   return hasPermission(policy, 'sessions:read') || hasPermission(policy, '*');
 }
 
-function parseBody(req, { maxBytes = LIMITS.bodyBytes } = {}) {
+function parseBody(req, { maxBytes = LIMITS.bodyBytes, timeoutMs = BODY_READ_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let received = 0;
     let rejected = false;
+    const timer = setTimeout(() => {
+      if (rejected) return;
+      rejected = true;
+      req.pause();
+      reject(Object.assign(new Error('body_read_timeout'), { status: 408 }));
+    }, timeoutMs);
     req.on('data', c => {
       if (rejected) return;
       received += c.length;
@@ -198,6 +210,7 @@ function parseBody(req, { maxBytes = LIMITS.bodyBytes } = {}) {
         const error = new Error('body_too_large');
         error.status = 413;
         rejected = true;
+        clearTimeout(timer);
         reject(error);
         return;
       }
@@ -205,6 +218,7 @@ function parseBody(req, { maxBytes = LIMITS.bodyBytes } = {}) {
     });
     req.on('end', () => {
       if (rejected) return;
+      clearTimeout(timer);
       const raw = Buffer.concat(chunks).toString('utf8');
       if (!raw) return resolve({});
       try {
@@ -215,7 +229,7 @@ function parseBody(req, { maxBytes = LIMITS.bodyBytes } = {}) {
         reject(error);
       }
     });
-    req.on('error', reject);
+    req.on('error', error => { clearTimeout(timer); reject(error); });
   });
 }
 
@@ -580,6 +594,7 @@ function requirePurpose(value) {
 
 function sessionVisible(session, actor, policy, policies) {
   if (!session || typeof session !== 'object') return false;
+  if (session.ownerSelf === true) return true;
   if (String(session.ownerActor || '') === actor) return true;
   const scope = String(session.scope || '');
   if (!scope || !getScopeConfig(scope, policies)) return false;
@@ -999,7 +1014,8 @@ async function performMemoryRead({ actor, policy, policies, fabricStore, id, req
 const defaultBackend = createBackendAdapter();
 const defaultSessionReader = createUnconfiguredSessionReader();
 
-function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), sessionReader = defaultSessionReader, sessionOptions = {}, clock = () => Date.now(), policyPath = POLICY_PATH } = {}) {
+function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, clock = () => Date.now(), policyPath = POLICY_PATH } = {}) {
+sessionReader = sessionReader || fabricStore.createSessionReader?.() || defaultSessionReader;
 const sessions = new Map();
 const sessionPolicy = { ...MCP_SESSION_DEFAULTS, ...sessionOptions };
 function pruneSessions(now = clock()) {
@@ -1127,7 +1143,7 @@ const requestHandler = async (req, res) => {
 
   if (url.pathname === '/v2/memory/proposals' && req.method === 'POST') {
     try {
-      const body = await parseBody(req);
+      const body = await parseBody(req, { timeoutMs: bodyReadTimeoutMs });
       validateCanonicalProposalBody(body);
       const validated = validateCanonicalProposal(body.record, body.rationale, body.expectedRevision ?? null);
       const idempotencyKey = String(req.headers['idempotency-key'] || '');
@@ -1147,6 +1163,22 @@ const requestHandler = async (req, res) => {
       });
       return json(res, proposal.duplicate ? 200 : 202, v2Envelope(requestId, { status: proposal.status, proposalId: proposal.id, duplicate: proposal.duplicate, idempotencyKey }));
     } catch (error) {
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/ingest/raw-events' && req.method === 'POST') {
+    try {
+      requirePermission(policy, 'raw:ingest');
+      const body = await parseBody(req, { timeoutMs: bodyReadTimeoutMs });
+      if (!body || Object.keys(body).sort().join('\0') !== 'envelope\0projection\0sourceInstanceId') throw Object.assign(new Error('invalid_request'), { status: 400 });
+      const result = await fabricStore.ingestRawEvent({ actor, sourceInstanceId: body.sourceInstanceId, projection: body.projection, envelope: body.envelope }, { requestId });
+      return jsonNoStore(res, result.duplicate ? 200 : 201, v2Envelope(requestId, { ...result, idempotencyKey: result.eventId }));
+    } catch (error) {
+      if (error?.message !== 'audit_unavailable') {
+        try { await auditRequired(fabricStore, { actor, action: 'raw_event_ingest', outcome: 'failed', requestId, details: { code: publicError(error).code } }); } catch (auditError) { if (auditError?.message === 'audit_unavailable') error = auditError; }
+      }
       const failure = v2Error(requestId, error, 500);
       return jsonNoStore(res, failure.status, failure.body);
     }

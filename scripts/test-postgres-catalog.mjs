@@ -25,6 +25,8 @@ class FakePool {
     this.proposals = new Map();
     this.proposalsByKey = new Map();
     this.auditEvents = new Map();
+    this.rawEvents = new Map();
+    this.rawSessions = new Map();
     this.connectCalls = 0;
     this.releaseCalls = 0;
     this.endCalls = 0;
@@ -56,6 +58,34 @@ class FakePool {
       if (!this.rawObjects.has(contentId)) this.rawObjects.set(contentId, { contentId, mediaType, byteLength, storageRef, createdAt });
       return { rows: [] };
     }
+    if (compact.startsWith('SELECT * FROM agent_memory_fabric.raw_events_v1 WHERE event_id=$1')) return { rows: [this.rawEvents.get(values[0])].filter(Boolean) };
+    if (compact.startsWith('INSERT INTO agent_memory_fabric.raw_sessions_v1')) {
+      const [sessionId, runtime, ownerTag, sourceTag, occurredAt, createdAt] = values;
+      if (!this.rawSessions.has(sessionId)) this.rawSessions.set(sessionId, { session_id: sessionId, runtime, owner_tag: ownerTag, source_tag: sourceTag, first_occurred_at: occurredAt, last_occurred_at: occurredAt, event_count: 0, created_at: createdAt });
+      return { rows: [] };
+    }
+    if (compact.startsWith('INSERT INTO agent_memory_fabric.raw_events_v1')) {
+      const [eventId, sessionId, contentId, payloadDigest, projectionJson, ownerTag, sourceTag, createdAt] = values;
+      if (this.rawEvents.has(eventId)) return { rows: [] };
+      const row = { event_id: eventId, session_id: sessionId, content_id: contentId, payload_digest: payloadDigest, projection_json: JSON.parse(projectionJson), owner_tag: ownerTag, source_tag: sourceTag, created_at: createdAt };
+      this.rawEvents.set(eventId, row);
+      return { rows: [row] };
+    }
+    if (compact.startsWith('UPDATE agent_memory_fabric.raw_sessions_v1 SET event_count=')) {
+      const session = this.rawSessions.get(values[1]);
+      if (session) {
+        session.event_count += 1;
+        if (values[0] && (!session.first_occurred_at || values[0] < session.first_occurred_at)) session.first_occurred_at = values[0];
+        if (values[0] && (!session.last_occurred_at || values[0] > session.last_occurred_at)) session.last_occurred_at = values[0];
+      }
+      return { rows: [] };
+    }
+    if (compact.startsWith('SELECT * FROM agent_memory_fabric.raw_sessions_v1 WHERE owner_tag=ANY')) {
+      const needle = String(values[1]).replaceAll('%', '').toLowerCase();
+      return { rows: [...this.rawSessions.values()].filter(row => values[0].includes(row.owner_tag) && (!needle || `${row.session_id} ${row.runtime}`.toLowerCase().includes(needle))).slice(0, values[2]) };
+    }
+    if (compact.startsWith('SELECT * FROM agent_memory_fabric.raw_sessions_v1 WHERE session_id=$1')) return { rows: [this.rawSessions.get(values[0])].filter(Boolean) };
+    if (compact.startsWith('SELECT * FROM agent_memory_fabric.raw_events_v1 WHERE session_id=$1')) return { rows: [...this.rawEvents.values()].filter(row => row.session_id === values[0]) };
     if (compact.startsWith('INSERT INTO agent_memory_fabric.fabric_proposals')) {
       if (this.failNextProposalInsert) {
         this.failNextProposalInsert = false;
@@ -137,10 +167,13 @@ test('PostgreSQL catalog bootstraps the complete versioned metadata schema idemp
   assert.equal(pool.connectCalls, 1);
   assert.equal(pool.releaseCalls, 1);
   const ddl = pool.queries.map((entry) => entry.text).join('\n');
-  for (const table of ['schema_migrations', 'raw_objects_v2', 'fabric_proposals', 'identity_records', 'ingest_cursors', 'audit_events_v2', 'retention_tombstones']) {
+  for (const table of ['schema_migrations', 'raw_objects_v2', 'fabric_proposals', 'identity_records', 'ingest_cursors', 'raw_sessions_v1', 'raw_events_v1', 'audit_events_v2', 'retention_tombstones']) {
     assert.match(ddl, new RegExp(`${POSTGRES_SCHEMA}\\.${table}`));
   }
   assert.match(ddl, /UNIQUE\(owner_tag, idempotency_tag\)/);
+  assert.match(ddl, /raw_sessions_v1[\s\S]*owner_tag TEXT NOT NULL[\s\S]*source_tag TEXT NOT NULL/);
+  assert.equal(ddl.includes('owner_actor TEXT'), false);
+  assert.equal(ddl.includes('source_instance_id TEXT'), false);
   assert.match(ddl, /value_ciphertext BYTEA/);
   assert.equal(ddl.includes('private proposal text'), false);
   const migration = pool.queries.find((entry) => entry.text.includes('schema_migrations(version) VALUES'));
@@ -182,6 +215,54 @@ test('PostgreSQL proposal transaction resolves concurrent idempotency conflicts 
   assert.equal(pool.endCalls, 1);
 });
 
+test('PostgreSQL raw event/session catalog matches SQLite idempotency and safe projection contract', async () => {
+  const pool = new FakePool();
+  const catalog = new PostgresCatalog({ pool });
+  const projection = { schema: 'amf.raw-event-projection/v1', eventId: `evt_${'a'.repeat(64)}`, sessionId: `ses_${'b'.repeat(64)}`, runtime: 'claude', subtype: 'user', occurredAt: '2026-07-12T00:00:00Z', role: 'user', contentType: 'text', contentParts: 1, hasContent: true };
+  const record = { eventId: projection.eventId, sessionId: projection.sessionId, contentId: 'c'.repeat(64), payloadDigest: 'd'.repeat(64), projection, ownerTag: 'owner-tag', sourceTag: 'source-tag', createdAt: '2026-07-12T00:00:01Z' };
+  const rawRecord = { contentId: record.contentId, mediaType: 'application/vnd.agent-memory-fabric.raw-event-ciphertext+json', byteLength: 456, storageRef: 'client-events/c.enc.json', createdAt: record.createdAt };
+  const audit = { id: 'raw-audit-1', ts: record.createdAt, actorTag: 'actor-tag', action: 'raw_event_ingest', outcome: 'stored', requestId: 'request', targetId: record.eventId, details: {} };
+  const first = await catalog.ingestRawEvent(record, rawRecord, audit);
+  const duplicate = await catalog.ingestRawEvent(record, rawRecord, { ...audit, id: 'raw-audit-2' });
+  assert.equal(first.duplicate, false);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal((await catalog.searchSessions({ ownerTags: ['owner-tag'], query: 'claude', limit: 10 })).length, 1);
+  assert.equal((await catalog.searchSessions({ ownerTags: ['owner-tag'], query: '%_', limit: 10 })).length, 0);
+  const searchQuery = pool.queries.filter(entry => entry.text.includes('raw_sessions_v1') && entry.text.includes('ILIKE')).at(-1);
+  assert.match(searchQuery.text, /ESCAPE '\\'/);
+  assert.match(searchQuery.text, /NULLS LAST/);
+  assert.equal(searchQuery.values[1], '%\\%\\_%');
+  assert.equal((await catalog.getSession(record.sessionId)).eventCount, 1);
+  assert.equal((await catalog.listSessionEvents(record.sessionId))[0].projection.role, 'user');
+  const hijackProjection = { ...projection, eventId: `evt_${'e'.repeat(64)}` };
+  await assert.rejects(catalog.ingestRawEvent({ ...record, eventId: hijackProjection.eventId, projection: hijackProjection, ownerTag: 'other-owner-tag', contentId: 'f'.repeat(64) }, { ...rawRecord, contentId: 'f'.repeat(64) }, { ...audit, id: 'raw-audit-3' }), /raw_session_binding_conflict/);
+  for (const query of pool.queries.filter(entry => entry.text.includes('raw_events_v1') && entry.values.length)) {
+    assert.equal(query.text.includes('SYNTHETIC_PRIVATE'), false);
+    assert.ok(Array.isArray(query.values));
+  }
+  await catalog.close();
+});
+
+test('PostgreSQL raw ingest reconciles a lost COMMIT acknowledgement and retry stays idempotent', async () => {
+  const pool = new FakePool();
+  const catalog = new PostgresCatalog({ pool });
+  const projection = { schema: 'amf.raw-event-projection/v1', eventId: `evt_${'9'.repeat(64)}`, sessionId: `ses_${'8'.repeat(64)}`, runtime: 'claude', subtype: 'user', occurredAt: '2026-07-12T01:00:00Z', role: 'user', contentType: 'text', contentParts: 1, hasContent: true };
+  const record = { eventId: projection.eventId, sessionId: projection.sessionId, contentId: '7'.repeat(64), payloadDigest: `hmac-sha256:v1:${'6'.repeat(64)}`, projection, ownerTag: 'opaque-owner-tag', sourceTag: 'opaque-source-tag', createdAt: '2026-07-12T01:00:01Z' };
+  const rawRecord = { contentId: record.contentId, mediaType: 'cipher', byteLength: 100, storageRef: 'client-events/7.enc.json', createdAt: record.createdAt };
+  await catalog.ready();
+  pool.loseNextCommitAck = true;
+  const first = await catalog.ingestRawEvent(record, rawRecord, { id: 'raw-ambiguous-1', ts: record.createdAt, actorTag: 'audit-tag', action: 'raw_event_ingest', outcome: 'stored', targetId: record.eventId, details: {} });
+  assert.equal(first.duplicate, false);
+  assert.ok(pool.releaseError instanceof Error, 'ambiguous COMMIT client must be discarded');
+  assert.equal(pool.rawEvents.size, 1);
+  assert.equal(pool.rawSessions.get(record.sessionId).event_count, 1);
+  const retry = await catalog.ingestRawEvent(record, rawRecord, { id: 'raw-ambiguous-2', ts: record.createdAt, actorTag: 'audit-tag', action: 'raw_event_ingest', outcome: 'duplicate', targetId: record.eventId, details: {} });
+  assert.equal(retry.duplicate, true);
+  assert.equal(pool.rawEvents.size, 1);
+  assert.equal(pool.rawSessions.get(record.sessionId).event_count, 1);
+  await catalog.close();
+});
+
 test('PostgreSQL catalog configuration is explicit and never falls back to SQLite', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-postgres-config-'));
   const base = { AMF_RAW_ENCRYPTION_KEY: 'a'.repeat(64), AMF_CATALOG_KIND: 'postgres' };
@@ -193,6 +274,14 @@ test('PostgreSQL catalog configuration is explicit and never falls back to SQLit
     assert.throws(() => createFabricStoreFromEnv({ rootPath: root, env: { ...base, AMF_CATALOG_DATABASE_URL: 'postgres://db/test', AMF_CATALOG_QUERY_TIMEOUT_MS: 'forever' } }), /invalid_environment:AMF_CATALOG_QUERY_TIMEOUT_MS/);
     assert.throws(() => createFabricStoreFromEnv({ rootPath: root, env: { ...base, AMF_CATALOG_DATABASE_URL: 'postgres://db/test', AMF_CATALOG_STATEMENT_TIMEOUT_MS: '120001' } }), /invalid_environment:AMF_CATALOG_STATEMENT_TIMEOUT_MS/);
     assert.throws(() => createFabricStoreFromEnv({ rootPath: root, env: { ...base, AMF_CATALOG_KIND: 'unknown' } }), /catalog_kind_invalid/);
+    assert.throws(() => createFabricStoreFromEnv({ rootPath: root, env: { ...base, AMF_CATALOG_DATABASE_URL: 'postgres://db/test', AMF_INGEST_KEY_RING_PATH: path.join(root, 'missing.json') } }), /raw_ingest_key_ring_file_invalid/);
+
+    const ingestKeyRingPath = path.join(root, 'ingest-key-ring.json');
+    fs.writeFileSync(ingestKeyRingPath, JSON.stringify({
+      keys: { 'client-v1': crypto.randomBytes(32).toString('base64') },
+      digestKey: crypto.randomBytes(32).toString('base64'),
+      authorizations: { 'client-v1': { actors: ['synthetic-actor'], sourceInstances: ['synthetic-host'] } }
+    }), { mode: 0o600 });
 
     let poolConfig;
     const pool = new FakePool();
@@ -200,11 +289,13 @@ test('PostgreSQL catalog configuration is explicit and never falls back to SQLit
       rootPath: root,
       env: {
         ...base, AMF_CATALOG_DATABASE_URL: 'postgres://db/amf_test', AMF_CATALOG_SSL_MODE: 'require', AMF_CATALOG_POOL_MAX: '7',
-        AMF_CATALOG_CONNECT_TIMEOUT_MS: '4000', AMF_CATALOG_QUERY_TIMEOUT_MS: '9000', AMF_CATALOG_STATEMENT_TIMEOUT_MS: '8000'
+        AMF_CATALOG_CONNECT_TIMEOUT_MS: '4000', AMF_CATALOG_QUERY_TIMEOUT_MS: '9000', AMF_CATALOG_STATEMENT_TIMEOUT_MS: '8000',
+        AMF_INGEST_KEY_RING_PATH: ingestKeyRingPath, AMF_INGEST_KEY_RING_JSON: '{invalid-json'
       },
       postgresPoolFactory: (config) => { poolConfig = config; return pool; }
     });
     assert.equal(store.status().backend, 'postgres');
+    assert.equal(store.status().rawIngestConfigured, true, 'mounted key-ring path must take precedence over JSON compatibility input');
     assert.deepEqual(poolConfig, {
       connectionString: 'postgres://db/amf_test', ssl: { rejectUnauthorized: false }, max: 7,
       connectionTimeoutMillis: 4000, query_timeout: 9000, statement_timeout: 8000
