@@ -13,8 +13,21 @@ updates the host workspace.
 1. Back up the current auth registry, policy, PAM workspace, record index,
    catalog, curator/applicator state, and outboxes.
 2. Provision separate curator/applicator actors and owner-only token files.
-3. Mount the dedicated routing-tag key ring read-only and set
-   `AMF_PAM_ROUTING_KEY_RING_PATH`. The key ring is mandatory. Canonical indexes
+3. Create one host directory selected by `AMF_PAM_RUNTIME_PRIVATE_DIR`, owned by
+   `AMF_SERVICE_UID:AMF_SERVICE_GID` (defaults `1000:1000`) with mode `0700`.
+   Install exactly `agent-memory-fabric-routing-key-ring.json`,
+   `pam-workspace-config.json`, and `pam-applicator-state-key` inside it, owned by
+   the same UID/GID with mode `0600`. Compose mounts that directory read-only at
+   `/run/amf-pam-private`; do not mount those files individually into root-owned
+   `/run/secrets` or `/run/config`. The session-route directory remains a
+   separate mount. Before recreating the service, run:
+
+   ```sh
+   docker compose run --rm --no-deps agent-memory-fabric npm run operator:preflight-pam-runtime
+   ```
+
+   The
+   routing key ring is mandatory. Canonical indexes
    use `contextRefs`; precomputed `contextTags` are rejected. The temporary
    `AMF_PAM_ALLOW_LEGACY_CONTEXT_TAGS_SHADOW=true` escape hatch is shadow-only,
    must never be used for promotion rollout, and should be removed after index
@@ -36,10 +49,10 @@ duplicate, without decrypting the proposal.
 Curation page cursors carry a server-side HMAC and become invalid after process
 restart. Restart pagination from the first page instead of persisting cursors.
 
-All mounted JSON/key/config files are regular owner-owned mode-`0600` files.
-Their parent directories must be owned by the service user and not writable by
-group or others; reads use a no-follow parent dirfd rather than a check-then-open
-path.
+The PAM runtime parent is exactly mode `0700`; its three files are regular,
+single-link, service-UID-and-GID-owned mode-`0600` files. Startup and the explicit container
+preflight verify the fixed path bindings and read through a no-follow parent
+dirfd. A root-owned parent fails closed before the catalog or listener starts.
 
 ## Rollback
 
