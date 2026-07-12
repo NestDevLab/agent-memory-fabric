@@ -109,7 +109,8 @@
       "target_branch": "main",
       "integration_branch": "main-integration",
       "commits": [
-        "029f28c64bb7de0b61da5804614c4d86c90cc2e9"
+        "029f28c64bb7de0b61da5804614c4d86c90cc2e9",
+        "552c9f0a332cc10a922472779ac743e0105d0f04"
       ],
       "meta": {}
     }
