@@ -285,6 +285,13 @@ test('Memory and SQLite normalize first/last timestamps, literal LIKE and search
       assert.equal(sessionA.lastOccurredAt, '2026-07-12T12:00:00Z');
       assert.equal(catalog.searchSessions({ ownerTags: ['owner-tag'], query: '%_', limit: 10 }).length, 0);
       assert.equal(catalog.searchSessions({ ownerTags: ['owner-tag'], query: '', limit: 10 })[0].id, `ses_${'b'.repeat(64)}`);
+      const offsetProjection = projection(`evt_${'4'.repeat(64)}`, `ses_${'c'.repeat(64)}`, '2026-07-12T00:00:00+02:00');
+      catalog.ingestRawEvent({ eventId: offsetProjection.eventId, sessionId: offsetProjection.sessionId, contentId: '4'.repeat(64), payloadDigest: `hmac-sha256:v1:${'7'.repeat(64)}`, projection: offsetProjection, ownerTag: 'owner-tag', sourceTag: 'source-tag', createdAt: '2026-07-12T04:00:00Z' }, { contentId: '4'.repeat(64), mediaType: 'cipher', byteLength: 1, storageRef: 'offset', createdAt: '2026-07-12T04:00:00Z' }, { id: `audit-offset-${catalog.constructor.name}`, ts: '2026-07-12T04:00:00Z', actorTag: 'tag', action: 'raw_event_ingest', outcome: 'stored', targetId: offsetProjection.eventId, details: {} });
+      assert.equal(catalog.listSessionEventsPage({ id: offsetProjection.sessionId, from: '2026-07-11T23:00:00Z' }).items.length, 0, 'offset event is compared by instant, not text');
+      assert.equal(catalog.listSessionEventsPage({ id: offsetProjection.sessionId, from: '2026-07-11T22:00:00Z', to: '2026-07-11T22:00:00.000Z' }).items.length, 1, 'equivalent UTC boundary is inclusive');
+      const subMsProjection = projection(`evt_${'5'.repeat(64)}`, `ses_${'d'.repeat(64)}`, '2026-07-12T00:00:00.0005Z');
+      catalog.ingestRawEvent({ eventId: subMsProjection.eventId, sessionId: subMsProjection.sessionId, contentId: '5'.repeat(64), payloadDigest: `hmac-sha256:v1:${'8'.repeat(64)}`, projection: subMsProjection, ownerTag: 'owner-tag', sourceTag: 'source-tag', createdAt: '2026-07-12T04:00:01Z' }, { contentId: '5'.repeat(64), mediaType: 'cipher', byteLength: 1, storageRef: 'sub-ms', createdAt: '2026-07-12T04:00:01Z' }, { id: `audit-sub-ms-${catalog.constructor.name}`, ts: '2026-07-12T04:00:01Z', actorTag: 'tag', action: 'raw_event_ingest', outcome: 'stored', targetId: subMsProjection.eventId, details: {} });
+      assert.equal(catalog.listSessionEventsPage({ id: subMsProjection.sessionId, to: '2026-07-12T00:00:00.0001Z' }).items.length, 1, 'sub-millisecond values compare at common millisecond precision');
     }
   } finally { catalogs[1].close(); fs.rmSync(root, { recursive: true, force: true }); }
 });
