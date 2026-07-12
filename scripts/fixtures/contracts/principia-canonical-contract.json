@@ -52,7 +52,7 @@
     "response": {
       "ok": true,
       "data": { "items": [], "nextCursor": null, "scopes": ["room:team"] },
-      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.5" }
+      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.6" }
     }
   },
   "memoryRead": {
@@ -60,7 +60,7 @@
     "response": {
       "ok": true,
       "data": { "record": {} },
-      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.5" }
+      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.6" }
     }
   },
   "sessionsSearch": {
@@ -68,7 +68,7 @@
     "response": {
       "ok": true,
       "data": { "items": [], "nextCursor": null, "total": 0 },
-      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.5" }
+      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.6" }
     }
   },
   "transcript": {
@@ -87,7 +87,7 @@
         ],
         "nextCursor": null
       },
-      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.5" }
+      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.6" }
     }
   }
 }
