@@ -75,7 +75,8 @@
       "target_branch": "main",
       "integration_branch": "main-integration",
       "commits": [
-        "d83bba3c83c16b8f4f36756e36dbdf0e3ba45c7f"
+        "d83bba3c83c16b8f4f36756e36dbdf0e3ba45c7f",
+        "a54158498e7b041da6205bda3db93beed529743e"
       ],
       "meta": {
         "purpose": "RAW projection v2 and logical message selection"
@@ -89,7 +90,9 @@
       "target_branch": "amf/raw-runtime-v2",
       "integration_branch": "main-integration",
       "commits": [
-        "f0c1a84715305fb511c62fe83b4d75bb0587822a"
+        "82079f734554081dfce19848b987956fd8fbc76b",
+        "2dc05ebe44ffc2d2e78bb9ea40a29adde215328f",
+        "df9220502de43a4cb7ec9409cd136c37c3ca6f2a"
       ],
       "meta": {
         "purpose": "Canonical PAM bridge, receipt recovery and context-bound API"
