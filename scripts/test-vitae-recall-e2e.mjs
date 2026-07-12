@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { buildContextRequest } from '../src/access-contract.mjs';
-import { ContextTokenVerifier, issueContextToken, issueSessionRouteBinding, requestDigest } from '../src/context-token.mjs';
+import { ContextTokenVerifier, issueContextToken, requestDigest } from '../src/context-token.mjs';
 import { FabricStore, MemoryCatalog, MemoryRawStore } from '../src/fabric-store.mjs';
 import { EncryptedOutbox } from '../src/ingest/outbox.mjs';
 import { normalizeIngestKeyRing, normalizedObservationDigest } from '../src/ingest/raw-event-contract.mjs';
@@ -23,6 +23,7 @@ import {
   RECALL_CONSUMER_CONTEXT_KEY_VERSION,
   RECALL_CONSUMER_SESSION_OWNER_ACTORS
 } from '../src/operator/recall-consumer-provisioning.mjs';
+import { provisionSessionRoutes } from '../src/operator/session-route-provisioning.mjs';
 import { createAgentMemoryFabricServer } from '../src/server.mjs';
 
 const COLLECTOR = RECALL_CONSUMER_SESSION_OWNER_ACTORS[0];
@@ -119,11 +120,14 @@ test('collector-owned Hermes RAW is recalled by Vitae through exact delegation a
       catalog, ingestKeyRing: KEY_RING, legacyV1Writes: false, clock: () => new Date(tick += 1) });
     const verifier = new ContextTokenVerifier({ keyRing: serverRing, policyRevision: POLICY_REVISION,
       clock: () => Date.parse('2026-07-12T20:05:00Z') });
-    privateJson(routeManifestPath, { schema: 'amf.session-route-manifest/v1', bindings: [
-      issueSessionRouteBinding({ actor: RECALL_CONSUMER_ACTOR,
-        canonicalScope: 'room:vitae:synthetic-group-topic', conversationKind: 'group',
-        contextTags: TOKEN_CONTEXT_TAGS }, consumerRing)
-    ] });
+    const routeInputPath = path.join(root, 'session-routes.input.json');
+    privateJson(routeInputPath, { schema: 'amf.session-route-input/v2', bindings: [{
+      actor: RECALL_CONSUMER_ACTOR, canonicalScope: 'room:vitae:synthetic-group-topic',
+      conversationKind: 'group', contextTags: TOKEN_CONTEXT_TAGS,
+      keyVersion: RECALL_CONSUMER_CONTEXT_KEY_VERSION
+    }] });
+    asRoot(() => provisionSessionRoutes({ inputPath: routeInputPath, contextKeyRingPath: contextPath,
+      manifestPath: routeManifestPath, serviceOwnerUid }));
     const canonicalStore = { configured: true, kind: 'synthetic-canonical',
       async search({ scopes }) { return { items: [], nextCursor: null, scopes }; },
       async read() { throw Object.assign(new Error('memory_not_found'), { status: 404 }); },

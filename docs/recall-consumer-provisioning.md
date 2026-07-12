@@ -70,10 +70,13 @@ The dry-run performs complete validation without a lock, random generation, back
 or handoff write. Run the same command as root without `--dry-run` only after reviewing its safe
 metadata output. Do not pass secrets on the command line.
 
-Provision the signed route separately from a private `0600` input. The input has schema
-`amf.session-route-input/v1` and contains `bindings` with exactly `actor`, `canonicalScope`,
-`conversationKind` and `contextTags`. Context tags must already be opaque HMAC tags; literal native
-identifiers are rejected. The current context-ring key signs every binding.
+Provision the signed route separately from a private `0600` input. New inputs use schema
+`amf.session-route-input/v2`; every binding contains exactly `actor`, `canonicalScope`,
+`conversationKind`, `contextTags` and `keyVersion`. Set `keyVersion` to the dedicated version in the
+consumer handoff (for Vitae, `ctx-vitae-v1`), not necessarily the server ring's current version.
+Context tags must already be opaque HMAC tags; literal native identifiers are rejected. The selected
+version must exist in the server ring. Legacy `v1` inputs remain accepted when the ring has one key;
+with a multi-key ring they fail closed unless `--key-version` explicitly selects one version.
 
 ```bash
 node scripts/amf-provision-session-routes.mjs \
@@ -81,6 +84,7 @@ node scripts/amf-provision-session-routes.mjs \
   --context-key-ring /private/context-key-ring.json \
   --manifest /private/session-routes/session-route-manifest.json \
   --service-owner-uid 1000 \
+  --key-version ctx-vitae-v1 \
   --dry-run
 ```
 
@@ -92,7 +96,8 @@ SHA-256 digest both before preparation and immediately before publication. It wr
 `0600` backup on update and atomically replaces and fsyncs the manifest. Initial creation uses an
 atomic no-replace link and fails closed if a target appears concurrently. A concurrent cooperative
 writer receives `session_route_lock_held` and must
-retry, at which point it merges the newly committed routes. The tool never prints keys or opaque tags. Mount the
+retry, at which point it merges the newly committed routes. A per-binding `keyVersion` and
+`--key-version` must agree when both are supplied. The tool never prints keys or opaque tags. Mount the
 whole manifest directory at `/run/amf-session-routes`; it must be owned by the service UID with
 mode `0700`, while the manifest must be owned by root or the service UID with mode `0600`.
 
