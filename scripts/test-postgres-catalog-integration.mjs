@@ -105,6 +105,10 @@ test('real PostgreSQL catalog integration in an explicitly isolated test databas
     const persistedEvents = await catalog.listSessionEvents(rawSessionId);
     assert.equal(persistedEvents.length, 3);
     assert.equal(new Set(persistedEvents.map(event => event.ownerTag)).size, 3);
+    assert.equal(await catalog.hasSessionParticipant(rawSessionId, [opaque('owner', 'assistant')]), true);
+    assert.equal(await catalog.hasSessionParticipant(rawSessionId, [opaque('owner', 'outsider')]), false);
+    assert.deepEqual(await catalog.listSessionEventsPage({ id: rawSessionId, offset: 0, limit: 2 }).then(page => ({ count: page.items.length, hasMore: page.hasMore })), { count: 2, hasMore: true });
+    assert.deepEqual(await catalog.listSessionEventsPage({ id: rawSessionId, offset: 2, limit: 2 }).then(page => ({ count: page.items.length, hasMore: page.hasMore })), { count: 1, hasMore: false });
     for (const actor of ['person', 'system', 'assistant']) {
       const visible = await catalog.searchSessions({ ownerTags: [opaque('owner', actor)], query: '', limit: 10 });
       assert.equal(visible.some(session => session.id === rawSessionId), true);

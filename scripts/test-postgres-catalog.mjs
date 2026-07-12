@@ -87,6 +87,13 @@ class FakePool {
       return { rows: [...this.rawSessions.values()].filter(row => participantSessions.has(row.session_id) && (!needle || `${row.session_id} ${row.runtime}`.toLowerCase().includes(needle))).slice(0, values[2]) };
     }
     if (compact.startsWith('SELECT * FROM agent_memory_fabric.raw_sessions_v1 WHERE session_id=$1')) return { rows: [this.rawSessions.get(values[0])].filter(Boolean) };
+    if (compact.startsWith('SELECT EXISTS ( SELECT 1 FROM agent_memory_fabric.raw_events_v1')) {
+      return { rows: [{ present: [...this.rawEvents.values()].some(row => row.session_id === values[0] && values[1].includes(row.owner_tag)) }] };
+    }
+    if (compact.startsWith('SELECT * FROM ( SELECT event_id,session_id,NULL::text AS logical_message_id')) {
+      const rows = [...this.rawEvents.values()].filter(row => row.session_id === values[0]).sort((a, b) => a.created_at.localeCompare(b.created_at) || a.event_id.localeCompare(b.event_id)).slice(values[4], values[4] + values[3]);
+      return { rows };
+    }
     if (compact.startsWith('SELECT * FROM agent_memory_fabric.raw_events_v1 WHERE session_id=$1')) return { rows: [...this.rawEvents.values()].filter(row => row.session_id === values[0]) };
     if (compact.startsWith('INSERT INTO agent_memory_fabric.fabric_proposals')) {
       if (this.failNextProposalInsert) {
@@ -230,6 +237,9 @@ test('PostgreSQL raw event/session catalog matches SQLite idempotency and safe p
   assert.equal(duplicate.duplicate, true);
   assert.equal((await catalog.searchSessions({ ownerTags: ['owner-tag'], query: 'claude', limit: 10 })).length, 1);
   assert.equal((await catalog.searchSessions({ ownerTags: ['owner-tag'], query: '%_', limit: 10 })).length, 0);
+  assert.equal(await catalog.hasSessionParticipant(record.sessionId, ['owner-tag']), true);
+  assert.equal(await catalog.hasSessionParticipant(record.sessionId, ['outsider-tag']), false);
+  assert.deepEqual(await catalog.listSessionEventsPage({ id: record.sessionId, offset: 0, limit: 1 }).then(page => ({ count: page.items.length, hasMore: page.hasMore })), { count: 1, hasMore: false });
   const searchQuery = pool.queries.filter(entry => entry.text.includes('raw_sessions_v1') && entry.text.includes('ILIKE')).at(-1);
   assert.match(searchQuery.text, /ESCAPE '\\'/);
   assert.match(searchQuery.text, /NULLS LAST/);

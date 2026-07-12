@@ -231,11 +231,19 @@ test('v2 sessions accept multi-role events and retries but reject room/thread re
       const events = await catalog.listSessionEvents(session.id);
       assert.equal(new Set(events.map(event => event.ownerTag)).size, 3, 'actor ownership remains event-scoped');
       assert.equal(new Set(events.map(event => event.sourceTag)).size, 3, 'source identity remains event-scoped');
+      assert.equal(await catalog.hasSessionParticipant(session.id, [events[0].ownerTag]), true);
+      assert.equal(await catalog.hasSessionParticipant(session.id, ['outsider-owner-tag']), false);
+      const firstPage = await catalog.listSessionEventsPage({ id: session.id, offset: 0, limit: 2 });
+      assert.equal(firstPage.items.length, 2); assert.equal(firstPage.hasMore, true);
+      const secondPage = await catalog.listSessionEventsPage({ id: session.id, offset: 2, limit: 2 });
+      assert.equal(secondPage.items.length, 1); assert.equal(secondPage.hasMore, false);
       const reader = store.createSessionReader();
       for (const actor of observations.map(observation => observation.actor)) {
         assert.deepEqual((await reader.search({ actor, query: '', limit: 10 })).items.map(result => result.id), [session.id]);
         assert.equal((await reader.get({ actor, id: session.id })).id, session.id);
-        assert.equal((await reader.transcript({ actor, id: session.id, view: 'redacted' })).items.length, 3);
+        const redactedPage = await reader.transcript({ actor, id: session.id, view: 'redacted', limit: 2 });
+        assert.equal(redactedPage.items.length, 2); assert.ok(redactedPage.nextCursor);
+        assert.equal((await reader.transcript({ actor, id: session.id, view: 'redacted', limit: 2, cursor: redactedPage.nextCursor })).items.length, 1);
         const original = await reader.transcript({ actor, id: session.id, view: 'original' });
         assert.equal(original.items.length, 3);
         assert.deepEqual(new Set(original.items.map(result => Buffer.from(result.raw.line, 'base64').toString('utf8').match(/raw-(?:owner|system|assistant)/)?.[0])), new Set(['raw-owner', 'raw-system', 'raw-assistant']));

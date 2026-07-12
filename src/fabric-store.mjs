@@ -537,7 +537,16 @@ export class MemoryCatalog {
     return [...this.rawSessions.values()].filter(item => participantSessions.has(item.id) && (!needle || `${item.id} ${item.runtime}`.toLowerCase().includes(needle))).sort(compareSessions).slice(0, limit);
   }
   getSession(id) { return this.rawSessions.get(id) || null; }
+  hasSessionParticipant(id, ownerTags = []) {
+    if (!ownerTags.length) return false;
+    const allowed = new Set(ownerTags);
+    return [...this.rawEvents.values(), ...this.rawEventsV2.values()].some(event => event.sessionId === id && allowed.has(event.ownerTag));
+  }
   listSessionEvents(id) { return [...this.rawEvents.values(), ...this.rawEventsV2.values()].filter(item => item.sessionId === id).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId)); }
+  listSessionEventsPage({ id, offset = 0, limit = 100, from = null, to = null }) {
+    const rows = this.listSessionEvents(id).filter(event => inTimeWindow(event.projection.occurredAt || event.createdAt, from, to)).slice(offset, offset + limit + 1);
+    return { items: rows.slice(0, limit), hasMore: rows.length > limit };
+  }
   rawV2Readiness() {
     try { for (const item of this.rawEventsV2.values()) validateProjectionV2(item.projection); }
     catch { return { safe: false, reason: 'literal_routing_scan_failed' }; }
@@ -906,7 +915,20 @@ export class SqliteCatalog {
     return this.db.prepare(`SELECT s.* FROM raw_sessions_v1 s WHERE (EXISTS (SELECT 1 FROM raw_events_v1 e WHERE e.session_id=s.session_id AND e.owner_tag IN (${placeholders})) OR EXISTS (SELECT 1 FROM raw_events_v2 e WHERE e.session_id=s.session_id AND e.owner_tag IN (${placeholders}))) AND (lower(s.session_id) LIKE lower(?) ESCAPE '\\' OR lower(s.runtime) LIKE lower(?) ESCAPE '\\') ORDER BY CASE WHEN s.last_occurred_at IS NULL THEN 1 ELSE 0 END,s.last_occurred_at DESC,s.created_at DESC,s.session_id ASC LIMIT ?`).all(...ownerTags, ...ownerTags, pattern, pattern, limit).map(row => this.mapSession(row));
   }
   getSession(id) { return this.mapSession(this.db.prepare('SELECT * FROM raw_sessions_v1 WHERE session_id=?').get(id)); }
+  hasSessionParticipant(id, ownerTags = []) {
+    if (!ownerTags.length) return false;
+    const placeholders = ownerTags.map(() => '?').join(',');
+    return Boolean(this.db.prepare(`SELECT 1 AS present FROM raw_events_v1 WHERE session_id=? AND owner_tag IN (${placeholders}) UNION ALL SELECT 1 AS present FROM raw_events_v2 WHERE session_id=? AND owner_tag IN (${placeholders}) LIMIT 1`).get(id, ...ownerTags, id, ...ownerTags));
+  }
   listSessionEvents(id) { return [...this.db.prepare('SELECT * FROM raw_events_v1 WHERE session_id=?').all(id), ...this.db.prepare('SELECT * FROM raw_events_v2 WHERE session_id=?').all(id)].map(row => this.mapRawEvent(row)).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId)); }
+  listSessionEventsPage({ id, offset = 0, limit = 100, from = null, to = null }) {
+    const rows = this.db.prepare(`SELECT * FROM (
+      SELECT event_id,session_id,NULL AS logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,coalesce(json_extract(projection_json,'$.occurredAt'),created_at) AS effective_at FROM raw_events_v1 WHERE session_id=?
+      UNION ALL
+      SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,coalesce(json_extract(projection_json,'$.occurredAt'),created_at) AS effective_at FROM raw_events_v2 WHERE session_id=?
+    ) events WHERE (? IS NULL OR effective_at>=?) AND (? IS NULL OR effective_at<=?) ORDER BY created_at,event_id LIMIT ? OFFSET ?`).all(id, id, from, from, to, to, limit + 1, offset);
+    return { items: rows.slice(0, limit).map(row => this.mapRawEvent(row)), hasMore: rows.length > limit };
+  }
   rawV2Readiness() {
     let counts;
     try {
@@ -1551,11 +1573,30 @@ export class PostgresCatalog {
   }
   async searchSessions({ ownerTags = [], query = '', limit = 20 }) { if (!ownerTags.length) return []; await this.ready(); return (await this._query(this.pool, `SELECT s.* FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 s WHERE (EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v1 e WHERE e.session_id=s.session_id AND e.owner_tag=ANY($1::text[])) OR EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v2 e WHERE e.session_id=s.session_id AND e.owner_tag=ANY($1::text[]))) AND (s.session_id ILIKE $2 ESCAPE '\\' OR s.runtime ILIKE $2 ESCAPE '\\') ORDER BY s.last_occurred_at DESC NULLS LAST,s.created_at DESC,s.session_id ASC LIMIT $3`, [ownerTags, escapedLike(query), limit])).rows.map(mapPostgresSession); }
   async getSession(id) { await this.ready(); return mapPostgresSession((await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 WHERE session_id=$1`, [id])).rows[0]); }
+  async hasSessionParticipant(id, ownerTags = []) {
+    if (!ownerTags.length) return false;
+    await this.ready();
+    const result = await this._query(this.pool, `SELECT EXISTS (
+      SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE session_id=$1 AND owner_tag=ANY($2::text[])
+      UNION ALL
+      SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE session_id=$1 AND owner_tag=ANY($2::text[])
+    ) AS present`, [id, ownerTags]);
+    return Boolean(result.rows[0]?.present);
+  }
   async listSessionEvents(id) {
     await this.ready();
     const legacy = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE session_id=$1 ORDER BY created_at,event_id`, [id]);
     const current = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE session_id=$1 ORDER BY created_at,event_id`, [id]);
     return [...(legacy.rows || []), ...(current.rows || [])].map(mapPostgresRawEvent).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId));
+  }
+  async listSessionEventsPage({ id, offset = 0, limit = 100, from = null, to = null }) {
+    await this.ready();
+    const result = await this._query(this.pool, `SELECT * FROM (
+      SELECT event_id,session_id,NULL::text AS logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,coalesce(nullif(projection_json->>'occurredAt','')::timestamptz,created_at) AS effective_at FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE session_id=$1
+      UNION ALL
+      SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,coalesce(nullif(projection_json->>'occurredAt','')::timestamptz,created_at) AS effective_at FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE session_id=$1
+    ) events WHERE ($2::timestamptz IS NULL OR effective_at>=$2::timestamptz) AND ($3::timestamptz IS NULL OR effective_at<=$3::timestamptz) ORDER BY created_at,event_id LIMIT $4 OFFSET $5`, [id, from, to, limit + 1, offset]);
+    return { items: result.rows.slice(0, limit).map(mapPostgresRawEvent), hasMore: result.rows.length > limit };
   }
   async rawV2Readiness() {
     await this.ready();
@@ -2130,9 +2171,8 @@ export class FabricStore {
     });
     const participantSession = async (actor, id) => {
       const session = await store._catalogOperation(() => store.catalog.getSession(id));
-      const ownerTags = new Set(store.rawStore.opaqueTags('raw-owner', actor));
-      const events = session ? await store._catalogOperation(() => store.catalog.listSessionEvents(id)) : [];
-      if (!session || !events.some(event => ownerTags.has(event.ownerTag))) throw createError('session_not_found', 404);
+      const participant = session && await store._catalogOperation(() => store.catalog.hasSessionParticipant(id, store.rawStore.opaqueTags('raw-owner', actor)));
+      if (!session || !participant) throw createError('session_not_found', 404);
       return session;
     };
     return {
@@ -2151,12 +2191,11 @@ export class FabricStore {
       },
       async transcript({ actor, id, view, cursor = null, limit = 100, from = null, to = null }) {
         await participantSession(actor, id);
-        const allEvents = await store._catalogOperation(() => store.catalog.listSessionEvents(id));
         const binding = pageBinding({ actor, id, view, from, to, operation: 'session_transcript' });
         const offset = decodePageCursor(cursor, binding);
-        const filtered = allEvents.filter(event => inTimeWindow(event.projection.occurredAt || event.createdAt, from, to));
-        const events = filtered.slice(offset, offset + limit);
-        const nextCursor = offset + events.length < filtered.length ? encodePageCursor(offset + events.length, binding) : null;
+        const page = await store._catalogOperation(() => store.catalog.listSessionEventsPage({ id, offset, limit, from, to }));
+        const events = page.items;
+        const nextCursor = page.hasMore ? encodePageCursor(offset + events.length, binding) : null;
         if (view !== 'original') return { id, view: 'redacted', items: events.map(event => ({ eventId: event.eventId, occurredAt: event.projection.occurredAt, role: event.projection.role, content: { redacted: true, contentType: event.projection.contentType, parts: event.projection.contentParts } })), nextCursor };
         await store._catalogOperation(() => store.catalog.appendAudit({ id: store.idFactory(), ts: store.clock().toISOString(), actorTag: store.rawStore.opaqueTag('audit-actor', actor), action: 'raw_decrypt_intent', outcome: 'authorized', requestId: null, targetId: id, scopeTag: null, details: { view: 'original' } }));
         const items = [];
