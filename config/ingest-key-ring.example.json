@@ -3,6 +3,13 @@
     "client-v1": "<canonical-base64-encoded-32-byte-key>"
   },
   "digestKey": "<independent-canonical-base64-encoded-32-byte-key>",
+  "logicalMessageKeys": {
+    "currentKeyVersion": "logical-v2",
+    "keys": {
+      "logical-v1": "<old-canonical-base64-encoded-32-byte-key>",
+      "logical-v2": "<current-canonical-base64-encoded-32-byte-key>"
+    }
+  },
   "authorizations": {
     "client-v1": {
       "actors": ["main-openclaw"],

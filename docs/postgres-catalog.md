@@ -48,11 +48,26 @@ from request handling. A separate approved GC/reconciliation job may delete only
 with a catalog-coordinated, transaction-safe proof that no reference exists; a
 racy check-then-delete is forbidden.
 
+### RAW projection v2 cutover
+
+Projection v2 writes only opaque keyed context tags and supports Codex, Claude,
+Hermes, OpenClaw and Principia observations. The catalog keeps v1 event/session
+tables readable during migration and writes new v2 observations to separate
+tables. Logical-message aliases join observations across HMAC key rotation;
+preferred observation, payload conflict and authoritative tombstone state are
+recomputed transactionally.
+
+`AMF_RAW_V2_CUTOVER=true` disables new v1 writes. The status capability
+`rawProjectionV2Ready` remains false until cutover is enabled and every stored v2
+projection passes the strict literal-routing scan. A false capability is a hard
+stop for fleet rollout, even when ordinary health checks remain green.
+
 ## Schema and privacy boundary
 
-The adapter owns the fixed `agent_memory_fabric` schema. Migration version 3 is
+The adapter owns the fixed `agent_memory_fabric` schema. Migration version 4 is
 idempotent and protected by a PostgreSQL advisory transaction lock. A database
-whose migration version is newer than the running binary is rejected.
+whose migration version is newer than the running binary is rejected. Projection
+v2 and logical-message selection are introduced by migration version 4.
 
 The schema contains:
 
