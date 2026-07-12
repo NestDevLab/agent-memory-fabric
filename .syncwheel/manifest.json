@@ -11,7 +11,8 @@
     "base": "origin/main",
     "strategy": "cherry-pick",
     "stacks": [
-      "amf-fabric-core"
+      "amf-fabric-core",
+      "amf-session-binding-fix"
     ]
   },
   "stacks": [
@@ -99,6 +100,18 @@
       "meta": {
         "purpose": "Canonical PAM bridge, receipt recovery and context-bound API"
       }
+    },
+    {
+      "id": "amf-session-binding-fix",
+      "branch": "fix/raw-session-binding",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "37dcf9d6263fd0559bc30a8b03c3183e93374914"
+      ],
+      "meta": {}
     }
   ],
   "syncwheel_tracking": "git-tracked",
