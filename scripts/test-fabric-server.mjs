@@ -164,6 +164,64 @@ test('v2 REST uses envelopes, queues idempotently and reads encrypted proposals'
   });
 });
 
+test('internal identity and retention APIs enforce the existing auth, ACL and audit envelope', async () => {
+  await withServer(async ({ api, fabricStore }) => {
+    const evidence = { type: 'operator_attestation', issuer: 'test', observedAt: '2026-07-11T12:00:00.000Z', claims: { ticketId: 'T-1', assertion: 'same person' } };
+    const created = await api('/v2/internal/identities', {
+      method: 'POST', headers: { 'idempotency-key': 'identity-api-1' },
+      body: JSON.stringify({ kind: 'person', externalKey: 'opaque-me', scope: 'main-lab', evidence })
+    });
+    assert.equal(created.response.status, 201);
+    assert.equal(created.body.ok, true);
+    assert.equal(created.body.data.revision, 1);
+    const denied = await api('/v2/internal/identities', {
+      method: 'POST', headers: { authorization: 'Bearer limited-token', 'idempotency-key': 'identity-denied' },
+      body: JSON.stringify({ kind: 'person', externalKey: 'denied', scope: 'main-lab', evidence })
+    });
+    assert.equal(denied.response.status, 403);
+    assert.ok(fabricStore.catalog.auditEvents.some(event => event.action === 'identity_create' && event.outcome === 'denied'));
+    const injected = await api('/v2/internal/identities', {
+      method: 'POST', headers: { 'idempotency-key': 'identity-injected' },
+      body: JSON.stringify({ actor: 'forged', kind: 'person', externalKey: 'injected', scope: 'main-lab', evidence })
+    });
+    assert.equal(injected.response.status, 400);
+    const read = await api(`/v2/internal/identities/${created.body.data.id}`);
+    assert.equal(read.response.status, 200);
+    assert.equal(read.body.data.kind, 'person');
+
+    const proposal = await fabricStore.propose({ actor: 'test-actor', scope: 'main-lab', text: 'old', metadata: { originalTimestamp: '2020-01-01T00:00:00.000Z' }, idempotencyKey: 'old-api' });
+    const plan = await api('/v2/internal/retention/plan', { method: 'POST', body: JSON.stringify({ asOf: new Date().toISOString(), scope: 'main-lab', limit: 10 }) });
+    assert.equal(plan.response.status, 200);
+    assert.deepEqual(plan.body.data.candidates.map(row => row.contentId), [proposal.contentId]);
+    const apply = await api('/v2/internal/retention/apply', { method: 'POST', headers: { 'idempotency-key': 'retention-api-1' }, body: JSON.stringify({ candidateIds: [proposal.contentId], expectedPlanAsOf: plan.body.data.asOf, reason: 'retention_expired' }) });
+    assert.equal(apply.response.status, 200);
+    assert.equal(apply.body.data.physicalDeletionPerformed, false);
+    const applyReplay = await api('/v2/internal/retention/apply', { method: 'POST', headers: { 'idempotency-key': 'retention-api-1' }, body: JSON.stringify({ candidateIds: [proposal.contentId], expectedPlanAsOf: plan.body.data.asOf, reason: 'retention_expired' }) });
+    assert.deepEqual(applyReplay.body.data, apply.body.data);
+    const deniedRetention = await api('/v2/internal/retention/plan', { method: 'POST', headers: { authorization: 'Bearer limited-token' }, body: JSON.stringify({ asOf: new Date().toISOString(), scope: 'main-lab', limit: 10 }) });
+    assert.equal(deniedRetention.response.status, 403);
+    assert.ok(fabricStore.catalog.auditEvents.some(event => event.action === 'retention_plan' && event.outcome === 'denied'));
+  });
+});
+
+test('memory search performs lifecycle filtering after the backend and leaks no revoked result or count', async () => {
+  const fabricStore = makeStore();
+  const proposal = await fabricStore.propose({ actor: 'test-actor', scope: 'main-lab', text: 'must disappear', metadata: { originalTimestamp: '2020-01-01T00:00:00.000Z' }, idempotencyKey: 'search-filter-source' });
+  await fabricStore.applyRetention({ actor: 'test-actor', idempotencyKey: 'search-filter-revoke', candidateIds: [proposal.contentId], expectedPlanAsOf: new Date().toISOString(), reason: 'revoked' }, { allowedScopes: ['main-lab'] });
+  const backend = {
+    kind: 'test-backend', configured: true,
+    async search() { return { items: [{ id: 'safe', memory: 'safe' }, { id: 'secret', memory: 'must disappear', proposalId: proposal.id }], total: 2, source: 'test' }; }
+  };
+  await withServer(async ({ api }) => {
+    const result = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ scope: 'main-lab', query: 'anything' }) });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body.data.result.items.map(item => item.id), ['safe']);
+    assert.equal(result.body.data.result.total, 1);
+    assert.equal(result.body.data.result.perScope[0].total, 1);
+    assert.equal(JSON.stringify(result.body).includes('must disappear'), false);
+  }, { fabricStore, backend });
+});
+
 test('legacy memory add queues instead of writing directly to Mem0', async () => {
   await withServer(async ({ api, getBackendAdds }) => {
     const queued = await api('/v1/memory/add', {

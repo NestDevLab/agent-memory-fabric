@@ -66,12 +66,23 @@ The schema contains:
 - audit events containing allowlisted operational metadata;
 - retention tombstones containing checksums and opaque source pointers.
 
+Schema version 3 adds `identity_records_v2`, append-only `identity_events_v2`
+with an opaque `response_json` snapshot for stable replay,
+`raw_retention_v2`, `retention_tombstones_v2`, and
+`retention_operations_v2` for atomic idempotency and ambiguous-commit
+reconciliation. See `identity-retention.md` for the mutation and
+deletion-safety contract.
+
 It does not contain proposal bodies, claims, transcripts, bearer tokens, people
 names, room names, or unencrypted cursor values. All runtime DML is parameterized.
 
 ## Migration and rollout
 
-This tranche does not migrate SQLite or legacy Mem0 data.
+This tranche does not migrate SQLite or legacy Mem0 data. It also does not
+provide an in-place upgrade for an existing PostgreSQL schema version 2.
+Applying version 3 to non-empty v2 state requires a separate isolated migration
+exercise, data/constraint verification, security review, backup and rollback
+proof, and an explicit migration/deployment gate.
 
 1. Provision an empty, isolated PostgreSQL database and least-privilege role.
 2. Back up the SQLite catalog and encrypted RAW root.
