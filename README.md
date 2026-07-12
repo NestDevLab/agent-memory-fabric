@@ -9,6 +9,7 @@ legacy product alias while clients migrate to `agent-memory-fabric`.
 - Mem0 backend adapter for scoped search
 - idempotent proposal queue; public requests never write directly to Mem0
 - encrypted, content-addressed RAW proposal storage and auditable catalog
+- encrypted transcript-event ingestion with a persistent outbox and session reader
 - local JSON auth registry, with optional n8n Data Table fallback
 - legacy REST v1, MCP SSE and MCP Streamable HTTP compatibility
 
@@ -32,7 +33,7 @@ MEM0_AUTH_CACHE_TTL_MS=15000
       "actor": "main-openclaw",
       "mode": "allow_all",
       "allowedScopes": "*",
-      "permissions": "memory:search,memory:read,memory:propose,memory:add,memory:status,sessions:read,raw:decrypt"
+      "permissions": "memory:search,memory:read,memory:propose,memory:add,memory:status,sessions:read,raw:decrypt,raw:ingest"
     }
   ]
 }
@@ -74,6 +75,18 @@ storage secrets.
 Proposal failures never locally delete content-addressed RAW, even after a proven
 rollback: another concurrent proposal may already reference the same blob. Orphan
 collection requires a separately approved, catalog-coordinated reference proof.
+RAW event ingestion rejects known session-binding conflicts before ciphertext
+commit. Failures or binding races after commit retain the encrypted object for
+reconciliation; physical deletion still requires the same catalog reference proof.
+
+Transcript clients encrypt each event before it reaches the HTTP boundary. Configure
+the server with `AMF_INGEST_KEY_RING_PATH`; the mounted JSON maps every key id to its
+allowed actor and source instances and includes an independent, rotation-stable
+`digestKey`. The authenticated stable digest provides logical idempotency: the same
+event encrypted again, including after an encryption-key rotation, is a duplicate;
+changed plaintext under the same event id is a conflict. Actor, source instance,
+event, session, projection and key id are bound into AES-GCM AAD. The catalog event,
+session update and audit row commit in one transaction.
 
 ## API v2
 
@@ -82,6 +95,7 @@ Success uses `{ "ok": true, "data": ..., "meta": ... }`; errors use
 
 - `POST /v2/memory/search`
 - `POST /v2/memory/proposals` (requires `Idempotency-Key`)
+- `POST /v2/ingest/raw-events` (requires `raw:ingest`)
 - `GET /v2/memory/:id` (canonical record, rationale and expected revision)
 - `GET /v2/memory/proposals/:id` (status only; no record decryption)
 - `POST /v2/sessions/search` (requires `purpose`)
@@ -91,7 +105,9 @@ Success uses `{ "ok": true, "data": ..., "meta": ... }`; errors use
 
 The proposal body is exactly `{record,rationale,expectedRevision?}`. `record`
 must conform to PAM 0.6 `amf-memory/v1`: canonical scope IDs, exact fields and
-strict timestamps/provenance/lifecycle. Restricted/confidential and
+strict timestamps/provenance/lifecycle. `confidence` is required and exactly
+`{score,basis,assessedAt}` with a finite `[0,1]` score, approved basis and UTC
+timestamp. Restricted/confidential and
 person/relationship records must carry a sealed AES-256-GCM envelope with
 canonical base64, 12-byte IV, 16-byte tag, opaque `kekId`/`keyRef`, and the PAM
 canonical AAD digest. A successful REST or MCP acknowledgement exposes
@@ -103,8 +119,9 @@ Every memory/session transport, including MCP, errors and status, is private and
 `continuity_resume`, `incident_debug`, `operator_review`, or `memory_curation`.
 MCP sessions have TTL, global/per-actor caps, and revalidate token activity and
 policy on every call. Original transcripts additionally require `raw:decrypt`;
-redacted is the default. MCP initialize advertises `sessionReader: false` and the
-routes return `session_reader_unconfigured` (`503`) until an adapter is wired.
+redacted is the default. The session reader is configured automatically when the
+ingest key ring and catalog are available; otherwise MCP advertises
+`sessionReader: false` and the routes return `session_reader_unconfigured` (`503`).
 
 MCP advertises `memory_search`, `memory_read`, `memory_propose`,
 `memory_proposal_status`, `sessions_search`,
@@ -127,6 +144,23 @@ bash scripts/run.sh
 ```
 
 Do not commit real secrets or runtime `.env` files.
+
+## Transcript ingestion CLI
+
+`scripts/amf-transcript-ingest.mjs` supports allowlisted Codex and Claude sources,
+durable encrypted outbox delivery, replay, deduplicated backfill and polling. A real
+run requires explicit `AMF_INGEST_ENDPOINT` (HTTPS), `AMF_INGEST_TOKEN`,
+`AMF_INGEST_ACTOR_ID`, source instance, key id, encryption key and independent digest
+key. `AMF_OUTBOX_KEY_RING_PATH` and `AMF_CURSOR_KEY_RING_PATH` retain old decrypt
+keys during rotation; `AMF_INGEST_CHECKPOINT_KEY` is independent and stable so
+existing rolling checkpoints do not change when encryption keys rotate. The local
+test sink cannot be selected outside test mode. Polling verifies
+bounded rolling checkpoints; use `--full-audit` for an explicit whole-history audit.
+Backfill uses a PID/host/nonce lease with heartbeat and only takes over a stale local
+lease after its owner is dead. Delivery failures remain queued and do not block the
+source runtime.
+The HTTP timeout covers request, headers and the complete streamed response body;
+responses are capped by `AMF_INGEST_HTTP_MAX_RESPONSE_BYTES` before JSON parsing.
 
 ## Deployment block
 

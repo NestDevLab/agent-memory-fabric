@@ -36,6 +36,8 @@ Audit is fail-closed: if the catalog cannot durably record an audit event within
 `AMF_AUDIT_TIMEOUT_MS` (default 2000 ms), the request returns controlled `503`
 instead of reporting success without accountability. Status health probes are
 bounded separately by `AMF_CATALOG_HEALTH_TIMEOUT_MS` (default 3000 ms).
+RAW ingestion commits its event row, session aggregate and audit row in the same
+transaction, so none can become visible without the others.
 
 A timeout or connection loss after `COMMIT` was sent is ambiguous, so the Fabric
 first reconciles by owner/idempotency key. All proposal failures and conflicts,
@@ -48,13 +50,16 @@ racy check-then-delete is forbidden.
 
 ## Schema and privacy boundary
 
-The adapter owns the fixed `agent_memory_fabric` schema. Migration version 1 is
+The adapter owns the fixed `agent_memory_fabric` schema. Migration version 3 is
 idempotent and protected by a PostgreSQL advisory transaction lock. A database
 whose migration version is newer than the running binary is rejected.
 
 The schema contains:
 
 - encrypted RAW object metadata and storage references;
+- RAW event metadata with only an allowlisted projection and stable keyed digest;
+- session aggregates bound to opaque keyed owner/source tags and runtime; actor and
+  source instance literals remain only inside authenticated ciphertext;
 - proposal state with a unique opaque owner/idempotency pair;
 - versioned identity metadata using opaque tags;
 - encrypted ingestion cursor values;

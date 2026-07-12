@@ -26,6 +26,7 @@ function canonicalRecord(text, scope = 'main-lab', revision = 1) {
     claimType: 'fact', scope: { type: 'domain', id: canonicalScope }, visibility: 'restricted',
     subjects: [{ identityId: 'agent:test', role: 'owner' }],
     claim: { encoding: 'sealed', alg: 'AES-256-GCM', kekId: 'kek:test-v1', keyRef: 'key:test-record-v1', iv: Buffer.alloc(12, 1).toString('base64'), ciphertext: Buffer.from(text).toString('base64'), tag: Buffer.alloc(16, 2).toString('base64'), aadSha256: '' },
+    confidence: { score: 0.9, basis: 'asserted', assessedAt: timestamp },
     provenance: [{ sourceType: 'test', sourceId: 'test-suite', eventId: 'event-stable-0001', contentSha256: crypto.createHash('sha256').update(text).digest('hex'), capturedAt: timestamp }],
     lifecycle: { status: 'active', validFrom: timestamp, validTo: null, supersedes: [], revokedAt: null, revocationReason: null },
     createdAt: timestamp, updatedAt: timestamp
@@ -246,6 +247,31 @@ test('v2 validates idempotency and query limits with stable error envelopes', as
     });
     assert.equal(nonCanonicalBody.response.status, 400);
     assert.equal(nonCanonicalBody.body.error.code, 'invalid_request');
+
+    const invalidRecords = [];
+    const missingConfidence = canonicalRecord('Missing confidence');
+    delete missingConfidence.confidence;
+    invalidRecords.push(['missing-confidence', missingConfidence]);
+    const nanConfidence = canonicalRecord('NaN confidence');
+    nanConfidence.confidence.score = Number.NaN;
+    invalidRecords.push(['nan-confidence', nanConfidence]);
+    const outOfRangeConfidence = canonicalRecord('Out of range confidence');
+    outOfRangeConfidence.confidence.score = 1.1;
+    invalidRecords.push(['range-confidence', outOfRangeConfidence]);
+    const unknownConfidence = canonicalRecord('Unknown confidence field');
+    unknownConfidence.confidence.legacy = true;
+    invalidRecords.push(['unknown-confidence', unknownConfidence]);
+    const restrictedPlain = canonicalRecord('Restricted plaintext');
+    restrictedPlain.claim = { encoding: 'plain', text: 'must be sealed' };
+    invalidRecords.push(['restricted-plain', restrictedPlain]);
+    for (const [idempotencyKey, record] of invalidRecords) {
+      const rejected = await api('/v2/memory/proposals', {
+        method: 'POST', headers: { 'idempotency-key': idempotencyKey },
+        body: JSON.stringify({ record, rationale: 'invalid_contract_regression', expectedRevision: 0 })
+      });
+      assert.equal(rejected.response.status, 400, `${idempotencyKey} was accepted`);
+      assert.equal(rejected.body.error.code, 'canonical_record_invalid');
+    }
 
     const forbidden = await api('/v2/memory/proposals', {
       method: 'POST',

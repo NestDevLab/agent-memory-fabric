@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 // PAM remains authoritative for file/workspace-only checks such as Markdown body
 // rules, graph projection collisions, transitions and supersedes target lookup.
 
-const RECORD_FIELDS = new Set(['schema', 'id', 'revision', 'claimType', 'scope', 'visibility', 'subjects', 'claim', 'lifecycle', 'provenance', 'createdAt', 'updatedAt']);
+const RECORD_FIELDS = new Set(['schema', 'id', 'revision', 'claimType', 'scope', 'visibility', 'subjects', 'claim', 'confidence', 'lifecycle', 'provenance', 'createdAt', 'updatedAt']);
 const CLAIM_TYPES = new Set(['fact', 'preference', 'event', 'decision', 'instruction', 'summary', 'relationship']);
 const SCOPE_TYPES = new Set(['agent', 'person', 'relationship', 'room', 'domain', 'shared']);
 const VISIBILITIES = new Set(['private', 'restricted', 'shared', 'confidential']);
@@ -14,6 +14,8 @@ const CLAIM_FIELDS = { plain: new Set(['encoding', 'text']), sealed: new Set(['e
 const LIFECYCLE_FIELDS = new Set(['status', 'validFrom', 'validTo', 'supersedes', 'revokedAt', 'revocationReason']);
 const PROVENANCE_FIELDS = new Set(['sourceType', 'sourceId', 'eventId', 'contentSha256', 'capturedAt']);
 const SUBJECT_FIELDS = new Set(['identityId', 'role']);
+const CONFIDENCE_FIELDS = new Set(['score', 'basis', 'assessedAt']);
+const CONFIDENCE_BASES = new Set(['observed', 'asserted', 'inferred', 'reviewed']);
 const MEMORY_ID_RE = /^mem_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$/;
 const OPAQUE_REF_RE = /^(?:agent|person|relationship|room|domain):[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
 const HASH_RE = /^[0-9a-f]{64}$/i;
@@ -27,7 +29,7 @@ function canonicalize(value) {
 }
 
 function aadObjectFor(record) {
-  const aad = { schema: record.schema, id: record.id, revision: record.revision, claimType: record.claimType, scope: record.scope, visibility: record.visibility, subjects: record.subjects };
+  const aad = { schema: record.schema, id: record.id, revision: record.revision, claimType: record.claimType, scope: record.scope, visibility: record.visibility, subjects: record.subjects, confidence: record.confidence };
   if (record.claim?.encoding === 'sealed') aad.envelope = { alg: record.claim.alg, kekId: record.claim.kekId, keyRef: record.claim.keyRef };
   return aad;
 }
@@ -109,6 +111,12 @@ function validateAmfMemoryRecord(record) {
       if (!HASH_RE.test(String(record.claim.aadSha256 ?? ''))) errors.push('sealed claim.aadSha256 must be a SHA-256 digest');
       else if (record.claim.aadSha256.toLowerCase() !== aadSha256For(record)) errors.push('sealed claim.aadSha256 must match canonical AAD');
     }
+  }
+
+  if (exactObject(record.confidence, 'confidence', CONFIDENCE_FIELDS, errors)) {
+    if (!Number.isFinite(record.confidence.score) || record.confidence.score < 0 || record.confidence.score > 1) errors.push('confidence.score must be finite and between 0 and 1');
+    if (!CONFIDENCE_BASES.has(record.confidence.basis)) errors.push('confidence.basis is invalid');
+    if (!isRfc3339Utc(record.confidence.assessedAt)) errors.push('confidence.assessedAt must be RFC 3339 UTC');
   }
 
   if (exactObject(record.lifecycle, 'lifecycle', LIFECYCLE_FIELDS, errors)) {

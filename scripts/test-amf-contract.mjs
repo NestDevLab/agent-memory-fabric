@@ -16,6 +16,7 @@ function baseRecord() {
     visibility: 'shared',
     subjects: [{ identityId: 'agent:22222222-2222-4222-8222-222222222222', role: 'owner' }],
     claim: { encoding: 'plain', text: 'A source-backed decision.' },
+    confidence: { score: 0.9, basis: 'reviewed', assessedAt: timestamp },
     lifecycle: { status: 'active', validFrom: timestamp, validTo: null, supersedes: [], revokedAt: null, revocationReason: null },
     provenance: [{ sourceType: 'test-session', sourceId: 'session-stable-0001', eventId: 'event-stable-0001', contentSha256: crypto.createHash('sha256').update('source').digest('hex'), capturedAt: timestamp }],
     createdAt: timestamp,
@@ -47,6 +48,28 @@ test('Fabric enforces PAM 0.6 restricted sealing and exact record fields', () =>
   assert.match(validateAmfMemoryRecord(wrongScope).errors.join('\n'), /scope.id must be canonical/);
 });
 
+test('Fabric requires the exact confidence object and rejects unsafe scores', () => {
+  const missing = baseRecord();
+  delete missing.confidence;
+  assert.match(validateAmfMemoryRecord(missing).errors.join('\n'), /missing field: confidence/);
+
+  const cases = [
+    ['NaN', { score: Number.NaN }, /finite and between/],
+    ['negative', { score: -0.01 }, /finite and between/],
+    ['greater than one', { score: 1.01 }, /finite and between/],
+    ['basis', { basis: 'guessed' }, /basis is invalid/],
+    ['timestamp', { assessedAt: '2026-07-11T12:00:00+00:00' }, /RFC 3339 UTC/],
+    ['unknown field', { legacy: true }, /unknown field: legacy/]
+  ];
+  for (const [label, mutation, pattern] of cases) {
+    const record = baseRecord();
+    record.confidence = { ...record.confidence, ...mutation };
+    const validation = validateAmfMemoryRecord(record);
+    assert.equal(validation.ok, false, `${label} confidence was accepted`);
+    assert.match(validation.errors.join('\n'), pattern);
+  }
+});
+
 test('Fabric enforces the PAM 0.6 sealed envelope, key refs, base64 sizes and canonical AAD', () => {
   const cases = [
     ['algorithm', { alg: 'AES-GCM' }, /alg/],
@@ -63,5 +86,20 @@ test('Fabric enforces the PAM 0.6 sealed envelope, key refs, base64 sizes and ca
     const validation = validateAmfMemoryRecord(record);
     assert.equal(validation.ok, false, `${label} was accepted`);
     assert.match(validation.errors.join('\n'), pattern);
+  }
+});
+
+test('sealed canonical AAD authenticates confidence score, basis and assessment time', () => {
+  const cases = [
+    ['score', { score: 0.8 }],
+    ['basis', { basis: 'asserted' }],
+    ['assessedAt', { assessedAt: '2026-07-11T11:00:00Z' }]
+  ];
+  for (const [label, mutation] of cases) {
+    const record = restrictedSealedRecord();
+    record.confidence = { ...record.confidence, ...mutation };
+    const validation = validateAmfMemoryRecord(record);
+    assert.equal(validation.ok, false, `${label} tamper was accepted`);
+    assert.match(validation.errors.join('\n'), /canonical AAD/);
   }
 });

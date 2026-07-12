@@ -9,6 +9,7 @@ Target shape:
 - v2 proposals carry the complete `amf-memory/v1` record, rationale and expected revision
 - PAM 0.6 structural validation is a dedicated adapter with shared conformance fixtures; restricted records are sealed and envelope/AAD/key fields fail closed
 - proposal RAW is content-addressed and encrypted independently from catalog metadata
+- transcript RAW is encrypted at the source and ingested through a durable outbox
 - downstream workers perform curation and PAM promotion outside the request path
 
 Surfaces:
@@ -32,10 +33,15 @@ Trust rules:
 - proposal acknowledgements echo the authoritative idempotency key on REST and MCP
 - catalog identity/routing values are opaque keyed tags
 - auth registries and encryption keys are runtime secrets, never tracked files
+- ingest keys are authorized per actor/source before decryption; those bindings and
+  the stable logical digest are authenticated as AES-GCM AAD
+- RAW event, session catalog and audit mutations are one atomic catalog transaction
 
-The current vertical slice uses a SQLite catalog and filesystem RAW store. Both sit
-behind interfaces with in-memory implementations for deterministic tests. PostgreSQL
-and native-session readers can replace them without changing REST or MCP contracts.
+The current vertical slice uses a SQLite or PostgreSQL catalog and filesystem RAW
+store, with in-memory implementations for deterministic tests. The same catalog
+provides redacted sessions and decrypts originals only after `raw:decrypt` policy.
+Codex and Claude adapters use bounded rolling checkpoints during polling and retain
+an explicit full-history audit mode.
 
 Compatibility:
 
