@@ -151,7 +151,7 @@ test('SQLite v2 persists opaque routing only and dual-reads the session catalog'
     const rawItem = item({ runtime: 'openclaw' });
     const result = await store.ingestRawEvent({ actor: 'raw-owner', sourceInstanceId: 'host', projection: rawItem.projection, envelope: envelope(rawItem) });
     assert.equal(result.status, 'stored');
-    const sessions = await store.createSessionReader().search({ actor: 'raw-owner', query: 'openclaw', limit: 10 });
+    const sessions = await store.createSessionReader().search({ actor: 'raw-owner', query: '', limit: 10 });
     assert.equal(sessions.items.length, 1);
     await store.ready();
     assert.equal(store.status().rawProjectionV2Ready, false);
@@ -246,7 +246,7 @@ test('v2 sessions accept multi-role events and retries but reject room/thread re
         assert.deepEqual((await reader.search({ actor, query: '', limit: 10 })).items.map(result => result.id), [session.id]);
         assert.equal((await reader.get({ actor, id: session.id })).id, session.id);
         const redactedPage = await reader.transcript({ actor, id: session.id, view: 'redacted', limit: 2 });
-        assert.equal(redactedPage.items.length, 2); assert.ok(redactedPage.nextCursor);
+        assert.equal(redactedPage.items.length, 1); assert.equal(redactedPage.items[0].role, 'user'); assert.ok(redactedPage.nextCursor);
         assert.equal((await reader.transcript({ actor, id: session.id, view: 'redacted', limit: 2, cursor: redactedPage.nextCursor })).items.length, 1);
         const original = await reader.transcript({ actor, id: session.id, view: 'original' });
         assert.equal(original.items.length, 3);
@@ -255,7 +255,7 @@ test('v2 sessions accept multi-role events and retries but reject room/thread re
       assert.equal((await reader.search({ actor: 'outsider', query: '', limit: 10 })).items.length, 0);
       await assert.rejects(reader.get({ actor: 'outsider', id: session.id }), /session_not_found/);
       await assert.rejects(reader.transcript({ actor: 'outsider', id: session.id, view: 'original' }), /session_not_found/);
-      assert.equal((await reader.transcript({ actor: observations[0].actor, id: session.id, view: 'redacted', to: '2026-07-12T00:00:00.0001Z' })).items.length, 3, 'sub-millisecond windows compare at common millisecond precision');
+      assert.equal((await reader.transcript({ actor: observations[0].actor, id: session.id, view: 'redacted', to: '2026-07-12T00:00:00.0001Z' })).items.length, 2, 'sub-millisecond windows compare at common millisecond precision while system content stays hidden');
       await assert.rejects(reader.transcript({ actor: observations[0].actor, id: session.id, view: 'redacted', from: '2026-07-12T00:00:01Z', to: '2026-07-12T00:00:00Z' }), /invalid_request/, 'reversed windows fail closed');
 
       const changedRoom = item({ actor: 'raw-assistant', sender: 'agent:vitae', role: 'assistant', room: 'other-room', nativeRevision: 4, sourceSequence: 4 });

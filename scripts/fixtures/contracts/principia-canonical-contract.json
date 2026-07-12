@@ -10,6 +10,7 @@
         "conversation": ["hmac-sha256:routing-v1:1111111111111111111111111111111111111111111111111111111111111111"],
         "room": ["hmac-sha256:routing-v1:2222222222222222222222222222222222222222222222222222222222222222"]
       },
+      "canonicalScopes": ["room:team"],
       "purpose": "conversation_recall",
       "policyRevision": "policy-v1",
       "issuedAt": "2026-07-12T12:00:00Z",
@@ -34,6 +35,16 @@
       "limit": 20,
       "from": null,
       "to": null
+    },
+    "sessionTranscriptDigestInput": {
+      "operation": "session_transcript",
+      "sessionId": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "view": "redacted",
+      "query": "appointment",
+      "cursor": null,
+      "limit": 12,
+      "from": null,
+      "to": null
     }
   },
   "memorySearch": {
@@ -41,7 +52,7 @@
     "response": {
       "ok": true,
       "data": { "items": [], "nextCursor": null, "scopes": ["room:team"] },
-      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.3" }
+      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.4" }
     }
   },
   "memoryRead": {
@@ -49,7 +60,7 @@
     "response": {
       "ok": true,
       "data": { "record": {} },
-      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.3" }
+      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.4" }
     }
   },
   "sessionsSearch": {
@@ -57,21 +68,26 @@
     "response": {
       "ok": true,
       "data": { "items": [], "nextCursor": null, "total": 0 },
-      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.3" }
+      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.4" }
     }
   },
   "transcript": {
+    "request": { "sessionId": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "view": "redacted", "query": "appointment", "purpose": "conversation_recall", "cursor": null, "limit": 12, "from": null, "to": null },
+    "rest": {
+      "path": "/v2/sessions/ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/transcript?query=appointment&limit=12&purpose=conversation_recall",
+      "headers": { "X-AMF-Context-Token": "<signed>" }
+    },
     "redacted": {
       "ok": true,
       "data": {
         "id": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "view": "redacted",
         "items": [
-          { "eventId": "evt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "occurredAt": "2026-07-12T12:00:00Z", "role": "user", "content": { "redacted": true, "contentType": "text", "parts": 1 } }
+          { "eventId": "evt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "occurredAt": "2026-07-12T12:00:00Z", "role": "user", "content": { "redacted": true, "contentType": "text", "parts": 1, "text": "Appointment confirmed." } }
         ],
         "nextCursor": null
       },
-      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.3" }
+      "meta": { "requestId": "fixture-request", "service": "agent-memory-fabric", "version": "0.5.4" }
     }
   }
 }

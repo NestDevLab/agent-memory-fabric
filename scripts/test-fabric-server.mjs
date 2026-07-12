@@ -8,7 +8,7 @@ import test from 'node:test';
 import { FabricStore, MemoryCatalog, MemoryRawStore } from '../src/fabric-store.mjs';
 import { aadSha256For } from '../src/amf-memory-record-validator.mjs';
 import { createAgentMemoryFabricServer } from '../src/server.mjs';
-import { ContextTokenVerifier, issueContextToken, requestDigest } from '../src/context-token.mjs';
+import { ContextTokenVerifier, issueContextToken, issueSessionRouteBinding, requestDigest } from '../src/context-token.mjs';
 import { buildContextRequest } from '../src/access-contract.mjs';
 
 const testPolicyPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'config', 'policies.example.json');
@@ -16,8 +16,13 @@ const CONTEXT_RING = { currentKeyVersion: 'ctx-v1', keys: { 'ctx-v1': Buffer.all
 const CONTEXT_NOW = Date.parse('2026-07-12T12:00:00Z');
 const ROOM_A = `hmac-sha256:routing-v1:${'a'.repeat(64)}`;
 const ROOM_B = `hmac-sha256:routing-v1:${'b'.repeat(64)}`;
-function contextTokenFor({ actor = 'test-actor', purpose, operation, input, room = ROOM_A, conversationKind = 'group', contextTags = null }) {
-  return issueContextToken({ actor, runtime: 'principia', profile: 'test', conversationKind, contextTags: contextTags || { conversation: [room], room: [room] }, purpose, policyRevision: 'policy-test', issuedAt: new Date(CONTEXT_NOW - 1000).toISOString(), expiresAt: new Date(CONTEXT_NOW + 60_000).toISOString(), nonce: crypto.randomBytes(16).toString('base64url'), requestDigest: requestDigest(buildContextRequest(operation, input)) }, CONTEXT_RING);
+function contextTokenFor({ actor = 'test-actor', purpose, operation, input, room = ROOM_A,
+  conversationKind = 'group', contextTags = null, canonicalScopes = ['room:team'] }) {
+  return issueContextToken({ actor, runtime: 'principia', profile: 'test', conversationKind,
+    contextTags: contextTags || { conversation: [room], room: [room] }, canonicalScopes,
+    purpose, policyRevision: 'policy-test', issuedAt: new Date(CONTEXT_NOW - 1000).toISOString(),
+    expiresAt: new Date(CONTEXT_NOW + 60_000).toISOString(), nonce: crypto.randomBytes(16).toString('base64url'),
+    requestDigest: requestDigest(buildContextRequest(operation, input)) }, CONTEXT_RING);
 }
 
 function makeStore() {
@@ -48,7 +53,9 @@ function canonicalProposal(text, scope = 'main-lab', revision = 1) {
   return { record: canonicalRecord(text, scope, revision), rationale: 'test_evidence', expectedRevision: revision - 1 };
 }
 
-async function withServer(run, { sessionOptions, clock, configuredSessionReader = true, sessionReader: sessionReaderOverride, fabricStore: fabricStoreOverride, backend: backendOverride, canonicalStore, contextVerifier, receiptCoordinator } = {}) {
+async function withServer(run, { sessionOptions, clock, configuredSessionReader = true,
+  sessionReader: sessionReaderOverride, fabricStore: fabricStoreOverride, backend: backendOverride,
+  canonicalStore, contextVerifier, receiptCoordinator, routeManifestSetup } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-server-'));
   const registryPath = path.join(dir, 'auth.json');
   const registry = {
@@ -66,7 +73,7 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
         active: true,
         actor: 'limited-actor',
         mode: 'scoped',
-        allowedScopes: 'main-lab',
+        allowedScopes: 'main-lab,room:team',
         permissions: 'memory:search,memory:read,sessions:read,purpose:continuity_resume,purpose:incident_debug,purpose:operator_review'
       },
       {
@@ -117,7 +124,22 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
     async transcript({ id, view }) { return { id, view, items: [], nextCursor: null }; }
   };
   const effectiveContextVerifier = contextVerifier || new ContextTokenVerifier({ keyRing: CONTEXT_RING, policyRevision: 'policy-test', clock: () => CONTEXT_NOW });
-  const server = createAgentMemoryFabricServer({ backend, fabricStore, canonicalStore, contextVerifier: effectiveContextVerifier, receiptCoordinator, sessionReader: configuredSessionReader ? sessionReader : undefined, sessionOptions, clock, policyPath: testPolicyPath });
+  const routeManifestPath = path.join(dir, 'session-routes.json');
+  fs.writeFileSync(routeManifestPath, JSON.stringify({ schema: 'amf.session-route-manifest/v1', bindings: [
+    issueSessionRouteBinding({ actor: 'test-actor', canonicalScope: 'room:team', conversationKind: 'group',
+      contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }, CONTEXT_RING),
+    issueSessionRouteBinding({ actor: 'limited-actor', canonicalScope: 'room:team', conversationKind: 'group',
+      contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }, CONTEXT_RING),
+    issueSessionRouteBinding({ actor: 'tirrenia-actor', canonicalScope: 'tirrenia', conversationKind: 'session',
+      contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }, CONTEXT_RING)
+  ] }), { mode: 0o600 });
+  fs.chmodSync(routeManifestPath, 0o600);
+  const effectiveRouteManifestPath = routeManifestSetup
+    ? routeManifestSetup({ dir, routeManifestPath }) || routeManifestPath : routeManifestPath;
+  const server = createAgentMemoryFabricServer({ backend, fabricStore, canonicalStore,
+    contextVerifier: effectiveContextVerifier, routeManifestPath: effectiveRouteManifestPath, receiptCoordinator,
+    sessionReader: configuredSessionReader ? sessionReader : undefined, sessionOptions, clock,
+    policyPath: testPolicyPath });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const api = async (pathname, options = {}) => {
@@ -133,7 +155,8 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
     return { response, body: text ? JSON.parse(text) : null };
   };
   try {
-    await run({ api, baseUrl, fabricStore, registry, writeRegistry, getBackendAdds: () => backendAdds });
+    await run({ api, baseUrl, fabricStore, registry, writeRegistry, routeManifestPath: effectiveRouteManifestPath,
+      getBackendAdds: () => backendAdds });
   } finally {
     await new Promise(resolve => server.close(resolve));
     if (originalRegistry === undefined) delete process.env.MEM0_AUTH_REGISTRY_PATH;
@@ -309,7 +332,7 @@ test('session context and purpose permission cannot be bypassed by caller-select
     const input = { query: 'Session', purpose: 'continuity_resume' };
     const wrongToken = contextTokenFor({ purpose: input.purpose, operation: 'sessions_search', input, room: ROOM_B });
     const wrong = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ ...input, contextToken: wrongToken }) });
-    assert.equal(wrong.response.status, 200); assert.deepEqual(wrong.body.data.items, []);
+    assert.equal(wrong.response.status, 403); assert.equal(wrong.body.error.code, 'scope_forbidden');
     const rightToken = contextTokenFor({ purpose: input.purpose, operation: 'sessions_search', input, room: ROOM_A });
     const right = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ ...input, contextToken: rightToken }) });
     assert.deepEqual(right.body.data.items.map(item => item.id), ['session-1']);
@@ -318,6 +341,47 @@ test('session context and purpose permission cannot be bypassed by caller-select
     const purposeBypass = await api('/v2/memory/search', { method: 'POST', headers: { authorization: 'Bearer limited-token' }, body: JSON.stringify({ query: 'x', scopes: ['main-lab'], purpose: 'memory_curation' }) });
     assert.equal(purposeBypass.response.status, 403); assert.equal(purposeBypass.body.error.code, 'forbidden');
   }, { canonicalStore });
+});
+
+test('session route manifest rejects unsafe parents and parent-swap races', async t => {
+  const canonicalStore = { configured: true, async search() { return { items: [], nextCursor: null }; },
+    async read() { throw Object.assign(new Error('memory_not_found'), { status: 404 }); } };
+  const assertRejected = async api => {
+    const input = { query: 'Session', purpose: 'continuity_resume' };
+    const token = contextTokenFor({ purpose: input.purpose, operation: 'sessions_search', input });
+    const result = await api('/v2/sessions/search', { method: 'POST',
+      body: JSON.stringify({ ...input, contextToken: token }) });
+    assert.equal(result.response.status, 500); assert.equal(result.body.error.code, 'internal_error');
+  };
+  await t.test('world-writable parent', async () => withServer(async ({ api }) => assertRejected(api), {
+    canonicalStore, routeManifestSetup({ dir }) { fs.chmodSync(dir, 0o777); }
+  }));
+  await t.test('symlink parent', async () => withServer(async ({ api }) => assertRejected(api), {
+    canonicalStore, routeManifestSetup({ dir, routeManifestPath }) {
+      const real = path.join(dir, 'real-routes'); const link = path.join(dir, 'linked-routes');
+      fs.mkdirSync(real, { mode: 0o700 });
+      fs.copyFileSync(routeManifestPath, path.join(real, 'session-routes.json'));
+      fs.chmodSync(path.join(real, 'session-routes.json'), 0o600); fs.symlinkSync(real, link);
+      return path.join(link, 'session-routes.json');
+    }
+  }));
+  await t.test('parent directory swap', async () => withServer(async ({ api, routeManifestPath }) => {
+    await api('/v2/status');
+    const directory = path.dirname(routeManifestPath); const displaced = `${directory}-displaced`;
+    const originalOpen = fs.openSync; let swapped = false;
+    fs.openSync = function swappedOpen(filePath, flags, ...args) {
+      if (!swapped && path.resolve(String(filePath)) === path.resolve(directory)
+        && typeof flags === 'number' && (flags & fs.constants.O_DIRECTORY)) {
+        swapped = true; fs.renameSync(directory, displaced); fs.mkdirSync(directory, { mode: 0o700 });
+      }
+      return originalOpen.call(fs, filePath, flags, ...args);
+    };
+    try { await assertRejected(api); }
+    finally {
+      fs.openSync = originalOpen;
+      if (swapped) { fs.rmSync(directory, { recursive: true, force: true }); fs.renameSync(displaced, directory); }
+    }
+  }, { canonicalStore }));
 });
 
 test('internal identity and retention APIs enforce the existing auth, ACL and audit envelope', async () => {
@@ -650,7 +714,8 @@ test('session transcript defaults redacted and requires raw decrypt permission f
     assert.equal(forbidden.response.status, 403);
     assert.equal(forbidden.body.error.code, 'raw_decrypt_forbidden');
 
-    const tirreniaContext = contextTokenFor({ actor: 'tirrenia-actor', purpose: 'operator_review', operation: 'session_get', input: { sessionId: 'session-1' } });
+    const tirreniaContext = contextTokenFor({ actor: 'tirrenia-actor', purpose: 'operator_review', operation: 'session_get',
+      input: { sessionId: 'session-1' }, conversationKind: 'session', canonicalScopes: ['tirrenia'] });
     const hidden = await api(`/v2/sessions/session-1?purpose=operator_review&contextToken=${encodeURIComponent(tirreniaContext)}`, {
       headers: { authorization: 'Bearer tirrenia-token' }
     });

@@ -36,12 +36,18 @@ test('context tokens bind actor, purpose, policy, room context and exact request
   const payload = {
     actor: 'vitae', runtime: 'principia', profile: 'production', conversationKind: 'group',
     contextTags: { room: [`hmac-sha256:routing-v1:${'a'.repeat(64)}`], person: [`hmac-sha256:routing-v1:${'b'.repeat(64)}`] },
+    canonicalScopes: ['room:vitae:team'],
     purpose: 'conversation_recall', policyRevision: 'policy-7', issuedAt: timestamp,
     expiresAt: new Date(now + 60_000).toISOString(), nonce: 'nonce_1234567890abcdef', requestDigest: requestDigest(request)
   };
   const token = issueContextToken(payload, ring);
   const verifier = new ContextTokenVerifier({ keyRing: ring, policyRevision: 'policy-7', clock: () => now });
-  assert.equal(verifier.verify(token, { actor: 'vitae', purpose: 'conversation_recall', request }).conversationKind, 'group');
+  const verified = verifier.verify(token, { actor: 'vitae', purpose: 'conversation_recall', request,
+    contextKeyVersions: ['ctx-v1'] });
+  assert.equal(verified.conversationKind, 'group');
+  assert.deepEqual(verified.canonicalScopes, ['room:vitae:team']);
+  assert.throws(() => verifier.verify(token, { actor: 'vitae', purpose: 'conversation_recall', request,
+    contextKeyVersions: ['ctx-other'] }), /context_invalid/);
   assert.equal(verifier.verify(token, { actor: 'vitae', purpose: 'conversation_recall', request }).nonce, payload.nonce, 'exact retries remain idempotent');
   assert.throws(() => verifier.verify(token, { actor: 'other', purpose: 'conversation_recall', request }), /context_invalid/);
   assert.throws(() => verifier.verify(token, { actor: 'vitae', purpose: 'conversation_recall', request: { ...request, query: 'different' } }), /context_invalid/);

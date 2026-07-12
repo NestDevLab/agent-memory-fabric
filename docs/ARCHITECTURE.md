@@ -23,7 +23,19 @@ Trust rules:
 
 - Mem0/OpenMemory is not the security boundary
 - policy and audit live in the fabric
-- transcript output is redacted by default
+- transcript output is redacted by default: only bounded normalized text from
+  authenticated v2 `user`/`assistant` observations is returned after durable audit
+- textual session search is context-first and decrypts only the newest bounded
+  256-event window of at most 64 candidate sessions per continuation page, with
+  a shared 16 MiB ciphertext budget; keyset continuation replaces candidate-count outages
+- redacted transcript queries use the same newest-event window and bind query,
+  context and cursor; original transcript queries are forbidden
+- session/event ordering uses effective `occurredAt` plus a stable id tiebreak;
+  only preferred logical observations survive conflict/tombstone/dedup gates
+- session context tokens sign canonical route scopes, which must be registered
+  and actor-allowlisted server-side; group/channel/thread recall requires a room scope
+- cursors carry a server-side MAC; REST GET context tokens use
+  `X-AMF-Context-Token`, never a query parameter for dedicated actors
 - original transcript access requires `raw:decrypt` and is audited
 - all memory/session transports, status and errors are private and `no-store`
 - session access requires an opaque purpose code plus owner/scope authorization
@@ -39,12 +51,16 @@ Trust rules:
 
 The current vertical slice uses a SQLite or PostgreSQL catalog and filesystem RAW
 store, with in-memory implementations for deterministic tests. The same catalog
-provides redacted sessions and decrypts originals only after `raw:decrypt` policy.
+provides policy-delegated redacted sessions and decrypts originals only after
+`raw:decrypt` policy. Redacted text is internally decrypted only after owner/context
+authorization and a durable decrypt-intent audit; RAW, system, tool and structured
+payloads never enter that response.
 Codex and Claude adapters use bounded rolling checkpoints during polling and retain
 an explicit full-history audit mode.
 
 Compatibility:
 
+- recall hardening release identity is `0.5.4`
 - product identity is `agent-memory-fabric`; `mem0-gateway` is a legacy alias
 - `AMF_AUTH_REGISTRY_PATH` supersedes `MEM0_AUTH_REGISTRY_PATH`
 - `AMF_POLICY_PATH` supersedes `MEM0_GATEWAY_POLICY_PATH`

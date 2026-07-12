@@ -103,6 +103,12 @@ Provision collector actors and per-client handoffs with the fail-closed
 operator CLI stores only bearer digests server-side and fixes collector access
 to `memory:status` plus `raw:ingest`.
 
+Provision the independent `agent:vitae` read-only recall credential and context-signing handoff
+with the [recall consumer provisioning runbook](docs/recall-consumer-provisioning.md). This path
+does not read or create RAW collector material. Approved group/topic contexts can add bounded,
+manifest-bound canonical `room:`, `person:` and `relationship:` scopes through repeatable
+`--scope` options; wildcard and broader scope classes are rejected.
+
 ## API v2
 
 Success uses `{ "ok": true, "data": ..., "meta": ... }`; errors use
@@ -134,7 +140,20 @@ Every memory/session transport, including MCP, errors and status, is private and
 `continuity_resume`, `incident_debug`, `operator_review`, or `memory_curation`.
 MCP sessions have TTL, global/per-actor caps, and revalidate token activity and
 policy on every call. Original transcripts additionally require `raw:decrypt`;
-redacted is the default. The session reader is configured automatically when the
+redacted is the default and returns only bounded, normalized `user`/`assistant`
+text from authenticated v2 observations. System, tool, structured and path/media
+payloads are omitted. A non-empty `sessions_search.query` searches that redacted
+text only after exact signed-context filtering. Redacted `session_transcript`
+also accepts `query`; the query, context and cursor are request-bound, while
+`original` plus `query` is rejected. Text search scans at most the newest 256
+events per candidate session and 16 MiB of ciphertext. Candidate sessions are
+context/time-filtered before each bounded 64-session page; a server-MACed keyset
+cursor continues without a `>64` outage. Only the preferred, non-conflicted,
+non-tombstoned logical observation is eligible. Older history can be selected
+with a signed time window. Signed `canonicalScopes` are checked against the
+server registry before session access. REST GET clients send the signed context
+only in `X-AMF-Context-Token`; dedicated actors such as Vitae cannot place it in
+the query string. The session reader is configured automatically when the
 ingest key ring and catalog are available; otherwise MCP advertises
 `sessionReader: false` and the routes return `session_reader_unconfigured` (`503`).
 
@@ -159,6 +178,10 @@ bash scripts/run.sh
 ```
 
 Do not commit real secrets or runtime `.env` files.
+
+Session recall also requires `AMF_SESSION_ROUTE_MANIFEST_PATH`. Create or update that signed,
+private manifest with `npm run operator:provision-session-routes -- ...`; the full root-only,
+dry-run-first procedure is in `docs/recall-consumer-provisioning.md`.
 
 ## Transcript ingestion CLI
 

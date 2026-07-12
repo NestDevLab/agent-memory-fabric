@@ -1,7 +1,7 @@
 {
   "name": "agent-memory-fabric",
   "private": true,
-  "version": "0.5.3",
+  "version": "0.5.4",
   "type": "module",
   "description": "Shared REST/MCP memory fabric with encrypted RAW storage and scoped proposal curation",
   "scripts": {
@@ -9,6 +9,8 @@
     "dev": "node --watch src/server.mjs",
     "check": "node src/server.mjs --check",
     "operator:provision-raw-collector": "node scripts/amf-provision-raw-collector.mjs",
+    "operator:provision-recall-consumer": "node scripts/amf-provision-recall-consumer.mjs",
+    "operator:provision-session-routes": "node scripts/amf-provision-session-routes.mjs",
     "test": "node --test scripts/test-*.mjs",
     "test:auth": "node --test scripts/test-auth-registry.mjs"
   },

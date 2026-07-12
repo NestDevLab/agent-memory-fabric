@@ -23,9 +23,10 @@ function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } =
 }
 
 const POLICY_PATH = process.env.AMF_POLICY_PATH || process.env.MEM0_GATEWAY_POLICY_PATH || '';
+const SESSION_ROUTE_MANIFEST_PATH = process.env.AMF_SESSION_ROUTE_MANIFEST_PATH || '';
 const PORT = envInteger('PORT', 8787, { min: 1, max: 65535 });
 const SERVICE_NAME = 'agent-memory-fabric';
-const SERVICE_VERSION = '0.5.3';
+const SERVICE_VERSION = '0.5.4';
 const LEGACY_SERVICE_ALIASES = ['mem0-gateway'];
 const LIMITS = Object.freeze({
   bodyBytes: envInteger('AMF_MAX_BODY_BYTES', 262144, { min: 1024, max: 16 * 1024 * 1024 }),
@@ -45,6 +46,8 @@ const MCP_SESSION_DEFAULTS = Object.freeze({
   maxPerActor: envInteger('AMF_MCP_MAX_SESSIONS_PER_ACTOR', 20, { min: 1, max: 1000 })
 });
 const authCache = { loadedAt: 0, rows: [], sourceKey: '', mtimeMs: 0 };
+const AUTH_ID = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$/;
+const AUTH_MODES = new Set(['allow_all', 'scoped', 'read_only_scoped', 'deny']);
 const PRIVATE_HEADERS = Object.freeze({
   'cache-control': 'no-store, private',
   pragma: 'no-cache',
@@ -57,7 +60,7 @@ const V1_HEADERS = Object.freeze({
   link: '</v2>; rel="successor-version"'
 });
 const PUBLIC_ERRORS = new Map([
-  ['invalid_json', [400, 'invalid_json']], ['invalid_request', [400, 'invalid_request']], ['scope_required', [400, 'scope_required']], ['scope_unregistered', [400, 'scope_unregistered']],
+  ['invalid_json', [400, 'invalid_json']], ['invalid_request', [400, 'invalid_request']], ['context_transport_invalid', [400, 'context_transport_invalid']], ['scope_required', [400, 'scope_required']], ['scope_unregistered', [400, 'scope_unregistered']],
   ['scope_unmapped', [400, 'scope_unmapped']], ['memory_text_required', [400, 'memory_text_required']], ['memory_id_required', [400, 'memory_id_required']],
   ['canonical_record_required', [400, 'canonical_record_required']], ['canonical_record_invalid', [400, 'canonical_record_invalid']], ['rationale_required', [400, 'rationale_required']],
   ['revision_invalid', [400, 'revision_invalid']], ['idempotency_key_required', [400, 'idempotency_key_required']], ['purpose_required', [400, 'purpose_required']],
@@ -83,7 +86,8 @@ const PUBLIC_ERRORS = new Map([
   ['session_capacity_exceeded', [429, 'session_capacity_exceeded']], ['fabric_store_unconfigured', [503, 'fabric_store_unconfigured']],
   ['raw_projection_invalid', [400, 'raw_projection_invalid']], ['raw_envelope_invalid', [400, 'raw_envelope_invalid']], ['raw_envelope_binding_invalid', [400, 'raw_envelope_binding_invalid']],
   ['source_instance_invalid', [400, 'source_instance_invalid']], ['raw_event_conflict', [409, 'raw_event_conflict']], ['raw_ingest_key_unavailable', [503, 'raw_ingest_key_unavailable']],
-  ['raw_session_binding_conflict', [409, 'raw_session_binding_conflict']], ['raw_envelope_authentication_failed', [400, 'raw_envelope_authentication_failed']],
+    ['raw_session_binding_conflict', [409, 'raw_session_binding_conflict']], ['raw_envelope_authentication_failed', [400, 'raw_envelope_authentication_failed']],
+    ['session_text_scan_bound_exceeded', [503, 'session_text_scan_bound_exceeded']],
   ['raw_ingest_unconfigured', [503, 'raw_ingest_unconfigured']],
   ['session_reader_unconfigured', [503, 'session_reader_unconfigured']], ['canonical_store_unconfigured', [503, 'canonical_store_unconfigured']], ['backend_not_configured', [503, 'backend_not_configured']],
   ['audit_unavailable', [503, 'audit_unavailable']], ['catalog_unavailable', [503, 'catalog_unavailable']], ['service_unavailable', [503, 'service_unavailable']]
@@ -95,6 +99,56 @@ function loadPolicies(policyPath = POLICY_PATH) {
     return JSON.parse(fs.readFileSync(policyPath, 'utf8'));
   } catch {
     return { actors: {}, scopes: {} };
+  }
+}
+
+function loadSessionRouteManifest(manifestPath, contextVerifier) {
+  if (!manifestPath || !contextVerifier?.verifySessionRouteBinding) {
+    throw Object.assign(new Error('session_route_manifest_invalid'), { status: 500 });
+  }
+  let directoryFd; let fd;
+  try {
+    const absolutePath = path.resolve(manifestPath);
+    const directoryPath = path.dirname(absolutePath); const childName = path.basename(absolutePath);
+    if (!childName || childName === '.' || childName === '..' || childName.includes('/')) throw new Error();
+    const directoryStat = fs.lstatSync(directoryPath);
+    const ownerUid = typeof process.geteuid === 'function' ? process.geteuid() : directoryStat.uid;
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o077) !== 0
+      || ![0, ownerUid].includes(directoryStat.uid)) throw new Error();
+    directoryFd = fs.openSync(directoryPath, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+      | (fs.constants.O_NOFOLLOW || 0));
+    const openedDirectory = fs.fstatSync(directoryFd);
+    if (!openedDirectory.isDirectory() || openedDirectory.dev !== directoryStat.dev
+      || openedDirectory.ino !== directoryStat.ino || (openedDirectory.mode & 0o077) !== 0
+      || ![0, ownerUid].includes(openedDirectory.uid)) throw new Error();
+    const procPath = `/proc/self/fd/${directoryFd}/${childName}`;
+    const stat = fs.lstatSync(procPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600
+      || ![0, ownerUid].includes(stat.uid) || stat.size < 2 || stat.size > 1024 * 1024) throw new Error();
+    fd = fs.openSync(procPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== stat.dev || opened.ino !== stat.ino
+      || (opened.mode & 0o777) !== 0o600 || ![0, ownerUid].includes(opened.uid)
+      || opened.size !== stat.size) throw new Error();
+    const parsed = JSON.parse(fs.readFileSync(fd, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || Object.keys(parsed).sort().join('\0') !== 'bindings\0schema'
+      || parsed.schema !== 'amf.session-route-manifest/v1' || !Array.isArray(parsed.bindings)
+      || !parsed.bindings.length || parsed.bindings.length > 10000) throw new Error();
+    const seen = new Set();
+    const bindings = parsed.bindings.map(item => {
+      const binding = contextVerifier.verifySessionRouteBinding(item);
+      const identity = `${binding.actor}\0${binding.conversationKind}\0${binding.canonicalScope}`;
+      if (seen.has(identity)) throw new Error();
+      seen.add(identity);
+      return binding;
+    });
+    return bindings;
+  } catch {
+    throw Object.assign(new Error('session_route_manifest_invalid'), { status: 500 });
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    if (directoryFd !== undefined) fs.closeSync(directoryFd);
   }
 }
 
@@ -443,7 +497,7 @@ function buildToolsListResult() {
         description: 'Read a redacted transcript by default; original requires raw:decrypt.',
         inputSchema: {
           type: 'object',
-          properties: { sessionId: { type: 'string' }, view: { type: 'string', enum: ['redacted', 'original'] }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 }, from: { type: ['string', 'null'] }, to: { type: ['string', 'null'] }, purpose: { type: 'string' }, contextToken: { type: 'string' } },
+          properties: { sessionId: { type: 'string' }, view: { type: 'string', enum: ['redacted', 'original'] }, query: { type: 'string' }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 }, from: { type: ['string', 'null'] }, to: { type: ['string', 'null'] }, purpose: { type: 'string' }, contextToken: { type: 'string' } },
           required: ['sessionId', 'purpose']
         }
       },
@@ -466,7 +520,8 @@ function buildToolsListResult() {
   };
 }
 
-async function executeMcpMethod({ body, actor, policy, policies, backend, fabricStore, canonicalStore, contextVerifier, sessionReader, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
+async function executeMcpMethod({ body, actor, policy, policies, backend, fabricStore, canonicalStore,
+  contextVerifier, routeManifestPath, sessionReader, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
   const method = body.method;
   const id = body.id ?? null;
 
@@ -573,9 +628,15 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       const purpose = requirePurpose(args.purpose);
       const query = String(args.query || '');
       const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: args.contextToken, request: buildContextRequest('sessions_search', args), required: true });
+      const routeScopes = requireSessionRouteScopes(context, actor, policy, policies, contextVerifier,
+        routeManifestPath);
       validateSearchInput(query);
-      const raw = await sessionReader.search({ actor, query, cursor: args.cursor || null, limit: normalizeSessionLimit(args.limit), from: args.from || null, to: args.to || null, purpose, context });
-      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy, policies, context)), nextCursor: raw?.nextCursor || null };
+      const ownerActors = authorizedSessionOwners(actor, policy);
+      const raw = await sessionReader.search({ actor, ownerActors, query, cursor: args.cursor || null,
+        limit: normalizeSessionLimit(args.limit), from: args.from || null, to: args.to || null, purpose, context });
+      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy,
+        policies, context, routeScopes, ownerActors)).map(item => exposeSession(item, routeScopes)),
+      nextCursor: raw?.nextCursor || null };
       await auditRequired(fabricStore, { actor, action: 'sessions_search', outcome: 'allowed', requestId, details: { resultCount: result.items.length, purpose } });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
     }
@@ -585,7 +646,8 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       const purpose = requirePurpose(args.purpose);
       const sessionTargetId = String(args.sessionId || args.id || '');
       const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: args.contextToken, request: buildContextRequest('session_get', { sessionId: sessionTargetId }), required: true });
-      const result = await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionTargetId, purpose, context });
+      const result = await getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+        routeManifestPath, id: sessionTargetId, purpose, context });
       await auditRequired(fabricStore, { actor, action: 'session_get', outcome: 'allowed', requestId, targetId: sessionTargetId, details: { purpose } });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
     }
@@ -595,8 +657,11 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       const purpose = requirePurpose(args.purpose);
       const sessionTargetId = String(args.sessionId || args.id || '');
       const view = args.view === 'original' ? 'original' : 'redacted';
+      const query = String(args.query || ''); validateSearchInput(query);
+      if (view === 'original' && query) throw Object.assign(new Error('invalid_request'), { status: 400 });
       const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: args.contextToken, request: buildContextRequest('session_transcript', { ...args, sessionId: sessionTargetId, view }), required: true });
-      await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionTargetId, purpose, context });
+      await getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+        routeManifestPath, id: sessionTargetId, purpose, context });
       if (view === 'original' && !hasPermission(policy, 'raw:decrypt')) {
         await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'denied', requestId, targetId: sessionTargetId, details: { view, purpose } });
         const error = new Error('raw_decrypt_forbidden');
@@ -604,7 +669,9 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
         throw error;
       }
       if (view === 'original') await auditRequired(fabricStore, { actor, action: 'raw_decrypt_intent', outcome: 'authorized', requestId, targetId: sessionTargetId, details: { view, purpose, transport: 'mcp' } });
-      const transcript = await sessionReader.transcript({ actor, id: sessionTargetId, view, cursor: args.cursor || null, limit: normalizeSessionLimit(args.limit || 100), from: args.from || null, to: args.to || null, purpose, context });
+      const transcript = await sessionReader.transcript({ actor, ownerActors: authorizedSessionOwners(actor, policy),
+        id: sessionTargetId, view, cursor: args.cursor || null, limit: normalizeSessionLimit(args.limit || 100),
+        query, from: args.from || null, to: args.to || null, purpose, context });
       const result = { ...transcript, nextCursor: transcript?.nextCursor || null };
       await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'allowed', requestId, targetId: sessionTargetId, details: { view, purpose } });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
@@ -664,22 +731,80 @@ function requireAccessContext(contextVerifier, { actor, policy, purpose, token, 
     if (required) throw Object.assign(new Error('context_required'), { status: 403 });
     return null;
   }
-  return contextVerifier.verify(token, { actor, purpose, request });
+  return contextVerifier.verify(token, { actor, purpose, request,
+    contextKeyVersions: policy.contextKeyVersions ?? null });
 }
 
-function sessionVisible(session, actor, policy, policies, context) {
+function authorizedSessionOwners(actor, policy) {
+  return [...new Set([actor, ...(Array.isArray(policy?.sessionOwnerActors) ? policy.sessionOwnerActors : [])])].sort();
+}
+
+function validateContextActorBinding(actor, policy, policies, contextVerifier) {
+  const registryVersions = Array.isArray(policy?.contextKeyVersions) ? [...policy.contextKeyVersions].sort() : [];
+  const versionOwners = new Map();
+  for (const [configuredActor, entry] of Object.entries(policies?.actors || {})) {
+    for (const version of Array.isArray(entry?.contextKeyVersions) ? entry.contextKeyVersions : []) {
+      const existing = versionOwners.get(version);
+      if (existing && existing !== configuredActor) {
+        const error = new Error('context_actor_binding_invalid'); error.status = 500; throw error;
+      }
+      versionOwners.set(version, configuredActor);
+    }
+  }
+  const configured = policies?.actors?.[actor];
+  const policyVersions = Array.isArray(configured?.contextKeyVersions)
+    ? [...new Set(configured.contextKeyVersions)].sort() : [];
+  if (registryVersions.join('\0') !== policyVersions.join('\0')
+    || registryVersions.some(version => !contextVerifier?.keyRing?.keys?.has(version))) {
+    const error = new Error('context_actor_binding_invalid'); error.status = 500; throw error;
+  }
+}
+
+function requireSessionRouteScopes(context, actor, policy, policies, contextVerifier, routeManifestPath) {
+  const scopes = Array.isArray(context?.canonicalScopes) ? [...context.canonicalScopes] : [];
+  const kind = String(context?.conversationKind || '');
+  if (!scopes.length || scopes.some(scope => !getScopeConfig(scope, policies) || !canReadScope(policy, scope))
+    || (['group', 'channel', 'thread'].includes(kind) && !scopes.some(scope => scope.startsWith('room:')))) {
+    const error = new Error('scope_forbidden'); error.status = 403; throw error;
+  }
+  const canonicalScope = primarySessionScope(scopes);
+  const binding = loadSessionRouteManifest(routeManifestPath, contextVerifier).find(item => item.actor === actor
+    && item.conversationKind === kind && item.canonicalScope === canonicalScope);
+  if (!binding || binding.keyVersion !== context?.keyVersion
+    || canonicalJson(binding.contextTags) !== canonicalJson(context?.contextTags)) {
+    const error = new Error('scope_forbidden'); error.status = 403; throw error;
+  }
+  return scopes;
+}
+
+function primarySessionScope(scopes) {
+  return scopes.find(scope => scope.startsWith('room:')) || scopes[0];
+}
+
+function exposeSession(session, routeScopes) {
+  const { ownerActor: _ownerActor, ...visible } = session;
+  return { ...visible, scope: primarySessionScope(routeScopes) };
+}
+
+function sessionVisible(session, actor, policy, policies, context, routeScopes,
+  ownerActors = authorizedSessionOwners(actor, policy)) {
   if (!session || typeof session !== 'object') return false;
   if (!context || !session.contextTags || !exactContextIntersection(session.contextTags, context.contextTags)) return false;
+  if (!Array.isArray(routeScopes) || !routeScopes.length
+    || routeScopes.some(scope => !getScopeConfig(scope, policies) || !canReadScope(policy, scope))) return false;
   if (session.ownerSelf === true) return true;
-  if (String(session.ownerActor || '') === actor) return true;
+  if (ownerActors.includes(String(session.ownerActor || ''))) return true;
   const scope = String(session.scope || '');
   if (!scope || !getScopeConfig(scope, policies)) return false;
   return canReadScope(policy, scope);
 }
 
-async function getAuthorizedSession(sessionReader, { actor, policy, policies, id, purpose, context = null }) {
+async function getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+  routeManifestPath, id, purpose, context = null }) {
   let session;
-  try { session = await sessionReader.get({ actor, id, purpose, context }); } catch (error) {
+  const ownerActors = authorizedSessionOwners(actor, policy);
+  const routeScopes = requireSessionRouteScopes(context, actor, policy, policies, contextVerifier, routeManifestPath);
+  try { session = await sessionReader.get({ actor, ownerActors, id, purpose, context }); } catch (error) {
     if (error?.status === 404) {
       const hidden = new Error('session_not_found');
       hidden.status = 404;
@@ -687,12 +812,12 @@ async function getAuthorizedSession(sessionReader, { actor, policy, policies, id
     }
     throw error;
   }
-  if (!sessionVisible(session, actor, policy, policies, context)) {
+  if (!sessionVisible(session, actor, policy, policies, context, routeScopes, ownerActors)) {
     const error = new Error('session_not_found');
     error.status = 404;
     throw error;
   }
-  return session;
+  return exposeSession(session, routeScopes);
 }
 
 function createUnconfiguredSessionReader() {
@@ -771,6 +896,23 @@ function parseCsvList(value) {
   return raw.split(',').map(x => x.trim()).filter(Boolean);
 }
 
+function strictAuthList(value, { wildcard = false, optional = false } = {}) {
+  if (value === undefined && optional) return [];
+  if (wildcard && value === '*') return ['*'];
+  const values = Array.isArray(value) ? value : typeof value === 'string' ? value.split(',') : null;
+  if (!values || values.some(item => typeof item !== 'string')) throw new Error('auth_registry_invalid_row');
+  const normalized = values.map(item => item.trim()).filter(Boolean);
+  if (!normalized.length || normalized.some(item => !(wildcard && item === '*') && !AUTH_ID.test(item))
+    || new Set(normalized).size !== normalized.length) throw new Error('auth_registry_invalid_row');
+  return normalized;
+}
+
+function strictAuthArray(value, { optional = false } = {}) {
+  if (value === undefined && optional) return [];
+  if (!Array.isArray(value)) throw new Error('auth_registry_invalid_row');
+  return strictAuthList(value);
+}
+
 function parseActive(value) {
   if (value === true) return true;
   if (value === false || value == null) return false;
@@ -815,15 +957,60 @@ function validateAuthRows(rows, sourceKind) {
     throw err;
   }
 
-  return rows.map((row, index) => {
+  const credentials = new Set();
+  const validated = rows.map((row, index) => {
     if (!row || typeof row !== 'object' || Array.isArray(row)) {
       const err = new Error('auth_registry_invalid_row');
       err.status = 500;
       err.data = { source: sourceKind, index };
       throw err;
     }
+    const tokenSha256 = row.tokenSha256;
+    const token = row.token;
+    const hasDigest = Object.hasOwn(row, 'tokenSha256'); const hasToken = Object.hasOwn(row, 'token');
+    const validDigest = typeof tokenSha256 === 'string' && /^[a-f0-9]{64}$/.test(tokenSha256);
+    const validToken = typeof token === 'string' && token.length > 0 && token.length <= 4096;
+    const activePrimitive = typeof row.active === 'boolean'
+      || (typeof row.active === 'string' && ['true', 'false', '1', '0', 'yes', 'no'].includes(row.active.trim().toLowerCase()));
+    let valid = typeof row.actor === 'string' && AUTH_ID.test(row.actor)
+      && activePrimitive && typeof row.mode === 'string' && AUTH_MODES.has(row.mode)
+      && hasDigest !== hasToken && (hasDigest ? validDigest : validToken);
+    try {
+      strictAuthList(row.allowedScopes, { wildcard: true });
+      strictAuthList(row.permissions, { wildcard: true });
+      strictAuthArray(row.sessionOwnerActors, { optional: true });
+      strictAuthArray(row.contextKeyVersions, { optional: true });
+    } catch { valid = false; }
+    const credential = validDigest ? tokenSha256 : validToken ? crypto.createHash('sha256').update(token, 'utf8').digest('hex') : '';
+    if (!valid || credentials.has(credential)) {
+      const err = new Error('auth_registry_invalid_row'); err.status = 500; err.data = { source: sourceKind, index }; throw err;
+    }
+    credentials.add(credential);
     return row;
   });
+  const byActor = new Map();
+  for (const row of validated) byActor.set(row.actor, [...(byActor.get(row.actor) || []), row]);
+  const contextVersionOwners = new Map();
+  for (let index = 0; index < validated.length; index += 1) {
+    const row = validated[index]; const owners = strictAuthArray(row.sessionOwnerActors, { optional: true });
+    for (const version of strictAuthArray(row.contextKeyVersions, { optional: true })) {
+      const existing = contextVersionOwners.get(version);
+      if (existing && existing !== row.actor) {
+        const err = new Error('auth_registry_invalid_row'); err.status = 500; err.data = { source: sourceKind, index }; throw err;
+      }
+      contextVersionOwners.set(version, row.actor);
+    }
+    for (const owner of owners) {
+      const targets = byActor.get(owner) || [];
+      const targetCanIngest = targets.some(target => parseActive(target.active)
+        && strictAuthList(target.permissions, { wildcard: true }).some(permission => permission === '*' || permission === 'raw:ingest'));
+      const targetDelegates = targets.some(target => strictAuthArray(target.sessionOwnerActors, { optional: true }).length > 0);
+      if (owner === row.actor || !targetCanIngest || targetDelegates) {
+        const err = new Error('auth_registry_invalid_row'); err.status = 500; err.data = { source: sourceKind, index }; throw err;
+      }
+    }
+  }
+  return validated;
 }
 
 function getBearerToken(req, { allowQueryToken = false } = {}) {
@@ -833,6 +1020,17 @@ function getBearerToken(req, { allowQueryToken = false } = {}) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const q = url.searchParams.get('access_token');
   return q ? String(q) : '';
+}
+
+function getAccessContextToken(req, url, policy) {
+  const header = req.headers['x-amf-context-token'];
+  const headerToken = Array.isArray(header) ? '' : String(header || '').trim();
+  const queryToken = String(url.searchParams.get('contextToken') || '').trim();
+  if ((headerToken && queryToken) || (queryToken && Array.isArray(policy?.contextKeyVersions)
+    && policy.contextKeyVersions.length > 0)) {
+    const error = new Error('context_transport_invalid'); error.status = 400; throw error;
+  }
+  return headerToken || queryToken || '';
 }
 
 async function loadAuthRegistry({ forceRefresh = false } = {}) {
@@ -943,14 +1141,21 @@ function authenticateDigest(candidate, rows) {
     err.status = 401;
     throw err;
   }
+  const policy = {
+    mode: String(row.mode || 'deny'),
+    allowedScopes: parseCsvList(row.allowedScopes),
+    permissions: parseCsvList(row.permissions)
+  };
+  if (Object.hasOwn(row, 'sessionOwnerActors')) {
+    policy.sessionOwnerActors = strictAuthArray(row.sessionOwnerActors);
+  }
+  if (Object.hasOwn(row, 'contextKeyVersions')) {
+    policy.contextKeyVersions = strictAuthArray(row.contextKeyVersions);
+  }
   return {
     actor: String(row.actor || 'anonymous'),
     tokenDigestHex: candidate.toString('hex'),
-    policy: {
-      mode: String(row.mode || 'deny'),
-      allowedScopes: parseCsvList(row.allowedScopes),
-      permissions: parseCsvList(row.permissions)
-    }
+    policy
   };
 }
 
@@ -1125,7 +1330,7 @@ const defaultSessionReader = createUnconfiguredSessionReader();
 const defaultCanonicalStore = createUnconfiguredCanonicalStore();
 const defaultContextVerifier = createUnconfiguredContextVerifier();
 
-function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, clock = () => Date.now(), policyPath = POLICY_PATH } = {}) {
+function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH } = {}) {
 if (!Number.isSafeInteger(rawIngestBodyBytes) || rawIngestBodyBytes < 1024 || rawIngestBodyBytes > 16 * 1024 * 1024) throw new Error('raw_ingest_body_limit_invalid');
 sessionReader = sessionReader || fabricStore.createSessionReader?.() || defaultSessionReader;
 const sessions = new Map();
@@ -1192,6 +1397,7 @@ const requestHandler = async (req, res) => {
       authContext = await authenticateRequest(req, { allowQueryToken: Boolean(isLegacySsePath) });
       logEvent('auth_ok', { requestId, method: req.method, path: url.pathname, sourceIp, actor: authContext.actor });
     }
+    validateContextActorBinding(authContext.actor, authContext.policy, policies, contextVerifier);
   } catch (error) {
     logEvent('auth_failed', { requestId, method: req.method, path: url.pathname, sourceIp, error: safeError(error), latencyMs: Date.now() - requestStartedAt });
     try {
@@ -1435,7 +1641,8 @@ const requestHandler = async (req, res) => {
     try {
       const purpose = requirePurpose(url.searchParams.get('purpose'));
       if (!canonicalStore.configured) throw Object.assign(new Error('canonical_store_unconfigured'), { status: 503 });
-      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: url.searchParams.get('contextToken'), request: buildContextRequest('memory_read', { id: pathnameParts[2] }), required: purpose === 'conversation_recall' });
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose,
+        token: getAccessContextToken(req, url, policy), request: buildContextRequest('memory_read', { id: pathnameParts[2] }), required: purpose === 'conversation_recall' });
       const memory = await performMemoryRead({ actor, policy, policies, fabricStore, canonicalStore, context, id: pathnameParts[2], requestId });
       return jsonNoStore(res, 200, v2Envelope(requestId, memory));
     } catch (error) {
@@ -1452,9 +1659,15 @@ const requestHandler = async (req, res) => {
       const query = String(body.query || '');
       const limit = normalizeSessionLimit(body.limit);
       const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: body.contextToken, request: buildContextRequest('sessions_search', body), required: true });
+      const routeScopes = requireSessionRouteScopes(context, actor, policy, policies, contextVerifier,
+        routeManifestPath);
       validateSearchInput(query);
-      const raw = await sessionReader.search({ actor, query, cursor: body.cursor || null, limit, from: body.from || null, to: body.to || null, purpose, context });
-      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy, policies, context)), nextCursor: raw?.nextCursor || null };
+      const ownerActors = authorizedSessionOwners(actor, policy);
+      const raw = await sessionReader.search({ actor, ownerActors, query, cursor: body.cursor || null, limit,
+        from: body.from || null, to: body.to || null, purpose, context });
+      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy,
+        policies, context, routeScopes, ownerActors)).map(item => exposeSession(item, routeScopes)),
+      nextCursor: raw?.nextCursor || null };
       await auditRequired(fabricStore, { actor, action: 'sessions_search', outcome: 'allowed', requestId, details: { resultCount: result.items.length, purpose } });
       return jsonNoStore(res, 200, v2Envelope(requestId, result));
     } catch (error) {
@@ -1472,9 +1685,15 @@ const requestHandler = async (req, res) => {
       let result;
       if (isTranscript) {
         const view = url.searchParams.get('view') === 'original' ? 'original' : 'redacted';
-        const transcriptInput = { sessionId, view, cursor: url.searchParams.get('cursor'), limit: url.searchParams.get('limit'), from: url.searchParams.get('from'), to: url.searchParams.get('to') };
-        const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: url.searchParams.get('contextToken'), request: buildContextRequest('session_transcript', transcriptInput), required: true });
-        await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionId, purpose, context });
+        const transcriptInput = { sessionId, view, query: url.searchParams.get('query') || '',
+          cursor: url.searchParams.get('cursor'), limit: url.searchParams.get('limit'),
+          from: url.searchParams.get('from'), to: url.searchParams.get('to') };
+        validateSearchInput(transcriptInput.query);
+        if (view === 'original' && transcriptInput.query) throw Object.assign(new Error('invalid_request'), { status: 400 });
+        const context = requireAccessContext(contextVerifier, { actor, policy, purpose,
+          token: getAccessContextToken(req, url, policy), request: buildContextRequest('session_transcript', transcriptInput), required: true });
+        await getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+          routeManifestPath, id: sessionId, purpose, context });
         if (view === 'original' && !hasPermission(policy, 'raw:decrypt')) {
           await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'denied', requestId, targetId: sessionId, details: { view, purpose } });
           const error = new Error('raw_decrypt_forbidden');
@@ -1482,12 +1701,16 @@ const requestHandler = async (req, res) => {
           throw error;
         }
         if (view === 'original') await auditRequired(fabricStore, { actor, action: 'raw_decrypt_intent', outcome: 'authorized', requestId, targetId: sessionId, details: { view, purpose, transport: 'rest' } });
-        const transcript = await sessionReader.transcript({ actor, id: sessionId, view, cursor: transcriptInput.cursor, limit: normalizeSessionLimit(transcriptInput.limit || 100), from: transcriptInput.from, to: transcriptInput.to, purpose, context });
+        const transcript = await sessionReader.transcript({ actor, ownerActors: authorizedSessionOwners(actor, policy),
+          id: sessionId, view, cursor: transcriptInput.cursor, limit: normalizeSessionLimit(transcriptInput.limit || 100),
+          query: transcriptInput.query, from: transcriptInput.from, to: transcriptInput.to, purpose, context });
         result = { ...transcript, nextCursor: transcript?.nextCursor || null };
         await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'allowed', requestId, targetId: sessionId, details: { view, purpose } });
       } else if (pathnameParts.length === 3) {
-        const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: url.searchParams.get('contextToken'), request: buildContextRequest('session_get', { sessionId }), required: true });
-        result = await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionId, purpose, context });
+        const context = requireAccessContext(contextVerifier, { actor, policy, purpose,
+          token: getAccessContextToken(req, url, policy), request: buildContextRequest('session_get', { sessionId }), required: true });
+        result = await getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+          routeManifestPath, id: sessionId, purpose, context });
         await auditRequired(fabricStore, { actor, action: 'session_get', outcome: 'allowed', requestId, targetId: sessionId, details: { purpose } });
       } else {
         const error = new Error('not_found');
@@ -1519,9 +1742,15 @@ const requestHandler = async (req, res) => {
       requireSessionPermission(policy);
       const body = await parseBody(req); const purpose = requirePurpose(body.purpose); const query = String(body.query || ''); const limit = normalizeSessionLimit(body.limit);
       const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: body.contextToken, request: buildContextRequest('sessions_search', body), required: true });
+      const routeScopes = requireSessionRouteScopes(context, actor, policy, policies, contextVerifier,
+        routeManifestPath);
       validateSearchInput(query);
-      const raw = await sessionReader.search({ actor, query, cursor: body.cursor || null, limit, from: body.from || null, to: body.to || null, purpose, context });
-      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy, policies, context)), nextCursor: raw?.nextCursor || null };
+      const ownerActors = authorizedSessionOwners(actor, policy);
+      const raw = await sessionReader.search({ actor, ownerActors, query, cursor: body.cursor || null, limit,
+        from: body.from || null, to: body.to || null, purpose, context });
+      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy,
+        policies, context, routeScopes, ownerActors)).map(item => exposeSession(item, routeScopes)),
+      nextCursor: raw?.nextCursor || null };
       await auditRequired(fabricStore, { actor, action: 'sessions_search', outcome: 'allowed', requestId, details: { resultCount: result.items.length, purpose, transport: 'v1' } });
       return jsonV1(res, 200, result);
     } catch (error) { const failure = publicError(error, 500); return jsonV1(res, failure.status, { error: failure.code }); }
@@ -1532,18 +1761,28 @@ const requestHandler = async (req, res) => {
       requireSessionPermission(policy); const id = pathnameParts[2]; const purpose = requirePurpose(url.searchParams.get('purpose')); const transcript = pathnameParts[3] === 'transcript';
       if (transcript) {
         const view = url.searchParams.get('view') === 'original' ? 'original' : 'redacted';
-        const input = { sessionId: id, view, cursor: url.searchParams.get('cursor'), limit: url.searchParams.get('limit'), from: url.searchParams.get('from'), to: url.searchParams.get('to') };
-        const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: url.searchParams.get('contextToken'), request: buildContextRequest('session_transcript', input), required: true });
-        await getAuthorizedSession(sessionReader, { actor, policy, policies, id, purpose, context });
+        const input = { sessionId: id, view, query: url.searchParams.get('query') || '',
+          cursor: url.searchParams.get('cursor'), limit: url.searchParams.get('limit'),
+          from: url.searchParams.get('from'), to: url.searchParams.get('to') };
+        validateSearchInput(input.query);
+        if (view === 'original' && input.query) throw Object.assign(new Error('invalid_request'), { status: 400 });
+        const context = requireAccessContext(contextVerifier, { actor, policy, purpose,
+          token: getAccessContextToken(req, url, policy), request: buildContextRequest('session_transcript', input), required: true });
+        await getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+          routeManifestPath, id, purpose, context });
         if (view === 'original' && !hasPermission(policy, 'raw:decrypt')) throw Object.assign(new Error('raw_decrypt_forbidden'), { status: 403 });
         if (view === 'original') await auditRequired(fabricStore, { actor, action: 'raw_decrypt_intent', outcome: 'authorized', requestId, targetId: id, details: { view, purpose, transport: 'v1' } });
-        const result = await sessionReader.transcript({ actor, id, view, cursor: input.cursor, limit: normalizeSessionLimit(input.limit || 100), from: input.from, to: input.to, purpose, context });
+        const result = await sessionReader.transcript({ actor, ownerActors: authorizedSessionOwners(actor, policy),
+          id, view, cursor: input.cursor, limit: normalizeSessionLimit(input.limit || 100), from: input.from,
+          to: input.to, query: input.query, purpose, context });
         await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'allowed', requestId, targetId: id, details: { view, purpose, transport: 'v1' } });
         return jsonV1(res, 200, result);
       }
       if (pathnameParts.length !== 3) throw Object.assign(new Error('not_found'), { status: 404 });
-      const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: url.searchParams.get('contextToken'), request: buildContextRequest('session_get', { sessionId: id }), required: true });
-      const result = await getAuthorizedSession(sessionReader, { actor, policy, policies, id, purpose, context });
+      const context = requireAccessContext(contextVerifier, { actor, policy, purpose,
+        token: getAccessContextToken(req, url, policy), request: buildContextRequest('session_get', { sessionId: id }), required: true });
+      const result = await getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+        routeManifestPath, id, purpose, context });
       await auditRequired(fabricStore, { actor, action: 'session_get', outcome: 'allowed', requestId, targetId: id, details: { purpose, transport: 'v1' } });
       return jsonV1(res, 200, result);
     } catch (error) { const failure = publicError(error, 500); return jsonV1(res, failure.status, { error: failure.code }); }
@@ -1694,6 +1933,7 @@ const requestHandler = async (req, res) => {
         fabricStore,
         canonicalStore,
         contextVerifier,
+        routeManifestPath,
         sessionReader,
         requestId,
         requestStartedAt,
@@ -1759,6 +1999,7 @@ const requestHandler = async (req, res) => {
         fabricStore,
         canonicalStore,
         contextVerifier,
+        routeManifestPath,
         sessionReader,
         requestId,
         requestStartedAt,
@@ -1882,5 +2123,6 @@ export {
   getAuthRegistrySource,
   loadAuthRegistry,
   parseActive,
-  parseCsvList
+  parseCsvList,
+  validateContextActorBinding
 };

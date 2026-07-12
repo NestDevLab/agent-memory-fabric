@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import pg from 'pg';
+import { exactContextIntersection } from './access-contract.mjs';
 import { ciphertextContentId, ciphertextPayloadDigest, decryptClientCiphertext, normalizeIngestKeyRing, validateClientCiphertext } from './ingest/raw-event-contract.mjs';
 import { normalizeSessionContextBinding, selectLogicalMessage, sessionBindingMatches, sessionContextBinding, validateProjectionV2 } from './ingest/raw-projection-v2.mjs';
 import { strictIsoTimestamp } from './ingest/transcripts/canonical.mjs';
@@ -527,7 +528,8 @@ export class MemoryCatalog {
     return { record: stored, duplicate: false, logical: structuredClone(logical) };
   }
   getRawEvent(id) { return this.rawEventsV2.get(id) || this.rawEvents.get(id) || null; }
-  searchSessions({ ownerTags = [], query = '', limit = 20 }) {
+  searchSessions({ ownerTags = [], query = '', limit = 20, after = null, from = null, to = null,
+    contextTags = null }) {
     const needle = query.toLowerCase();
     const allowed = new Set(ownerTags);
     const participantSessions = new Set(
@@ -535,7 +537,11 @@ export class MemoryCatalog {
         .filter(event => allowed.has(event.ownerTag))
         .map(event => event.sessionId)
     );
-    return [...this.rawSessions.values()].filter(item => participantSessions.has(item.id) && (!needle || `${item.id} ${item.runtime}`.toLowerCase().includes(needle))).sort(compareSessions).slice(0, limit);
+    return [...this.rawSessions.values()].filter(item => participantSessions.has(item.id)
+      && (!needle || `${item.id} ${item.runtime}`.toLowerCase().includes(needle))
+      && sessionIntersectsTimeWindow(item, from, to)
+      && (!contextTags || exactContextIntersection(item.contextTags, contextTags))
+      && afterSessionPageKey(item, after)).sort(compareSessions).slice(0, limit);
   }
   getSession(id) { return this.rawSessions.get(id) || null; }
   hasSessionParticipant(id, ownerTags = []) {
@@ -544,8 +550,15 @@ export class MemoryCatalog {
     return [...this.rawEvents.values(), ...this.rawEventsV2.values()].some(event => event.sessionId === id && allowed.has(event.ownerTag));
   }
   listSessionEvents(id) { return [...this.rawEvents.values(), ...this.rawEventsV2.values()].filter(item => item.sessionId === id).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId)); }
-  listSessionEventsPage({ id, offset = 0, limit = 100, from = null, to = null }) {
-    const rows = this.listSessionEvents(id).filter(event => inTimeWindow(event.projection.occurredAt || event.createdAt, from, to)).slice(offset, offset + limit + 1);
+  listSessionEventsPage({ id, offset = 0, limit = 100, from = null, to = null, newest = false }) {
+    const filtered = this.listSessionEvents(id).filter(event => inTimeWindow(event.projection.occurredAt || event.createdAt, from, to));
+    if (newest) {
+      const rows = filtered.sort((a, b) => Date.parse(b.projection.occurredAt || b.createdAt)
+        - Date.parse(a.projection.occurredAt || a.createdAt) || b.eventId.localeCompare(a.eventId))
+        .slice(offset, offset + limit + 1);
+      return { items: rows.slice(0, limit), hasMore: rows.length > limit };
+    }
+    const rows = filtered.slice(offset, offset + limit + 1);
     return { items: rows.slice(0, limit), hasMore: rows.length > limit };
   }
   rawV2Readiness() {
@@ -650,28 +663,119 @@ function laterTimestamp(current, candidate) {
 }
 
 function compareSessions(a, b) {
-  const aTime = a.lastOccurredAt ? Date.parse(a.lastOccurredAt) : -Infinity;
-  const bTime = b.lastOccurredAt ? Date.parse(b.lastOccurredAt) : -Infinity;
+  const aTime = Date.parse(a.lastOccurredAt || a.createdAt);
+  const bTime = Date.parse(b.lastOccurredAt || b.createdAt);
   return bTime - aTime || String(b.createdAt).localeCompare(String(a.createdAt)) || a.id.localeCompare(b.id);
+}
+
+function sessionPageKey(session) {
+  return { lastOccurredAt: session.lastOccurredAt || null, createdAt: session.createdAt, id: session.id };
+}
+
+function validSessionPageKey(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).sort().join('\0') === 'createdAt\0id\0lastOccurredAt'
+    && (value.lastOccurredAt === null || strictIsoTimestamp(value.lastOccurredAt) === value.lastOccurredAt)
+    && strictIsoTimestamp(value.createdAt) === value.createdAt
+    && typeof value.id === 'string' && value.id.length > 0 && value.id.length <= 256;
+}
+
+function afterSessionPageKey(session, after) {
+  if (!after) return true;
+  return compareSessions(session, { id: after.id, createdAt: after.createdAt,
+    lastOccurredAt: after.lastOccurredAt }) > 0;
 }
 
 function escapedLike(value) { return `%${String(value).replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_')}%`; }
 
 function pageBinding(value) { return crypto.createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex'); }
-function decodePageCursor(cursor, binding) {
-  if (!cursor) return 0;
+
+const SESSION_OWNER_ACTOR = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$/;
+const MAX_REDACTED_TEXT_BYTES = 4 * 1024;
+const MAX_REDACTED_PAGE_BYTES = 64 * 1024;
+const SESSION_SEARCH_MAX_CANDIDATES = 64;
+const SESSION_TEXT_SCAN_MAX_EVENTS = 256;
+const SESSION_TEXT_SCAN_MAX_CIPHERTEXT_BYTES = 16 * 1024 * 1024;
+const SESSION_WINDOW_OFFSET = Symbol('sessionWindowOffset');
+
+function normalizedSessionOwners(actor, ownerActors = null) {
+  const values = ownerActors == null ? [actor] : ownerActors;
+  if (!Array.isArray(values) || values.some(value => typeof value !== 'string' || !SESSION_OWNER_ACTOR.test(value))
+    || !values.includes(actor) || values.includes('*')) throw createError('session_owner_policy_invalid', 500);
+  return [...new Set(values)].sort();
+}
+
+function boundedUtf8(value, maxBytes = MAX_REDACTED_TEXT_BYTES) {
+  const normalized = String(value).normalize('NFC').replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim();
+  if (!normalized || Buffer.byteLength(normalized, 'utf8') <= maxBytes) return normalized;
+  let output = ''; let used = 0;
+  for (const character of normalized) {
+    const size = Buffer.byteLength(character, 'utf8');
+    if (used + size > maxBytes) break;
+    output += character; used += size;
+  }
+  return output;
+}
+
+function safeTextPart(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (Object.keys(value).some(key => !['type', 'text'].includes(key))) return null;
+  const type = String(value.type || '');
+  if (!['text', 'input_text', 'output_text'].includes(type)) return null;
+  return typeof value.text === 'string' ? value.text : null;
+}
+
+function redactedTextFromNormalized(item, projection, maxBytes = MAX_REDACTED_TEXT_BYTES) {
+  if (!['user', 'assistant'].includes(projection.role) || projection.contentType !== 'text') return null;
+  const normalized = item?.event?.normalized;
+  if (!normalized || normalized.role !== projection.role || normalized.contentType !== 'text') return null;
+  let parts;
+  if (typeof normalized.value === 'string') parts = [normalized.value];
+  else if (Array.isArray(normalized.value) && normalized.value.length <= 100) parts = normalized.value.map(safeTextPart);
+  else return null;
+  if (!parts.length || parts.some(part => part === null)) return null;
+  const text = boundedUtf8(parts.join('\n'), Math.min(MAX_REDACTED_TEXT_BYTES, maxBytes));
+  return text || null;
+}
+
+function normalizedTextQuery(value) {
+  return String(value || '').normalize('NFC').replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ').trim().toLocaleLowerCase('und');
+}
+
+function decodePageCursor(cursor, binding, rawStore, defaultState) {
+  if (!cursor) return structuredClone(defaultState);
   let value;
   try { value = JSON.parse(Buffer.from(String(cursor), 'base64url').toString('utf8')); } catch { throw createError('invalid_request', 400); }
-  if (!value || Object.keys(value).sort().join('\0') !== 'binding\0offset' || value.binding !== binding || !Number.isSafeInteger(value.offset) || value.offset < 0 || value.offset > 10000) throw createError('invalid_request', 400);
-  return value.offset;
+  if (!value || Object.keys(value).sort().join('\0') !== 'binding\0mac\0state\0v' || value.v !== 1
+    || value.binding !== binding || typeof value.mac !== 'string') throw createError('invalid_request', 400);
+  const unsigned = canonicalJson({ v: value.v, binding: value.binding, state: value.state });
+  const candidate = Buffer.from(value.mac, 'utf8');
+  const validMac = rawStore.opaqueTags('session-page-cursor', unsigned).some(tag => {
+    const expected = Buffer.from(tag, 'utf8');
+    return expected.length === candidate.length && crypto.timingSafeEqual(expected, candidate);
+  });
+  if (!validMac) throw createError('invalid_request', 400);
+  return structuredClone(value.state);
 }
-function encodePageCursor(offset, binding) { return Buffer.from(JSON.stringify({ binding, offset }), 'utf8').toString('base64url'); }
+function encodePageCursor(state, binding, rawStore) {
+  const unsigned = { v: 1, binding, state };
+  return Buffer.from(canonicalJson({ ...unsigned,
+    mac: rawStore.opaqueTag('session-page-cursor', canonicalJson(unsigned)) }), 'utf8').toString('base64url');
+}
 function inTimeWindow(timestamp, from, to) {
   // The cross-backend window contract is Unix-millisecond precision. Stored
   // projection strings retain their original precision because they are AAD-bound.
   if (!timestamp) return !from && !to;
   const value = Date.parse(timestamp);
   return (!from || value >= Date.parse(from)) && (!to || value <= Date.parse(to));
+}
+
+function sessionIntersectsTimeWindow(session, from, to) {
+  const first = Date.parse(session.firstOccurredAt || session.createdAt);
+  const last = Date.parse(session.lastOccurredAt || session.createdAt);
+  return (!from || last >= Date.parse(from)) && (!to || first <= Date.parse(to));
 }
 
 function validateTimeWindow(from, to) {
@@ -689,6 +793,10 @@ export class SqliteCatalog {
     this.db.function('amf_epoch_ms', { deterministic: true }, value => {
       const parsed = Date.parse(String(value || ''));
       return Number.isFinite(parsed) ? parsed : null;
+    });
+    this.db.function('amf_context_intersects', { deterministic: true }, (stored, presented) => {
+      try { return exactContextIntersection(JSON.parse(stored), JSON.parse(presented)) ? 1 : 0; }
+      catch { return 0; }
     });
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
@@ -922,11 +1030,28 @@ export class SqliteCatalog {
   }
   getRawEvent(id) { return this.mapRawEvent(this.db.prepare('SELECT * FROM raw_events_v2 WHERE event_id=?').get(id) || this.db.prepare('SELECT * FROM raw_events_v1 WHERE event_id=?').get(id)); }
   mapSession(row) { return row ? { id: row.session_id, runtime: row.runtime, ownerTag: row.owner_tag, sourceTag: row.source_tag, conversationKind: row.conversation_kind || null, contextTags: row.session_binding_json ? JSON.parse(row.session_binding_json) : null, firstOccurredAt: row.first_occurred_at, lastOccurredAt: row.last_occurred_at, eventCount: row.event_count, createdAt: row.created_at } : null; }
-  searchSessions({ ownerTags = [], query = '', limit = 20 }) {
+  searchSessions({ ownerTags = [], query = '', limit = 20, after = null, from = null, to = null,
+    contextTags = null }) {
     if (!ownerTags.length) return [];
     const pattern = escapedLike(query);
     const placeholders = ownerTags.map(() => '?').join(',');
-    return this.db.prepare(`SELECT s.* FROM raw_sessions_v1 s WHERE (EXISTS (SELECT 1 FROM raw_events_v1 e WHERE e.session_id=s.session_id AND e.owner_tag IN (${placeholders})) OR EXISTS (SELECT 1 FROM raw_events_v2 e WHERE e.session_id=s.session_id AND e.owner_tag IN (${placeholders}))) AND (lower(s.session_id) LIKE lower(?) ESCAPE '\\' OR lower(s.runtime) LIKE lower(?) ESCAPE '\\') ORDER BY CASE WHEN s.last_occurred_at IS NULL THEN 1 ELSE 0 END,s.last_occurred_at DESC,s.created_at DESC,s.session_id ASC LIMIT ?`).all(...ownerTags, ...ownerTags, pattern, pattern, limit).map(row => this.mapSession(row));
+    if (after !== null && !validSessionPageKey(after)) throw createError('invalid_request', 400);
+    const afterMs = after ? Date.parse(after.lastOccurredAt || after.createdAt) : null;
+    const contextJson = contextTags ? canonicalJson(contextTags) : null;
+    return this.db.prepare(`SELECT s.* FROM raw_sessions_v1 s WHERE
+      (EXISTS (SELECT 1 FROM raw_events_v1 e WHERE e.session_id=s.session_id AND e.owner_tag IN (${placeholders}))
+       OR EXISTS (SELECT 1 FROM raw_events_v2 e WHERE e.session_id=s.session_id AND e.owner_tag IN (${placeholders})))
+      AND (lower(s.session_id) LIKE lower(?) ESCAPE '\\' OR lower(s.runtime) LIKE lower(?) ESCAPE '\\')
+      AND (? IS NULL OR amf_epoch_ms(coalesce(s.last_occurred_at,s.created_at))>=amf_epoch_ms(?))
+      AND (? IS NULL OR amf_epoch_ms(coalesce(s.first_occurred_at,s.created_at))<=amf_epoch_ms(?))
+      AND (? IS NULL OR amf_context_intersects(s.session_binding_json,?)=1)
+      AND (? IS NULL OR amf_epoch_ms(coalesce(s.last_occurred_at,s.created_at))<?
+        OR (amf_epoch_ms(coalesce(s.last_occurred_at,s.created_at))=? AND s.created_at<?)
+        OR (amf_epoch_ms(coalesce(s.last_occurred_at,s.created_at))=? AND s.created_at=? AND s.session_id>?))
+      ORDER BY amf_epoch_ms(coalesce(s.last_occurred_at,s.created_at)) DESC,s.created_at DESC,s.session_id ASC LIMIT ?`)
+      .all(...ownerTags, ...ownerTags, pattern, pattern, from, from, to, to, contextJson, contextJson,
+        afterMs, afterMs, afterMs, after?.createdAt || null, afterMs, after?.createdAt || null, after?.id || null,
+        limit).map(row => this.mapSession(row));
   }
   getSession(id) { return this.mapSession(this.db.prepare('SELECT * FROM raw_sessions_v1 WHERE session_id=?').get(id)); }
   hasSessionParticipant(id, ownerTags = []) {
@@ -935,12 +1060,13 @@ export class SqliteCatalog {
     return Boolean(this.db.prepare(`SELECT 1 AS present FROM raw_events_v1 WHERE session_id=? AND owner_tag IN (${placeholders}) UNION ALL SELECT 1 AS present FROM raw_events_v2 WHERE session_id=? AND owner_tag IN (${placeholders}) LIMIT 1`).get(id, ...ownerTags, id, ...ownerTags));
   }
   listSessionEvents(id) { return [...this.db.prepare('SELECT * FROM raw_events_v1 WHERE session_id=?').all(id), ...this.db.prepare('SELECT * FROM raw_events_v2 WHERE session_id=?').all(id)].map(row => this.mapRawEvent(row)).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId)); }
-  listSessionEventsPage({ id, offset = 0, limit = 100, from = null, to = null }) {
+  listSessionEventsPage({ id, offset = 0, limit = 100, from = null, to = null, newest = false }) {
+    const order = newest ? 'effective_at_ms DESC,event_id DESC' : 'created_at,event_id';
     const rows = this.db.prepare(`SELECT * FROM (
       SELECT event_id,session_id,NULL AS logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,amf_epoch_ms(coalesce(json_extract(projection_json,'$.occurredAt'),created_at)) AS effective_at_ms FROM raw_events_v1 WHERE session_id=?
       UNION ALL
       SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,amf_epoch_ms(coalesce(json_extract(projection_json,'$.occurredAt'),created_at)) AS effective_at_ms FROM raw_events_v2 WHERE session_id=?
-    ) events WHERE (? IS NULL OR effective_at_ms>=amf_epoch_ms(?)) AND (? IS NULL OR effective_at_ms<=amf_epoch_ms(?)) ORDER BY created_at,event_id LIMIT ? OFFSET ?`).all(id, id, from, from, to, to, limit + 1, offset);
+    ) events WHERE (? IS NULL OR effective_at_ms>=amf_epoch_ms(?)) AND (? IS NULL OR effective_at_ms<=amf_epoch_ms(?)) ORDER BY ${order} LIMIT ? OFFSET ?`).all(id, id, from, from, to, to, limit + 1, offset);
     return { items: rows.slice(0, limit).map(row => this.mapRawEvent(row)), hasMore: rows.length > limit };
   }
   rawV2Readiness() {
@@ -1585,7 +1711,33 @@ export class PostgresCatalog {
     const v2 = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE event_id=$1`, [id]);
     return mapPostgresRawEvent(v2.rows[0] || (await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE event_id=$1`, [id])).rows[0]);
   }
-  async searchSessions({ ownerTags = [], query = '', limit = 20 }) { if (!ownerTags.length) return []; await this.ready(); return (await this._query(this.pool, `SELECT s.* FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 s WHERE (EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v1 e WHERE e.session_id=s.session_id AND e.owner_tag=ANY($1::text[])) OR EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v2 e WHERE e.session_id=s.session_id AND e.owner_tag=ANY($1::text[]))) AND (s.session_id ILIKE $2 ESCAPE '\\' OR s.runtime ILIKE $2 ESCAPE '\\') ORDER BY s.last_occurred_at DESC NULLS LAST,s.created_at DESC,s.session_id ASC LIMIT $3`, [ownerTags, escapedLike(query), limit])).rows.map(mapPostgresSession); }
+  async searchSessions({ ownerTags = [], query = '', limit = 20, after = null, from = null, to = null,
+    contextTags = null }) {
+    if (!ownerTags.length) return [];
+    if (after !== null && !validSessionPageKey(after)) throw createError('invalid_request', 400);
+    await this.ready();
+    const result = await this._query(this.pool, `SELECT s.* FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 s WHERE
+      (EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v1 e WHERE e.session_id=s.session_id AND e.owner_tag=ANY($1::text[]))
+       OR EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v2 e WHERE e.session_id=s.session_id AND e.owner_tag=ANY($1::text[])))
+      AND (s.session_id ILIKE $2 ESCAPE '\\' OR s.runtime ILIKE $2 ESCAPE '\\')
+      AND ($3::timestamptz IS NULL OR coalesce(s.last_occurred_at,s.created_at)>=$3::timestamptz)
+      AND ($4::timestamptz IS NULL OR coalesce(s.first_occurred_at,s.created_at)<=$4::timestamptz)
+      AND ($5::jsonb IS NULL OR (s.session_binding_json IS NOT NULL
+        AND EXISTS (SELECT 1 FROM jsonb_each(s.session_binding_json) routing
+          WHERE routing.key IN ('conversation','room','person','relationship','thread'))
+        AND NOT EXISTS (
+          SELECT 1 FROM jsonb_each(s.session_binding_json) binding
+          WHERE binding.key IN ('conversation','room','person','relationship','thread')
+            AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(binding.value) stored_tag
+              WHERE ($5::jsonb -> binding.key) ? stored_tag.value))))
+      AND ($6::timestamptz IS NULL OR coalesce(s.last_occurred_at,s.created_at)<$6::timestamptz
+        OR (coalesce(s.last_occurred_at,s.created_at)=$6::timestamptz AND s.created_at<$7::timestamptz)
+        OR (coalesce(s.last_occurred_at,s.created_at)=$6::timestamptz AND s.created_at=$7::timestamptz AND s.session_id>$8))
+      ORDER BY coalesce(s.last_occurred_at,s.created_at) DESC,s.created_at DESC,s.session_id ASC LIMIT $9`,
+    [ownerTags, escapedLike(query), from, to, contextTags ? canonicalJson(contextTags) : null,
+      after ? (after.lastOccurredAt || after.createdAt) : null, after?.createdAt || null, after?.id || null, limit]);
+    return result.rows.map(mapPostgresSession);
+  }
   async getSession(id) { await this.ready(); return mapPostgresSession((await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 WHERE session_id=$1`, [id])).rows[0]); }
   async hasSessionParticipant(id, ownerTags = []) {
     if (!ownerTags.length) return false;
@@ -1603,13 +1755,14 @@ export class PostgresCatalog {
     const current = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE session_id=$1 ORDER BY created_at,event_id`, [id]);
     return [...(legacy.rows || []), ...(current.rows || [])].map(mapPostgresRawEvent).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId));
   }
-  async listSessionEventsPage({ id, offset = 0, limit = 100, from = null, to = null }) {
+  async listSessionEventsPage({ id, offset = 0, limit = 100, from = null, to = null, newest = false }) {
     await this.ready();
+    const order = newest ? 'effective_at_ms DESC,event_id DESC' : 'created_at,event_id';
     const result = await this._query(this.pool, `SELECT * FROM (
       SELECT event_id,session_id,NULL::text AS logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,floor(extract(epoch FROM coalesce(nullif(projection_json->>'occurredAt','')::timestamptz,created_at))*1000)::bigint AS effective_at_ms FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE session_id=$1
       UNION ALL
       SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,floor(extract(epoch FROM coalesce(nullif(projection_json->>'occurredAt','')::timestamptz,created_at))*1000)::bigint AS effective_at_ms FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE session_id=$1
-    ) events WHERE ($2::timestamptz IS NULL OR effective_at_ms>=floor(extract(epoch FROM $2::timestamptz)*1000)::bigint) AND ($3::timestamptz IS NULL OR effective_at_ms<=floor(extract(epoch FROM $3::timestamptz)*1000)::bigint) ORDER BY created_at,event_id LIMIT $4 OFFSET $5`, [id, from, to, limit + 1, offset]);
+    ) events WHERE ($2::timestamptz IS NULL OR effective_at_ms>=floor(extract(epoch FROM $2::timestamptz)*1000)::bigint) AND ($3::timestamptz IS NULL OR effective_at_ms<=floor(extract(epoch FROM $3::timestamptz)*1000)::bigint) ORDER BY ${order} LIMIT $4 OFFSET $5`, [id, from, to, limit + 1, offset]);
     return { items: result.rows.slice(0, limit).map(mapPostgresRawEvent), hasMore: result.rows.length > limit };
   }
   async rawV2Readiness() {
@@ -2174,45 +2327,196 @@ export class FabricStore {
     return { status: stored.duplicate ? 'duplicate' : 'stored', duplicate: stored.duplicate, eventId: projection.eventId, sessionId: projection.sessionId, contentId: stored.record.contentId, ...(projectionV2 ? { logicalMessageId: stored.record.logicalMessageId, preferredObservationId: stored.logical?.preferredObservationId, payloadConflict: stored.logical?.payloadConflict, tombstoned: stored.logical?.tombstoned } : {}) };
   }
 
-  createSessionReader() {
+  createSessionReader({ textScanMaxCiphertextBytes = SESSION_TEXT_SCAN_MAX_CIPHERTEXT_BYTES } = {}) {
     if (!this.ingestKeys || !this.catalog.searchSessions) return null;
+    if (!Number.isSafeInteger(textScanMaxCiphertextBytes) || textScanMaxCiphertextBytes < 1024
+      || textScanMaxCiphertextBytes > SESSION_TEXT_SCAN_MAX_CIPHERTEXT_BYTES) {
+      throw createError('invalid_request', 400);
+    }
     const store = this;
-    const publicSession = session => ({
-      id: session.id, runtime: session.runtime, firstOccurredAt: session.firstOccurredAt,
-      lastOccurredAt: session.lastOccurredAt, eventCount: session.eventCount, createdAt: session.createdAt,
-      title: `${session.runtime} session`, scope: '', ownerSelf: true,
-      conversationKind: session.conversationKind || null, contextTags: session.contextTags ? structuredClone(session.contextTags) : null
-    });
-    const participantSession = async (actor, id) => {
+    const publicSession = (session, actor, owners) => {
+      const ownerActor = owners.find(owner => store.rawStore.opaqueTags('raw-owner', owner).includes(session.ownerTag)) || null;
+      const visible = { id: session.id, runtime: session.runtime, firstOccurredAt: session.firstOccurredAt,
+        lastOccurredAt: session.lastOccurredAt, eventCount: session.eventCount, createdAt: session.createdAt,
+        title: `${session.runtime} session`, scope: '', ownerSelf: ownerActor === actor,
+        conversationKind: session.conversationKind || null,
+        contextTags: session.contextTags ? structuredClone(session.contextTags) : null };
+      Object.defineProperty(visible, 'ownerActor', { value: ownerActor, enumerable: false });
+      return visible;
+    };
+    const participantSession = async (actor, ownerActors, id) => {
       const session = await store._catalogOperation(() => store.catalog.getSession(id));
-      const participant = session && await store._catalogOperation(() => store.catalog.hasSessionParticipant(id, store.rawStore.opaqueTags('raw-owner', actor)));
+      const owners = normalizedSessionOwners(actor, ownerActors);
+      const ownerTags = owners.flatMap(owner => store.rawStore.opaqueTags('raw-owner', owner));
+      const participant = session && await store._catalogOperation(() => store.catalog.hasSessionParticipant(id, ownerTags));
       if (!session || !participant) throw createError('session_not_found', 404);
       return session;
+    };
+    const canonicalEvents = async (events, baseOffset = 0) => {
+      const selected = []; const seen = new Set(); const logicalCache = new Map();
+      for (const [index, event] of events.entries()) {
+        const select = () => {
+          Object.defineProperty(event, SESSION_WINDOW_OFFSET, { value: baseOffset + index,
+            enumerable: false, configurable: true });
+          selected.push(event);
+        };
+        if (event.projection.schema !== 'amf.raw-event-projection/v2') {
+          if (!seen.has(event.eventId)) { seen.add(event.eventId); select(); }
+          continue;
+        }
+        const logicalMessageId = String(event.logicalMessageId || event.projection.logicalMessageId || '');
+        if (!logicalMessageId) continue;
+        let logical = logicalCache.get(logicalMessageId);
+        if (logical === undefined) {
+          logical = await store._catalogOperation(() => store.catalog.findLogicalMessage([logicalMessageId]));
+          logicalCache.set(logicalMessageId, logical || null);
+        }
+        if (!logical || logical.payloadConflict || logical.tombstoned
+          || logical.preferredObservationId !== event.eventId || seen.has(logical.logicalMessageId)) continue;
+        seen.add(logical.logicalMessageId); select();
+      }
+      return selected;
+    };
+    const decryptRedacted = async ({ events, query = '', budget = { ciphertextBytes: 0 }, maxOutputBytes = MAX_REDACTED_PAGE_BYTES }) => {
+      const items = []; let remainingBytes = maxOutputBytes;
+      const candidates = events.filter(event => event.projection.schema === 'amf.raw-event-projection/v2'
+        && ['user', 'assistant'].includes(event.projection.role) && event.projection.contentType === 'text');
+      for (const event of candidates) {
+        if (remainingBytes <= 0) break;
+        const envelope = await store.rawStore.getClientCiphertext(event.contentId);
+        const ciphertextBytes = Buffer.byteLength(String(envelope.ciphertext || ''), 'base64');
+        if (ciphertextBytes > textScanMaxCiphertextBytes) throw createError('session_text_scan_bound_exceeded', 503);
+        budget.ciphertextBytes += ciphertextBytes;
+        if (budget.ciphertextBytes > textScanMaxCiphertextBytes) {
+          if (budget.allowContinuation) {
+            budget.exhausted = true;
+            budget.resumeOffset = event[SESSION_WINDOW_OFFSET];
+            break;
+          }
+          throw createError('session_text_scan_bound_exceeded', 503);
+        }
+        if (!store.rawStore.opaqueTags('raw-owner', envelope.actorId).includes(event.ownerTag)
+          || !store.rawStore.opaqueTags('raw-source', envelope.sourceInstanceId).includes(event.sourceTag)) {
+          throw createError('catalog_binding_mismatch', 500);
+        }
+        const decrypted = decryptClientCiphertext({ actorId: envelope.actorId,
+          sourceInstanceId: envelope.sourceInstanceId, projection: event.projection, envelope }, store.ingestKeys);
+        const text = redactedTextFromNormalized(decrypted, event.projection, remainingBytes);
+        if (!text || (query && !normalizedTextQuery(text).includes(query))) continue;
+        remainingBytes -= Buffer.byteLength(text, 'utf8');
+        items.push({ eventId: event.eventId, occurredAt: event.projection.occurredAt,
+          role: event.projection.role, content: { redacted: true, contentType: 'text',
+            parts: event.projection.contentParts, text } });
+      }
+      return items;
     };
     return {
       configured: true,
       kind: 'fabric-ciphertext-catalog',
-      async search({ actor, query, cursor = null, limit, from = null, to = null }) {
+      async search({ actor, ownerActors = null, query, cursor = null, limit, from = null, to = null,
+        context = null }) {
         validateTimeWindow(from, to);
-        const binding = pageBinding({ actor, query, from, to, operation: 'sessions_search' });
-        const offset = decodePageCursor(cursor, binding);
-        const sessions = await store._catalogOperation(() => store.catalog.searchSessions({ ownerTags: store.rawStore.opaqueTags('raw-owner', actor), query, limit: Math.min(offset + limit + 1, 10001) }));
-        const filtered = sessions.filter(session => inTimeWindow(session.lastOccurredAt || session.createdAt, from, to));
-        const page = filtered.slice(offset, offset + limit);
-        return { items: page.map(publicSession), total: page.length, nextCursor: offset + page.length < filtered.length ? encodePageCursor(offset + page.length, binding) : null };
+        const owners = normalizedSessionOwners(actor, ownerActors);
+        const textQuery = normalizedTextQuery(query);
+        if (textQuery.length > 4096 || (textQuery && !context?.contextTags)) throw createError('invalid_request', 400);
+        const binding = pageBinding({ actor, ownerActors: owners, query: textQuery,
+          contextTags: context?.contextTags || null, from, to, operation: 'sessions_search' });
+        const cursorState = decodePageCursor(cursor, binding, store.rawStore,
+          textQuery ? { after: null, resume: null } : { after: null });
+        const validResume = cursorState?.resume === null || (cursorState?.resume
+          && Object.keys(cursorState.resume).sort().join('\0') === 'eventOffset\0sessionId'
+          && typeof cursorState.resume.sessionId === 'string'
+          && Number.isSafeInteger(cursorState.resume.eventOffset) && cursorState.resume.eventOffset >= 0
+          && cursorState.resume.eventOffset < SESSION_TEXT_SCAN_MAX_EVENTS);
+        if (!cursorState || Object.keys(cursorState).sort().join('\0') !== (textQuery ? 'after\0resume' : 'after')
+          || (cursorState.after !== null && !validSessionPageKey(cursorState.after))
+          || (textQuery && !validResume)) throw createError('invalid_request', 400);
+        const ownerTags = owners.flatMap(owner => store.rawStore.opaqueTags('raw-owner', owner));
+        const sessions = await store._catalogOperation(() => store.catalog.searchSessions({ ownerTags, query: '',
+          limit: textQuery ? SESSION_SEARCH_MAX_CANDIDATES + 1 : limit + 1, after: cursorState.after,
+          from, to, contextTags: context?.contextTags || null }));
+        const filtered = sessions.filter(session => sessionIntersectsTimeWindow(session, from, to)
+          && (!context?.contextTags || exactContextIntersection(session.contextTags, context.contextTags)));
+        if (!textQuery) {
+          const page = filtered.slice(0, limit); const hasMore = filtered.length > page.length;
+          return { items: page.map(session => publicSession(session, actor, owners)), total: page.length,
+            nextCursor: hasMore && page.length ? encodePageCursor({ after: sessionPageKey(page.at(-1)) }, binding,
+              store.rawStore) : null };
+        }
+        await store._catalogOperation(() => store.catalog.appendAudit({ id: store.idFactory(), ts: store.clock().toISOString(),
+          actorTag: store.rawStore.opaqueTag('audit-actor', actor), action: 'raw_session_search_decrypt_intent',
+          outcome: 'authorized', requestId: null, targetId: null, scopeTag: null,
+          details: { resultCount: Math.min(filtered.length, SESSION_SEARCH_MAX_CANDIDATES), view: 'redacted' } }));
+        if (cursorState.resume && filtered[0]?.id !== cursorState.resume.sessionId) {
+          throw createError('invalid_request', 400);
+        }
+        const matched = []; const budget = { ciphertextBytes: 0, allowContinuation: true, exhausted: false };
+        let processed = 0; let completedAfter = cursorState.after; let continuation = null;
+        for (const session of filtered.slice(0, SESSION_SEARCH_MAX_CANDIDATES)) {
+          const eventOffset = cursorState.resume && processed === 0 ? cursorState.resume.eventOffset : 0;
+          const eventPage = await store._catalogOperation(() => store.catalog.listSessionEventsPage({ id: session.id,
+            offset: eventOffset, limit: SESSION_TEXT_SCAN_MAX_EVENTS - eventOffset, from, to, newest: true }));
+          const events = await canonicalEvents(eventPage.items, eventOffset);
+          const found = (await decryptRedacted({ events, query: textQuery, budget,
+            maxOutputBytes: MAX_REDACTED_PAGE_BYTES })).length > 0;
+          if (found) matched.push(session);
+          if (budget.exhausted && !found) {
+            if (!Number.isSafeInteger(budget.resumeOffset)) throw createError('invalid_request', 500);
+            continuation = { sessionId: session.id, eventOffset: budget.resumeOffset };
+            break;
+          }
+          completedAfter = sessionPageKey(session);
+          processed += 1;
+          if (matched.length >= limit || budget.exhausted) break;
+        }
+        const hasMore = Boolean(continuation) || processed < filtered.length;
+        return { items: matched.map(session => publicSession(session, actor, owners)), total: matched.length,
+          nextCursor: hasMore ? encodePageCursor({ after: completedAfter, resume: continuation },
+            binding, store.rawStore) : null };
       },
-      async get({ actor, id }) {
-        return publicSession(await participantSession(actor, id));
+      async get({ actor, ownerActors = null, id }) {
+        const owners = normalizedSessionOwners(actor, ownerActors);
+        return publicSession(await participantSession(actor, owners, id), actor, owners);
       },
-      async transcript({ actor, id, view, cursor = null, limit = 100, from = null, to = null }) {
+      async transcript({ actor, ownerActors = null, id, view, query = '', cursor = null, limit = 100,
+        from = null, to = null, context = null }) {
         validateTimeWindow(from, to);
-        await participantSession(actor, id);
-        const binding = pageBinding({ actor, id, view, from, to, operation: 'session_transcript' });
-        const offset = decodePageCursor(cursor, binding);
-        const page = await store._catalogOperation(() => store.catalog.listSessionEventsPage({ id, offset, limit, from, to }));
-        const events = page.items;
-        const nextCursor = page.hasMore ? encodePageCursor(offset + events.length, binding) : null;
-        if (view !== 'original') return { id, view: 'redacted', items: events.map(event => ({ eventId: event.eventId, occurredAt: event.projection.occurredAt, role: event.projection.role, content: { redacted: true, contentType: event.projection.contentType, parts: event.projection.contentParts } })), nextCursor };
+        const owners = normalizedSessionOwners(actor, ownerActors);
+        const session = await participantSession(actor, owners, id);
+        const textQuery = normalizedTextQuery(query);
+        if (textQuery.length > 4096 || (textQuery && (view === 'original' || !context?.contextTags
+          || !exactContextIntersection(session.contextTags, context.contextTags)))) throw createError('invalid_request', 400);
+        const binding = pageBinding({ actor, ownerActors: owners, id, view, query: textQuery,
+          contextTags: context?.contextTags || null, from, to, operation: 'session_transcript' });
+        const cursorState = decodePageCursor(cursor, binding, store.rawStore, { offset: 0 });
+        if (!cursorState || Object.keys(cursorState).join('\0') !== 'offset'
+          || !Number.isSafeInteger(cursorState.offset) || cursorState.offset < 0 || cursorState.offset > 10000) {
+          throw createError('invalid_request', 400);
+        }
+        const offset = cursorState.offset;
+        const page = await store._catalogOperation(() => store.catalog.listSessionEventsPage({ id,
+          offset: textQuery ? 0 : offset, limit: textQuery ? SESSION_TEXT_SCAN_MAX_EVENTS : limit, from, to,
+          newest: Boolean(textQuery) }));
+        const events = view === 'original' ? page.items : await canonicalEvents(page.items);
+        let nextCursor = !textQuery && page.hasMore ? encodePageCursor({ offset: offset + page.items.length },
+          binding, store.rawStore) : null;
+        if (view !== 'original') {
+          const candidates = events.filter(event => event.projection.schema === 'amf.raw-event-projection/v2'
+            && ['user', 'assistant'].includes(event.projection.role)
+            && event.projection.contentType === 'text');
+          if (candidates.length) await store._catalogOperation(() => store.catalog.appendAudit({ id: store.idFactory(),
+            ts: store.clock().toISOString(), actorTag: store.rawStore.opaqueTag('audit-actor', actor),
+            action: 'raw_redacted_decrypt_intent', outcome: 'authorized', requestId: null, targetId: id,
+            scopeTag: null, details: { view: 'redacted', resultCount: candidates.length } }));
+          let items = await decryptRedacted({ events, query: textQuery });
+          if (textQuery) {
+            const paged = items.slice(offset, offset + limit);
+            nextCursor = offset + paged.length < items.length ? encodePageCursor({ offset: offset + paged.length },
+              binding, store.rawStore) : null;
+            items = paged;
+          }
+          return { id, view: 'redacted', items, nextCursor };
+        }
         await store._catalogOperation(() => store.catalog.appendAudit({ id: store.idFactory(), ts: store.clock().toISOString(), actorTag: store.rawStore.opaqueTag('audit-actor', actor), action: 'raw_decrypt_intent', outcome: 'authorized', requestId: null, targetId: id, scopeTag: null, details: { view: 'original' } }));
         const items = [];
         for (const event of events) {
