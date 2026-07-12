@@ -7,6 +7,7 @@ import { canonicalJson, sha256Id } from './canonical.mjs';
 const VERSION = 1;
 const SAFE_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const HKDF_SALT = Buffer.from('agent-memory-fabric/cursor/v1', 'utf8');
+const SAFE_NAMESPACE = /^[a-z][a-z0-9._-]{0,31}$/;
 
 function parseKey(value) {
   const raw = String(value || '');
@@ -64,8 +65,10 @@ function writeAtomic(target, value) {
   }
 }
 
-export function sourceCursorKey(runtime, logicalSource) {
-  return sha256Id('amf-transcript-cursor-v1', runtime, logicalSource);
+export function sourceCursorKey(runtime, logicalSource, namespace = 'default') {
+  if (!SAFE_NAMESPACE.test(String(namespace))) throw new Error('cursor_namespace_invalid');
+  if (namespace === 'default') return sha256Id('amf-transcript-cursor-v1', runtime, logicalSource);
+  return sha256Id('amf-transcript-cursor-v2', namespace, runtime, logicalSource);
 }
 
 export class CursorStore {

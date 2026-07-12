@@ -10,6 +10,7 @@ import { validateAmfMemoryRecord } from './amf-memory-record-validator.mjs';
 import { createCanonicalPamBridgeFromEnv, createReceiptCoordinatorFromEnv, createUnconfiguredCanonicalStore } from './canonical-memory-bridge.mjs';
 import { createContextVerifierFromEnv, createUnconfiguredContextVerifier } from './context-token.mjs';
 import { PURPOSES, buildContextRequest, exactContextIntersection, normalizeScopeList, scopeRequiresContext } from './access-contract.mjs';
+import { RAW_EVENT_HTTP_MAX_BODY_BYTES } from './ingest/raw-event-contract.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
@@ -24,10 +25,11 @@ function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } =
 const POLICY_PATH = process.env.AMF_POLICY_PATH || process.env.MEM0_GATEWAY_POLICY_PATH || '';
 const PORT = envInteger('PORT', 8787, { min: 1, max: 65535 });
 const SERVICE_NAME = 'agent-memory-fabric';
-const SERVICE_VERSION = '0.5.2';
+const SERVICE_VERSION = '0.5.3';
 const LEGACY_SERVICE_ALIASES = ['mem0-gateway'];
 const LIMITS = Object.freeze({
   bodyBytes: envInteger('AMF_MAX_BODY_BYTES', 262144, { min: 1024, max: 16 * 1024 * 1024 }),
+  rawIngestBodyBytes: envInteger('AMF_MAX_RAW_INGEST_BODY_BYTES', RAW_EVENT_HTTP_MAX_BODY_BYTES, { min: RAW_EVENT_HTTP_MAX_BODY_BYTES, max: 16 * 1024 * 1024 }),
   queryChars: envInteger('AMF_MAX_QUERY_CHARS', 4096, { min: 1, max: 65536 }),
   proposalChars: envInteger('AMF_MAX_PROPOSAL_CHARS', 32768, { min: 1, max: 1048576 }),
   metadataBytes: envInteger('AMF_MAX_METADATA_BYTES', 16384, { min: 2, max: 1048576 }),
@@ -1123,7 +1125,8 @@ const defaultSessionReader = createUnconfiguredSessionReader();
 const defaultCanonicalStore = createUnconfiguredCanonicalStore();
 const defaultContextVerifier = createUnconfiguredContextVerifier();
 
-function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, clock = () => Date.now(), policyPath = POLICY_PATH } = {}) {
+function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, clock = () => Date.now(), policyPath = POLICY_PATH } = {}) {
+if (!Number.isSafeInteger(rawIngestBodyBytes) || rawIngestBodyBytes < 1024 || rawIngestBodyBytes > 16 * 1024 * 1024) throw new Error('raw_ingest_body_limit_invalid');
 sessionReader = sessionReader || fabricStore.createSessionReader?.() || defaultSessionReader;
 const sessions = new Map();
 const sessionPolicy = { ...MCP_SESSION_DEFAULTS, ...sessionOptions };
@@ -1405,7 +1408,7 @@ const requestHandler = async (req, res) => {
   if (url.pathname === '/v2/ingest/raw-events' && req.method === 'POST') {
     try {
       requirePermission(policy, 'raw:ingest');
-      const body = await parseBody(req, { timeoutMs: bodyReadTimeoutMs });
+      const body = await parseBody(req, { maxBytes: rawIngestBodyBytes, timeoutMs: bodyReadTimeoutMs });
       if (!body || Object.keys(body).sort().join('\0') !== 'envelope\0projection\0sourceInstanceId') throw Object.assign(new Error('invalid_request'), { status: 400 });
       const result = await fabricStore.ingestRawEvent({ actor, sourceInstanceId: body.sourceInstanceId, projection: body.projection, envelope: body.envelope }, { requestId });
       return jsonNoStore(res, result.duplicate ? 200 : 201, v2Envelope(requestId, { ...result, idempotencyKey: result.eventId }));

@@ -7,10 +7,11 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { FabricStore, FileRawStore, MemoryCatalog, MemoryRawStore, SqliteCatalog } from '../src/fabric-store.mjs';
-import { ciphertextContentId } from '../src/ingest/raw-event-contract.mjs';
+import { RAW_EVENT_HTTP_MAX_BODY_BYTES, ciphertextContentId } from '../src/ingest/raw-event-contract.mjs';
 import { HttpRawEventSink } from '../src/ingest/http-raw-event-sink.mjs';
 import { EncryptedOutbox } from '../src/ingest/outbox.mjs';
 import { parseClaudeRecord } from '../src/ingest/transcripts/claude.mjs';
+import { MAX_TRANSCRIPT_JSONL_LINE_BYTES } from '../src/ingest/transcripts/jsonl-tail.mjs';
 import { createAgentMemoryFabricServer } from '../src/server.mjs';
 
 const KEY = crypto.createHash('sha256').update('synthetic-ingest-key').digest('hex');
@@ -26,7 +27,7 @@ function syntheticItem(secret = 'SYNTHETIC_RAW_PRIVATE_TEXT') {
   return parseClaudeRecord({ value, rawBytes: Buffer.from(JSON.stringify(value)), lineEnding: 'lf' });
 }
 
-async function withRawServer(run, { bodyReadTimeoutMs } = {}) {
+async function withRawServer(run, { bodyReadTimeoutMs, rawIngestBodyBytes } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-raw-server-'));
   const registryPath = path.join(root, 'auth.json');
   fs.writeFileSync(registryPath, JSON.stringify({ rows: [
@@ -41,7 +42,7 @@ async function withRawServer(run, { bodyReadTimeoutMs } = {}) {
   const rawStore = new MemoryRawStore({ encryptionKey: crypto.randomBytes(32).toString('base64') });
   const catalog = new MemoryCatalog();
   const store = new FabricStore({ rawStore, catalog, ingestKeyRing: KEY_RING });
-  const server = createAgentMemoryFabricServer({ fabricStore: store, policyPath: '', bodyReadTimeoutMs });
+  const server = createAgentMemoryFabricServer({ fabricStore: store, policyPath: '', bodyReadTimeoutMs, rawIngestBodyBytes });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const api = async (pathname, { token = 'ingest-token', ...options } = {}) => {
@@ -80,6 +81,40 @@ test('HTTP ciphertext sink stores idempotently without sending RAW plaintext', a
     const rotationDuplicate = await api('/v2/ingest/raw-events', { method: 'POST', body: JSON.stringify({ ...body, envelope: rotated.encrypt(item) }) });
     assert.equal(rotationDuplicate.body.data.status, 'duplicate', 'stable digest survives encryption-key rotation');
   });
+});
+
+test('RAW ingest accepts a maximum native JSONL record under the shared 8 MiB HTTP contract', async () => {
+  await withRawServer(async ({ root, baseUrl, catalog }) => {
+    const template = { type: 'user', uuid: 'max-line-event', sessionId: 'max-line-session', message: { role: 'user', content: '' } };
+    const fixedBytes = Buffer.byteLength(JSON.stringify(template));
+    template.message.content = 'x'.repeat(MAX_TRANSCRIPT_JSONL_LINE_BYTES - 1 - fixedBytes);
+    const raw = Buffer.from(JSON.stringify(template));
+    assert.equal(raw.length + 1, MAX_TRANSCRIPT_JSONL_LINE_BYTES, 'line plus LF reaches the client boundary exactly');
+    const item = parseClaudeRecord({ value: template, rawBytes: raw, lineEnding: 'lf' });
+    const outbox = new EncryptedOutbox({ rootPath: path.join(root, 'max-line-outbox'), ...RAW_OUTBOX });
+    const envelope = outbox.encrypt(item);
+    const serialized = JSON.stringify({ sourceInstanceId: 'synthetic-host', projection: item.projection, envelope });
+    assert.ok(Buffer.byteLength(serialized) < RAW_EVENT_HTTP_MAX_BODY_BYTES);
+    outbox.enqueue(item);
+    const sink = new HttpRawEventSink({ endpoint: `${baseUrl}/v2/ingest/raw-events`, token: 'ingest-token', sourceInstanceId: 'synthetic-host', actorId: 'raw-owner', allowInsecureTest: true });
+    assert.equal((await outbox.deliver(item.event.eventId, sink)).state, 'acknowledged');
+    assert.equal(catalog.rawEvents.size, 1);
+  });
+});
+
+test('RAW ingest body boundary is inclusive and rejects the first excess byte before JSON handling', async () => {
+  const limit = 16 * 1024;
+  await withRawServer(async ({ root, api }) => {
+    const outbox = new EncryptedOutbox({ rootPath: path.join(root, 'boundary-outbox'), ...RAW_OUTBOX });
+    const item = syntheticItem('SYNTHETIC_BOUNDARY_PRIVATE');
+    const base = JSON.stringify({ sourceInstanceId: 'synthetic-host', projection: item.projection, envelope: outbox.encrypt(item) });
+    assert.ok(Buffer.byteLength(base) < limit);
+    const exact = `${base}${' '.repeat(limit - Buffer.byteLength(base))}`;
+    assert.equal((await api('/v2/ingest/raw-events', { method: 'POST', body: exact })).response.status, 201);
+    const excess = await api('/v2/ingest/raw-events', { method: 'POST', body: `${exact} ` });
+    assert.equal(excess.response.status, 413);
+    assert.equal(excess.body.error.code, 'body_too_large');
+  }, { rawIngestBodyBytes: limit });
 });
 
 test('raw ingest rejects permission, projection/AAD drift, unavailable keys and event conflicts', async () => {
@@ -191,6 +226,26 @@ test('HTTP sink bounds and times out the complete streaming response body', asyn
     await assert.rejects(stalled.deliverCiphertext(payload, { idempotencyKey: item.projection.eventId }), error => error.message === 'raw_event_http_delivery_failed' && error.cause?.message === 'raw_event_http_timeout');
     assert.ok(Date.now() - started < 1000);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('HTTP sink refuses an oversized ciphertext request before transport and leaves no plaintext artifact', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-http-request-'));
+  const outbox = new EncryptedOutbox({ rootPath: root, ...RAW_OUTBOX });
+  const item = syntheticItem('SYNTHETIC_REQUEST_LIMIT_PRIVATE');
+  const envelope = outbox.encrypt(item);
+  const requestBytes = Buffer.byteLength(JSON.stringify({ sourceInstanceId: 'synthetic-host', projection: item.projection, envelope }));
+  let called = false;
+  try {
+    const sink = new HttpRawEventSink({
+      endpoint: 'https://fabric.example.test/v2/ingest/raw-events', token: 'token', sourceInstanceId: 'synthetic-host', actorId: 'raw-owner',
+      maxRequestBytes: requestBytes - 1, fetchImpl: async () => { called = true; throw new Error('must_not_run'); }
+    });
+    await assert.rejects(sink.deliverCiphertext({ projection: item.projection, envelope }, { idempotencyKey: item.projection.eventId }), error => error.message === 'raw_event_http_delivery_failed' && error.cause?.message === 'raw_event_http_request_too_large');
+    assert.equal(called, false);
+  } finally {
+    assert.equal(JSON.stringify(fs.readdirSync(root)).includes('SYNTHETIC_REQUEST_LIMIT_PRIVATE'), false);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('ingest event and durable audit roll back together on an audit constraint failure', async () => {

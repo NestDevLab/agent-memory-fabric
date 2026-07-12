@@ -4,7 +4,7 @@ import path from 'node:path';
 import { parseClaudeRecord, claudeSessionHint } from './claude.mjs';
 import { parseCodexRecord, codexSessionHint } from './codex.mjs';
 import { sourceCursorKey } from './cursor-store.mjs';
-import { readCompleteJsonl } from './jsonl-tail.mjs';
+import { MAX_TRANSCRIPT_JSONL_LINE_BYTES, readCompleteJsonl, readFirstCompleteJsonl, tailBootstrapOffset } from './jsonl-tail.mjs';
 
 const ADAPTERS = {
   codex: { parse: parseCodexRecord, sessionHint: codexSessionHint },
@@ -41,15 +41,15 @@ function prefixCheckpoint(outbox, filePath, length) {
   return bytes ? outbox.checkpoint(bytes) : null;
 }
 
-function consumedCheckpoint(outbox, filePath, length) {
+function consumedCheckpoint(outbox, filePath, startOffset, endOffset) {
   let chain = outbox.chainSeed();
-  if (length === 0) return chain;
+  if (startOffset === endOffset) return chain;
   const fd = fs.openSync(filePath, 'r');
-  let position = 0;
+  let position = startOffset;
   let carry = Buffer.alloc(0);
   try {
-    while (position < length) {
-      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, length - position));
+    while (position < endOffset) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, endOffset - position));
       const bytesRead = fs.readSync(fd, chunk, 0, chunk.length, position);
       if (bytesRead === 0) throw new Error('transcript_checkpoint_short_read');
       position += bytesRead;
@@ -67,6 +67,15 @@ function consumedCheckpoint(outbox, filePath, length) {
   return chain;
 }
 
+function initialSessionHint(adapter, runtime, filePath, supplied) {
+  if (supplied) return supplied;
+  if (runtime !== 'codex') return null;
+  const first = readFirstCompleteJsonl(filePath);
+  const discovered = first?.value ? adapter.sessionHint(first.value) : null;
+  if (!discovered) throw new Error('codex_session_id_missing');
+  return discovered;
+}
+
 function tailWindow(outbox, filePath, offset) {
   if (offset === 0) return { tailWindowStart: 0, tailWindowCheckpoint: null };
   const tailWindowStart = Math.max(0, offset - 64 * 1024);
@@ -79,21 +88,26 @@ export class TranscriptIngestor {
     this.outbox = outbox;
     this.cursorStore = cursorStore;
     this.sink = sink;
-    this.maxBytes = maxBytes;
+    if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_TRANSCRIPT_JSONL_LINE_BYTES)) throw new Error('transcript_batch_limit_invalid');
+    this.maxBytes = maxBytes ?? MAX_TRANSCRIPT_JSONL_LINE_BYTES;
   }
 
-  async ingestFile({ runtime, filePath, logicalSource = filePath, sessionHint = null, fullAudit = false }) {
+  async ingestFile({ runtime, filePath, logicalSource = filePath, sessionHint = null, fullAudit = false, cursorNamespace = 'default', bootstrapTail = false, requireExistingCursor = false }) {
     const adapter = ADAPTERS[runtime];
     if (!adapter) throw new Error('transcript_runtime_unsupported');
     const resolvedPath = pathResolveSafe(filePath);
     filePath = resolvedPath;
     const stat = fs.statSync(filePath);
-    const key = sourceCursorKey(runtime, logicalSource);
+    const key = sourceCursorKey(runtime, logicalSource, cursorNamespace);
     const previous = this.cursorStore.read(key);
+    if (bootstrapTail && previous) throw new Error('tail_bootstrap_cursor_exists');
+    if (bootstrapTail && fullAudit) throw new Error('tail_bootstrap_full_audit_conflict');
+    if (fullAudit && previous?.bootstrapMode === 'tail') throw new Error('transcript_full_audit_requires_backfill_cursor');
+    if (!bootstrapTail && requireExistingCursor && !previous) throw new Error('realtime_cursor_uninitialized');
     const identity = fileIdentity(stat);
     let rotated = Boolean(previous && (previous.fileIdentity !== identity || stat.size < previous.offset));
     if (fullAudit && previous && !rotated && previous.consumedCheckpoint) {
-      if (consumedCheckpoint(this.outbox, filePath, previous.offset) !== previous.consumedCheckpoint) rotated = true;
+      if (consumedCheckpoint(this.outbox, filePath, previous.chainStartOffset || 0, previous.offset) !== previous.consumedCheckpoint) rotated = true;
     }
     if (previous && !rotated && previous.tailWindowCheckpoint && previous.tailWindowStart < previous.offset) {
       const tail = readRange(filePath, previous.tailWindowStart, previous.offset);
@@ -107,18 +121,28 @@ export class TranscriptIngestor {
       const boundary = readRange(filePath, previous.checkpointStart, previous.offset);
       if (!boundary || this.outbox.checkpoint(boundary) !== previous.checkpoint) rotated = true;
     }
-    const newCursor = generation => {
+    const newCursor = (generation, { offset = 0, initialHint = sessionHint, bootstrapped = false } = {}) => {
       const prefixLength = Math.min(stat.size, 4096);
       return {
-        version: 1, runtime, generation, fileIdentity: identity, offset: 0, sessionHint,
+        version: 2, runtime, cursorNamespace, generation, fileIdentity: identity, offset, sessionHint: initialHint,
         prefixLength, prefixCheckpoint: prefixCheckpoint(this.outbox, filePath, prefixLength),
-        consumedCheckpoint: this.outbox.chainSeed()
+        chainStartOffset: offset, consumedCheckpoint: this.outbox.chainSeed(),
+        ...(bootstrapped ? { bootstrapMode: 'tail', ...tailWindow(this.outbox, filePath, offset) } : {})
       };
     };
+    if (bootstrapTail) {
+      const offset = tailBootstrapOffset(filePath, { size: stat.size });
+      const cursor = newCursor(0, { offset, initialHint: initialSessionHint(adapter, runtime, filePath, sessionHint), bootstrapped: true });
+      this.cursorStore.write(key, cursor);
+      return {
+        runtime, sourceKey: key, cursorNamespace, generation: 0, offset,
+        partialBytes: stat.size - offset, rotated: false, bootstrapped: true, auditMode: 'bounded', results: []
+      };
+    }
     let cursor = rotated
       ? newCursor(previous.generation + 1)
       : previous || newCursor(0);
-    if (!cursor.consumedCheckpoint) cursor = { ...cursor, consumedCheckpoint: consumedCheckpoint(this.outbox, filePath, cursor.offset) };
+    if (!cursor.consumedCheckpoint) cursor = { ...cursor, chainStartOffset: 0, consumedCheckpoint: consumedCheckpoint(this.outbox, filePath, 0, cursor.offset) };
     if (!cursor.sessionHint && sessionHint) cursor.sessionHint = sessionHint;
     if (!previous || rotated) this.cursorStore.write(key, cursor);
     const batch = readCompleteJsonl(filePath, { offset: cursor.offset, maxBytes: this.maxBytes });
@@ -153,8 +177,8 @@ export class TranscriptIngestor {
       results.push({ eventId: item.event.eventId, projection: item.projection, delivered });
     }
     return {
-      runtime, sourceKey: key, generation: cursor.generation, offset: cursor.offset,
-      partialBytes: batch.partialBytes, rotated, auditMode: fullAudit ? 'full' : 'bounded', results
+      runtime, sourceKey: key, cursorNamespace, generation: cursor.generation, offset: cursor.offset,
+      partialBytes: batch.partialBytes, rotated, bootstrapped: false, auditMode: fullAudit ? 'full' : 'bounded', results
     };
   }
 }

@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 
 import { EncryptedOutbox } from '../src/ingest/outbox.mjs';
 import { HttpRawEventSink } from '../src/ingest/http-raw-event-sink.mjs';
+import { RAW_EVENT_HTTP_MAX_BODY_BYTES } from '../src/ingest/raw-event-contract.mjs';
 import { CursorStore } from '../src/ingest/transcripts/cursor-store.mjs';
 import { TranscriptIngestor } from '../src/ingest/transcripts/ingestor.mjs';
 import { runTranscriptBackfill } from '../src/ingest/transcripts/backfill.mjs';
@@ -13,8 +14,8 @@ const FIXTURE_ROOT = fs.realpathSync(path.join(import.meta.dirname, 'fixtures', 
 
 function argumentsFrom(argv) {
   const options = {};
-  const flags = new Set(['--replay', '--backfill', '--full-audit', '--test-mode', '--allow-live-source']);
-  const values = new Set(['--runtime', '--file', '--root', '--lease', '--spool', '--cursors', '--sink-module', '--source-instance', '--source-instance-id', '--session-id']);
+  const flags = new Set(['--replay', '--backfill', '--bootstrap-tail', '--full-audit', '--test-mode', '--allow-live-source']);
+  const values = new Set(['--runtime', '--file', '--root', '--lease', '--spool', '--cursors', '--cursor-namespace', '--sink-module', '--source-instance', '--source-instance-id', '--session-id']);
   for (let index = 0; index < argv.length; index += 1) {
     const name = argv[index];
     if (!name.startsWith('--')) throw new Error(`unknown_argument:${name}`);
@@ -188,6 +189,7 @@ async function resolveSink(options, injectedSink, env, { sourceInstanceId, actor
   const sink = new HttpRawEventSink({
     endpoint: env.AMF_INGEST_ENDPOINT || '', token: env.AMF_INGEST_TOKEN || '', sourceInstanceId, actorId,
     timeoutMs: boundedEnvInteger(env, 'AMF_INGEST_HTTP_TIMEOUT_MS', 10000, 100, 120000),
+    maxRequestBytes: boundedEnvInteger(env, 'AMF_INGEST_HTTP_MAX_REQUEST_BYTES', RAW_EVENT_HTTP_MAX_BODY_BYTES, RAW_EVENT_HTTP_MAX_BODY_BYTES, 16 * 1024 * 1024),
     maxResponseBytes: boundedEnvInteger(env, 'AMF_INGEST_HTTP_MAX_RESPONSE_BYTES', 64 * 1024, 256, 1024 * 1024)
   });
   if (!sink.configured) throw new Error('raw_event_http_sink_unconfigured');
@@ -198,9 +200,13 @@ export async function main(argv = process.argv.slice(2), env = process.env, { si
   const options = argumentsFrom(argv);
   for (const required of ['spool', 'cursors']) if (!options[required]) throw new Error(`argument_required:${required}`);
   if (!options.replay && !options.runtime) throw new Error('argument_required:runtime');
-  if (options.replay && options.backfill) throw new Error('ingest_mode_conflict');
+  if ([options.replay, options.backfill, options['bootstrap-tail']].filter(Boolean).length > 1) throw new Error('ingest_mode_conflict');
+  if (options['bootstrap-tail'] && (options['full-audit'] || options['test-mode'] || !options['allow-live-source'])) throw new Error('tail_bootstrap_mode_invalid');
   const backfill = options.backfill ? resolveBackfillScope(options, env) : null;
   const source = options.replay || options.backfill ? null : resolveSource(options, env);
+  const cursorNamespace = options['cursor-namespace'] || (source?.fixture || options.replay ? 'default' : '');
+  if (backfill && cursorNamespace !== 'backfill') throw new Error('backfill_cursor_namespace_required');
+  if (source && !source.fixture && cursorNamespace !== 'realtime') throw new Error('realtime_cursor_namespace_required');
   const replayScope = options.replay ? validateReplayScope(options, env, injectedSink) : null;
   const encryptionKey = env.AMF_OUTBOX_ENCRYPTION_KEY;
   const outboxKeyRing = readKeyRing(env, 'AMF_OUTBOX_KEY_RING');
@@ -226,13 +232,16 @@ export async function main(argv = process.argv.slice(2), env = process.env, { si
     }),
     sink
   });
-  if (backfill) return runTranscriptBackfill({ ...backfill, runtime: options.runtime, ingestor, fullAudit: Boolean(options['full-audit']) });
+  if (backfill) return runTranscriptBackfill({ ...backfill, runtime: options.runtime, ingestor, cursorNamespace, fullAudit: Boolean(options['full-audit']) });
   return ingestor.ingestFile({
     runtime: options.runtime,
     filePath: source.filePath,
     logicalSource: source.logicalSource,
     sessionHint: options['session-id'] || null,
-    fullAudit: Boolean(options['full-audit'])
+    fullAudit: Boolean(options['full-audit']),
+    cursorNamespace,
+    bootstrapTail: Boolean(options['bootstrap-tail']),
+    requireExistingCursor: !source.fixture
   });
 }
 

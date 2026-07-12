@@ -171,6 +171,19 @@ lease after its owner is dead. Delivery failures remain queued and do not block 
 source runtime.
 The HTTP timeout covers request, headers and the complete streamed response body;
 responses are capped by `AMF_INGEST_HTTP_MAX_RESPONSE_BYTES` before JSON parsing.
+Live polling is fail-closed when its encrypted cursor is absent. Initialize a new
+poller exactly once with `--cursor-namespace realtime --bootstrap-tail`; this records
+the last complete-line boundary, retains an in-progress final line, and keeps the
+Codex native session hint encrypted. Subsequent polls use
+`--cursor-namespace realtime` without the bootstrap flag. Historical ingestion uses
+`--backfill --cursor-namespace backfill`, so it cannot consume or overwrite realtime
+cursors even when both namespaces share one cursor directory.
+
+Native JSONL records are bounded at 4 MiB including their line ending. Double Base64
+expansion for encrypted RAW envelopes is covered by the shared 8 MiB request contract:
+server `AMF_MAX_RAW_INGEST_BODY_BYTES` and client
+`AMF_INGEST_HTTP_MAX_REQUEST_BYTES` both default to `8388608` and production values
+cannot be lower. Other API routes retain the smaller `AMF_MAX_BODY_BYTES` limit.
 
 ## Deployment block
 
