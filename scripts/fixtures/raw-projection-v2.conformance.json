@@ -31,4 +31,3 @@
   "normalizationVersion": "amf-observation-normalization/v1",
   "normalizedPayloadDigest": "hmac-sha256:payload-v1:5555555555555555555555555555555555555555555555555555555555555555"
 }
-

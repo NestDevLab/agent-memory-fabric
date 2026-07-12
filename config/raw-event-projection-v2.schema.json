@@ -39,4 +39,3 @@
     "contextTags": { "type": "object", "additionalProperties": false, "required": ["sender", "conversation"], "properties": { "actor": { "$ref": "#/$defs/tagArray" }, "sender": { "$ref": "#/$defs/tagArray" }, "conversation": { "$ref": "#/$defs/tagArray" }, "room": { "$ref": "#/$defs/tagArray" }, "person": { "$ref": "#/$defs/tagArray" }, "relationship": { "$ref": "#/$defs/tagArray" }, "thread": { "$ref": "#/$defs/tagArray" } } }
   }
 }
-
