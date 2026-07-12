@@ -83,13 +83,16 @@ function validateInput(value, keyRing, defaultKeyVersion) {
     if (!exactKeys(candidate, expectedKeys)) {
       throw fail('session_route_input_invalid');
     }
-    const candidateKeyVersion = candidate.keyVersion ?? defaultKeyVersion;
+    if (value.schema === INPUT_SCHEMA_V2 && typeof candidate.keyVersion !== 'string') {
+      throw fail('session_route_key_version_invalid');
+    }
+    const candidateKeyVersion = candidate.keyVersion === undefined ? defaultKeyVersion : candidate.keyVersion;
     if (candidate.keyVersion !== undefined && defaultKeyVersion !== undefined
       && candidate.keyVersion !== defaultKeyVersion) throw fail('session_route_key_version_conflict');
     if (candidateKeyVersion === undefined && normalizedRing.keys.size !== 1) {
       throw fail('session_route_key_version_required');
     }
-    const keyVersion = candidateKeyVersion ?? normalizedRing.currentKeyVersion;
+    const keyVersion = candidateKeyVersion === undefined ? normalizedRing.currentKeyVersion : candidateKeyVersion;
     if (typeof keyVersion !== 'string' || !normalizedRing.keys.has(keyVersion)) {
       throw fail('session_route_key_version_invalid');
     }

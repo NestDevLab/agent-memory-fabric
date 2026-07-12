@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
-import { ContextTokenVerifier } from '../src/context-token.mjs';
+import { ContextTokenVerifier, issueSessionRouteBinding } from '../src/context-token.mjs';
 import { provisionSessionRoutes } from '../src/operator/session-route-provisioning.mjs';
 
 const TAG_A = `hmac-sha256:routing-v1:${'a'.repeat(64)}`;
@@ -85,6 +85,13 @@ test('multi-key rings require an explicit route key and sign with the consumer v
       manifestPath: sample.manifestPath, serviceOwnerUid: sample.serviceOwnerUid };
     assert.throws(() => provisionSessionRoutes({ ...options, dryRun: true }),
       /session_route_key_version_required/);
+    privateJson(sample.inputPath, { schema: 'amf.session-route-input/v2', bindings: [
+      { ...sample.binding, keyVersion: null }
+    ] });
+    assert.throws(() => provisionSessionRoutes({ ...options, dryRun: true }),
+      /session_route_key_version_invalid/);
+    assert.throws(() => issueSessionRouteBinding({ ...sample.binding, keyVersion: null }, sample.ring),
+      /context_key_version_invalid/);
 
     privateJson(sample.inputPath, { schema: 'amf.session-route-input/v2', bindings: [
       { ...sample.binding, keyVersion: 'ctx-vitae-v1' }

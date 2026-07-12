@@ -71,7 +71,10 @@ function normalizeRouteBinding(value) {
 
 export function issueSessionRouteBinding(payload, keyRing) {
   const normalizedRing = keyRing?.keys instanceof Map ? keyRing : normalizeContextKeyRing(keyRing);
-  const keyVersion = payload?.keyVersion ?? normalizedRing.currentKeyVersion;
+  if (payload && Object.hasOwn(payload, 'keyVersion') && typeof payload.keyVersion !== 'string') {
+    throw new Error('context_key_version_invalid');
+  }
+  const keyVersion = payload?.keyVersion === undefined ? normalizedRing.currentKeyVersion : payload.keyVersion;
   if (!normalizedRing.keys.has(keyVersion)) throw new Error('context_key_version_missing');
   const unsigned = normalizeRouteBinding({ ...payload, keyVersion });
   return { ...unsigned, mac: sign(canonicalJson(unsigned), normalizedRing.keys.get(unsigned.keyVersion)) };
