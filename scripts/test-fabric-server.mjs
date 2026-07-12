@@ -243,6 +243,66 @@ test('room and person canonical recall require exact context intersection across
   }, { canonicalStore });
 });
 
+test('sensitive PAM routing fails closed for missing, malformed and wrong context across REST, MCP and v1 search/read', async () => {
+  const definitions = [
+    ['room', 'room:team', 'missing'],
+    ['person', 'person:alice', 'malformed'],
+    ['relationship', 'relationship:team', 'wrong']
+  ];
+  const records = definitions.map(([type, scope], index) => {
+    const value = canonicalRecord(`Sensitive ${type}`, 'main-lab');
+    value.id = `mem_sensitive_${index}0000000`; value.scope = { type, id: scope }; value.visibility = 'shared'; value.claim.aadSha256 = aadSha256For(value);
+    return value;
+  });
+  const routing = new Map([
+    [records[0].id, null],
+    [records[1].id, { person: ['literal-person'] }],
+    [records[2].id, { conversation: [ROOM_B], relationship: [ROOM_B] }]
+  ]);
+  const canonicalStore = {
+    configured: true,
+    routingContext(id) { return routing.get(id) || null; },
+    async search({ scopes }) { return { items: records.filter(record => scopes.includes(record.scope.id)), nextCursor: null }; },
+    async read({ id }) { const value = records.find(record => record.id === id); if (!value) throw Object.assign(new Error('memory_not_found'), { status: 404 }); return value; }
+  };
+  const tagsFor = (type, value = ROOM_A) => ({ conversation: [value], [type]: [value] });
+  await withServer(async ({ api }) => {
+    const initialized = await api('/mcp/test-client/sensitive', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } }) });
+    const mcpSession = initialized.response.headers.get('mcp-session-id');
+    const mcpCall = (name, args, id) => api('/mcp/test-client/sensitive', { method: 'POST', headers: { 'mcp-session-id': mcpSession }, body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) });
+
+    const roomSearch = { query: 'sensitive', scopes: ['room:team'], purpose: 'conversation_recall' };
+    roomSearch.contextToken = contextTokenFor({ purpose: roomSearch.purpose, operation: 'memory_search', input: roomSearch, contextTags: tagsFor('room') });
+    const missingRest = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify(roomSearch) });
+    assert.deepEqual(missingRest.body.data.items, []);
+    const roomReadToken = contextTokenFor({ purpose: 'conversation_recall', operation: 'memory_read', input: { id: records[0].id }, contextTags: tagsFor('room') });
+    assert.equal((await api(`/v2/memory/${records[0].id}?purpose=conversation_recall&contextToken=${encodeURIComponent(roomReadToken)}`)).response.status, 404);
+
+    const personSearch = { query: 'sensitive', scopes: ['person:alice'], purpose: 'conversation_recall' };
+    personSearch.contextToken = contextTokenFor({ purpose: personSearch.purpose, operation: 'memory_search', input: personSearch, contextTags: tagsFor('person') });
+    const malformedMcp = await mcpCall('memory_search', personSearch, 2);
+    assert.deepEqual(JSON.parse(malformedMcp.body.result.content[0].text).items, []);
+    const personRead = { id: records[1].id, purpose: 'conversation_recall' };
+    personRead.contextToken = contextTokenFor({ purpose: personRead.purpose, operation: 'memory_read', input: personRead, contextTags: tagsFor('person') });
+    assert.equal((await mcpCall('memory_read', personRead, 3)).body.error.message, 'memory_not_found');
+
+    const relationshipSearch = { query: 'sensitive', scopes: ['relationship:team'], purpose: 'conversation_recall' };
+    relationshipSearch.contextToken = contextTokenFor({ purpose: relationshipSearch.purpose, operation: 'memory_search', input: relationshipSearch, contextTags: tagsFor('relationship') });
+    assert.deepEqual((await api('/v1/memory/search', { method: 'POST', body: JSON.stringify(relationshipSearch) })).body.items, []);
+    const relationshipRead = { id: records[2].id, purpose: 'conversation_recall' };
+    relationshipRead.contextToken = contextTokenFor({ purpose: relationshipRead.purpose, operation: 'memory_read', input: relationshipRead, contextTags: tagsFor('relationship') });
+    assert.equal((await api('/v1/memory/read', { method: 'POST', body: JSON.stringify(relationshipRead) })).response.status, 404);
+
+    for (const [index, [type]] of definitions.entries()) routing.set(records[index].id, tagsFor(type));
+    const restAllowed = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ ...roomSearch, contextToken: contextTokenFor({ purpose: roomSearch.purpose, operation: 'memory_search', input: roomSearch, contextTags: tagsFor('room') }) }) });
+    assert.deepEqual(restAllowed.body.data.items.map(item => item.id), [records[0].id]);
+    const mcpAllowed = await mcpCall('memory_read', { ...personRead, contextToken: contextTokenFor({ purpose: personRead.purpose, operation: 'memory_read', input: personRead, contextTags: tagsFor('person') }) }, 4);
+    assert.equal(JSON.parse(mcpAllowed.body.result.content[0].text).record.id, records[1].id);
+    const v1Allowed = await api('/v1/memory/read', { method: 'POST', body: JSON.stringify({ ...relationshipRead, contextToken: contextTokenFor({ purpose: relationshipRead.purpose, operation: 'memory_read', input: relationshipRead, contextTags: tagsFor('relationship') }) }) });
+    assert.equal(v1Allowed.body.record.id, records[2].id);
+  }, { canonicalStore });
+});
+
 test('session context and purpose permission cannot be bypassed by caller-selected purpose or another room token', async () => {
   const canonicalStore = { configured: true, async search() { return { items: [], nextCursor: null }; }, async read() { throw Object.assign(new Error('memory_not_found'), { status: 404 }); } };
   await withServer(async ({ api }) => {

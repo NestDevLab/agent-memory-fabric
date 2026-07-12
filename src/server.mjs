@@ -1033,8 +1033,10 @@ function recordActiveNow(record) {
 
 function contextAllowsRecord(record, context, canonicalStore) {
   const sensitiveScope = /^(?:person|relationship|room):/.test(String(record?.scope?.id || ''));
-  if ((sensitiveScope || canonicalStore?.routingContext?.(record.id)) && !context) return false;
-  if (context && canonicalStore?.routingContext?.(record.id) && !exactContextIntersection(canonicalStore.routingContext(record.id), context.contextTags)) return false;
+  let routingContext = null;
+  try { routingContext = canonicalStore?.routingContext?.(record.id) || null; } catch { return false; }
+  if (sensitiveScope && !routingContext) return false;
+  if (routingContext && (!context || !exactContextIntersection(routingContext, context.contextTags))) return false;
   if (context && ['group', 'channel'].includes(context.conversationKind) && record.visibility !== 'shared') return false;
   return true;
 }

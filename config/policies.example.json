@@ -21,6 +21,9 @@
     "person:alice": {
       "backendUserId": "openmemory"
     },
+    "relationship:team": {
+      "backendUserId": "openmemory"
+    },
     "tirrenia": {
       "backendUserId": "openclaw_tirrenia"
     },
