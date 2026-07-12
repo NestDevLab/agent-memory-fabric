@@ -1,6 +1,6 @@
 # Curation rollout and rollback
 
-This runbook targets the integrated Agent Memory Fabric `0.5.5` release.
+This runbook targets the integrated Agent Memory Fabric `0.5.6` release.
 
 The Fabric container reads the canonical PAM workspace at
 `/srv/brain-shared` and the single record index at
