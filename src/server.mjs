@@ -11,6 +11,7 @@ import { createCanonicalPamBridgeFromEnv, createReceiptCoordinatorFromEnv, creat
 import { createContextVerifierFromEnv, createUnconfiguredContextVerifier } from './context-token.mjs';
 import { PURPOSES, buildContextRequest, exactContextIntersection, normalizeScopeList, scopeRequiresContext } from './access-contract.mjs';
 import { RAW_EVENT_HTTP_MAX_BODY_BYTES } from './ingest/raw-event-contract.mjs';
+import { validatePamRuntimePrivateDirFromEnv } from './operator/pam-runtime-private-dir.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
@@ -2210,6 +2211,7 @@ if (isMain) {
     let runtimeReceiptCoordinator;
     let runtimeServer;
     try {
+      validatePamRuntimePrivateDirFromEnv(process.env);
       runtimeFabricStore = createFabricStoreFromEnv({ rootPath: ROOT });
       runtimeCanonicalStore = createCanonicalPamBridgeFromEnv(process.env);
       const runtimeContextVerifier = createContextVerifierFromEnv(process.env);

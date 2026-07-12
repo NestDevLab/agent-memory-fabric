@@ -246,6 +246,11 @@ disabled.
 `compose.agent-memory-fabric.yml` is the source overlay prepared for CT113. It
 builds the pinned Dockerfile with `npm ci`, requires an explicitly approved
 `.115` bind address, and mounts reviewed production policy, auth registry and
-key ring files. No example policy is a runtime fallback. The generic service
+key ring files. The PAM routing ring, workspace config and applicator state key
+are mounted together from `AMF_PAM_RUNTIME_PRIVATE_DIR` into a dedicated parent
+owned by the configured service UID; individual mounts into root-owned
+`/run/secrets` or `/run/config` are unsupported. Run
+`npm run operator:preflight-pam-runtime` inside the container before rollout.
+No example policy is a runtime fallback. The generic service
 retains `mem0-gateway` only as a network alias.
 This change does not apply or deploy that overlay.
