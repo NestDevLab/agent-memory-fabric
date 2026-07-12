@@ -81,6 +81,7 @@ test('projection v2 accepts every runtime and rejects literal context routing or
   assert.throws(() => validateProjectionV2({ ...item().projection, contextTags: { sender: ['Alice'], conversation: [tag('conversation', 'room')] } }), /raw_projection_invalid/);
   assert.throws(() => validateProjectionV2({ ...item().projection, nativeRoomId: 'literal-room' }), /raw_projection_invalid/);
   assert.throws(() => deriveLogicalMessageIds({ canonicalSenderIdentity: 'person:alice', senderTag: tag('sender', 'alice'), conversationTag: tag('conversation', 'room'), direction: 'inbound' }, LOGICAL_KEYS), /strong_identifier_required/);
+  assert.equal(validateProjectionV2({ ...item().projection, occurredAt: '2026-07-12T00:00:00.0001Z' }).occurredAt, '2026-07-12T00:00:00.0001Z');
 });
 
 test('session binding contains only conversation, room and thread invariants', () => {
@@ -254,6 +255,8 @@ test('v2 sessions accept multi-role events and retries but reject room/thread re
       assert.equal((await reader.search({ actor: 'outsider', query: '', limit: 10 })).items.length, 0);
       await assert.rejects(reader.get({ actor: 'outsider', id: session.id }), /session_not_found/);
       await assert.rejects(reader.transcript({ actor: 'outsider', id: session.id, view: 'original' }), /session_not_found/);
+      assert.equal((await reader.transcript({ actor: observations[0].actor, id: session.id, view: 'redacted', to: '2026-07-12T00:00:00.0001Z' })).items.length, 3, 'sub-millisecond windows compare at common millisecond precision');
+      await assert.rejects(reader.transcript({ actor: observations[0].actor, id: session.id, view: 'redacted', from: '2026-07-12T00:00:01Z', to: '2026-07-12T00:00:00Z' }), /invalid_request/, 'reversed windows fail closed');
 
       const changedRoom = item({ actor: 'raw-assistant', sender: 'agent:vitae', role: 'assistant', room: 'other-room', nativeRevision: 4, sourceSequence: 4 });
       await assert.rejects(store.ingestRawEvent({ actor: 'raw-assistant', sourceInstanceId: 'assistant-host', projection: changedRoom.projection, envelope: envelope(changedRoom, 'raw-assistant', 'assistant-host') }), /raw_session_binding_conflict/);

@@ -5,6 +5,7 @@ import Database from 'better-sqlite3';
 import pg from 'pg';
 import { ciphertextContentId, ciphertextPayloadDigest, decryptClientCiphertext, normalizeIngestKeyRing, validateClientCiphertext } from './ingest/raw-event-contract.mjs';
 import { normalizeSessionContextBinding, selectLogicalMessage, sessionBindingMatches, sessionContextBinding, validateProjectionV2 } from './ingest/raw-projection-v2.mjs';
+import { strictIsoTimestamp } from './ingest/transcripts/canonical.mjs';
 import {
   retentionDeadline,
   retentionTombstone,
@@ -666,9 +667,18 @@ function decodePageCursor(cursor, binding) {
 }
 function encodePageCursor(offset, binding) { return Buffer.from(JSON.stringify({ binding, offset }), 'utf8').toString('base64url'); }
 function inTimeWindow(timestamp, from, to) {
+  // The cross-backend window contract is Unix-millisecond precision. Stored
+  // projection strings retain their original precision because they are AAD-bound.
   if (!timestamp) return !from && !to;
   const value = Date.parse(timestamp);
   return (!from || value >= Date.parse(from)) && (!to || value <= Date.parse(to));
+}
+
+function validateTimeWindow(from, to) {
+  for (const value of [from, to]) {
+    if (value !== null && strictIsoTimestamp(value) !== value) throw createError('invalid_request', 400);
+  }
+  if (from && to && Date.parse(from) > Date.parse(to)) throw createError('invalid_request', 400);
 }
 
 export class SqliteCatalog {
@@ -676,6 +686,10 @@ export class SqliteCatalog {
     this.databasePath = path.resolve(databasePath);
     fs.mkdirSync(path.dirname(this.databasePath), { recursive: true, mode: 0o700 });
     this.db = new Database(this.databasePath);
+    this.db.function('amf_epoch_ms', { deterministic: true }, value => {
+      const parsed = Date.parse(String(value || ''));
+      return Number.isFinite(parsed) ? parsed : null;
+    });
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
     this.db.exec(`
@@ -923,10 +937,10 @@ export class SqliteCatalog {
   listSessionEvents(id) { return [...this.db.prepare('SELECT * FROM raw_events_v1 WHERE session_id=?').all(id), ...this.db.prepare('SELECT * FROM raw_events_v2 WHERE session_id=?').all(id)].map(row => this.mapRawEvent(row)).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId)); }
   listSessionEventsPage({ id, offset = 0, limit = 100, from = null, to = null }) {
     const rows = this.db.prepare(`SELECT * FROM (
-      SELECT event_id,session_id,NULL AS logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,coalesce(julianday(json_extract(projection_json,'$.occurredAt')),julianday(created_at)) AS effective_at FROM raw_events_v1 WHERE session_id=?
+      SELECT event_id,session_id,NULL AS logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,amf_epoch_ms(coalesce(json_extract(projection_json,'$.occurredAt'),created_at)) AS effective_at_ms FROM raw_events_v1 WHERE session_id=?
       UNION ALL
-      SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,coalesce(julianday(json_extract(projection_json,'$.occurredAt')),julianday(created_at)) AS effective_at FROM raw_events_v2 WHERE session_id=?
-    ) events WHERE (? IS NULL OR effective_at>=julianday(?)) AND (? IS NULL OR effective_at<=julianday(?)) ORDER BY created_at,event_id LIMIT ? OFFSET ?`).all(id, id, from, from, to, to, limit + 1, offset);
+      SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,amf_epoch_ms(coalesce(json_extract(projection_json,'$.occurredAt'),created_at)) AS effective_at_ms FROM raw_events_v2 WHERE session_id=?
+    ) events WHERE (? IS NULL OR effective_at_ms>=amf_epoch_ms(?)) AND (? IS NULL OR effective_at_ms<=amf_epoch_ms(?)) ORDER BY created_at,event_id LIMIT ? OFFSET ?`).all(id, id, from, from, to, to, limit + 1, offset);
     return { items: rows.slice(0, limit).map(row => this.mapRawEvent(row)), hasMore: rows.length > limit };
   }
   rawV2Readiness() {
@@ -1592,10 +1606,10 @@ export class PostgresCatalog {
   async listSessionEventsPage({ id, offset = 0, limit = 100, from = null, to = null }) {
     await this.ready();
     const result = await this._query(this.pool, `SELECT * FROM (
-      SELECT event_id,session_id,NULL::text AS logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,coalesce(nullif(projection_json->>'occurredAt','')::timestamptz,created_at) AS effective_at FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE session_id=$1
+      SELECT event_id,session_id,NULL::text AS logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,floor(extract(epoch FROM coalesce(nullif(projection_json->>'occurredAt','')::timestamptz,created_at))*1000)::bigint AS effective_at_ms FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE session_id=$1
       UNION ALL
-      SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,coalesce(nullif(projection_json->>'occurredAt','')::timestamptz,created_at) AS effective_at FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE session_id=$1
-    ) events WHERE ($2::timestamptz IS NULL OR effective_at>=$2::timestamptz) AND ($3::timestamptz IS NULL OR effective_at<=$3::timestamptz) ORDER BY created_at,event_id LIMIT $4 OFFSET $5`, [id, from, to, limit + 1, offset]);
+      SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,floor(extract(epoch FROM coalesce(nullif(projection_json->>'occurredAt','')::timestamptz,created_at))*1000)::bigint AS effective_at_ms FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE session_id=$1
+    ) events WHERE ($2::timestamptz IS NULL OR effective_at_ms>=floor(extract(epoch FROM $2::timestamptz)*1000)::bigint) AND ($3::timestamptz IS NULL OR effective_at_ms<=floor(extract(epoch FROM $3::timestamptz)*1000)::bigint) ORDER BY created_at,event_id LIMIT $4 OFFSET $5`, [id, from, to, limit + 1, offset]);
     return { items: result.rows.slice(0, limit).map(mapPostgresRawEvent), hasMore: result.rows.length > limit };
   }
   async rawV2Readiness() {
@@ -2179,6 +2193,7 @@ export class FabricStore {
       configured: true,
       kind: 'fabric-ciphertext-catalog',
       async search({ actor, query, cursor = null, limit, from = null, to = null }) {
+        validateTimeWindow(from, to);
         const binding = pageBinding({ actor, query, from, to, operation: 'sessions_search' });
         const offset = decodePageCursor(cursor, binding);
         const sessions = await store._catalogOperation(() => store.catalog.searchSessions({ ownerTags: store.rawStore.opaqueTags('raw-owner', actor), query, limit: Math.min(offset + limit + 1, 10001) }));
@@ -2190,6 +2205,7 @@ export class FabricStore {
         return publicSession(await participantSession(actor, id));
       },
       async transcript({ actor, id, view, cursor = null, limit = 100, from = null, to = null }) {
+        validateTimeWindow(from, to);
         await participantSession(actor, id);
         const binding = pageBinding({ actor, id, view, from, to, operation: 'session_transcript' });
         const offset = decodePageCursor(cursor, binding);

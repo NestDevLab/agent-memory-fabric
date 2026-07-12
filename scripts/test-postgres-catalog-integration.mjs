@@ -9,7 +9,7 @@ const enabled = connectionString && process.env.AMF_TEST_POSTGRES_ALLOW_MUTATION
 
 function digest(value) { return crypto.createHash('sha256').update(String(value)).digest('hex'); }
 function opaque(namespace, value) { return `hmac-sha256:integration:${digest(`${namespace}:${value}`)}`; }
-function rawV2Fixture({ suffix, marker, sessionId, role, actor, sender, conversation = 'conversation-a', room = 'room-a', thread = null }) {
+function rawV2Fixture({ suffix, marker, sessionId, role, actor, sender, conversation = 'conversation-a', room = 'room-a', thread = null, occurredAt = `2026-07-12T12:00:0${marker}.000Z` }) {
   const eventId = `evt_${digest(`${suffix}:event:${marker}`)}`;
   const logicalMessageId = `lmsg_${digest(`${suffix}:logical:${marker}`)}`;
   const contentId = digest(`${suffix}:content:${marker}`);
@@ -22,7 +22,7 @@ function rawV2Fixture({ suffix, marker, sessionId, role, actor, sender, conversa
     schema: 'amf.raw-event-projection/v2', eventId, sessionId, logicalMessageId, logicalMessageAliases: [],
     derivationVersion: 'amf-logical-message/v1', keyVersion: 'integration', sourceKind: 'hermes', observationClass: 'native',
     direction: role === 'assistant' ? 'outbound' : 'inbound', conversationKind: 'group', contextTags, subtype: 'message',
-    occurredAt: `2026-07-12T12:00:0${marker}.000Z`, editedAt: null, nativeRevision: Number(marker), sourceSequence: Number(marker),
+    occurredAt, editedAt: null, nativeRevision: Number(marker), sourceSequence: Number(marker),
     authoritativeDeletion: false, role, contentType: 'text', contentParts: 1, hasContent: true,
     normalizationVersion: 'amf-observation-normalization/v1', normalizedPayloadDigest: `hmac-sha256:integration:${digest(`${suffix}:payload:${marker}`)}`
   };
@@ -112,6 +112,12 @@ test('real PostgreSQL catalog integration in an explicitly isolated test databas
     assert.equal((await catalog.listSessionEventsPage({ id: rawSessionId, from: '2026-07-12T14:00:03+02:00' })).items.length, 1, 'offset boundary is inclusive');
     assert.equal((await catalog.listSessionEventsPage({ id: rawSessionId, from: '2026-07-12T12:00:01.001Z' })).items.length, 2, 'fractional from excludes the earlier event');
     assert.equal((await catalog.listSessionEventsPage({ id: rawSessionId, to: '2026-07-12T12:00:00.999Z' })).items.length, 0, 'fractional to excludes all later events');
+    const subMsSessionId = `ses_${digest(`${suffix}:sub-ms-session`)}`;
+    cleanupSessionIds.add(subMsSessionId);
+    const subMsEvent = rawV2Fixture({ suffix, marker: '7', sessionId: subMsSessionId, role: 'user', actor: 'person', sender: 'person', occurredAt: '2026-07-12T12:00:00.0005Z' });
+    cleanupContentIds.add(subMsEvent.record.contentId);
+    await catalog.ingestRawEventV2(subMsEvent.record, subMsEvent.raw, { id: `${suffix}-raw-audit-sub-ms`, ts: '2026-07-12T12:00:01Z', actorTag: subMsEvent.record.ownerTag, action: 'raw_event_ingest', targetId: subMsEvent.record.eventId, details: {} });
+    assert.equal((await catalog.listSessionEventsPage({ id: subMsSessionId, to: '2026-07-12T12:00:00.0001Z' })).items.length, 1, 'PostgreSQL uses the shared millisecond comparison precision');
     for (const actor of ['person', 'system', 'assistant']) {
       const visible = await catalog.searchSessions({ ownerTags: [opaque('owner', actor)], query: '', limit: 10 });
       assert.equal(visible.some(session => session.id === rawSessionId), true);
