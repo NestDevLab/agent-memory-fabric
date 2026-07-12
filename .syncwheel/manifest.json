@@ -11,7 +11,8 @@
     "base": "origin/main",
     "strategy": "cherry-pick",
     "stacks": [
-      "amf-fabric-core"
+      "amf-fabric-core",
+      "amf-collector-provisioning"
     ]
   },
   "stacks": [
@@ -99,6 +100,18 @@
       "meta": {
         "purpose": "Canonical PAM bridge, receipt recovery and context-bound API"
       }
+    },
+    {
+      "id": "amf-collector-provisioning",
+      "branch": "amf/collector-provisioning",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "e7cb130d54f9a81f7dec77fde8d7b9ed9baaa248"
+      ],
+      "meta": {}
     }
   ],
   "syncwheel_tracking": "git-tracked",
