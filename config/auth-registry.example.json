@@ -1,15 +1,15 @@
 {
   "rows": [
     {
-      "token": "replace-with-a-random-secret-token",
+      "tokenSha256": "5232b8b43646788aa6ee169eadc914fc21bcdfa56c52e914413569e1f7affe81",
       "active": true,
       "actor": "main-openclaw",
       "mode": "allow_all",
       "allowedScopes": "*",
-      "permissions": "memory:search,memory:add"
+      "permissions": "memory:search,memory:read,memory:propose,memory:add,memory:status,sessions:read,raw:decrypt,raw:ingest"
     },
     {
-      "token": "replace-with-another-random-secret-token",
+      "tokenSha256": "bb02fe8c359c08e4a35e2372fc43713150bfc27a3b622812fc59f83b92366bc0",
       "active": true,
       "actor": "openclaw-tirrenia",
       "mode": "scoped",

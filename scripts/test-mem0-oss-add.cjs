@@ -1,5 +1,5 @@
 const path = require('path');
-const { Memory } = require(path.resolve(__dirname, '../node_modules/mem0ai/dist/oss/index.js'));
+const { Memory } = require('mem0ai/oss');
 
 async function buildMemory() {
   return new Memory({

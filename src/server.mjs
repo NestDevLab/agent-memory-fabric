@@ -5,25 +5,115 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createBackendAdapter } from './backend.mjs';
+import { createFabricStoreFromEnv, createUnconfiguredFabricStore } from './fabric-store.mjs';
+import { validateAmfMemoryRecord } from './amf-memory-record-validator.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
-const POLICY_PATH = process.env.MEM0_GATEWAY_POLICY_PATH || path.join(ROOT, 'config', 'policies.example.json');
-const PORT = Number(process.env.PORT || 8787);
-const sessions = new Map();
-const AUTH_CACHE_TTL_MS = Number(process.env.MEM0_AUTH_CACHE_TTL_MS || '15000');
-const authCache = { loadedAt: 0, rows: [], sourceKey: '', mtimeMs: 0 };
+function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return fallback;
+  if (!/^\d+$/.test(raw)) throw new Error(`invalid_environment:${name}`);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`invalid_environment:${name}`);
+  return value;
+}
 
-function loadPolicies() {
+const POLICY_PATH = process.env.AMF_POLICY_PATH || process.env.MEM0_GATEWAY_POLICY_PATH || '';
+const PORT = envInteger('PORT', 8787, { min: 1, max: 65535 });
+const SERVICE_NAME = 'agent-memory-fabric';
+const SERVICE_VERSION = '0.2.0';
+const LEGACY_SERVICE_ALIASES = ['mem0-gateway'];
+const LIMITS = Object.freeze({
+  bodyBytes: envInteger('AMF_MAX_BODY_BYTES', 262144, { min: 1024, max: 16 * 1024 * 1024 }),
+  queryChars: envInteger('AMF_MAX_QUERY_CHARS', 4096, { min: 1, max: 65536 }),
+  proposalChars: envInteger('AMF_MAX_PROPOSAL_CHARS', 32768, { min: 1, max: 1048576 }),
+  metadataBytes: envInteger('AMF_MAX_METADATA_BYTES', 16384, { min: 2, max: 1048576 }),
+  idempotencyKeyChars: envInteger('AMF_MAX_IDEMPOTENCY_KEY_CHARS', 200, { min: 16, max: 1024 })
+});
+const AUTH_CACHE_TTL_MS = envInteger('MEM0_AUTH_CACHE_TTL_MS', 15000, { min: 0, max: 3600000 });
+const AUDIT_TIMEOUT_MS = envInteger('AMF_AUDIT_TIMEOUT_MS', 2000, { min: 100, max: 30000 });
+const CATALOG_HEALTH_TIMEOUT_MS = envInteger('AMF_CATALOG_HEALTH_TIMEOUT_MS', 3000, { min: 100, max: 30000 });
+const BODY_READ_TIMEOUT_MS = envInteger('AMF_BODY_READ_TIMEOUT_MS', 10000, { min: 100, max: 120000 });
+const MCP_SESSION_DEFAULTS = Object.freeze({
+  ttlMs: envInteger('AMF_MCP_SESSION_TTL_MS', 900000, { min: 1000, max: 86400000 }),
+  maxGlobal: envInteger('AMF_MCP_MAX_SESSIONS', 1000, { min: 1, max: 100000 }),
+  maxPerActor: envInteger('AMF_MCP_MAX_SESSIONS_PER_ACTOR', 20, { min: 1, max: 1000 })
+});
+const authCache = { loadedAt: 0, rows: [], sourceKey: '', mtimeMs: 0 };
+const PRIVATE_HEADERS = Object.freeze({
+  'cache-control': 'no-store, private',
+  pragma: 'no-cache',
+  expires: '0',
+  vary: 'authorization'
+});
+const V1_HEADERS = Object.freeze({
+  deprecation: 'true',
+  sunset: 'Thu, 31 Dec 2026 23:59:59 GMT',
+  link: '</v2>; rel="successor-version"'
+});
+const PUBLIC_ERRORS = new Map([
+  ['invalid_json', [400, 'invalid_json']], ['invalid_request', [400, 'invalid_request']], ['scope_required', [400, 'scope_required']], ['scope_unregistered', [400, 'scope_unregistered']],
+  ['scope_unmapped', [400, 'scope_unmapped']], ['memory_text_required', [400, 'memory_text_required']], ['memory_id_required', [400, 'memory_id_required']],
+  ['canonical_record_required', [400, 'canonical_record_required']], ['canonical_record_invalid', [400, 'canonical_record_invalid']], ['rationale_required', [400, 'rationale_required']],
+  ['revision_invalid', [400, 'revision_invalid']], ['idempotency_key_required', [400, 'idempotency_key_required']], ['purpose_required', [400, 'purpose_required']],
+  ['purpose_invalid', [400, 'purpose_invalid']], ['session_limit_invalid', [400, 'session_limit_invalid']], ['raw_content_id_invalid', [400, 'raw_content_id_invalid']],
+  ['missing_token', [401, 'missing_token']], ['invalid_token', [401, 'invalid_token']], ['session_expired', [401, 'session_expired']], ['session_revoked', [401, 'session_revoked']],
+  ['forbidden', [403, 'forbidden']], ['scope_forbidden', [403, 'scope_forbidden']], ['memory_search_forbidden', [403, 'memory_search_forbidden']],
+  ['sessions_forbidden', [403, 'sessions_forbidden']], ['raw_decrypt_forbidden', [403, 'raw_decrypt_forbidden']],
+  ['not_found', [404, 'not_found']], ['memory_not_found', [404, 'memory_not_found']], ['session_not_found', [404, 'session_not_found']], ['unknown_session', [404, 'unknown_session']],
+  ['idempotency_key_conflict', [409, 'idempotency_key_conflict']], ['body_too_large', [413, 'body_too_large']], ['query_too_large', [413, 'query_too_large']],
+  ['body_read_timeout', [408, 'body_read_timeout']],
+  ['proposal_too_large', [413, 'proposal_too_large']], ['metadata_too_large', [413, 'metadata_too_large']], ['idempotency_key_too_large', [413, 'idempotency_key_too_large']],
+  ['session_capacity_exceeded', [429, 'session_capacity_exceeded']], ['fabric_store_unconfigured', [503, 'fabric_store_unconfigured']],
+  ['raw_projection_invalid', [400, 'raw_projection_invalid']], ['raw_envelope_invalid', [400, 'raw_envelope_invalid']], ['raw_envelope_binding_invalid', [400, 'raw_envelope_binding_invalid']],
+  ['source_instance_invalid', [400, 'source_instance_invalid']], ['raw_event_conflict', [409, 'raw_event_conflict']], ['raw_ingest_key_unavailable', [503, 'raw_ingest_key_unavailable']],
+  ['raw_session_binding_conflict', [409, 'raw_session_binding_conflict']], ['raw_envelope_authentication_failed', [400, 'raw_envelope_authentication_failed']],
+  ['raw_ingest_unconfigured', [503, 'raw_ingest_unconfigured']],
+  ['session_reader_unconfigured', [503, 'session_reader_unconfigured']], ['backend_not_configured', [503, 'backend_not_configured']],
+  ['audit_unavailable', [503, 'audit_unavailable']], ['catalog_unavailable', [503, 'catalog_unavailable']], ['service_unavailable', [503, 'service_unavailable']]
+]);
+
+function loadPolicies(policyPath = POLICY_PATH) {
+  if (!policyPath) return { actors: {}, scopes: {} };
   try {
-    return JSON.parse(fs.readFileSync(POLICY_PATH, 'utf8'));
+    return JSON.parse(fs.readFileSync(policyPath, 'utf8'));
   } catch {
     return { actors: {}, scopes: {} };
   }
 }
 
-function json(res, status, body) {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+function json(res, status, body, extraHeaders = {}) {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...PRIVATE_HEADERS, ...extraHeaders });
   res.end(JSON.stringify(body, null, 2));
+}
+
+function jsonNoStore(res, status, body) {
+  return json(res, status, body);
+}
+
+function jsonV1(res, status, body) {
+  return json(res, status, body, V1_HEADERS);
+}
+
+function v2Envelope(requestId, data) {
+  return { ok: true, data, meta: { requestId, service: SERVICE_NAME, version: SERVICE_VERSION } };
+}
+
+function v2Error(requestId, error, fallbackStatus = 500) {
+  const [mappedStatus, code] = PUBLIC_ERRORS.get(error?.message) || [fallbackStatus >= 500 ? 500 : fallbackStatus, fallbackStatus >= 500 ? 'internal_error' : 'request_failed'];
+  return {
+    status: mappedStatus,
+    body: {
+      ok: false,
+      error: { code, message: code, details: null },
+      meta: { requestId, service: SERVICE_NAME, version: SERVICE_VERSION }
+    }
+  };
+}
+
+function publicError(error, fallbackStatus = 500) {
+  const [status, code] = PUBLIC_ERRORS.get(error?.message) || [fallbackStatus >= 500 ? 500 : fallbackStatus, fallbackStatus >= 500 ? 'internal_error' : 'request_failed'];
+  return { status, code };
 }
 
 function nowIso() {
@@ -32,10 +122,10 @@ function nowIso() {
 
 function safeError(error) {
   if (!error) return null;
+  const sanitized = publicError(error, Number(error?.status || 500));
   return {
-    message: error?.message || String(error),
-    status: error?.status,
-    data: error?.data || error?.body || null
+    code: sanitized.code,
+    status: sanitized.status
   };
 }
 
@@ -45,6 +135,31 @@ function logEvent(event, payload = {}) {
   } catch {
     console.log(JSON.stringify({ ts: nowIso(), event, payload_error: true }));
   }
+}
+
+async function boundedDependency(operation, timeoutMs, code) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error(code), { status: 503 })), timeoutMs);
+      })
+    ]);
+  } catch (error) {
+    if (error?.message === code) throw error;
+    throw Object.assign(new Error(code), { status: 503, cause: error });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function auditRequired(fabricStore, event) {
+  return boundedDependency(() => fabricStore.audit(event), AUDIT_TIMEOUT_MS, 'audit_unavailable');
+}
+
+function healthRequired(fabricStore) {
+  return boundedDependency(() => fabricStore.health?.(), CATALOG_HEALTH_TIMEOUT_MS, 'catalog_unavailable');
 }
 
 function getScopeConfig(scope, policies) {
@@ -64,8 +179,8 @@ function hasPermission(policy, permission) {
   return perms.includes('*') || perms.includes(permission);
 }
 
-function canWriteScope(policy, scope) {
-  if (!hasPermission(policy, 'memory:add')) return false;
+function canProposeScope(policy, scope) {
+  if (!hasPermission(policy, 'memory:propose') && !hasPermission(policy, 'memory:add')) return false;
   if (policy.mode === 'allow_all') return true;
   if (policy.mode === 'scoped') {
     return Array.isArray(policy.allowedScopes) && (policy.allowedScopes.includes(scope) || policy.allowedScopes.includes('*'));
@@ -73,17 +188,125 @@ function canWriteScope(policy, scope) {
   return false;
 }
 
-function parseBody(req) {
+function canReadSessions(policy) {
+  return hasPermission(policy, 'sessions:read') || hasPermission(policy, '*');
+}
+
+function parseBody(req, { maxBytes = LIMITS.bodyBytes, timeoutMs = BODY_READ_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', c => chunks.push(c));
+    let received = 0;
+    let rejected = false;
+    const timer = setTimeout(() => {
+      if (rejected) return;
+      rejected = true;
+      req.pause();
+      reject(Object.assign(new Error('body_read_timeout'), { status: 408 }));
+    }, timeoutMs);
+    req.on('data', c => {
+      if (rejected) return;
+      received += c.length;
+      if (received > maxBytes) {
+        const error = new Error('body_too_large');
+        error.status = 413;
+        rejected = true;
+        clearTimeout(timer);
+        reject(error);
+        return;
+      }
+      chunks.push(c);
+    });
     req.on('end', () => {
+      if (rejected) return;
+      clearTimeout(timer);
       const raw = Buffer.concat(chunks).toString('utf8');
       if (!raw) return resolve({});
-      try { resolve(JSON.parse(raw)); } catch (err) { reject(err); }
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        const error = new Error('invalid_json');
+        error.status = 400;
+        reject(error);
+      }
     });
-    req.on('error', reject);
+    req.on('error', error => { clearTimeout(timer); reject(error); });
   });
+}
+
+function validateSearchInput(query) {
+  if (query.length > LIMITS.queryChars) {
+    const error = new Error('query_too_large');
+    error.status = 413;
+    error.data = { maxChars: LIMITS.queryChars };
+    throw error;
+  }
+}
+
+function validateProposalInput({ scope, text, metadata, idempotencyKey, requireIdempotencyKey }) {
+  if (!scope) {
+    const error = new Error('scope_required');
+    error.status = 400;
+    throw error;
+  }
+  if (!text.trim()) {
+    const error = new Error('memory_text_required');
+    error.status = 400;
+    throw error;
+  }
+  if (text.length > LIMITS.proposalChars) {
+    const error = new Error('proposal_too_large');
+    error.status = 413;
+    error.data = { maxChars: LIMITS.proposalChars };
+    throw error;
+  }
+  if (Buffer.byteLength(JSON.stringify(metadata), 'utf8') > LIMITS.metadataBytes) {
+    const error = new Error('metadata_too_large');
+    error.status = 413;
+    error.data = { maxBytes: LIMITS.metadataBytes };
+    throw error;
+  }
+  if (requireIdempotencyKey && !idempotencyKey) {
+    const error = new Error('idempotency_key_required');
+    error.status = 400;
+    throw error;
+  }
+  if (idempotencyKey.length > LIMITS.idempotencyKeyChars) {
+    const error = new Error('idempotency_key_too_large');
+    error.status = 413;
+    error.data = { maxChars: LIMITS.idempotencyKeyChars };
+    throw error;
+  }
+}
+
+function validateCanonicalProposal(record, rationale, expectedRevision) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) throw Object.assign(new Error('canonical_record_required'), { status: 400 });
+  const revision = Number(record.revision);
+  const validation = validateAmfMemoryRecord(record);
+  if (!validation.ok) throw Object.assign(new Error('canonical_record_invalid'), { status: 400 });
+  const recordBytes = Buffer.byteLength(canonicalJson(record), 'utf8') + Buffer.byteLength(String(rationale || ''), 'utf8');
+  if (recordBytes > LIMITS.proposalChars) throw Object.assign(new Error('proposal_too_large'), { status: 413 });
+  if (typeof rationale !== 'string' || !rationale.trim()) throw Object.assign(new Error('rationale_required'), { status: 400 });
+  if (expectedRevision != null && (!Number.isInteger(expectedRevision) || expectedRevision < 0 || expectedRevision !== revision - 1)) {
+    throw Object.assign(new Error('revision_invalid'), { status: 400 });
+  }
+  return { scope: record.scope.id, revision };
+}
+
+function validateCanonicalProposalBody(body) {
+  const allowed = new Set(['record', 'rationale', 'expectedRevision']);
+  if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !allowed.has(key))) {
+    throw Object.assign(new Error('invalid_request'), { status: 400 });
+  }
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+
+function deriveV1IdempotencyKey({ actor, scope, text, metadata, infer }) {
+  return `v1-${crypto.createHash('sha256').update(canonicalJson({ actor, scope, text, metadata, infer })).digest('hex')}`;
 }
 
 function sendSse(res, event, data) {
@@ -111,11 +334,11 @@ function getMcpSessionHeader(req) {
   return String(req.headers['mcp-session-id'] || req.headers['Mcp-Session-Id'] || '').trim();
 }
 
-function buildInitializeResult(protocolVersion) {
+function buildInitializeResult(protocolVersion, sessionReader) {
   return {
     protocolVersion: protocolVersion || '2024-11-05',
-    capabilities: { tools: {} },
-    serverInfo: { name: 'mem0-gateway', version: '0.1.0' }
+    capabilities: { tools: {}, experimental: { sessionReader: Boolean(sessionReader?.configured), streamableHttpGet: false } },
+    serverInfo: { name: SERVICE_NAME, version: SERVICE_VERSION }
   };
 }
 
@@ -124,36 +347,93 @@ function buildToolsListResult() {
     tools: [
       {
         name: 'memory_search',
-        description: 'Search memory within an allowed scope through the custom Mem0 gateway.',
+        description: 'Search memory within one or more allowed scopes.',
         inputSchema: {
           type: 'object',
           properties: {
             scope: { type: 'string' },
+            scopes: { type: 'array', items: { type: 'string' } },
             query: { type: 'string' }
           },
           required: ['scope', 'query']
         }
       },
       {
+        name: 'memory_read',
+        description: 'Read a queued memory proposal and its encrypted RAW payload when allowed.',
+        inputSchema: {
+          type: 'object',
+          properties: { id: { type: 'string' } },
+          required: ['id']
+        }
+      },
+      {
+        name: 'memory_propose',
+        description: 'Queue a canonical, revision-aware memory proposal for later curation.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            record: { type: 'object' },
+            rationale: { type: 'string' },
+            expectedRevision: { type: ['integer', 'null'], minimum: 0 },
+            idempotencyKey: { type: 'string', description: 'Optional transport retry key; derived deterministically when omitted.' }
+          },
+          required: ['record', 'rationale']
+        }
+      },
+      {
+        name: 'memory_proposal_status',
+        description: 'Read proposal lifecycle status without decrypting the proposed record.',
+        inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] }
+      },
+      {
+        name: 'sessions_search',
+        description: 'Search native session metadata through the configured session reader.',
+        inputSchema: {
+          type: 'object',
+          properties: { query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 100 }, purpose: { type: 'string', enum: ['conversation_recall', 'continuity_resume', 'incident_debug', 'operator_review', 'memory_curation'] } },
+          required: ['query', 'purpose']
+        }
+      },
+      {
+        name: 'session_get',
+        description: 'Read one session metadata record.',
+        inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, purpose: { type: 'string' } }, required: ['sessionId', 'purpose'] }
+      },
+      {
+        name: 'session_transcript',
+        description: 'Read a redacted transcript by default; original requires raw:decrypt.',
+        inputSchema: {
+          type: 'object',
+          properties: { sessionId: { type: 'string' }, view: { type: 'string', enum: ['redacted', 'original'] }, purpose: { type: 'string' } },
+          required: ['sessionId', 'purpose']
+        }
+      },
+      {
+        name: 'memory_status',
+        description: 'Return fabric, backend, limits and compatibility status.',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
         name: 'list_scopes',
-        description: 'List scopes visible to the current actor.',
+        description: 'Legacy alias: list scopes visible to the current actor.',
         inputSchema: { type: 'object', properties: {} }
       },
       {
         name: 'gateway_health',
-        description: 'Return health and backend information for the custom gateway.',
+        description: 'Legacy alias: return fabric health.',
         inputSchema: { type: 'object', properties: {} }
       }
     ]
   };
 }
 
-async function executeMcpMethod({ body, actor, policy, policies, backend, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
+async function executeMcpMethod({ body, actor, policy, policies, backend, fabricStore, sessionReader, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
   const method = body.method;
   const id = body.id ?? null;
 
   if (method === 'initialize') {
-    return createRpcResult(id, buildInitializeResult(body.params?.protocolVersion));
+    return createRpcResult(id, buildInitializeResult(body.params?.protocolVersion, sessionReader));
   }
 
   if (method === 'notifications/initialized') {
@@ -179,8 +459,16 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, reques
     if (name === 'gateway_health') {
       logEvent('mcp_tools_call', { requestId, actor, tool: 'gateway_health', sessionId, clientName, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
       return createRpcResult(id, {
-        content: [{ type: 'text', text: JSON.stringify({ backend: backend.kind, configured: backend.configured }, null, 2) }]
+        content: [{ type: 'text', text: JSON.stringify({ ok: true, service: SERVICE_NAME, version: SERVICE_VERSION }, null, 2) }]
       });
+    }
+
+    if (name === 'memory_status') {
+      requirePermission(policy, 'memory:status');
+      await healthRequired(fabricStore);
+      const status = buildStatus({ backend, fabricStore, sessionReader });
+      await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] });
     }
 
     if (name === 'memory_search') {
@@ -194,22 +482,180 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, reques
       });
     }
 
+    if (name === 'memory_propose') {
+      const validated = validateCanonicalProposal(args.record, args.rationale, args.expectedRevision ?? null);
+      const derivedIdempotencyKey = `mcp-${crypto.createHash('sha256').update(canonicalJson({ actor, record: args.record, rationale: args.rationale, expectedRevision: args.expectedRevision ?? null })).digest('hex')}`;
+      const proposal = await performMemoryProposal({
+        actor,
+        policy,
+        policies,
+        fabricStore,
+        scope: validated.scope,
+        record: args.record,
+        rationale: args.rationale.trim(),
+        expectedRevision: args.expectedRevision ?? null,
+        idempotencyKey: String(args.idempotencyKey || derivedIdempotencyKey),
+        source: 'mcp',
+        requestId,
+        requireIdempotencyKey: true
+      });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify({ status: proposal.status, proposalId: proposal.id, duplicate: proposal.duplicate, idempotencyKey: String(args.idempotencyKey || derivedIdempotencyKey) }, null, 2) }] });
+    }
+
+    if (name === 'memory_proposal_status') {
+      const status = await performMemoryProposalStatus({ actor, policy, policies, fabricStore, id: String(args.id || ''), requestId });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] });
+    }
+
+    if (name === 'memory_read') {
+      const memory = await performMemoryRead({ actor, policy, policies, fabricStore, id: String(args.id || ''), requestId });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(memory, null, 2) }] });
+    }
+
+    if (name === 'sessions_search') {
+      requireSessionPermission(policy);
+      const purpose = requirePurpose(args.purpose);
+      const query = String(args.query || '');
+      validateSearchInput(query);
+      const raw = await sessionReader.search({ actor, query, limit: normalizeSessionLimit(args.limit), purpose });
+      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy, policies)) };
+      await auditRequired(fabricStore, { actor, action: 'sessions_search', outcome: 'allowed', requestId, details: { resultCount: result.items.length, purpose } });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
+    }
+
+    if (name === 'session_get') {
+      requireSessionPermission(policy);
+      const purpose = requirePurpose(args.purpose);
+      const sessionTargetId = String(args.sessionId || args.id || '');
+      const result = await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionTargetId, purpose });
+      await auditRequired(fabricStore, { actor, action: 'session_get', outcome: 'allowed', requestId, targetId: sessionTargetId, details: { purpose } });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
+    }
+
+    if (name === 'session_transcript') {
+      requireSessionPermission(policy);
+      const purpose = requirePurpose(args.purpose);
+      const sessionTargetId = String(args.sessionId || args.id || '');
+      await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionTargetId, purpose });
+      const view = args.view === 'original' ? 'original' : 'redacted';
+      if (view === 'original' && !hasPermission(policy, 'raw:decrypt')) {
+        await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'denied', requestId, targetId: sessionTargetId, details: { view, purpose } });
+        const error = new Error('raw_decrypt_forbidden');
+        error.status = 403;
+        throw error;
+      }
+      const result = await sessionReader.transcript({ actor, id: sessionTargetId, view, purpose });
+      await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'allowed', requestId, targetId: sessionTargetId, details: { view, purpose } });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
+    }
+
     return createRpcError(id, -32601, 'Unknown tool');
   }
 
-  return createRpcError(id, -32601, `Unsupported method: ${method}`);
+  return createRpcError(id, -32601, 'Unsupported method');
+}
+
+function normalizeSessionLimit(value) {
+  const parsed = Number(value || 20);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100) {
+    const error = new Error('session_limit_invalid');
+    error.status = 400;
+    error.data = { min: 1, max: 100 };
+    throw error;
+  }
+  return parsed;
+}
+
+function requireSessionPermission(policy) {
+  if (canReadSessions(policy)) return;
+  const error = new Error('sessions_forbidden');
+  error.status = 403;
+  throw error;
+}
+
+function requirePermission(policy, permission) {
+  if (hasPermission(policy, permission)) return;
+  const error = new Error('forbidden');
+  error.status = 403;
+  throw error;
+}
+
+function requirePurpose(value) {
+  const purpose = String(value || '').trim();
+  if (!purpose) {
+    const error = new Error('purpose_required');
+    error.status = 400;
+    throw error;
+  }
+  const allowed = new Set(['conversation_recall', 'continuity_resume', 'incident_debug', 'operator_review', 'memory_curation']);
+  if (!allowed.has(purpose)) throw Object.assign(new Error('purpose_invalid'), { status: 400 });
+  return purpose;
+}
+
+function sessionVisible(session, actor, policy, policies) {
+  if (!session || typeof session !== 'object') return false;
+  if (session.ownerSelf === true) return true;
+  if (String(session.ownerActor || '') === actor) return true;
+  const scope = String(session.scope || '');
+  if (!scope || !getScopeConfig(scope, policies)) return false;
+  return canReadScope(policy, scope);
+}
+
+async function getAuthorizedSession(sessionReader, { actor, policy, policies, id, purpose }) {
+  let session;
+  try { session = await sessionReader.get({ actor, id, purpose }); } catch (error) {
+    if (error?.status === 404) {
+      const hidden = new Error('session_not_found');
+      hidden.status = 404;
+      throw hidden;
+    }
+    throw error;
+  }
+  if (!sessionVisible(session, actor, policy, policies)) {
+    const error = new Error('session_not_found');
+    error.status = 404;
+    throw error;
+  }
+  return session;
+}
+
+function createUnconfiguredSessionReader() {
+  const fail = async () => {
+    const error = new Error('session_reader_unconfigured');
+    error.status = 503;
+    throw error;
+  };
+  return { configured: false, kind: 'unconfigured', search: fail, get: fail, transcript: fail };
+}
+
+function buildStatus({ backend, fabricStore, sessionReader }) {
+  return {
+    service: SERVICE_NAME,
+    version: SERVICE_VERSION,
+    aliases: LEGACY_SERVICE_ALIASES,
+    backend: { kind: backend.kind, configured: backend.configured },
+    fabricStore: fabricStore.status(),
+    sessionReader: { kind: sessionReader.kind || 'custom', configured: Boolean(sessionReader.configured) },
+    compatibility: { restV1: true, mcpSse: true, mcpStreamableHttp: true },
+    limits: LIMITS
+  };
 }
 
 function getAllowedScopes(policy, policies) {
-  if (policy.mode === 'allow_all') return Object.keys(policies.scopes || {});
-  if (policy.mode === 'scoped' || policy.mode === 'read_only_scoped') return policy.allowedScopes || [];
+  const registered = Object.keys(policies.scopes || {});
+  if (policy.mode === 'allow_all') return registered;
+  if (policy.mode === 'scoped' || policy.mode === 'read_only_scoped') {
+    const configured = policy.allowedScopes || [];
+    if (configured.includes('*')) return registered;
+    return configured.filter(scope => registered.includes(scope));
+  }
   return [];
 }
 
 function normalizeRequestedScopes(inputScope, inputScopes, policy, policies) {
   const availableScopes = Object.keys(policies.scopes || {});
   const allowedScopes = getAllowedScopes(policy, policies);
-  const hasWildcardAccess = allowedScopes.includes('*');
+  const hasWildcardAccess = policy.mode === 'allow_all' || (policy.allowedScopes || []).includes('*');
 
   let requested = [];
   if (Array.isArray(inputScopes) && inputScopes.length) {
@@ -255,7 +701,7 @@ function parseActive(value) {
 }
 
 function getAuthRegistrySource() {
-  const localPath = String(process.env.MEM0_AUTH_REGISTRY_PATH || '').trim();
+  const localPath = String(process.env.AMF_AUTH_REGISTRY_PATH || process.env.MEM0_AUTH_REGISTRY_PATH || '').trim();
   if (localPath) {
     return {
       kind: 'local-json',
@@ -302,15 +748,16 @@ function validateAuthRows(rows, sourceKind) {
   });
 }
 
-function getBearerToken(req) {
+function getBearerToken(req, { allowQueryToken = false } = {}) {
   const auth = String(req.headers.authorization || req.headers.Authorization || '');
   if (auth.startsWith('Bearer ')) return auth.slice('Bearer '.length).trim();
+  if (!allowQueryToken) return '';
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const q = url.searchParams.get('access_token');
   return q ? String(q) : '';
 }
 
-async function loadAuthRegistry() {
+async function loadAuthRegistry({ forceRefresh = false } = {}) {
   const now = Date.now();
   const source = getAuthRegistrySource();
 
@@ -327,14 +774,13 @@ async function loadAuthRegistry() {
     } catch (error) {
       const err = new Error('auth_registry_file_unreadable');
       err.status = 500;
-      err.data = { path: source.path, cause: error?.code || error?.message || String(error) };
       throw err;
     }
 
     if (
       authCache.sourceKey === source.cacheKey &&
       authCache.mtimeMs === stat.mtimeMs &&
-      now - authCache.loadedAt < AUTH_CACHE_TTL_MS &&
+      !forceRefresh && now - authCache.loadedAt < AUTH_CACHE_TTL_MS &&
       Array.isArray(authCache.rows)
     ) {
       return authCache.rows;
@@ -346,7 +792,6 @@ async function loadAuthRegistry() {
     } catch (error) {
       const err = new Error('auth_registry_file_invalid_json');
       err.status = 500;
-      err.data = { path: source.path, cause: error?.message || String(error) };
       throw err;
     }
 
@@ -357,7 +802,7 @@ async function loadAuthRegistry() {
     return authCache.rows;
   }
 
-  if (now - authCache.loadedAt < AUTH_CACHE_TTL_MS && authCache.sourceKey === source.cacheKey && Array.isArray(authCache.rows)) {
+  if (!forceRefresh && now - authCache.loadedAt < AUTH_CACHE_TTL_MS && authCache.sourceKey === source.cacheKey && Array.isArray(authCache.rows)) {
     return authCache.rows;
   }
 
@@ -377,7 +822,6 @@ async function loadAuthRegistry() {
   if (!res.ok) {
     const err = new Error(`auth_registry_http_${res.status}`);
     err.status = res.status;
-    err.body = data ?? text;
     throw err;
   }
   authCache.rows = validateAuthRows(extractAuthRows(data, source.kind), source.kind);
@@ -387,23 +831,43 @@ async function loadAuthRegistry() {
   return authCache.rows;
 }
 
-async function authenticateRequest(req) {
-  const token = getBearerToken(req);
+function tokenDigest(value) {
+  return crypto.createHash('sha256').update(String(value), 'utf8').digest();
+}
+
+function registryTokenDigest(row) {
+  const configured = String(row.tokenSha256 || '').trim().toLowerCase();
+  if (/^[a-f0-9]{64}$/.test(configured)) return Buffer.from(configured, 'hex');
+  if (row.token) return tokenDigest(row.token);
+  return Buffer.alloc(32);
+}
+
+async function authenticateRequest(req, { allowQueryToken = false } = {}) {
+  const token = getBearerToken(req, { allowQueryToken });
   if (!token) {
     const err = new Error('missing_token');
     err.status = 401;
     throw err;
   }
-  const rows = await loadAuthRegistry();
-  const row = rows.find(r => String(r.token || '') === token && parseActive(r.active));
+  const rows = await loadAuthRegistry({ forceRefresh: true });
+  const candidate = tokenDigest(token);
+  return authenticateDigest(candidate, rows);
+}
+
+function authenticateDigest(candidate, rows) {
+  let row = null;
+  for (const current of rows) {
+    const matches = crypto.timingSafeEqual(candidate, registryTokenDigest(current));
+    if (matches && parseActive(current.active)) row = current;
+  }
   if (!row) {
     const err = new Error('invalid_token');
     err.status = 401;
     throw err;
   }
   return {
-    token,
     actor: String(row.actor || 'anonymous'),
+    tokenDigestHex: candidate.toString('hex'),
     policy: {
       mode: String(row.mode || 'deny'),
       allowedScopes: parseCsvList(row.allowedScopes),
@@ -412,7 +876,24 @@ async function authenticateRequest(req) {
   };
 }
 
+async function revalidateSession(session) {
+  try {
+    return authenticateDigest(Buffer.from(session.tokenDigestHex, 'hex'), await loadAuthRegistry({ forceRefresh: true }));
+  } catch {
+    const error = new Error('session_revoked');
+    error.status = 401;
+    throw error;
+  }
+}
+
 async function performScopedSearch({ actor, scope, scopes, query, policy, policies, backend }) {
+  if (!hasPermission(policy, 'memory:search')) {
+    const error = new Error('memory_search_forbidden');
+    error.status = 403;
+    error.data = { actor, permission: 'memory:search' };
+    throw error;
+  }
+  validateSearchInput(query);
   const resolvedScopes = normalizeRequestedScopes(scope, scopes, policy, policies);
   const searchResults = [];
   const startedAt = Date.now();
@@ -458,85 +939,320 @@ async function performScopedSearch({ actor, scope, scopes, query, policy, polici
   };
 }
 
-async function performScopedAdd({ actor, scope, text, metadata, infer, policy, policies, backend }) {
-  if (!canWriteScope(policy, scope)) {
-    const err = new Error('scope_forbidden');
-    err.status = 403;
-    err.data = { actor, scope, permission: 'memory:add' };
-    throw err;
+async function performMemoryProposal({ actor, policy, policies, fabricStore, scope, text = '', metadata = {}, infer = false, record = null, rationale = null, expectedRevision = null, idempotencyKey, source, requestId, requireIdempotencyKey }) {
+  if (record) validateCanonicalProposal(record, rationale, expectedRevision);
+  else validateProposalInput({ scope, text, metadata, idempotencyKey, requireIdempotencyKey });
+  if (requireIdempotencyKey && !idempotencyKey) throw Object.assign(new Error('idempotency_key_required'), { status: 400 });
+  if (idempotencyKey.length > LIMITS.idempotencyKeyChars) throw Object.assign(new Error('idempotency_key_too_large'), { status: 413 });
+  if (!getScopeConfig(scope, policies)) {
+    const error = new Error('scope_unregistered');
+    error.status = 400;
+    throw error;
   }
-  const scopeConfig = getScopeConfig(scope, policies);
-  if (!scopeConfig?.backendUserId) {
-    const err = new Error('scope_unmapped');
-    err.status = 400;
-    err.data = { scope };
-    throw err;
+  if (!canProposeScope(policy, scope)) {
+    const error = new Error('scope_forbidden');
+    error.status = 403;
+    error.data = { actor, scope, permission: 'memory:propose' };
+    await auditRequired(fabricStore, { actor, action: 'memory_propose', outcome: 'denied', requestId, scope });
+    throw error;
   }
-  const result = await backend.add({
-    backendUserId: scopeConfig.backendUserId,
-    text,
-    metadata,
-    infer
-  });
-  return {
-    ok: true,
+  let proposal;
+  try {
+    proposal = await fabricStore.propose({ actor, scope, text, metadata, infer, record, rationale, expectedRevision, source, idempotencyKey });
+  } catch (error) {
+    await auditRequired(fabricStore, { actor, action: 'memory_propose', outcome: 'failed', requestId, scope, details: { code: publicError(error).code } });
+    throw error;
+  }
+  await auditRequired(fabricStore, {
     actor,
+    action: 'memory_propose',
+    outcome: proposal.duplicate ? 'duplicate' : 'queued',
+    requestId,
+    targetId: proposal.id,
     scope,
-    backendUserId: scopeConfig.backendUserId,
-    result
+    details: { source, contentId: proposal.contentId }
+  });
+  return proposal;
+}
+
+function authorizationFor(actor, policy, policies) {
+  return {
+    actor,
+    allowedScopes: policy.mode === 'allow_all' ? [] : getAllowedScopes(policy, policies),
+    allowAll: policy.mode === 'allow_all'
   };
 }
 
-const backend = createBackendAdapter();
+async function performMemoryProposalStatus({ actor, policy, policies, fabricStore, id, requestId }) {
+  if (!id) throw Object.assign(new Error('memory_id_required'), { status: 400 });
+  if (!hasPermission(policy, 'memory:read')) throw Object.assign(new Error('memory_not_found'), { status: 404 });
+  const status = await fabricStore.getProposalStatusAuthorized(id, authorizationFor(actor, policy, policies));
+  await auditRequired(fabricStore, { actor, action: 'memory_proposal_status', outcome: 'allowed', requestId, targetId: id });
+  return status;
+}
 
-const server = http.createServer(async (req, res) => {
+async function performMemoryRead({ actor, policy, policies, fabricStore, id, requestId }) {
+  if (!id) {
+    const error = new Error('memory_id_required');
+    error.status = 400;
+    throw error;
+  }
+  if (!hasPermission(policy, 'memory:read')) {
+    await auditRequired(fabricStore, { actor, action: 'memory_read', outcome: 'denied', requestId, targetId: id });
+    const error = new Error('memory_not_found');
+    error.status = 404;
+    throw error;
+  }
+  const memory = await fabricStore.readProposalAuthorized(id, authorizationFor(actor, policy, policies));
+  await auditRequired(fabricStore, { actor, action: 'memory_read', outcome: 'allowed', requestId, targetId: id, scope: memory.scope });
+  if (memory.payload?.type === 'canonical-memory-proposal') {
+    return { id: memory.id, proposalStatus: memory.status, contentId: memory.contentId, createdAt: memory.createdAt, record: memory.payload.record, rationale: memory.payload.rationale, expectedRevision: memory.payload.expectedRevision };
+  }
+  return memory;
+}
+
+const defaultBackend = createBackendAdapter();
+const defaultSessionReader = createUnconfiguredSessionReader();
+
+function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, clock = () => Date.now(), policyPath = POLICY_PATH } = {}) {
+sessionReader = sessionReader || fabricStore.createSessionReader?.() || defaultSessionReader;
+const sessions = new Map();
+const sessionPolicy = { ...MCP_SESSION_DEFAULTS, ...sessionOptions };
+function pruneSessions(now = clock()) {
+  for (const [id, session] of sessions) {
+    if (now - session.lastSeenAt >= sessionPolicy.ttlMs) {
+      if (session.res && !session.res.destroyed) session.res.end();
+      sessions.delete(id);
+    }
+  }
+}
+function registerSession(session) {
+  pruneSessions();
+  if (sessions.size >= sessionPolicy.maxGlobal || [...sessions.values()].filter(item => item.actor === session.actor).length >= sessionPolicy.maxPerActor) {
+    throw Object.assign(new Error('session_capacity_exceeded'), { status: 429 });
+  }
+  const id = createMcpSessionId();
+  sessions.set(id, { ...session, createdAt: clock(), lastSeenAt: clock() });
+  return id;
+}
+const requestHandler = async (req, res) => {
   const requestId = crypto.randomUUID();
   const requestStartedAt = Date.now();
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathnameParts = url.pathname.split('/').filter(Boolean);
-  const policies = loadPolicies();
+  const policies = loadPolicies(policyPath);
   const sourceIp = String(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown');
   const isMcpMessagePost = url.pathname === '/mcp/messages/' && req.method === 'POST';
+  const isLegacySsePath = pathnameParts[0] === 'mcp' && pathnameParts[2] === 'sse' && pathnameParts[3] && req.method === 'GET';
   const isStreamableMcpPath = pathnameParts[0] === 'mcp' && pathnameParts.length === 3 && pathnameParts[1] && pathnameParts[2] && pathnameParts[2] !== 'messages';
   const requestSessionId = isMcpMessagePost ? (url.searchParams.get('session_id') || '') : (isStreamableMcpPath ? getMcpSessionHeader(req) : '');
+  pruneSessions();
   const requestSession = requestSessionId ? sessions.get(requestSessionId) : null;
 
   if (url.pathname === '/health') {
     logEvent('health_check', { requestId, method: req.method, path: url.pathname, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
     return json(res, 200, {
       ok: true,
-      service: 'mem0-gateway',
-      backend: {
-        kind: backend.kind,
-        configured: backend.configured
-      },
-      auth: {
-        registry: getAuthRegistrySource().kind
-      }
+      service: SERVICE_NAME,
+      version: SERVICE_VERSION
     });
   }
 
   let authContext;
   try {
     if (requestSession) {
-      authContext = {
-        token: 'session',
-        actor: requestSession.actor,
-        policy: requestSession.policy,
-        viaSession: true
-      };
+      let refreshed;
+      try {
+        refreshed = await revalidateSession(requestSession);
+      } catch (error) {
+        if (requestSession.res && !requestSession.res.destroyed) requestSession.res.end();
+        sessions.delete(requestSessionId);
+        throw error;
+      }
+      requestSession.actor = refreshed.actor;
+      requestSession.policy = refreshed.policy;
+      requestSession.lastSeenAt = clock();
+      authContext = { ...refreshed, viaSession: true };
       logEvent('auth_ok', { requestId, method: req.method, path: url.pathname, sourceIp, actor: authContext.actor, viaSession: true, sessionId: requestSessionId });
+    } else if (requestSessionId) {
+      throw Object.assign(new Error('session_expired'), { status: 401 });
     } else {
-      authContext = await authenticateRequest(req);
+      authContext = await authenticateRequest(req, { allowQueryToken: Boolean(isLegacySsePath) });
       logEvent('auth_ok', { requestId, method: req.method, path: url.pathname, sourceIp, actor: authContext.actor });
     }
   } catch (error) {
     logEvent('auth_failed', { requestId, method: req.method, path: url.pathname, sourceIp, error: safeError(error), latencyMs: Date.now() - requestStartedAt });
-    return json(res, error?.status || 401, { error: error?.message || 'unauthorized' });
+    try {
+      await auditRequired(fabricStore, { actor: 'anonymous', action: 'authenticate', outcome: 'denied', requestId, details: { code: publicError(error, 401).code } });
+    } catch (auditError) {
+      const failure = url.pathname.startsWith('/v2/')
+        ? v2Error(requestId, auditError, 503)
+        : { status: 503, body: { error: 'audit_unavailable' } };
+      return url.pathname.startsWith('/v1/')
+        ? jsonV1(res, failure.status, failure.body)
+        : json(res, failure.status, failure.body);
+    }
+    if (url.pathname.startsWith('/v2/')) {
+      const failure = v2Error(requestId, error, 401);
+      return json(res, failure.status, failure.body);
+    }
+    const failure = publicError(error, 401);
+    if (url.pathname.startsWith('/v1/')) return jsonV1(res, failure.status, { error: failure.code });
+    return json(res, failure.status, { error: failure.code });
   }
 
   const actor = authContext.actor;
   const policy = authContext.policy;
+
+  if (url.pathname === '/v2/status' && req.method === 'GET') {
+    try {
+      requirePermission(policy, 'memory:status');
+      await healthRequired(fabricStore);
+      const response = buildStatus({ backend, fabricStore, sessionReader });
+      await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
+      return json(res, 200, v2Envelope(requestId, response));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 403);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/memory/search' && req.method === 'POST') {
+    let body;
+    try {
+      body = await parseBody(req);
+      const response = await performScopedSearch({
+        actor,
+        scope: typeof body.scope === 'string' ? body.scope : '',
+        scopes: Array.isArray(body.scopes) ? body.scopes : [],
+        query: String(body.query || ''),
+        policy,
+        policies,
+        backend
+      });
+      await auditRequired(fabricStore, { actor, action: 'memory_search', outcome: 'allowed', requestId, details: { scopes: response.scopes, total: response.result?.total || 0 } });
+      return json(res, 200, v2Envelope(requestId, response));
+    } catch (error) {
+      if (error?.message !== 'audit_unavailable') {
+        await auditRequired(fabricStore, { actor, action: 'memory_search', outcome: 'failed', requestId, details: { code: publicError(error).code } });
+      }
+      const failure = v2Error(requestId, error, 502);
+      return json(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/memory/proposals' && req.method === 'POST') {
+    try {
+      const body = await parseBody(req, { timeoutMs: bodyReadTimeoutMs });
+      validateCanonicalProposalBody(body);
+      const validated = validateCanonicalProposal(body.record, body.rationale, body.expectedRevision ?? null);
+      const idempotencyKey = String(req.headers['idempotency-key'] || '');
+      const proposal = await performMemoryProposal({
+        actor,
+        policy,
+        policies,
+        fabricStore,
+        scope: validated.scope,
+        record: body.record,
+        rationale: body.rationale.trim(),
+        expectedRevision: body.expectedRevision ?? null,
+        idempotencyKey,
+        source: 'v2-rest',
+        requestId,
+        requireIdempotencyKey: true
+      });
+      return json(res, proposal.duplicate ? 200 : 202, v2Envelope(requestId, { status: proposal.status, proposalId: proposal.id, duplicate: proposal.duplicate, idempotencyKey }));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/ingest/raw-events' && req.method === 'POST') {
+    try {
+      requirePermission(policy, 'raw:ingest');
+      const body = await parseBody(req, { timeoutMs: bodyReadTimeoutMs });
+      if (!body || Object.keys(body).sort().join('\0') !== 'envelope\0projection\0sourceInstanceId') throw Object.assign(new Error('invalid_request'), { status: 400 });
+      const result = await fabricStore.ingestRawEvent({ actor, sourceInstanceId: body.sourceInstanceId, projection: body.projection, envelope: body.envelope }, { requestId });
+      return jsonNoStore(res, result.duplicate ? 200 : 201, v2Envelope(requestId, { ...result, idempotencyKey: result.eventId }));
+    } catch (error) {
+      if (error?.message !== 'audit_unavailable') {
+        try { await auditRequired(fabricStore, { actor, action: 'raw_event_ingest', outcome: 'failed', requestId, details: { code: publicError(error).code } }); } catch (auditError) { if (auditError?.message === 'audit_unavailable') error = auditError; }
+      }
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (pathnameParts[0] === 'v2' && pathnameParts[1] === 'memory' && pathnameParts[2] === 'proposals' && pathnameParts[3] && pathnameParts.length === 4 && req.method === 'GET') {
+    try {
+      const status = await performMemoryProposalStatus({ actor, policy, policies, fabricStore, id: pathnameParts[3], requestId });
+      return jsonNoStore(res, 200, v2Envelope(requestId, status));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (pathnameParts[0] === 'v2' && pathnameParts[1] === 'memory' && pathnameParts[2] && pathnameParts.length === 3 && req.method === 'GET') {
+    try {
+      const memory = await performMemoryRead({ actor, policy, policies, fabricStore, id: pathnameParts[2], requestId });
+      return jsonNoStore(res, 200, v2Envelope(requestId, memory));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/sessions/search' && req.method === 'POST') {
+    try {
+      requireSessionPermission(policy);
+      const body = await parseBody(req);
+      const purpose = requirePurpose(body.purpose);
+      const query = String(body.query || '');
+      validateSearchInput(query);
+      const raw = await sessionReader.search({ actor, query, limit: normalizeSessionLimit(body.limit), purpose });
+      const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy, policies)) };
+      await auditRequired(fabricStore, { actor, action: 'sessions_search', outcome: 'allowed', requestId, details: { resultCount: result.items.length, purpose } });
+      return jsonNoStore(res, 200, v2Envelope(requestId, result));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (pathnameParts[0] === 'v2' && pathnameParts[1] === 'sessions' && pathnameParts[2] && req.method === 'GET') {
+    try {
+      requireSessionPermission(policy);
+      const sessionId = pathnameParts[2];
+      const isTranscript = pathnameParts[3] === 'transcript';
+      const purpose = requirePurpose(url.searchParams.get('purpose'));
+      let result;
+      if (isTranscript) {
+        await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionId, purpose });
+        const view = url.searchParams.get('view') === 'original' ? 'original' : 'redacted';
+        if (view === 'original' && !hasPermission(policy, 'raw:decrypt')) {
+          await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'denied', requestId, targetId: sessionId, details: { view, purpose } });
+          const error = new Error('raw_decrypt_forbidden');
+          error.status = 403;
+          throw error;
+        }
+        result = await sessionReader.transcript({ actor, id: sessionId, view, purpose });
+        await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'allowed', requestId, targetId: sessionId, details: { view, purpose } });
+      } else if (pathnameParts.length === 3) {
+        result = await getAuthorizedSession(sessionReader, { actor, policy, policies, id: sessionId, purpose });
+        await auditRequired(fabricStore, { actor, action: 'session_get', outcome: 'allowed', requestId, targetId: sessionId, details: { purpose } });
+      } else {
+        const error = new Error('not_found');
+        error.status = 404;
+        throw error;
+      }
+      return jsonNoStore(res, 200, v2Envelope(requestId, result));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 500);
+      return json(res, failure.status, failure.body);
+    }
+  }
 
   if (url.pathname === '/v1/policies/resolve') {
     const scope = url.searchParams.get('scope') || '';
@@ -548,64 +1264,102 @@ const server = http.createServer(async (req, res) => {
       scopeConfig: getScopeConfig(scope, policies)
     };
     logEvent('resolve_policy', { requestId, actor, path: url.pathname, scope, allowed: response.allowed, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
-    return json(res, 200, response);
+    return jsonV1(res, 200, response);
   }
 
   if (url.pathname === '/v1/memory/search' && req.method === 'POST') {
     const body = await parseBody(req).catch(() => null);
-    if (!body) return json(res, 400, { error: 'invalid_json' });
+    if (!body) return jsonV1(res, 400, { error: 'invalid_json' });
     const scope = typeof body.scope === 'string' ? body.scope : '';
     const scopes = Array.isArray(body.scopes) ? body.scopes : [];
     const query = String(body.query || '');
     try {
       const response = await performScopedSearch({ actor, scope, scopes, query, policy, policies, backend });
       logEvent('memory_search', { requestId, actor, path: url.pathname, requestedScope: scope || null, requestedScopes: scopes, resolvedScopes: response.scopes, total: response.result?.total, perScope: response.result?.perScope, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
-      return json(res, 200, response);
+      return jsonV1(res, 200, response);
     } catch (error) {
       const status = error?.status === 403 ? 403 : error?.status === 400 ? 400 : 502;
       logEvent('memory_search_failed', { requestId, actor, path: url.pathname, requestedScope: scope || null, requestedScopes: scopes, sourceIp, statusCode: status, error: safeError(error), latencyMs: Date.now() - requestStartedAt });
-      return json(res, status, {
-        error: error?.message || 'backend_error',
-        details: error?.data || error?.body || null
-      });
+      const failure = publicError(error, status);
+      return jsonV1(res, failure.status, { error: failure.code });
     }
   }
 
   if (url.pathname === '/v1/memory/add' && req.method === 'POST') {
     const body = await parseBody(req).catch(() => null);
-    if (!body) return json(res, 400, { error: 'invalid_json' });
+    if (!body) return jsonV1(res, 400, { error: 'invalid_json' });
     const scope = String(body.scope || '');
     const text = String(body.text || '');
     const metadata = body.metadata && typeof body.metadata === 'object' ? body.metadata : {};
     const infer = Boolean(body.infer);
     try {
-      const response = await performScopedAdd({ actor, scope, text, metadata, infer, policy, policies, backend });
-      logEvent('memory_add', { requestId, actor, path: url.pathname, scope, infer, metadataKeys: Object.keys(metadata || {}), sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
-      return json(res, 200, response);
-    } catch (error) {
-      const status = error?.status === 403 ? 403 : error?.status === 400 ? 400 : 502;
-      logEvent('memory_add_failed', { requestId, actor, path: url.pathname, scope, infer, sourceIp, statusCode: status, error: safeError(error), latencyMs: Date.now() - requestStartedAt });
-      return json(res, status, {
-        error: error?.message || 'backend_error',
-        details: error?.data || error?.body || null
+      const proposal = await performMemoryProposal({
+        actor,
+        policy,
+        policies,
+        fabricStore,
+        scope,
+        text,
+        metadata,
+        infer,
+        idempotencyKey: String(req.headers['idempotency-key'] || body.idempotencyKey || deriveV1IdempotencyKey({ actor, scope, text, metadata, infer })),
+        source: 'v1-memory-add',
+        requestId,
+        requireIdempotencyKey: false
       });
+      const response = {
+        ok: true,
+        accepted: true,
+        status: 'queued',
+        state: 'queued',
+        queued: true,
+        promoted: false,
+        proposalId: proposal.id,
+        actor,
+        scope,
+        proposal,
+        result: {
+          status: 'queued',
+          proposalId: proposal.id,
+          canonical: false
+        }
+      };
+      logEvent('memory_add_queued', { requestId, actor, path: url.pathname, scope, infer, metadataKeys: Object.keys(metadata || {}), proposalId: proposal.id, duplicate: proposal.duplicate, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
+      return jsonV1(res, 200, response);
+    } catch (error) {
+      const status = error?.status || 500;
+      logEvent('memory_add_failed', { requestId, actor, path: url.pathname, scope, infer, sourceIp, statusCode: status, error: safeError(error), latencyMs: Date.now() - requestStartedAt });
+      const failure = publicError(error, status);
+      return jsonV1(res, failure.status, { error: failure.code });
     }
   }
 
   if (pathnameParts[0] === 'mcp' && pathnameParts[2] === 'sse' && pathnameParts[3] && req.method === 'GET') {
     const clientName = String(pathnameParts[1]);
     const identity = String(pathnameParts[3]);
-    const sessionId = createMcpSessionId();
+    let sessionId;
+    try {
+      sessionId = registerSession({ res, actor, policy, tokenDigestHex: authContext.tokenDigestHex, clientName, identity, transport: 'sse' });
+    } catch (error) {
+      const failure = publicError(error, 429);
+      return json(res, failure.status, { error: failure.code });
+    }
     res.writeHead(200, {
       'content-type': 'text/event-stream',
-      'cache-control': 'no-cache, no-transform',
+      ...PRIVATE_HEADERS,
+      'cache-control': 'no-store, private, no-transform',
       connection: 'keep-alive'
     });
-    sessions.set(sessionId, { res, actor, policy, clientName, identity });
     sendSse(res, 'endpoint', `/mcp/messages/?session_id=${sessionId}`);
     req.on('close', () => {
       sessions.delete(sessionId);
     });
+    return;
+  }
+
+  if (isStreamableMcpPath && req.method === 'GET') {
+    res.writeHead(405, { ...PRIVATE_HEADERS, allow: 'POST, DELETE' });
+    res.end();
     return;
   }
 
@@ -618,9 +1372,13 @@ const server = http.createServer(async (req, res) => {
     let sessionId = requestSessionId;
     let session = requestSession;
     if (!session) {
-      sessionId = createMcpSessionId();
-      session = { actor, policy, clientName, identity, transport: 'streamable-http' };
-      sessions.set(sessionId, session);
+      try {
+        sessionId = registerSession({ actor, policy, tokenDigestHex: authContext.tokenDigestHex, clientName, identity, transport: 'streamable-http' });
+        session = sessions.get(sessionId);
+      } catch (error) {
+        const failure = publicError(error, 429);
+        return json(res, failure.status, { error: failure.code });
+      }
       if (body.method !== 'initialize') {
         logEvent('mcp_session_recreated', { requestId, actor, clientName, identity, sourceIp, oldSessionId: requestSessionId || null, sessionId });
       }
@@ -633,6 +1391,8 @@ const server = http.createServer(async (req, res) => {
         policy: session.policy,
         policies,
         backend,
+        fabricStore,
+        sessionReader,
         requestId,
         requestStartedAt,
         sourceIp,
@@ -642,7 +1402,7 @@ const server = http.createServer(async (req, res) => {
 
       if (responseBody === null) {
         res.writeHead(202, {
-          'cache-control': 'no-cache',
+          ...PRIVATE_HEADERS,
           'mcp-session-id': sessionId
         });
         res.end();
@@ -651,19 +1411,20 @@ const server = http.createServer(async (req, res) => {
 
       res.writeHead(200, {
         'content-type': 'application/json; charset=utf-8',
-        'cache-control': 'no-cache',
+        ...PRIVATE_HEADERS,
         'mcp-session-id': sessionId
       });
       res.end(JSON.stringify(responseBody, null, 2));
       return;
     } catch (error) {
       logEvent('mcp_tools_call_failed', { requestId, actor: session.actor, sessionId, clientName: session.clientName, sourceIp, statusCode: 500, error: safeError(error), latencyMs: Date.now() - requestStartedAt });
+      const failure = publicError(error, 500);
       res.writeHead(200, {
         'content-type': 'application/json; charset=utf-8',
-        'cache-control': 'no-cache',
+        ...PRIVATE_HEADERS,
         'mcp-session-id': sessionId
       });
-      res.end(JSON.stringify(createRpcError(body.id ?? null, -32000, error?.message || 'gateway_error', error?.data || error?.body || null), null, 2));
+      res.end(JSON.stringify(createRpcError(body.id ?? null, -32000, failure.code), null, 2));
       return;
     }
   }
@@ -671,7 +1432,7 @@ const server = http.createServer(async (req, res) => {
   if (isStreamableMcpPath && req.method === 'DELETE') {
     if (!requestSession) return json(res, 404, { error: 'unknown_session' });
     sessions.delete(requestSessionId);
-    res.writeHead(204);
+    res.writeHead(204, PRIVATE_HEADERS);
     res.end();
     return;
   }
@@ -693,6 +1454,8 @@ const server = http.createServer(async (req, res) => {
         policy: currentPolicy,
         policies,
         backend,
+        fabricStore,
+        sessionReader,
         requestId,
         requestStartedAt,
         sourceIp,
@@ -702,37 +1465,103 @@ const server = http.createServer(async (req, res) => {
       if (responseBody !== null) {
         sendSse(session.res, 'message', responseBody);
       }
-      res.writeHead(200).end();
+      res.writeHead(200, PRIVATE_HEADERS).end();
       return;
     } catch (error) {
       logEvent('mcp_tools_call_failed', { requestId, actor: currentActor, sessionId, clientName: session.clientName, sourceIp, statusCode: 500, error: safeError(error), latencyMs: Date.now() - requestStartedAt });
-      sendSse(session.res, 'message', createRpcError(id, -32000, error?.message || 'gateway_error', error?.data || error?.body || null));
-      res.writeHead(200).end();
+      const failure = publicError(error, 500);
+      sendSse(session.res, 'message', createRpcError(body.id ?? null, -32000, failure.code));
+      res.writeHead(200, PRIVATE_HEADERS).end();
       return;
     }
   }
 
-  return json(res, 404, { error: 'not_found', path: url.pathname });
+  if (url.pathname.startsWith('/v2/')) {
+    const error = new Error('not_found');
+    error.status = 404;
+    const failure = v2Error(requestId, error, 404);
+    return json(res, failure.status, failure.body);
+  }
+  return json(res, 404, { error: 'not_found' });
+};
+const applicationServer = http.createServer((req, res) => {
+  requestHandler(req, res).catch((error) => {
+    logEvent('request_handler_failed', {
+      method: req.method,
+      path: String(req.url || ''),
+      error: safeError(error),
+      statusCode: 503
+    });
+    if (res.headersSent || res.writableEnded) {
+      if (!res.destroyed) res.destroy();
+      return;
+    }
+    const requestId = crypto.randomUUID();
+    const pathname = String(req.url || '').split('?', 1)[0];
+    if (pathname.startsWith('/v2/')) {
+      const failure = v2Error(requestId, Object.assign(new Error('service_unavailable'), { status: 503 }), 503);
+      json(res, failure.status, failure.body);
+      return;
+    }
+    if (pathname.startsWith('/v1/')) {
+      jsonV1(res, 503, { error: 'service_unavailable' });
+      return;
+    }
+    json(res, 503, { error: 'service_unavailable' });
+  });
 });
+applicationServer.on('close', () => {
+  Promise.resolve(fabricStore.close?.()).catch((error) => {
+    logEvent('fabric_store_close_failed', { error: safeError(error) });
+  });
+});
+return applicationServer;
+}
 
 if (process.argv.includes('--check')) {
-  console.log(JSON.stringify({ ok: true, policyPath: POLICY_PATH, port: PORT, backend: backend.kind, configured: backend.configured, authRegistry: getAuthRegistrySource().kind }, null, 2));
+  const checkStore = createUnconfiguredFabricStore('check_only');
+  console.log(JSON.stringify({ ok: true, service: SERVICE_NAME, aliases: LEGACY_SERVICE_ALIASES, policyPath: POLICY_PATH, port: PORT, backend: defaultBackend.kind, configured: defaultBackend.configured, fabricStore: checkStore.status(), authRegistry: getAuthRegistrySource().kind }, null, 2));
   process.exit(0);
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 
 if (isMain) {
-  server.listen(PORT, () => {
-    console.log(`mem0-gateway listening on :${PORT}`);
-    console.log(`policy path: ${POLICY_PATH}`);
-    console.log(`backend kind: ${backend.kind}`);
-    console.log(`auth registry: ${getAuthRegistrySource().kind}`);
-  });
+  if (process.env.AMF_SERVER_ENABLED !== 'true') {
+    console.error('agent-memory-fabric disabled: set AMF_SERVER_ENABLED=true explicitly');
+    process.exitCode = 78;
+  } else if (!POLICY_PATH) {
+    console.error('agent-memory-fabric disabled: AMF_POLICY_PATH must reference an explicit production policy');
+    process.exitCode = 78;
+  } else {
+    let runtimeFabricStore;
+    let runtimeServer;
+    try {
+      runtimeFabricStore = createFabricStoreFromEnv({ rootPath: ROOT });
+      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore });
+    } catch (error) {
+      console.error(`agent-memory-fabric disabled: configuration failed: ${safeError(error)?.code || 'internal_error'}`);
+      process.exitCode = 78;
+    }
+    Promise.resolve(runtimeFabricStore?.ready?.()).then(() => {
+      if (!runtimeServer) return;
+      runtimeServer.listen(PORT, () => {
+        console.log(`${SERVICE_NAME} listening on :${PORT}`);
+        console.log(`policy path: ${POLICY_PATH}`);
+        console.log(`backend kind: ${defaultBackend.kind}`);
+        console.log(`auth registry: ${getAuthRegistrySource().kind}`);
+      });
+    }).catch(async (error) => {
+      console.error(`agent-memory-fabric disabled: catalog initialization failed: ${safeError(error)?.code || 'internal_error'}`);
+      try { await runtimeFabricStore?.close?.(); } catch {}
+      process.exitCode = 78;
+    });
+  }
 }
 
 export {
   authenticateRequest,
+  createAgentMemoryFabricServer,
   getAuthRegistrySource,
   loadAuthRegistry,
   parseActive,

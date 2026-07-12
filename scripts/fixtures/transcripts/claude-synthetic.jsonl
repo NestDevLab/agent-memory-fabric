@@ -1,0 +1,2 @@
+{"type":"user","uuid":"claude-event-user","sessionId":"claude-session-synthetic","timestamp":"2026-07-11T11:00:00.000Z","message":{"role":"user","content":"SYNTHETIC_PRIVATE_CLAUDE_TEXT"}}
+{"type":"assistant","uuid":"claude-event-assistant","sessionId":"claude-session-synthetic","message":{"role":"assistant","content":[{"type":"text","text":"SYNTHETIC_PRIVATE_CLAUDE_REPLY"}]}}

@@ -1,0 +1,12 @@
+{
+  "keys": {
+    "client-v1": "<canonical-base64-encoded-32-byte-key>"
+  },
+  "digestKey": "<independent-canonical-base64-encoded-32-byte-key>",
+  "authorizations": {
+    "client-v1": {
+      "actors": ["main-openclaw"],
+      "sourceInstances": ["ct107-codex"]
+    }
+  }
+}

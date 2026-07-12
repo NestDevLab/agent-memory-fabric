@@ -1,0 +1,45 @@
+services:
+  agent-memory-fabric:
+    image: agent-memory-fabric:0.2.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    read_only: true
+    environment:
+      AMF_SERVER_ENABLED: "true"
+      AMF_POLICY_PATH: /run/config/agent-memory-fabric-policy.json
+      AMF_AUTH_REGISTRY_PATH: /run/secrets/agent-memory-fabric-auth.json
+      AMF_RAW_KEY_RING_PATH: /run/secrets/agent-memory-fabric-key-ring.json
+      AMF_INGEST_KEY_RING_PATH: /run/secrets/agent-memory-fabric-ingest-key-ring.json
+      AMF_DATA_PATH: /var/lib/agent-memory-fabric
+      AMF_CATALOG_KIND: "${AMF_CATALOG_KIND:-sqlite}"
+      AMF_CATALOG_PATH: /var/lib/agent-memory-fabric/catalog.sqlite
+      AMF_CATALOG_DATABASE_URL: "${AMF_CATALOG_DATABASE_URL:-}"
+      AMF_CATALOG_SSL_MODE: "${AMF_CATALOG_SSL_MODE:-verify-full}"
+      AMF_CATALOG_POOL_MAX: "${AMF_CATALOG_POOL_MAX:-10}"
+      AMF_CATALOG_CONNECT_TIMEOUT_MS: "${AMF_CATALOG_CONNECT_TIMEOUT_MS:-5000}"
+      AMF_CATALOG_QUERY_TIMEOUT_MS: "${AMF_CATALOG_QUERY_TIMEOUT_MS:-15000}"
+      AMF_CATALOG_STATEMENT_TIMEOUT_MS: "${AMF_CATALOG_STATEMENT_TIMEOUT_MS:-10000}"
+      AMF_AUDIT_TIMEOUT_MS: "${AMF_AUDIT_TIMEOUT_MS:-2000}"
+      AMF_CATALOG_HEALTH_TIMEOUT_MS: "${AMF_CATALOG_HEALTH_TIMEOUT_MS:-3000}"
+      AMF_BODY_READ_TIMEOUT_MS: "${AMF_BODY_READ_TIMEOUT_MS:-10000}"
+      MEM0_BACKEND_KIND: disabled
+    env_file:
+      - path: .env.runtime
+        required: false
+    volumes:
+      - ./var/agent-memory-fabric:/var/lib/agent-memory-fabric
+      - ${AMF_PRODUCTION_POLICY_PATH:?mount the reviewed CT113 production policy}:/run/config/agent-memory-fabric-policy.json:ro
+      - ${AMF_AUTH_REGISTRY_SECRET_PATH:?mount the CT113 auth registry secret}:/run/secrets/agent-memory-fabric-auth.json:ro
+      - ${AMF_KEY_RING_SECRET_PATH:?mount the CT113 key-ring secret}:/run/secrets/agent-memory-fabric-key-ring.json:ro
+      - ${AMF_INGEST_KEY_RING_SECRET_PATH:?mount the CT113 ingest key-ring secret}:/run/secrets/agent-memory-fabric-ingest-key-ring.json:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    ports:
+      - "${AMF_BIND_ADDRESS:-192.168.1.115}:8787:8787"
+    networks:
+      default:
+        aliases:
+          - mem0-gateway
