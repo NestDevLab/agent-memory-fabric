@@ -64,6 +64,15 @@ const PUBLIC_ERRORS = new Map([
   ['idempotency_key_conflict', [409, 'idempotency_key_conflict']], ['body_too_large', [413, 'body_too_large']], ['query_too_large', [413, 'query_too_large']],
   ['body_read_timeout', [408, 'body_read_timeout']],
   ['proposal_too_large', [413, 'proposal_too_large']], ['metadata_too_large', [413, 'metadata_too_large']], ['idempotency_key_too_large', [413, 'idempotency_key_too_large']],
+  ['identity_invalid', [400, 'identity_invalid']], ['identity_kind_invalid', [400, 'identity_kind_invalid']], ['identity_external_key_invalid', [400, 'identity_external_key_invalid']],
+  ['identity_scope_invalid', [400, 'identity_scope_invalid']], ['identity_evidence_invalid', [400, 'identity_evidence_invalid']], ['identity_evidence_type_invalid', [400, 'identity_evidence_type_invalid']],
+  ['identity_evidence_timestamp_invalid', [400, 'identity_evidence_timestamp_invalid']], ['identity_merge_invalid', [400, 'identity_merge_invalid']], ['identity_split_invalid', [400, 'identity_split_invalid']],
+  ['identity_target_required', [400, 'identity_target_required']], ['identity_evidence_strength_required', [400, 'identity_evidence_strength_required']],
+  ['retention_plan_invalid', [400, 'retention_plan_invalid']], ['retention_apply_invalid', [400, 'retention_apply_invalid']], ['retention_as_of_invalid', [400, 'retention_as_of_invalid']],
+  ['retention_limit_invalid', [400, 'retention_limit_invalid']], ['retention_candidates_invalid', [400, 'retention_candidates_invalid']], ['retention_reason_invalid', [400, 'retention_reason_invalid']],
+  ['identity_auto_merge_forbidden', [403, 'identity_auto_merge_forbidden']], ['identity_not_found', [404, 'identity_not_found']], ['retention_not_found', [404, 'retention_not_found']],
+  ['identity_already_exists', [409, 'identity_already_exists']], ['identity_state_conflict', [409, 'identity_state_conflict']], ['revision_conflict', [409, 'revision_conflict']],
+  ['retention_plan_in_future', [409, 'retention_plan_in_future']],
   ['session_capacity_exceeded', [429, 'session_capacity_exceeded']], ['fabric_store_unconfigured', [503, 'fabric_store_unconfigured']],
   ['raw_projection_invalid', [400, 'raw_projection_invalid']], ['raw_envelope_invalid', [400, 'raw_envelope_invalid']], ['raw_envelope_binding_invalid', [400, 'raw_envelope_binding_invalid']],
   ['source_instance_invalid', [400, 'source_instance_invalid']], ['raw_event_conflict', [409, 'raw_event_conflict']], ['raw_ingest_key_unavailable', [503, 'raw_ingest_key_unavailable']],
@@ -156,6 +165,17 @@ async function boundedDependency(operation, timeoutMs, code) {
 
 function auditRequired(fabricStore, event) {
   return boundedDependency(() => fabricStore.audit(event), AUDIT_TIMEOUT_MS, 'audit_unavailable');
+}
+
+async function auditInternalFailure(fabricStore, { actor, action, requestId, targetId = null, error }) {
+  if (error?.message === 'audit_unavailable') return error;
+  const failure = publicError(error, Number(error?.status || 500));
+  try {
+    await auditRequired(fabricStore, { actor, action, outcome: failure.status < 500 ? 'denied' : 'failed', requestId, targetId, details: { code: failure.code } });
+    return error;
+  } catch (auditError) {
+    return auditError;
+  }
 }
 
 function healthRequired(fabricStore) {
@@ -475,7 +495,7 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       const scope = typeof args.scope === 'string' ? args.scope : '';
       const scopes = Array.isArray(args.scopes) ? args.scopes : [];
       const query = String(args.query || '');
-      const searchResult = await performScopedSearch({ actor, scope, scopes, query, policy, policies, backend });
+      const searchResult = await performScopedSearch({ actor, scope, scopes, query, policy, policies, backend, fabricStore });
       logEvent('mcp_tools_call', { requestId, actor, tool: 'memory_search', sessionId, clientName, requestedScope: scope || null, requestedScopes: scopes, resolvedScopes: searchResult.scopes, perScope: searchResult.result?.perScope, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
       return createRpcResult(id, {
         content: [{ type: 'text', text: JSON.stringify(searchResult, null, 2) }]
@@ -886,7 +906,7 @@ async function revalidateSession(session) {
   }
 }
 
-async function performScopedSearch({ actor, scope, scopes, query, policy, policies, backend }) {
+async function performScopedSearch({ actor, scope, scopes, query, policy, policies, backend, fabricStore }) {
   if (!hasPermission(policy, 'memory:search')) {
     const error = new Error('memory_search_forbidden');
     error.status = 403;
@@ -908,12 +928,13 @@ async function performScopedSearch({ actor, scope, scopes, query, policy, polici
     }
     const scopeStartedAt = Date.now();
     const result = await backend.search({ backendUserId: scopeConfig.backendUserId, query, scope: resolvedScope });
-    const items = (result?.items || []).map(item => ({ ...item, scope: resolvedScope }));
+    const filteredItems = await fabricStore.filterRecallItems(result?.items || [], { allowedScopes: [resolvedScope] });
+    const items = filteredItems.map(item => ({ ...item, scope: resolvedScope }));
     searchResults.push({
       scope: resolvedScope,
       backendUserId: scopeConfig.backendUserId,
       items,
-      total: result?.total || items.length,
+      total: items.length,
       source: result?.source || backend.kind,
       latencyMs: Date.now() - scopeStartedAt
     });
@@ -1117,6 +1138,86 @@ const requestHandler = async (req, res) => {
     }
   }
 
+  if (url.pathname === '/v2/internal/identities' && req.method === 'POST') {
+    try {
+      requirePermission(policy, 'identity:write');
+      const body = await parseBody(req);
+      if (Object.hasOwn(body, 'actor') || Object.hasOwn(body, 'idempotencyKey')) throw Object.assign(new Error('invalid_request'), { status: 400 });
+      const scope = String(body.scope || '');
+      if (!getScopeConfig(scope, policies) || !canReadScope(policy, scope)) throw Object.assign(new Error('scope_forbidden'), { status: 403 });
+      const result = await fabricStore.createIdentity({ ...body, actor, idempotencyKey: String(req.headers['idempotency-key'] || '') });
+      await auditRequired(fabricStore, { actor, action: 'identity_create', outcome: result.duplicate ? 'duplicate' : 'created', requestId, targetId: result.id, scope });
+      return jsonNoStore(res, result.duplicate ? 200 : 201, v2Envelope(requestId, result));
+    } catch (error) {
+      const reported = await auditInternalFailure(fabricStore, { actor, action: 'identity_create', requestId, error });
+      const failure = v2Error(requestId, reported, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (pathnameParts[0] === 'v2' && pathnameParts[1] === 'internal' && pathnameParts[2] === 'identities' && pathnameParts[3] && pathnameParts.length === 4 && req.method === 'GET') {
+    try {
+      requirePermission(policy, 'identity:read');
+      const result = await fabricStore.readIdentityAuthorized(pathnameParts[3], authorizationFor(actor, policy, policies));
+      await auditRequired(fabricStore, { actor, action: 'identity_read', outcome: 'allowed', requestId, targetId: result.id });
+      return jsonNoStore(res, 200, v2Envelope(requestId, result));
+    } catch (error) {
+      const reported = await auditInternalFailure(fabricStore, { actor, action: 'identity_read', requestId, targetId: pathnameParts[3], error });
+      const failure = v2Error(requestId, reported, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (pathnameParts[0] === 'v2' && pathnameParts[1] === 'internal' && pathnameParts[2] === 'identities' && pathnameParts[3] && ['merge', 'split'].includes(pathnameParts[4]) && pathnameParts.length === 5 && req.method === 'POST') {
+    const operation = pathnameParts[4];
+    try {
+      requirePermission(policy, 'identity:write');
+      const body = await parseBody(req);
+      if (Object.hasOwn(body, 'actor') || Object.hasOwn(body, 'idempotencyKey')) throw Object.assign(new Error('invalid_request'), { status: 400 });
+      const scope = String(body.scope || '');
+      if (!getScopeConfig(scope, policies) || !canReadScope(policy, scope)) throw Object.assign(new Error('scope_forbidden'), { status: 403 });
+      const input = { ...body, actor, idempotencyKey: String(req.headers['idempotency-key'] || '') };
+      const result = operation === 'merge'
+        ? await fabricStore.mergeIdentity(pathnameParts[3], input)
+        : await fabricStore.splitIdentity(pathnameParts[3], input);
+      await auditRequired(fabricStore, { actor, action: `identity_${operation}`, outcome: result.duplicate ? 'duplicate' : 'applied', requestId, targetId: result.id, scope });
+      return jsonNoStore(res, 200, v2Envelope(requestId, result));
+    } catch (error) {
+      const reported = await auditInternalFailure(fabricStore, { actor, action: `identity_${operation}`, requestId, targetId: pathnameParts[3], error });
+      const failure = v2Error(requestId, reported, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/internal/retention/plan' && req.method === 'POST') {
+    try {
+      requirePermission(policy, 'retention:manage');
+      const body = await parseBody(req);
+      const result = await fabricStore.planRetention(body, authorizationFor(actor, policy, policies));
+      await auditRequired(fabricStore, { actor, action: 'retention_plan', outcome: 'allowed', requestId, details: { resultCount: result.candidates.length } });
+      return jsonNoStore(res, 200, v2Envelope(requestId, result));
+    } catch (error) {
+      const reported = await auditInternalFailure(fabricStore, { actor, action: 'retention_plan', requestId, error });
+      const failure = v2Error(requestId, reported, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/internal/retention/apply' && req.method === 'POST') {
+    try {
+      requirePermission(policy, 'retention:manage');
+      const body = await parseBody(req);
+      if (Object.hasOwn(body, 'actor') || Object.hasOwn(body, 'idempotencyKey')) throw Object.assign(new Error('invalid_request'), { status: 400 });
+      const result = await fabricStore.applyRetention({ ...body, actor, idempotencyKey: String(req.headers['idempotency-key'] || '') }, authorizationFor(actor, policy, policies));
+      await auditRequired(fabricStore, { actor, action: 'retention_apply', outcome: 'applied', requestId, details: { resultCount: result.results.length } });
+      return jsonNoStore(res, 200, v2Envelope(requestId, result));
+    } catch (error) {
+      const reported = await auditInternalFailure(fabricStore, { actor, action: 'retention_apply', requestId, error });
+      const failure = v2Error(requestId, reported, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
   if (url.pathname === '/v2/memory/search' && req.method === 'POST') {
     let body;
     try {
@@ -1128,7 +1229,8 @@ const requestHandler = async (req, res) => {
         query: String(body.query || ''),
         policy,
         policies,
-        backend
+        backend,
+        fabricStore
       });
       await auditRequired(fabricStore, { actor, action: 'memory_search', outcome: 'allowed', requestId, details: { scopes: response.scopes, total: response.result?.total || 0 } });
       return json(res, 200, v2Envelope(requestId, response));
@@ -1274,7 +1376,7 @@ const requestHandler = async (req, res) => {
     const scopes = Array.isArray(body.scopes) ? body.scopes : [];
     const query = String(body.query || '');
     try {
-      const response = await performScopedSearch({ actor, scope, scopes, query, policy, policies, backend });
+      const response = await performScopedSearch({ actor, scope, scopes, query, policy, policies, backend, fabricStore });
       logEvent('memory_search', { requestId, actor, path: url.pathname, requestedScope: scope || null, requestedScopes: scopes, resolvedScopes: response.scopes, total: response.result?.total, perScope: response.result?.perScope, sourceIp, statusCode: 200, latencyMs: Date.now() - requestStartedAt });
       return jsonV1(res, 200, response);
     } catch (error) {

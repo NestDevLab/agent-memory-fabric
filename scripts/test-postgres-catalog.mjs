@@ -11,7 +11,8 @@ import {
   FabricStore,
   MemoryRawStore,
   PostgresCatalog,
-  createFabricStoreFromEnv
+  createFabricStoreFromEnv,
+  identityPairLockKey
 } from '../src/fabric-store.mjs';
 
 class FakePool {
@@ -167,7 +168,7 @@ test('PostgreSQL catalog bootstraps the complete versioned metadata schema idemp
   assert.equal(pool.connectCalls, 1);
   assert.equal(pool.releaseCalls, 1);
   const ddl = pool.queries.map((entry) => entry.text).join('\n');
-  for (const table of ['schema_migrations', 'raw_objects_v2', 'fabric_proposals', 'identity_records', 'ingest_cursors', 'raw_sessions_v1', 'raw_events_v1', 'audit_events_v2', 'retention_tombstones']) {
+  for (const table of ['schema_migrations', 'raw_objects_v2', 'fabric_proposals', 'identity_records', 'identity_records_v2', 'identity_events_v2', 'raw_retention_v2', 'retention_operations_v2', 'ingest_cursors', 'raw_sessions_v1', 'raw_events_v1', 'audit_events_v2', 'retention_tombstones', 'retention_tombstones_v2']) {
     assert.match(ddl, new RegExp(`${POSTGRES_SCHEMA}\\.${table}`));
   }
   assert.match(ddl, /UNIQUE\(owner_tag, idempotency_tag\)/);
@@ -377,5 +378,26 @@ test('PostgreSQL catalog refuses a schema newer than this binary', async () => {
   const catalog = new PostgresCatalog({ pool });
   await assert.rejects(catalog.ready(), /catalog_schema_version_unsupported/);
   assert.ok(pool.queries.some((entry) => entry.text === 'ROLLBACK'));
+  await catalog.close();
+});
+
+test('PostgreSQL reciprocal merges acquire the same direction-independent pair lock', async () => {
+  const pool = new FakePool();
+  const catalog = new PostgresCatalog({ pool });
+  const event = {
+    id: 'event-pair', identityId: 'identity-a', revision: 2, operation: 'merge', targetIdentityId: 'identity-b',
+    evidenceContentId: 'e'.repeat(64), evidenceStrength: 'strong', automatic: false, actorTag: 'actor-tag',
+    idempotencyTag: 'idem-pair', response: { id: 'identity-a', kind: 'person', status: 'merged', canonicalIdentityId: 'identity-b', revision: 2 },
+    createdAt: '2026-07-11T12:00:00.000Z'
+  };
+  await assert.rejects(catalog.mutateIdentity({ sourceId: 'identity-a', targetId: 'identity-b', expectedRevision: 1, operation: 'merge', event, rawRecord: raw('e'.repeat(64)) }), /identity_not_found/);
+  const first = pool.queries.find(entry => entry.text.includes('hashtextextended($1, 1)'));
+  assert.deepEqual(first.values, [identityPairLockKey('identity-a', 'identity-b')]);
+  assert.match(first.values[0], /^[a-f0-9]{64}$/);
+  assert.equal(first.values[0].includes('\u0000'), false);
+  pool.queries.length = 0;
+  await assert.rejects(catalog.mutateIdentity({ sourceId: 'identity-b', targetId: 'identity-a', expectedRevision: 1, operation: 'merge', event: { ...event, id: 'event-pair-reverse', identityId: 'identity-b', targetIdentityId: 'identity-a', idempotencyTag: 'idem-pair-reverse' }, rawRecord: raw('f'.repeat(64)) }), /identity_not_found/);
+  const reverse = pool.queries.find(entry => entry.text.includes('hashtextextended($1, 1)'));
+  assert.deepEqual(reverse.values, first.values);
   await catalog.close();
 });

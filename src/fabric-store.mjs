@@ -4,6 +4,13 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import pg from 'pg';
 import { ciphertextContentId, ciphertextPayloadDigest, decryptClientCiphertext, normalizeIngestKeyRing, validateClientCiphertext } from './ingest/raw-event-contract.mjs';
+import {
+  retentionDeadline,
+  retentionTombstone,
+  validateIdentityCreate,
+  validateIdentityMutation,
+  validateRetentionAction
+} from './identity-retention.mjs';
 
 const { Pool } = pg;
 
@@ -124,6 +131,20 @@ function secureReadFile(directoryFd, filename) {
 function secureRemoveFile(directoryFd, filename) {
   try { fs.unlinkSync(procFdChild(directoryFd, filename)); fs.fsyncSync(directoryFd); }
   catch (error) { if (error?.code !== 'ENOENT') mapSecurePathError(error); }
+}
+
+function recallRefs(item) {
+  const metadata = item?.metadata && typeof item.metadata === 'object' && !Array.isArray(item.metadata) ? item.metadata : {};
+  return {
+    proposalId: typeof item?.proposalId === 'string' ? item.proposalId : (typeof metadata.proposalId === 'string' ? metadata.proposalId : null),
+    contentId: typeof item?.contentId === 'string' ? item.contentId : (typeof metadata.contentId === 'string' ? metadata.contentId : null),
+    identityId: typeof item?.identityId === 'string' ? item.identityId : (typeof metadata.identityId === 'string' ? metadata.identityId : null)
+  };
+}
+
+export function identityPairLockKey(first, second) {
+  const ordered = [String(first), String(second)].sort();
+  return crypto.createHash('sha256').update(canonicalJson(['identity-pair', ...ordered]), 'utf8').digest('hex');
 }
 
 function parseMasterKey(value) {
@@ -378,6 +399,13 @@ export class MemoryCatalog {
     this.auditEvents = [];
     this.rawEvents = new Map();
     this.rawSessions = new Map();
+    this.identities = new Map();
+    this.identitiesByTag = new Map();
+    this.identityEvents = [];
+    this.identityIdempotency = new Map();
+    this.retention = new Map();
+    this.retentionTombstones = new Map();
+    this.retentionOperations = new Map();
   }
   findProposal(ownerTags, idempotencyTags) {
     for (const ownerTag of ownerTags) for (const idempotencyTag of idempotencyTags) {
@@ -390,11 +418,28 @@ export class MemoryCatalog {
     const existing = this.findProposal([record.ownerTag], [record.idempotencyTag]);
     if (existing) return { record: existing, duplicate: true };
     this.rawObjects.set(rawRecord.contentId, { ...rawRecord });
+    if (rawRecord.retention) this.retention.set(rawRecord.contentId, { ...rawRecord.retention });
     this.proposals.set(record.id, { ...record });
     this.idempotency.set(`${record.ownerTag}\u0000${record.idempotencyTag}`, record.id);
     return { record: this.proposals.get(record.id), duplicate: false };
   }
   getProposal(id) { return this.proposals.get(id) || null; }
+  recallItemActive(refs, scopeTags) {
+    const allowed = new Set(scopeTags);
+    if (refs.proposalId) {
+      const row = this.proposals.get(refs.proposalId);
+      if (!row || !allowed.has(row.scopeTag) || ['revoked', 'rejected'].includes(row.status)) return false;
+    }
+    if (refs.contentId) {
+      const row = this.retention.get(refs.contentId);
+      if (!row || !allowed.has(row.scopeTag) || row.lifecycle !== 'active') return false;
+    }
+    if (refs.identityId) {
+      const row = this.identities.get(refs.identityId);
+      if (!row || !allowed.has(row.scopeTag) || row.status !== 'active') return false;
+    }
+    return true;
+  }
   appendAudit(event) { this.auditEvents.push({ ...event }); }
   ingestRawEvent(record, rawRecord, auditEvent) {
     const existing = this.rawEvents.get(record.eventId);
@@ -423,6 +468,85 @@ export class MemoryCatalog {
   }
   getSession(id) { return this.rawSessions.get(id) || null; }
   listSessionEvents(id) { return [...this.rawEvents.values()].filter(item => item.sessionId === id).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId)); }
+  createIdentity(record, event, rawRecord) {
+    const replay = this.identityIdempotency.get(event.idempotencyTag);
+    if (replay) return { record: { ...this.identities.get(replay.identityId) }, event: { ...replay }, duplicate: true };
+    const existingId = this.identitiesByTag.get(record.identityTag);
+    if (existingId) return { record: { ...this.identities.get(existingId) }, event: null, duplicate: true };
+    this.rawObjects.set(rawRecord.contentId, { ...rawRecord });
+    this.identities.set(record.id, { ...record });
+    this.identitiesByTag.set(record.identityTag, record.id);
+    this.identityEvents.push({ ...event });
+    this.identityIdempotency.set(event.idempotencyTag, { ...event });
+    return { record: { ...record }, event: { ...event }, duplicate: false };
+  }
+  findIdentityOperation(idempotencyTags) {
+    for (const tag of idempotencyTags) {
+      const event = this.identityIdempotency.get(tag);
+      if (event) return { event: { ...event }, record: { ...this.identities.get(event.identityId) } };
+    }
+    return null;
+  }
+  getIdentity(id) { const row = this.identities.get(id); return row ? { ...row } : null; }
+  mutateIdentity({ sourceId, targetId = null, expectedRevision, operation, event, rawRecord }) {
+    const replay = this.identityIdempotency.get(event.idempotencyTag);
+    if (replay) return { record: { ...this.identities.get(replay.identityId) }, event: { ...replay }, duplicate: true };
+    const source = this.identities.get(sourceId);
+    if (!source) throw createError('identity_not_found', 404);
+    if (source.revision !== expectedRevision) throw createError('revision_conflict', 409);
+    if (operation === 'merge') {
+      const target = this.identities.get(targetId);
+      if (!target || target.status !== 'active' || target.scopeTag !== source.scopeTag || target.identityKind !== source.identityKind || target.id === source.id) throw createError('identity_not_found', 404);
+      if (source.status !== 'active') throw createError('identity_state_conflict', 409);
+      source.status = 'merged';
+      source.canonicalIdentityId = target.id;
+    } else if (operation === 'split') {
+      if (source.status !== 'merged' || !source.canonicalIdentityId) throw createError('identity_state_conflict', 409);
+      source.status = 'active';
+      source.canonicalIdentityId = null;
+    } else throw createError('identity_operation_invalid', 400);
+    this.rawObjects.set(rawRecord.contentId, { ...rawRecord });
+    source.revision += 1;
+    source.updatedAt = event.createdAt;
+    const storedEvent = { ...event, revision: source.revision, targetIdentityId: targetId };
+    this.identityEvents.push(storedEvent);
+    this.identityIdempotency.set(event.idempotencyTag, storedEvent);
+    return { record: { ...source }, event: { ...storedEvent }, duplicate: false };
+  }
+  planRetention({ asOf, scopeTags, limit }) {
+    const allowed = scopeTags ? new Set(scopeTags) : null;
+    return [...this.retention.values()]
+      .filter(row => row.lifecycle === 'active' && row.expiresAt <= asOf && (!allowed || allowed.has(row.scopeTag)))
+      .sort((a, b) => a.expiresAt.localeCompare(b.expiresAt) || a.contentId.localeCompare(b.contentId))
+      .slice(0, limit).map(row => ({ ...row }));
+  }
+  findRetentionOperation(idempotencyTags) {
+    for (const tag of idempotencyTags) if (this.retentionOperations.has(tag)) return { ...this.retentionOperations.get(tag) };
+    return null;
+  }
+  applyRetention({ contentIds, expectedPlanAsOf, reason, createdAt, idFactory, allowedScopeTags = null, operation }) {
+    const replay = this.retentionOperations.get(operation.idempotencyTag);
+    if (replay) return { response: structuredClone(replay.response), requestDigest: replay.requestDigest, duplicate: true };
+    const results = [];
+    const allowed = allowedScopeTags ? new Set(allowedScopeTags) : null;
+    for (const contentId of contentIds) {
+      const row = this.retention.get(contentId);
+      if (!row || (allowed && !allowed.has(row.scopeTag)) || row.lifecycle !== 'active' || (reason === 'retention_expired' && row.expiresAt > expectedPlanAsOf)) continue;
+      row.lifecycle = reason === 'retention_expired' ? 'expired' : reason;
+      row.revision += 1;
+      row.updatedAt = createdAt;
+      const tombstone = retentionTombstone({ id: idFactory(), row, reason, createdAt });
+      this.retentionTombstones.set(tombstone.id, tombstone);
+      for (const proposal of this.proposals.values()) {
+        if (proposal.contentId === contentId && proposal.scopeTag === row.scopeTag && !['revoked', 'rejected'].includes(proposal.status)) proposal.status = 'revoked';
+      }
+      const referenced = [...this.proposals.values()].some(proposal => proposal.contentId === contentId && !['revoked', 'rejected'].includes(proposal.status));
+      results.push({ contentId, lifecycle: row.lifecycle, tombstoneId: tombstone.id, gcCandidate: !referenced });
+    }
+    const response = { appliedAt: createdAt, physicalDeletionPerformed: false, results };
+    this.retentionOperations.set(operation.idempotencyTag, { ...operation, response: structuredClone(response) });
+    return { response, requestDigest: operation.requestDigest, duplicate: false };
+  }
   status() {
     return { backend: 'memory', rawObjects: this.rawObjects.size, queuedProposals: [...this.proposals.values()].filter(item => item.status === 'queued').length, auditEvents: this.auditEvents.length };
   }
@@ -464,6 +588,12 @@ export class SqliteCatalog {
       CREATE INDEX IF NOT EXISTS raw_sessions_v1_owner_tag_idx ON raw_sessions_v1(owner_tag,last_occurred_at);
       CREATE INDEX IF NOT EXISTS raw_events_v1_session_created_idx ON raw_events_v1(session_id,created_at,event_id);
       CREATE TABLE IF NOT EXISTS audit_events_v2 (id TEXT PRIMARY KEY, ts TEXT NOT NULL, actor_tag TEXT NOT NULL, action TEXT NOT NULL, outcome TEXT NOT NULL, request_id TEXT, target_id TEXT, scope_tag TEXT, details_json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS identity_records_v2 (id TEXT PRIMARY KEY, identity_tag TEXT NOT NULL UNIQUE, identity_kind TEXT NOT NULL CHECK(identity_kind IN ('agent','person','relationship','room','domain','shared')), scope_tag TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','merged','split','revoked')), canonical_identity_id TEXT REFERENCES identity_records_v2(id), revision INTEGER NOT NULL CHECK(revision >= 1), created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS identity_events_v2 (id TEXT PRIMARY KEY, identity_id TEXT NOT NULL REFERENCES identity_records_v2(id), revision INTEGER NOT NULL CHECK(revision >= 1), operation TEXT NOT NULL CHECK(operation IN ('create','merge','split','revoke')), target_identity_id TEXT REFERENCES identity_records_v2(id), evidence_content_id TEXT NOT NULL REFERENCES raw_objects_v2(content_id), evidence_strength TEXT NOT NULL CHECK(evidence_strength IN ('strong','weak')), automatic INTEGER NOT NULL CHECK(automatic IN (0,1)), actor_tag TEXT NOT NULL, idempotency_tag TEXT NOT NULL UNIQUE, response_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(identity_id,revision));
+      CREATE TABLE IF NOT EXISTS raw_retention_v2 (content_id TEXT PRIMARY KEY REFERENCES raw_objects_v2(content_id), content_checksum TEXT NOT NULL, scope_tag TEXT NOT NULL, source_pointer_tag TEXT, original_created_at TEXT NOT NULL, expires_at TEXT NOT NULL, lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active','revoked','forgotten','expired')), revision INTEGER NOT NULL CHECK(revision >= 1), updated_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS raw_retention_v2_expiry_idx ON raw_retention_v2(lifecycle, expires_at);
+      CREATE TABLE IF NOT EXISTS retention_tombstones_v2 (id TEXT PRIMARY KEY, content_id TEXT NOT NULL, content_checksum TEXT NOT NULL, source_pointer_tag TEXT, reason_code TEXT NOT NULL CHECK(reason_code IN ('retention_expired','revoked','forgotten')), original_created_at TEXT NOT NULL, expired_at TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS retention_operations_v2 (id TEXT PRIMARY KEY, idempotency_tag TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL, response_json TEXT NOT NULL, created_at TEXT NOT NULL);
     `);
     this.selectProposal = this.db.prepare('SELECT * FROM fabric_proposals WHERE id = ?');
     this.selectProposalByTags = this.db.prepare('SELECT * FROM fabric_proposals WHERE owner_tag = ? AND idempotency_tag = ?');
@@ -471,6 +601,7 @@ export class SqliteCatalog {
       const existing = this.selectProposalByTags.get(record.ownerTag, record.idempotencyTag);
       if (existing) return { record: this.mapProposal(existing), duplicate: true };
       this.db.prepare('INSERT OR IGNORE INTO raw_objects_v2(content_id,media_type,byte_length,storage_ref,created_at) VALUES (@contentId,@mediaType,@byteLength,@storageRef,@createdAt)').run(raw);
+      if (raw.retention) this.db.prepare('INSERT OR IGNORE INTO raw_retention_v2(content_id,content_checksum,scope_tag,source_pointer_tag,original_created_at,expires_at,lifecycle,revision,updated_at) VALUES (@contentId,@contentChecksum,@scopeTag,@sourcePointerTag,@originalCreatedAt,@expiresAt,@lifecycle,@revision,@updatedAt)').run(raw.retention);
       this.db.prepare('INSERT INTO fabric_proposals(id,owner_tag,scope_tag,status,content_id,idempotency_tag,source_tag,created_at) VALUES (@id,@ownerTag,@scopeTag,@status,@contentId,@idempotencyTag,@sourceTag,@createdAt)').run(record);
       return { record, duplicate: false };
     });
@@ -490,7 +621,70 @@ export class SqliteCatalog {
       this.db.prepare('INSERT INTO audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES (?,?,?,?,?,?,?,?,?)').run(auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, 'stored', auditEvent.requestId || null, auditEvent.targetId, null, JSON.stringify(auditEvent.details || {}));
       return { record, duplicate: false };
     });
+    this.selectIdentity = this.db.prepare('SELECT * FROM identity_records_v2 WHERE id = ?');
+    this.selectIdentityEventByIdempotency = this.db.prepare('SELECT * FROM identity_events_v2 WHERE idempotency_tag = ?');
+    this.createIdentityTransaction = this.db.transaction((record, event, raw) => {
+      const replay = this.selectIdentityEventByIdempotency.get(event.idempotencyTag);
+      if (replay) return { record: this.mapIdentity(this.selectIdentity.get(replay.identity_id)), event: this.mapIdentityEvent(replay), duplicate: true };
+      const existing = this.db.prepare('SELECT * FROM identity_records_v2 WHERE identity_tag=?').get(record.identityTag);
+      if (existing) return { record: this.mapIdentity(existing), event: null, duplicate: true };
+      this.db.prepare('INSERT OR IGNORE INTO raw_objects_v2(content_id,media_type,byte_length,storage_ref,created_at) VALUES (@contentId,@mediaType,@byteLength,@storageRef,@createdAt)').run(raw);
+      this.db.prepare('INSERT INTO identity_records_v2(id,identity_tag,identity_kind,scope_tag,status,canonical_identity_id,revision,created_at,updated_at) VALUES (@id,@identityTag,@identityKind,@scopeTag,@status,@canonicalIdentityId,@revision,@createdAt,@updatedAt)').run(record);
+      this.db.prepare('INSERT INTO identity_events_v2(id,identity_id,revision,operation,target_identity_id,evidence_content_id,evidence_strength,automatic,actor_tag,idempotency_tag,response_json,created_at) VALUES (@id,@identityId,@revision,@operation,@targetIdentityId,@evidenceContentId,@evidenceStrength,@automatic,@actorTag,@idempotencyTag,@responseJson,@createdAt)').run({ ...event, automatic: event.automatic ? 1 : 0, responseJson: JSON.stringify(event.response) });
+      return { record, event, duplicate: false };
+    });
+    this.mutateIdentityTransaction = this.db.transaction(({ sourceId, targetId, expectedRevision, operation, event, rawRecord }) => {
+      const replay = this.selectIdentityEventByIdempotency.get(event.idempotencyTag);
+      if (replay) return { record: this.mapIdentity(this.selectIdentity.get(replay.identity_id)), event: this.mapIdentityEvent(replay), duplicate: true };
+      const sourceRow = this.selectIdentity.get(sourceId);
+      if (!sourceRow) throw createError('identity_not_found', 404);
+      const source = this.mapIdentity(sourceRow);
+      if (source.revision !== expectedRevision) throw createError('revision_conflict', 409);
+      let status;
+      let canonicalIdentityId;
+      if (operation === 'merge') {
+        const target = this.mapIdentity(this.selectIdentity.get(targetId));
+        if (!target || target.status !== 'active' || target.scopeTag !== source.scopeTag || target.identityKind !== source.identityKind || target.id === source.id) throw createError('identity_not_found', 404);
+        if (source.status !== 'active') throw createError('identity_state_conflict', 409);
+        status = 'merged'; canonicalIdentityId = target.id;
+      } else if (operation === 'split') {
+        if (source.status !== 'merged' || !source.canonicalIdentityId) throw createError('identity_state_conflict', 409);
+        status = 'active'; canonicalIdentityId = null;
+      } else throw createError('identity_operation_invalid', 400);
+      this.db.prepare('INSERT OR IGNORE INTO raw_objects_v2(content_id,media_type,byte_length,storage_ref,created_at) VALUES (@contentId,@mediaType,@byteLength,@storageRef,@createdAt)').run(rawRecord);
+      const revision = source.revision + 1;
+      const changed = this.db.prepare('UPDATE identity_records_v2 SET status=?, canonical_identity_id=?, revision=?, updated_at=? WHERE id=? AND revision=?').run(status, canonicalIdentityId, revision, event.createdAt, sourceId, expectedRevision);
+      if (changed.changes !== 1) throw createError('revision_conflict', 409);
+      const storedEvent = { ...event, revision, targetIdentityId: targetId, automatic: event.automatic ? 1 : 0 };
+      this.db.prepare('INSERT INTO identity_events_v2(id,identity_id,revision,operation,target_identity_id,evidence_content_id,evidence_strength,automatic,actor_tag,idempotency_tag,response_json,created_at) VALUES (@id,@identityId,@revision,@operation,@targetIdentityId,@evidenceContentId,@evidenceStrength,@automatic,@actorTag,@idempotencyTag,@responseJson,@createdAt)').run({ ...storedEvent, responseJson: JSON.stringify(storedEvent.response) });
+      return { record: this.mapIdentity(this.selectIdentity.get(sourceId)), event: storedEvent, duplicate: false };
+    });
+    this.selectRetentionOperation = this.db.prepare('SELECT * FROM retention_operations_v2 WHERE idempotency_tag=?');
+    this.applyRetentionTransaction = this.db.transaction(({ contentIds, expectedPlanAsOf, reason, createdAt, idFactory, allowedScopeTags = null, operation }) => {
+      const replay = this.selectRetentionOperation.get(operation.idempotencyTag);
+      if (replay) return { response: JSON.parse(replay.response_json), requestDigest: replay.request_digest, duplicate: true };
+      const results = [];
+      for (const contentId of contentIds) {
+        const row = this.db.prepare('SELECT * FROM raw_retention_v2 WHERE content_id=?').get(contentId);
+        if (!row || (allowedScopeTags && !allowedScopeTags.includes(row.scope_tag)) || row.lifecycle !== 'active' || (reason === 'retention_expired' && row.expires_at > expectedPlanAsOf)) continue;
+        const lifecycle = reason === 'retention_expired' ? 'expired' : reason;
+        const revision = row.revision + 1;
+        const changed = this.db.prepare("UPDATE raw_retention_v2 SET lifecycle=?, revision=?, updated_at=? WHERE content_id=? AND revision=? AND lifecycle='active'").run(lifecycle, revision, createdAt, contentId, row.revision);
+        if (changed.changes !== 1) throw createError('revision_conflict', 409);
+        const tombstone = retentionTombstone({ id: idFactory(), row: this.mapRetention({ ...row, lifecycle, revision, updated_at: createdAt }), reason, createdAt });
+        this.db.prepare('INSERT INTO retention_tombstones_v2(id,content_id,content_checksum,source_pointer_tag,reason_code,original_created_at,expired_at,created_at) VALUES (@id,@contentId,@contentChecksum,@sourcePointerTag,@reasonCode,@originalCreatedAt,@expiredAt,@createdAt)').run(tombstone);
+        this.db.prepare("UPDATE fabric_proposals SET status='revoked' WHERE content_id=? AND scope_tag=? AND status NOT IN ('revoked','rejected')").run(contentId, row.scope_tag);
+        const referenced = this.db.prepare("SELECT 1 FROM fabric_proposals WHERE content_id=? AND status NOT IN ('revoked','rejected') LIMIT 1").get(contentId);
+        results.push({ contentId, lifecycle, tombstoneId: tombstone.id, gcCandidate: !referenced });
+      }
+      const response = { appliedAt: createdAt, physicalDeletionPerformed: false, results };
+      this.db.prepare('INSERT INTO retention_operations_v2(id,idempotency_tag,request_digest,response_json,created_at) VALUES (?,?,?,?,?)').run(operation.id, operation.idempotencyTag, operation.requestDigest, JSON.stringify(response), createdAt);
+      return { response, requestDigest: operation.requestDigest, duplicate: false };
+    });
   }
+  mapIdentity(row) { return row ? { id: row.id, identityTag: row.identity_tag, identityKind: row.identity_kind, scopeTag: row.scope_tag, status: row.status, canonicalIdentityId: row.canonical_identity_id, revision: row.revision, createdAt: row.created_at, updatedAt: row.updated_at } : null; }
+  mapIdentityEvent(row) { return row ? { ...row, evidenceContentId: row.evidence_content_id, response: JSON.parse(row.response_json) } : null; }
+  mapRetention(row) { return row ? { contentId: row.content_id, contentChecksum: row.content_checksum, scopeTag: row.scope_tag, sourcePointerTag: row.source_pointer_tag, originalCreatedAt: row.original_created_at, expiresAt: row.expires_at, lifecycle: row.lifecycle, revision: row.revision, updatedAt: row.updated_at } : null; }
   mapProposal(row) {
     return row ? { id: row.id, ownerTag: row.owner_tag, scopeTag: row.scope_tag, status: row.status, contentId: row.content_id, idempotencyTag: row.idempotency_tag, sourceTag: row.source_tag, createdAt: row.created_at } : null;
   }
@@ -505,6 +699,21 @@ export class SqliteCatalog {
     return this.insertBoth(record, rawRecord);
   }
   getProposal(id) { return this.mapProposal(this.selectProposal.get(id)); }
+  recallItemActive(refs, scopeTags) {
+    if (refs.proposalId) {
+      const row = this.selectProposal.get(refs.proposalId);
+      if (!row || !scopeTags.includes(row.scope_tag) || ['revoked', 'rejected'].includes(row.status)) return false;
+    }
+    if (refs.contentId) {
+      const row = this.db.prepare('SELECT * FROM raw_retention_v2 WHERE content_id=?').get(refs.contentId);
+      if (!row || !scopeTags.includes(row.scope_tag) || row.lifecycle !== 'active') return false;
+    }
+    if (refs.identityId) {
+      const row = this.selectIdentity.get(refs.identityId);
+      if (!row || !scopeTags.includes(row.scope_tag) || row.status !== 'active') return false;
+    }
+    return true;
+  }
   appendAudit(event) {
     this.insertAudit.run({ id: event.id, ts: event.ts, actorTag: event.actorTag, action: event.action, outcome: event.outcome, requestId: event.requestId || null, targetId: event.targetId || null, scopeTag: event.scopeTag || null, detailsJson: JSON.stringify(event.details || {}) });
   }
@@ -520,6 +729,30 @@ export class SqliteCatalog {
   }
   getSession(id) { return this.mapSession(this.db.prepare('SELECT * FROM raw_sessions_v1 WHERE session_id=?').get(id)); }
   listSessionEvents(id) { return this.db.prepare('SELECT * FROM raw_events_v1 WHERE session_id=? ORDER BY created_at,event_id').all(id).map(row => this.mapRawEvent(row)); }
+  createIdentity(record, event, rawRecord) { return this.createIdentityTransaction(record, event, rawRecord); }
+  findIdentityOperation(idempotencyTags) {
+    for (const tag of idempotencyTags) {
+      const event = this.selectIdentityEventByIdempotency.get(tag);
+      if (event) return { event: this.mapIdentityEvent(event), record: this.mapIdentity(this.selectIdentity.get(event.identity_id)) };
+    }
+    return null;
+  }
+  getIdentity(id) { return this.mapIdentity(this.selectIdentity.get(id)); }
+  mutateIdentity(input) { return this.mutateIdentityTransaction(input); }
+  planRetention({ asOf, scopeTags, limit }) {
+    const rows = scopeTags
+      ? this.db.prepare(`SELECT * FROM raw_retention_v2 WHERE lifecycle='active' AND expires_at<=? AND scope_tag IN (${scopeTags.map(() => '?').join(',')}) ORDER BY expires_at,content_id LIMIT ?`).all(asOf, ...scopeTags, limit)
+      : this.db.prepare("SELECT * FROM raw_retention_v2 WHERE lifecycle='active' AND expires_at<=? ORDER BY expires_at,content_id LIMIT ?").all(asOf, limit);
+    return rows.map(row => this.mapRetention(row));
+  }
+  findRetentionOperation(idempotencyTags) {
+    for (const tag of idempotencyTags) {
+      const row = this.selectRetentionOperation.get(tag);
+      if (row) return { response: JSON.parse(row.response_json), requestDigest: row.request_digest, idempotencyTag: row.idempotency_tag };
+    }
+    return null;
+  }
+  applyRetention(input) { return this.applyRetentionTransaction(input); }
   status() {
     return { backend: 'sqlite', rawObjects: this.db.prepare('SELECT count(*) AS count FROM raw_objects_v2').get().count, queuedProposals: this.db.prepare("SELECT count(*) AS count FROM fabric_proposals WHERE status='queued'").get().count, auditEvents: this.db.prepare('SELECT count(*) AS count FROM audit_events_v2').get().count };
   }
@@ -606,6 +839,61 @@ const POSTGRES_SCHEMA_SQL = [
     original_created_at TIMESTAMPTZ NOT NULL,
     expired_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.identity_records_v2 (
+    id TEXT PRIMARY KEY,
+    identity_tag TEXT NOT NULL UNIQUE,
+    identity_kind TEXT NOT NULL CHECK (identity_kind IN ('agent','person','relationship','room','domain','shared')),
+    scope_tag TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active','merged','split','revoked')),
+    canonical_identity_id TEXT REFERENCES ${POSTGRES_SCHEMA}.identity_records_v2(id),
+    revision BIGINT NOT NULL CHECK (revision >= 1),
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.identity_events_v2 (
+    id TEXT PRIMARY KEY,
+    identity_id TEXT NOT NULL REFERENCES ${POSTGRES_SCHEMA}.identity_records_v2(id),
+    revision BIGINT NOT NULL,
+    operation TEXT NOT NULL CHECK (operation IN ('create','merge','split','revoke')),
+    target_identity_id TEXT REFERENCES ${POSTGRES_SCHEMA}.identity_records_v2(id),
+    evidence_content_id TEXT NOT NULL REFERENCES ${POSTGRES_SCHEMA}.raw_objects_v2(content_id),
+    evidence_strength TEXT NOT NULL CHECK (evidence_strength IN ('strong','weak')),
+    automatic BOOLEAN NOT NULL,
+    actor_tag TEXT NOT NULL,
+    idempotency_tag TEXT NOT NULL UNIQUE,
+    response_json JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    UNIQUE(identity_id, revision)
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.raw_retention_v2 (
+    content_id TEXT PRIMARY KEY REFERENCES ${POSTGRES_SCHEMA}.raw_objects_v2(content_id),
+    content_checksum TEXT NOT NULL,
+    scope_tag TEXT NOT NULL,
+    source_pointer_tag TEXT,
+    original_created_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    lifecycle TEXT NOT NULL CHECK (lifecycle IN ('active','revoked','forgotten','expired')),
+    revision BIGINT NOT NULL CHECK (revision >= 1),
+    updated_at TIMESTAMPTZ NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS raw_retention_v2_expiry_idx ON ${POSTGRES_SCHEMA}.raw_retention_v2(lifecycle, expires_at)`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.retention_tombstones_v2 (
+    id TEXT PRIMARY KEY,
+    content_id TEXT NOT NULL,
+    content_checksum TEXT NOT NULL,
+    source_pointer_tag TEXT,
+    reason_code TEXT NOT NULL,
+    original_created_at TIMESTAMPTZ NOT NULL,
+    expired_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.retention_operations_v2 (
+    id TEXT PRIMARY KEY,
+    idempotency_tag TEXT NOT NULL UNIQUE,
+    request_digest TEXT NOT NULL,
+    response_json JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL
   )`
 ];
 
@@ -660,6 +948,51 @@ function mapPostgresRawEvent(row) {
 
 function mapPostgresSession(row) {
   return row ? { id: row.session_id, runtime: row.runtime, ownerTag: row.owner_tag, sourceTag: row.source_tag, firstOccurredAt: row.first_occurred_at ? new Date(row.first_occurred_at).toISOString() : null, lastOccurredAt: row.last_occurred_at ? new Date(row.last_occurred_at).toISOString() : null, eventCount: Number(row.event_count), createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at) } : null;
+}
+
+function mapPostgresIdentity(row) {
+  return row ? {
+    id: row.id,
+    identityTag: row.identity_tag,
+    identityKind: row.identity_kind,
+    scopeTag: row.scope_tag,
+    status: row.status,
+    canonicalIdentityId: row.canonical_identity_id,
+    revision: Number(row.revision),
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at)
+  } : null;
+}
+
+function mapPostgresIdentityEvent(row) {
+  return row ? {
+    ...row,
+    evidenceContentId: row.evidence_content_id,
+    response: typeof row.response_json === 'string' ? JSON.parse(row.response_json) : row.response_json
+  } : null;
+}
+
+function mapPostgresRetention(row) {
+  return row ? {
+    contentId: row.content_id,
+    contentChecksum: row.content_checksum,
+    scopeTag: row.scope_tag,
+    sourcePointerTag: row.source_pointer_tag,
+    originalCreatedAt: row.original_created_at instanceof Date ? row.original_created_at.toISOString() : String(row.original_created_at),
+    expiresAt: row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at),
+    lifecycle: row.lifecycle,
+    revision: Number(row.revision),
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at)
+  } : null;
+}
+
+async function insertPostgresIdentityEvent(catalog, client, event) {
+  await catalog._query(client,
+    `INSERT INTO ${POSTGRES_SCHEMA}.identity_events_v2
+      (id,identity_id,revision,operation,target_identity_id,evidence_content_id,evidence_strength,automatic,actor_tag,idempotency_tag,response_json,created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12)`,
+    [event.id, event.identityId, event.revision, event.operation, event.targetIdentityId, event.evidenceContentId, event.evidenceStrength, Boolean(event.automatic), event.actorTag, event.idempotencyTag, JSON.stringify(event.response), event.createdAt]
+  );
 }
 
 export class PostgresCatalog {
@@ -817,6 +1150,15 @@ export class PostgresCatalog {
          VALUES ($1,$2,$3,$4,$5) ON CONFLICT (content_id) DO NOTHING`,
         [rawRecord.contentId, rawRecord.mediaType, rawRecord.byteLength, rawRecord.storageRef, rawRecord.createdAt]
       );
+      if (rawRecord.retention) {
+        const retention = rawRecord.retention;
+        await this._query(client,
+          `INSERT INTO ${POSTGRES_SCHEMA}.raw_retention_v2
+            (content_id,content_checksum,scope_tag,source_pointer_tag,original_created_at,expires_at,lifecycle,revision,updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (content_id) DO NOTHING`,
+          [retention.contentId, retention.contentChecksum, retention.scopeTag, retention.sourcePointerTag, retention.originalCreatedAt, retention.expiresAt, retention.lifecycle, retention.revision, retention.updatedAt]
+        );
+      }
       const inserted = await this._query(client,
         `INSERT INTO ${POSTGRES_SCHEMA}.fabric_proposals
           (id,owner_tag,scope_tag,status,content_id,idempotency_tag,source_tag,created_at)
@@ -928,6 +1270,25 @@ export class PostgresCatalog {
   async searchSessions({ ownerTags = [], query = '', limit = 20 }) { if (!ownerTags.length) return []; await this.ready(); return (await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 WHERE owner_tag=ANY($1::text[]) AND (session_id ILIKE $2 ESCAPE '\\' OR runtime ILIKE $2 ESCAPE '\\') ORDER BY last_occurred_at DESC NULLS LAST,created_at DESC,session_id ASC LIMIT $3`, [ownerTags, escapedLike(query), limit])).rows.map(mapPostgresSession); }
   async getSession(id) { await this.ready(); return mapPostgresSession((await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 WHERE session_id=$1`, [id])).rows[0]); }
   async listSessionEvents(id) { await this.ready(); return (await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE session_id=$1 ORDER BY created_at,event_id`, [id])).rows.map(mapPostgresRawEvent); }
+  async recallItemActive(refs, scopeTags) {
+    await this.ready();
+    if (refs.proposalId) {
+      const result = await this._query(this.pool, `SELECT status,scope_tag FROM ${POSTGRES_SCHEMA}.fabric_proposals WHERE id=$1`, [refs.proposalId]);
+      const row = result.rows[0];
+      if (!row || !scopeTags.includes(row.scope_tag) || ['revoked', 'rejected'].includes(row.status)) return false;
+    }
+    if (refs.contentId) {
+      const result = await this._query(this.pool, `SELECT lifecycle,scope_tag FROM ${POSTGRES_SCHEMA}.raw_retention_v2 WHERE content_id=$1`, [refs.contentId]);
+      const row = result.rows[0];
+      if (!row || !scopeTags.includes(row.scope_tag) || row.lifecycle !== 'active') return false;
+    }
+    if (refs.identityId) {
+      const result = await this._query(this.pool, `SELECT status,scope_tag FROM ${POSTGRES_SCHEMA}.identity_records_v2 WHERE id=$1`, [refs.identityId]);
+      const row = result.rows[0];
+      if (!row || !scopeTags.includes(row.scope_tag) || row.status !== 'active') return false;
+    }
+    return true;
+  }
 
   async appendAudit(event) {
     await this.ready();
@@ -937,6 +1298,203 @@ export class PostgresCatalog {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)`,
       [event.id, event.ts, event.actorTag, event.action, event.outcome, event.requestId || null, event.targetId || null, event.scopeTag || null, JSON.stringify(event.details || {})]
     );
+  }
+
+  async createIdentity(record, event, rawRecord) {
+    await this.ready();
+    const client = await this._connect();
+    let commitAttempted = false;
+    let destroyClient = false;
+    try {
+      await this._begin(client);
+      await this._query(client, 'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [event.idempotencyTag]);
+      const replay = await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.identity_events_v2 WHERE idempotency_tag=$1`, [event.idempotencyTag]);
+      if (replay.rows[0]) {
+        const row = await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.identity_records_v2 WHERE id=$1`, [replay.rows[0].identity_id]);
+        commitAttempted = true;
+        await this._query(client, 'COMMIT');
+        return { record: mapPostgresIdentity(row.rows[0]), event: mapPostgresIdentityEvent(replay.rows[0]), duplicate: true };
+      }
+      await this._query(client,
+        `INSERT INTO ${POSTGRES_SCHEMA}.raw_objects_v2(content_id,media_type,byte_length,storage_ref,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (content_id) DO NOTHING`,
+        [rawRecord.contentId, rawRecord.mediaType, rawRecord.byteLength, rawRecord.storageRef, rawRecord.createdAt]
+      );
+      const inserted = await this._query(client,
+        `INSERT INTO ${POSTGRES_SCHEMA}.identity_records_v2(id,identity_tag,identity_kind,scope_tag,status,canonical_identity_id,revision,created_at,updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (identity_tag) DO NOTHING RETURNING *`,
+        [record.id, record.identityTag, record.identityKind, record.scopeTag, record.status, null, record.revision, record.createdAt, record.updatedAt]
+      );
+      if (!inserted.rows[0]) {
+        const existing = await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.identity_records_v2 WHERE identity_tag=$1`, [record.identityTag]);
+        commitAttempted = true;
+        await this._query(client, 'COMMIT');
+        return { record: mapPostgresIdentity(existing.rows[0]), event: null, duplicate: true };
+      }
+      await insertPostgresIdentityEvent(this, client, event);
+      commitAttempted = true;
+      await this._query(client, 'COMMIT');
+      return { record: mapPostgresIdentity(inserted.rows[0]), event, duplicate: false };
+    } catch (error) {
+      if (commitAttempted) {
+        destroyClient = true;
+        error.catalogTransactionOutcome = 'ambiguous_commit';
+      } else {
+        try { await this._query(client, 'ROLLBACK'); } catch { destroyClient = true; }
+      }
+      throw error;
+    } finally { client.release(destroyClient ? new Error('catalog_client_discarded') : undefined); }
+  }
+
+  async findIdentityOperation(idempotencyTags) {
+    await this.ready();
+    const result = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.identity_events_v2 WHERE idempotency_tag=ANY($1::text[]) ORDER BY created_at LIMIT 1`, [idempotencyTags]);
+    if (!result.rows[0]) return null;
+    const record = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.identity_records_v2 WHERE id=$1`, [result.rows[0].identity_id]);
+    return { event: mapPostgresIdentityEvent(result.rows[0]), record: mapPostgresIdentity(record.rows[0]) };
+  }
+
+  async getIdentity(id) {
+    await this.ready();
+    const result = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.identity_records_v2 WHERE id=$1`, [id]);
+    return mapPostgresIdentity(result.rows[0]);
+  }
+
+  async mutateIdentity({ sourceId, targetId, expectedRevision, operation, event, rawRecord }) {
+    await this.ready();
+    const client = await this._connect();
+    let commitAttempted = false;
+    let destroyClient = false;
+    try {
+      await this._begin(client);
+      await this._query(client, 'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [event.idempotencyTag]);
+      const replay = await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.identity_events_v2 WHERE idempotency_tag=$1`, [event.idempotencyTag]);
+      if (replay.rows[0]) {
+        const row = await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.identity_records_v2 WHERE id=$1`, [replay.rows[0].identity_id]);
+        commitAttempted = true;
+        await this._query(client, 'COMMIT');
+        return { record: mapPostgresIdentity(row.rows[0]), event: mapPostgresIdentityEvent(replay.rows[0]), duplicate: true };
+      }
+      if (operation === 'merge') {
+        const pairKey = identityPairLockKey(sourceId, targetId);
+        await this._query(client, 'SELECT pg_advisory_xact_lock(hashtextextended($1, 1))', [pairKey]);
+      }
+      const sourceResult = await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.identity_records_v2 WHERE id=$1 FOR UPDATE`, [sourceId]);
+      const source = mapPostgresIdentity(sourceResult.rows[0]);
+      if (!source) throw createError('identity_not_found', 404);
+      if (source.revision !== expectedRevision) throw createError('revision_conflict', 409);
+      let status;
+      let canonicalIdentityId;
+      if (operation === 'merge') {
+        const targetResult = await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.identity_records_v2 WHERE id=$1 FOR SHARE`, [targetId]);
+        const target = mapPostgresIdentity(targetResult.rows[0]);
+        if (!target || target.status !== 'active' || target.scopeTag !== source.scopeTag || target.identityKind !== source.identityKind || target.id === source.id) throw createError('identity_not_found', 404);
+        if (source.status !== 'active') throw createError('identity_state_conflict', 409);
+        status = 'merged'; canonicalIdentityId = target.id;
+      } else if (operation === 'split') {
+        if (source.status !== 'merged' || !source.canonicalIdentityId) throw createError('identity_state_conflict', 409);
+        status = 'active'; canonicalIdentityId = null;
+      } else throw createError('identity_operation_invalid', 400);
+      await this._query(client,
+        `INSERT INTO ${POSTGRES_SCHEMA}.raw_objects_v2(content_id,media_type,byte_length,storage_ref,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (content_id) DO NOTHING`,
+        [rawRecord.contentId, rawRecord.mediaType, rawRecord.byteLength, rawRecord.storageRef, rawRecord.createdAt]
+      );
+      const revision = source.revision + 1;
+      const updated = await this._query(client,
+        `UPDATE ${POSTGRES_SCHEMA}.identity_records_v2 SET status=$1,canonical_identity_id=$2,revision=$3,updated_at=$4 WHERE id=$5 AND revision=$6 RETURNING *`,
+        [status, canonicalIdentityId, revision, event.createdAt, sourceId, expectedRevision]
+      );
+      if (!updated.rows[0]) throw createError('revision_conflict', 409);
+      const storedEvent = { ...event, revision, targetIdentityId: targetId };
+      await insertPostgresIdentityEvent(this, client, storedEvent);
+      commitAttempted = true;
+      await this._query(client, 'COMMIT');
+      return { record: mapPostgresIdentity(updated.rows[0]), event: storedEvent, duplicate: false };
+    } catch (error) {
+      if (commitAttempted) {
+        destroyClient = true;
+        error.catalogTransactionOutcome = 'ambiguous_commit';
+      } else {
+        try { await this._query(client, 'ROLLBACK'); } catch { destroyClient = true; }
+      }
+      throw error;
+    } finally { client.release(destroyClient ? new Error('catalog_client_discarded') : undefined); }
+  }
+
+  async planRetention({ asOf, scopeTags, limit }) {
+    await this.ready();
+    const result = scopeTags
+      ? await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_retention_v2 WHERE lifecycle='active' AND expires_at<=$1 AND scope_tag=ANY($2::text[]) ORDER BY expires_at,content_id LIMIT $3`, [asOf, scopeTags, limit])
+      : await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_retention_v2 WHERE lifecycle='active' AND expires_at<=$1 ORDER BY expires_at,content_id LIMIT $2`, [asOf, limit]);
+    return result.rows.map(mapPostgresRetention);
+  }
+
+  async findRetentionOperation(idempotencyTags) {
+    await this.ready();
+    const result = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.retention_operations_v2 WHERE idempotency_tag=ANY($1::text[]) ORDER BY created_at LIMIT 1`, [idempotencyTags]);
+    const row = result.rows[0];
+    return row ? { response: typeof row.response_json === 'string' ? JSON.parse(row.response_json) : row.response_json, requestDigest: row.request_digest, idempotencyTag: row.idempotency_tag } : null;
+  }
+
+  async applyRetention({ contentIds, expectedPlanAsOf, reason, createdAt, idFactory, allowedScopeTags = null, operation }) {
+    await this.ready();
+    const client = await this._connect();
+    let commitAttempted = false;
+    let destroyClient = false;
+    try {
+      await this._begin(client);
+      await this._query(client, 'SELECT pg_advisory_xact_lock(hashtextextended($1, 2))', [operation.idempotencyTag]);
+      const replay = await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.retention_operations_v2 WHERE idempotency_tag=$1`, [operation.idempotencyTag]);
+      if (replay.rows[0]) {
+        const row = replay.rows[0];
+        commitAttempted = true;
+        await this._query(client, 'COMMIT');
+        return { response: typeof row.response_json === 'string' ? JSON.parse(row.response_json) : row.response_json, requestDigest: row.request_digest, duplicate: true };
+      }
+      const results = [];
+      for (const contentId of contentIds) {
+        const selected = await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_retention_v2 WHERE content_id=$1 FOR UPDATE`, [contentId]);
+        const row = mapPostgresRetention(selected.rows[0]);
+        if (!row || (allowedScopeTags && !allowedScopeTags.includes(row.scopeTag)) || row.lifecycle !== 'active' || (reason === 'retention_expired' && row.expiresAt > expectedPlanAsOf)) continue;
+        const lifecycle = reason === 'retention_expired' ? 'expired' : reason;
+        const updated = await this._query(client,
+          `UPDATE ${POSTGRES_SCHEMA}.raw_retention_v2 SET lifecycle=$1,revision=revision+1,updated_at=$2 WHERE content_id=$3 AND revision=$4 AND lifecycle='active' RETURNING *`,
+          [lifecycle, createdAt, contentId, row.revision]
+        );
+        if (!updated.rows[0]) throw createError('revision_conflict', 409);
+        const tombstone = retentionTombstone({ id: idFactory(), row: mapPostgresRetention(updated.rows[0]), reason, createdAt });
+        await this._query(client,
+          `INSERT INTO ${POSTGRES_SCHEMA}.retention_tombstones_v2(id,content_id,content_checksum,source_pointer_tag,reason_code,original_created_at,expired_at,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [tombstone.id, tombstone.contentId, tombstone.contentChecksum, tombstone.sourcePointerTag, tombstone.reasonCode, tombstone.originalCreatedAt, tombstone.expiredAt, tombstone.createdAt]
+        );
+        await this._query(client,
+          `UPDATE ${POSTGRES_SCHEMA}.fabric_proposals SET status='revoked' WHERE content_id=$1 AND scope_tag=$2 AND status NOT IN ('revoked','rejected')`,
+          [contentId, row.scopeTag]
+        );
+        // Reference proof and lifecycle transition share this transaction. We
+        // return a GC candidate only; physical deletion is a separate gated job.
+        const references = await this._query(client,
+          `SELECT 1 FROM ${POSTGRES_SCHEMA}.fabric_proposals WHERE content_id=$1 AND status NOT IN ('revoked','rejected') LIMIT 1 FOR SHARE`,
+          [contentId]
+        );
+        results.push({ contentId, lifecycle, tombstoneId: tombstone.id, gcCandidate: references.rows.length === 0 });
+      }
+      const response = { appliedAt: createdAt, physicalDeletionPerformed: false, results };
+      await this._query(client,
+        `INSERT INTO ${POSTGRES_SCHEMA}.retention_operations_v2(id,idempotency_tag,request_digest,response_json,created_at) VALUES ($1,$2,$3,$4::jsonb,$5)`,
+        [operation.id, operation.idempotencyTag, operation.requestDigest, JSON.stringify(response), createdAt]
+      );
+      commitAttempted = true;
+      await this._query(client, 'COMMIT');
+      return { response, requestDigest: operation.requestDigest, duplicate: false };
+    } catch (error) {
+      if (commitAttempted) {
+        destroyClient = true;
+        error.catalogTransactionOutcome = 'ambiguous_commit';
+      } else {
+        try { await this._query(client, 'ROLLBACK'); } catch { destroyClient = true; }
+      }
+      throw error;
+    } finally { client.release(destroyClient ? new Error('catalog_client_discarded') : undefined); }
   }
 
   async health() {
@@ -983,21 +1541,25 @@ export class PostgresCatalog {
 const SAFE_AUDIT_DETAIL_KEYS = new Set(['code', 'contentId', 'duplicate', 'resultCount', 'total', 'view', 'purpose', 'transport']);
 
 export class FabricStore {
-  constructor({ rawStore, catalog, ingestKeyRing = null, clock = () => new Date(), idFactory = () => crypto.randomUUID() }) {
+  constructor({ rawStore, catalog, ingestKeyRing = null, clock = () => new Date(), idFactory = () => crypto.randomUUID(), retentionPolicy = {}, identityPolicy = {} }) {
     this.rawStore = rawStore;
     this.catalog = catalog;
     this.clock = clock;
     this.idFactory = idFactory;
+    this.retentionPolicy = { defaultYears: 3, scopeDays: {}, ...retentionPolicy };
+    this.identityPolicy = { allowAutomaticStrongMerge: false, ...identityPolicy };
+    this.physicalRawDeletionEnabled = false;
     this.configured = true;
     this._proposalMutation = Promise.resolve();
     this.ingestKeys = ingestKeyRing ? normalizeIngestKeyRing(ingestKeyRing) : null;
+    this._identityMutation = Promise.resolve();
   }
 
   async _catalogOperation(operation) {
     try {
       return await operation();
     } catch (error) {
-      if (error?.message === 'catalog_unavailable' || error?.message === 'catalog_schema_version_unsupported' || (Number(error?.status) >= 400 && Number(error?.status) < 500)) throw error;
+      if (error?.message === 'catalog_unavailable' || error?.message === 'catalog_schema_version_unsupported' || (Number.isInteger(error?.status) && error.status >= 400 && error.status < 500)) throw error;
       const wrapped = createError('catalog_unavailable', 503, { code: String(error?.code || 'catalog_operation_failed') });
       wrapped.code = String(error?.code || 'catalog_operation_failed');
       throw wrapped;
@@ -1024,6 +1586,8 @@ export class FabricStore {
       return { id: existing.id, status: existing.status, contentId: existing.contentId, scope, createdAt: existing.createdAt, duplicate: true };
     }
     const createdAt = this.clock().toISOString();
+    const originalCreatedAt = String(metadata?.originalTimestamp || createdAt);
+    const expiresAt = retentionDeadline(originalCreatedAt, scope, this.retentionPolicy);
     const raw = await this.rawStore.commit(prepared);
     const catalogRecord = {
       id: this.idFactory(), ownerTag: this.rawStore.opaqueTag('owner', actor), scopeTag: this.rawStore.opaqueTag('scope', scope), status: 'queued', contentId: raw.contentId,
@@ -1032,7 +1596,24 @@ export class FabricStore {
     try {
       const queued = await this._catalogOperation(() => this.catalog.enqueueProposalWithRaw(
         catalogRecord,
-        { contentId: raw.contentId, mediaType: 'application/vnd.agent-memory-fabric.proposal+json', byteLength: raw.byteLength, storageRef: raw.storageRef, createdAt }
+        {
+          contentId: raw.contentId,
+          mediaType: 'application/vnd.agent-memory-fabric.proposal+json',
+          byteLength: raw.byteLength,
+          storageRef: raw.storageRef,
+          createdAt,
+          retention: {
+            contentId: raw.contentId,
+            contentChecksum: raw.contentId,
+            scopeTag: this.rawStore.opaqueTag('scope', scope),
+            sourcePointerTag: metadata?.nativePointer ? this.rawStore.opaqueTag('native-pointer', metadata.nativePointer) : null,
+            originalCreatedAt,
+            expiresAt,
+            lifecycle: 'active',
+            revision: 1,
+            updatedAt: createdAt
+          }
+        }
       ));
       if (queued.duplicate) {
         const existingPayload = await this.rawStore.get(queued.record.contentId);
@@ -1076,7 +1657,7 @@ export class FabricStore {
   async readProposalAuthorized(id, { actor, allowedScopes = [], allowAll = false }) {
     const record = await this._catalogOperation(() => this.catalog.getProposal(id));
     const scopeTags = new Set(allowedScopes.flatMap(scope => this.rawStore.opaqueTags('scope', scope)));
-    if (!record || (!allowAll && !scopeTags.has(record.scopeTag))) {
+    if (!record || ['revoked', 'rejected'].includes(record.status) || (!allowAll && !scopeTags.has(record.scopeTag))) {
       throw createError('memory_not_found', 404);
     }
     const payload = await this.rawStore.get(record.contentId);
@@ -1172,6 +1753,213 @@ export class FabricStore {
     };
   }
 
+  async filterRecallItems(items, { allowedScopes = [] } = {}) {
+    const scopeTags = allowedScopes.flatMap(scope => this.rawStore.opaqueTags('scope', scope));
+    const visible = [];
+    for (const item of Array.isArray(items) ? items : []) {
+      const refs = recallRefs(item);
+      if (!refs.proposalId && !refs.contentId && !refs.identityId) {
+        visible.push(item);
+        continue;
+      }
+      if (await this._catalogOperation(() => this.catalog.recallItemActive(refs, scopeTags))) visible.push(item);
+    }
+    return visible;
+  }
+
+  _queueIdentity(operation) {
+    const run = this._identityMutation.catch(() => {}).then(operation);
+    this._identityMutation = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  createIdentity(input) {
+    return this._queueIdentity(async () => {
+      const actor = String(input.actor || '');
+      const clean = { ...input }; delete clean.actor;
+      const validated = validateIdentityCreate(clean);
+      if (!actor) throw createError('identity_actor_required', 400);
+      const createdAt = this.clock().toISOString();
+      const evidencePayload = { type: 'identity-evidence', operation: 'create', actor, identityKind: validated.kind, externalKey: validated.externalKey, scope: validated.scope, evidence: validated.evidence };
+      const replay = await this._catalogOperation(() => this.catalog.findIdentityOperation(this.rawStore.opaqueTags('identity-idempotency', validated.idempotencyKey)));
+      if (replay) {
+        const previous = await this.rawStore.get(replay.event.evidenceContentId || replay.event.evidence_content_id);
+        if (canonicalJson(previous) !== canonicalJson(evidencePayload)) throw createError('idempotency_key_conflict', 409);
+        return this._publicIdentityResult({ ...replay, duplicate: true }, validated.scope);
+      }
+      const prepared = this.rawStore.prepare(evidencePayload);
+      const raw = await this.rawStore.commit(prepared);
+      const identityId = this.idFactory();
+      const record = {
+        id: identityId,
+        identityTag: this.rawStore.opaqueTag('identity', `${validated.scope}\u0000${validated.kind}\u0000${validated.externalKey}`),
+        identityKind: validated.kind,
+        scopeTag: this.rawStore.opaqueTag('scope', validated.scope),
+        status: 'active', canonicalIdentityId: null, revision: 1, createdAt, updatedAt: createdAt
+      };
+      const event = {
+        id: this.idFactory(), identityId, revision: 1, operation: 'create', targetIdentityId: null,
+        evidenceContentId: raw.contentId,
+        evidenceStrength: validated.evidence.type === 'weak_observation' ? 'weak' : 'strong',
+        automatic: false,
+        actorTag: this.rawStore.opaqueTag('audit-actor', actor),
+        idempotencyTag: this.rawStore.opaqueTag('identity-idempotency', validated.idempotencyKey),
+        response: { id: identityId, kind: validated.kind, status: 'active', canonicalIdentityId: null, revision: 1 },
+        createdAt
+      };
+      let result;
+      try {
+        result = await this._catalogOperation(() => this.catalog.createIdentity(record, event, {
+          contentId: raw.contentId, mediaType: 'application/vnd.agent-memory-fabric.identity-evidence+json', byteLength: raw.byteLength, storageRef: raw.storageRef, createdAt
+        }));
+      } catch (error) {
+        if (error?.catalogTransactionOutcome !== 'ambiguous_commit') throw error;
+        const reconciled = await this._catalogOperation(() => this.catalog.findIdentityOperation(this.rawStore.opaqueTags('identity-idempotency', validated.idempotencyKey)));
+        if (!reconciled) throw error;
+        const previous = await this.rawStore.get(reconciled.event.evidenceContentId);
+        if (canonicalJson(previous) !== canonicalJson(evidencePayload)) throw createError('idempotency_key_conflict', 409);
+        result = { ...reconciled, duplicate: true };
+      }
+      if (result.duplicate && !result.event) throw createError('identity_already_exists', 409);
+      return this._publicIdentityResult(result, validated.scope);
+    });
+  }
+
+  mergeIdentity(sourceId, input) {
+    return this._identityMutationAction('merge', sourceId, input);
+  }
+
+  splitIdentity(sourceId, input) {
+    return this._identityMutationAction('split', sourceId, input);
+  }
+
+  _identityMutationAction(operation, sourceId, input) {
+    return this._queueIdentity(async () => {
+      const actor = String(input.actor || '');
+      const scope = String(input.scope || '');
+      if (!actor) throw createError('identity_actor_required', 400);
+      if (!scope) throw createError('identity_scope_invalid', 400);
+      const clean = { ...input }; delete clean.actor; delete clean.scope;
+      const validated = validateIdentityMutation(clean, operation);
+      if (operation === 'merge' && validated.automatic) {
+        const evidenceIsStrong = validated.evidence.type !== 'weak_observation';
+        if (!this.identityPolicy.allowAutomaticStrongMerge || !evidenceIsStrong) throw createError('identity_auto_merge_forbidden', 403);
+      }
+      const source = await this._catalogOperation(() => this.catalog.getIdentity(sourceId));
+      const scopeTags = new Set(this.rawStore.opaqueTags('scope', scope));
+      if (!source || !scopeTags.has(source.scopeTag)) throw createError('identity_not_found', 404);
+      const createdAt = this.clock().toISOString();
+      const evidencePayload = { type: 'identity-evidence', operation, actor, scope, sourceId, targetId: validated.targetId || null, evidence: validated.evidence };
+      const replay = await this._catalogOperation(() => this.catalog.findIdentityOperation(this.rawStore.opaqueTags('identity-idempotency', validated.idempotencyKey)));
+      if (replay) {
+        const previous = await this.rawStore.get(replay.event.evidenceContentId || replay.event.evidence_content_id);
+        if (canonicalJson(previous) !== canonicalJson(evidencePayload)) throw createError('idempotency_key_conflict', 409);
+        return this._publicIdentityResult({ ...replay, duplicate: true }, scope);
+      }
+      const prepared = this.rawStore.prepare(evidencePayload);
+      const raw = await this.rawStore.commit(prepared);
+      const event = {
+        id: this.idFactory(), identityId: sourceId, revision: validated.expectedRevision + 1, operation,
+        targetIdentityId: validated.targetId || source.canonicalIdentityId || null,
+        evidenceContentId: raw.contentId,
+        evidenceStrength: validated.evidence.type === 'weak_observation' ? 'weak' : 'strong',
+        automatic: operation === 'merge' ? validated.automatic : false,
+        actorTag: this.rawStore.opaqueTag('audit-actor', actor),
+        idempotencyTag: this.rawStore.opaqueTag('identity-idempotency', validated.idempotencyKey),
+        response: {
+          id: sourceId,
+          kind: source.identityKind,
+          status: operation === 'merge' ? 'merged' : 'active',
+          canonicalIdentityId: operation === 'merge' ? validated.targetId : null,
+          revision: validated.expectedRevision + 1
+        },
+        createdAt
+      };
+      let result;
+      try {
+        result = await this._catalogOperation(() => this.catalog.mutateIdentity({
+          sourceId, targetId: validated.targetId || source.canonicalIdentityId || null, expectedRevision: validated.expectedRevision,
+          operation, event,
+          rawRecord: { contentId: raw.contentId, mediaType: 'application/vnd.agent-memory-fabric.identity-evidence+json', byteLength: raw.byteLength, storageRef: raw.storageRef, createdAt }
+        }));
+      } catch (error) {
+        if (error?.catalogTransactionOutcome !== 'ambiguous_commit') throw error;
+        const reconciled = await this._catalogOperation(() => this.catalog.findIdentityOperation(this.rawStore.opaqueTags('identity-idempotency', validated.idempotencyKey)));
+        if (!reconciled) throw error;
+        const previous = await this.rawStore.get(reconciled.event.evidenceContentId);
+        if (canonicalJson(previous) !== canonicalJson(evidencePayload)) throw createError('idempotency_key_conflict', 409);
+        result = { ...reconciled, duplicate: true };
+      }
+      return this._publicIdentityResult(result, scope);
+    });
+  }
+
+  _publicIdentityResult(result, scope) {
+    const snapshot = result.event?.response;
+    if (snapshot) return { ...snapshot, scope, duplicate: result.duplicate, eventId: result.event.id };
+    const row = result.record;
+    return { id: row.id, kind: row.identityKind, scope, status: row.status, canonicalIdentityId: row.canonicalIdentityId, revision: row.revision, duplicate: result.duplicate, eventId: result.event?.id || null };
+  }
+
+  async readIdentityAuthorized(id, { allowedScopes = [], allowAll = false }) {
+    const row = await this._catalogOperation(() => this.catalog.getIdentity(id));
+    const allowed = new Set(allowedScopes.flatMap(scope => this.rawStore.opaqueTags('scope', scope)));
+    if (!row || (!allowAll && !allowed.has(row.scopeTag))) throw createError('identity_not_found', 404);
+    return { id: row.id, kind: row.identityKind, status: row.status, canonicalIdentityId: row.canonicalIdentityId, revision: row.revision, createdAt: row.createdAt, updatedAt: row.updatedAt };
+  }
+
+  async planRetention(input, { allowedScopes = [], allowAll = false } = {}) {
+    const validated = validateRetentionAction(input, 'plan');
+    const scopes = validated.scope ? [validated.scope] : allowedScopes;
+    if (!allowAll && validated.scope && !allowedScopes.includes(validated.scope)) throw createError('retention_not_found', 404);
+    const scopeTags = allowAll && !validated.scope ? null : scopes.flatMap(scope => this.rawStore.opaqueTags('scope', scope));
+    const rows = await this._catalogOperation(() => this.catalog.planRetention({ asOf: validated.asOf, scopeTags, limit: validated.limit }));
+    return { asOf: validated.asOf, candidates: rows.map(row => ({ contentId: row.contentId, checksum: row.contentChecksum, originalCreatedAt: row.originalCreatedAt, expiresAt: row.expiresAt, lifecycle: row.lifecycle })) };
+  }
+
+  async applyRetention(input, { allowedScopes = [], allowAll = false } = {}) {
+    const actor = String(input.actor || '');
+    if (!actor) throw createError('identity_actor_required', 400);
+    const clean = { ...input }; delete clean.actor;
+    const validated = validateRetentionAction(clean, 'apply');
+    const allowedScopeTags = allowAll ? null : allowedScopes.flatMap(scope => this.rawStore.opaqueTags('scope', scope));
+    const createdAt = this.clock().toISOString();
+    if (validated.reason === 'retention_expired' && validated.expectedPlanAsOf > createdAt) throw createError('retention_plan_in_future', 409);
+    const idempotencyTags = this.rawStore.opaqueTags('retention-idempotency', `${actor}\u0000${validated.idempotencyKey}`);
+    const requestDigest = crypto.createHash('sha256').update(canonicalJson({
+      candidateIds: validated.candidateIds,
+      expectedPlanAsOf: validated.expectedPlanAsOf,
+      reason: validated.reason,
+      authorization: { allowAll: Boolean(allowAll), allowedScopes: allowAll ? [] : [...allowedScopes].sort() }
+    })).digest('hex');
+    const existing = await this._catalogOperation(() => this.catalog.findRetentionOperation(idempotencyTags));
+    if (existing) {
+      if (existing.requestDigest !== requestDigest) throw createError('idempotency_key_conflict', 409);
+      return structuredClone(existing.response);
+    }
+    const operation = { id: this.idFactory(), idempotencyTag: this.rawStore.opaqueTag('retention-idempotency', `${actor}\u0000${validated.idempotencyKey}`), requestDigest };
+    let applied;
+    try {
+      applied = await this._catalogOperation(() => this.catalog.applyRetention({
+        contentIds: validated.candidateIds,
+        expectedPlanAsOf: validated.expectedPlanAsOf,
+        reason: validated.reason,
+        createdAt,
+        idFactory: this.idFactory,
+        allowedScopeTags,
+        operation
+      }));
+    } catch (error) {
+      if (error?.catalogTransactionOutcome !== 'ambiguous_commit') throw error;
+      const reconciled = await this._catalogOperation(() => this.catalog.findRetentionOperation(idempotencyTags));
+      if (!reconciled) throw error;
+      if (reconciled.requestDigest !== requestDigest) throw createError('idempotency_key_conflict', 409);
+      return structuredClone(reconciled.response);
+    }
+    if (applied.requestDigest !== requestDigest) throw createError('idempotency_key_conflict', 409);
+    return structuredClone(applied.response);
+  }
+
   async audit({ actor = 'anonymous', action, outcome, requestId = null, targetId = null, scope = null, details = {} }) {
     const safeDetails = Object.fromEntries(Object.entries(details).filter(([key]) => SAFE_AUDIT_DETAIL_KEYS.has(key)));
     await this._catalogOperation(() => this.catalog.appendAudit({ id: this.idFactory(), ts: this.clock().toISOString(), actorTag: this.rawStore.opaqueTag('audit-actor', actor), action, outcome, requestId, targetId, scopeTag: scope ? this.rawStore.opaqueTag('audit-scope', scope) : null, details: safeDetails }));
@@ -1179,11 +1967,31 @@ export class FabricStore {
   async ready() { await this._catalogOperation(() => this.catalog.ready?.()); }
   async health() { return this._catalogOperation(() => this.catalog.health ? this.catalog.health() : this.status()); }
   async close() { await this.catalog.close?.(); }
-  status() { return { configured: true, rawIngestConfigured: Boolean(this.ingestKeys), ...this.catalog.status() }; }
+  status() { return { configured: true, rawIngestConfigured: Boolean(this.ingestKeys), physicalRawDeletionEnabled: false, ...this.catalog.status() }; }
 }
 
 export function createUnconfiguredFabricStore(reason = 'raw_encryption_key_required') {
-  return { configured: false, reason, async propose() { throw createError('fabric_store_unconfigured', 503); }, async ingestRawEvent() { throw createError('raw_ingest_unconfigured', 503); }, async readProposalAuthorized() { throw createError('fabric_store_unconfigured', 503); }, async getProposalStatusAuthorized() { throw createError('fabric_store_unconfigured', 503); }, async readProposal() { throw createError('fabric_store_unconfigured', 503); }, createSessionReader() { return null; }, async audit() {}, async ready() {}, async close() {}, status() { return { configured: false }; } };
+  const unavailable = async () => { throw createError('fabric_store_unconfigured', 503); };
+  const rawUnavailable = async () => { throw createError('raw_ingest_unconfigured', 503); };
+  return { configured: false, reason, propose: unavailable, ingestRawEvent: rawUnavailable, createIdentity: unavailable, mergeIdentity: unavailable, splitIdentity: unavailable, readIdentityAuthorized: unavailable, planRetention: unavailable, applyRetention: unavailable, readProposalAuthorized: unavailable, getProposalStatusAuthorized: unavailable, readProposal: unavailable, createSessionReader() { return null; }, async filterRecallItems() { return []; }, async audit() {}, async ready() {}, async close() {}, status() { return { configured: false }; } };
+}
+
+function loadLifecyclePolicies(env) {
+  let retentionPolicy = { defaultYears: 3, scopeDays: {} };
+  const policyPath = String(env.AMF_RETENTION_POLICY_PATH || '').trim();
+  if (policyPath) {
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(path.resolve(policyPath), 'utf8')); } catch { throw createError('retention_policy_invalid', 500); }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).some(key => !['defaultYears', 'scopeDays'].includes(key))) throw createError('retention_policy_invalid', 500);
+    const defaultYears = parsed.defaultYears ?? 3;
+    if (!Number.isSafeInteger(defaultYears) || defaultYears < 1 || defaultYears > 100) throw createError('retention_policy_invalid', 500);
+    if (!parsed.scopeDays || typeof parsed.scopeDays !== 'object' || Array.isArray(parsed.scopeDays)) throw createError('retention_policy_invalid', 500);
+    for (const [scope, days] of Object.entries(parsed.scopeDays)) if (!scope || scope.length > 1024 || !Number.isSafeInteger(days) || days < 1 || days > 36500) throw createError('retention_policy_invalid', 500);
+    retentionPolicy = { defaultYears, scopeDays: { ...parsed.scopeDays } };
+  }
+  const automaticRaw = String(env.AMF_IDENTITY_AUTO_MERGE_STRONG || 'false').trim().toLowerCase();
+  if (!['true', 'false'].includes(automaticRaw)) throw createError('identity_policy_invalid', 500);
+  return { retentionPolicy, identityPolicy: { allowAutomaticStrongMerge: automaticRaw === 'true' } };
 }
 
 export function createFabricStoreFromEnv({ rootPath = process.cwd(), env = process.env, postgresPoolFactory } = {}) {
@@ -1195,6 +2003,7 @@ export function createFabricStoreFromEnv({ rootPath = process.cwd(), env = proce
   }
   const encryptionKey = env.AMF_RAW_ENCRYPTION_KEY;
   if (!keyRing && !encryptionKey) return createUnconfiguredFabricStore();
+  const lifecyclePolicies = loadLifecyclePolicies(env);
   const dataRoot = path.resolve(rootPath, env.AMF_DATA_PATH || 'var/agent-memory-fabric');
   const catalogKind = String(env.AMF_CATALOG_KIND || 'sqlite').trim().toLowerCase();
   let catalog;
@@ -1219,7 +2028,7 @@ export function createFabricStoreFromEnv({ rootPath = process.cwd(), env = proce
   } else if (env.AMF_INGEST_KEY_RING_JSON) {
     try { ingestKeyRing = JSON.parse(env.AMF_INGEST_KEY_RING_JSON); } catch { throw createError('raw_ingest_key_ring_invalid', 500); }
   }
-  return new FabricStore({ rawStore, catalog, ingestKeyRing });
+  return new FabricStore({ rawStore, catalog, ingestKeyRing, ...lifecyclePolicies });
 }
 
 export { POSTGRES_SCHEMA, POSTGRES_SCHEMA_VERSION };
