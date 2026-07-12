@@ -923,10 +923,10 @@ export class SqliteCatalog {
   listSessionEvents(id) { return [...this.db.prepare('SELECT * FROM raw_events_v1 WHERE session_id=?').all(id), ...this.db.prepare('SELECT * FROM raw_events_v2 WHERE session_id=?').all(id)].map(row => this.mapRawEvent(row)).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId)); }
   listSessionEventsPage({ id, offset = 0, limit = 100, from = null, to = null }) {
     const rows = this.db.prepare(`SELECT * FROM (
-      SELECT event_id,session_id,NULL AS logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,coalesce(json_extract(projection_json,'$.occurredAt'),created_at) AS effective_at FROM raw_events_v1 WHERE session_id=?
+      SELECT event_id,session_id,NULL AS logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,coalesce(julianday(json_extract(projection_json,'$.occurredAt')),julianday(created_at)) AS effective_at FROM raw_events_v1 WHERE session_id=?
       UNION ALL
-      SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,coalesce(json_extract(projection_json,'$.occurredAt'),created_at) AS effective_at FROM raw_events_v2 WHERE session_id=?
-    ) events WHERE (? IS NULL OR effective_at>=?) AND (? IS NULL OR effective_at<=?) ORDER BY created_at,event_id LIMIT ? OFFSET ?`).all(id, id, from, from, to, to, limit + 1, offset);
+      SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at,coalesce(julianday(json_extract(projection_json,'$.occurredAt')),julianday(created_at)) AS effective_at FROM raw_events_v2 WHERE session_id=?
+    ) events WHERE (? IS NULL OR effective_at>=julianday(?)) AND (? IS NULL OR effective_at<=julianday(?)) ORDER BY created_at,event_id LIMIT ? OFFSET ?`).all(id, id, from, from, to, to, limit + 1, offset);
     return { items: rows.slice(0, limit).map(row => this.mapRawEvent(row)), hasMore: rows.length > limit };
   }
   rawV2Readiness() {

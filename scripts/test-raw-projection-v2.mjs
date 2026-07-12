@@ -237,6 +237,9 @@ test('v2 sessions accept multi-role events and retries but reject room/thread re
       assert.equal(firstPage.items.length, 2); assert.equal(firstPage.hasMore, true);
       const secondPage = await catalog.listSessionEventsPage({ id: session.id, offset: 2, limit: 2 });
       assert.equal(secondPage.items.length, 1); assert.equal(secondPage.hasMore, false);
+      assert.equal((await catalog.listSessionEventsPage({ id: session.id, from: '2026-07-12T02:00:00+02:00' })).items.length, 3, 'equivalent offset boundary is inclusive');
+      assert.equal((await catalog.listSessionEventsPage({ id: session.id, from: '2026-07-12T00:00:00.001Z' })).items.length, 0, 'fractional instant after event excludes it');
+      assert.equal((await catalog.listSessionEventsPage({ id: session.id, to: '2026-07-11T23:59:59.999Z' })).items.length, 0, 'fractional instant before event excludes it');
       const reader = store.createSessionReader();
       for (const actor of observations.map(observation => observation.actor)) {
         assert.deepEqual((await reader.search({ actor, query: '', limit: 10 })).items.map(result => result.id), [session.id]);

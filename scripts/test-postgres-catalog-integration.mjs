@@ -109,6 +109,9 @@ test('real PostgreSQL catalog integration in an explicitly isolated test databas
     assert.equal(await catalog.hasSessionParticipant(rawSessionId, [opaque('owner', 'outsider')]), false);
     assert.deepEqual(await catalog.listSessionEventsPage({ id: rawSessionId, offset: 0, limit: 2 }).then(page => ({ count: page.items.length, hasMore: page.hasMore })), { count: 2, hasMore: true });
     assert.deepEqual(await catalog.listSessionEventsPage({ id: rawSessionId, offset: 2, limit: 2 }).then(page => ({ count: page.items.length, hasMore: page.hasMore })), { count: 1, hasMore: false });
+    assert.equal((await catalog.listSessionEventsPage({ id: rawSessionId, from: '2026-07-12T14:00:03+02:00' })).items.length, 1, 'offset boundary is inclusive');
+    assert.equal((await catalog.listSessionEventsPage({ id: rawSessionId, from: '2026-07-12T12:00:01.001Z' })).items.length, 2, 'fractional from excludes the earlier event');
+    assert.equal((await catalog.listSessionEventsPage({ id: rawSessionId, to: '2026-07-12T12:00:00.999Z' })).items.length, 0, 'fractional to excludes all later events');
     for (const actor of ['person', 'system', 'assistant']) {
       const visible = await catalog.searchSessions({ ownerTags: [opaque('owner', actor)], query: '', limit: 10 });
       assert.equal(visible.some(session => session.id === rawSessionId), true);
