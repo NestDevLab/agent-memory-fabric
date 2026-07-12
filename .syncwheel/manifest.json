@@ -110,7 +110,8 @@
       "integration_branch": "main-integration",
       "commits": [
         "5726e763cfbdbb3d6a5fe305dd9d20132d6118cc",
-        "4699ab8feb1708c79571f0b257b3134ba8c150e7"
+        "4699ab8feb1708c79571f0b257b3134ba8c150e7",
+        "b42144f6ccf0f42d3cfa6a6d2080f05c32cd47cc"
       ],
       "meta": {
         "purpose": "Make RAW multi-actor session reads ACL-coherent"
