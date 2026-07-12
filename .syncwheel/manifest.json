@@ -85,7 +85,7 @@
     {
       "id": "amf-canonical-bridge",
       "branch": "amf/canonical-bridge",
-      "base": "d83bba3c83c16b8f4f36756e36dbdf0e3ba45c7f",
+      "base": "a54158498e7b041da6205bda3db93beed529743e",
       "target_remote": "origin",
       "target_branch": "amf/raw-runtime-v2",
       "integration_branch": "main-integration",
