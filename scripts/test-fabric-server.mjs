@@ -8,6 +8,7 @@ import test from 'node:test';
 import { FabricStore, MemoryCatalog, MemoryRawStore } from '../src/fabric-store.mjs';
 import { aadSha256For } from '../src/amf-memory-record-validator.mjs';
 import { createAgentMemoryFabricServer } from '../src/server.mjs';
+import { ContextTokenVerifier, issueContextToken, requestDigest } from '../src/context-token.mjs';
 
 const testPolicyPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'config', 'policies.example.json');
 
@@ -39,7 +40,7 @@ function canonicalProposal(text, scope = 'main-lab', revision = 1) {
   return { record: canonicalRecord(text, scope, revision), rationale: 'test_evidence', expectedRevision: revision - 1 };
 }
 
-async function withServer(run, { sessionOptions, clock, configuredSessionReader = true, fabricStore: fabricStoreOverride, backend: backendOverride } = {}) {
+async function withServer(run, { sessionOptions, clock, configuredSessionReader = true, fabricStore: fabricStoreOverride, backend: backendOverride, canonicalStore, contextVerifier, receiptCoordinator } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-server-'));
   const registryPath = path.join(dir, 'auth.json');
   const registry = {
@@ -107,7 +108,7 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
     async get({ id }) { return { id, title: 'Session', scope: 'main-lab', ownerActor: 'test-actor' }; },
     async transcript({ id, view }) { return { id, view, messages: [] }; }
   };
-  const server = createAgentMemoryFabricServer({ backend, fabricStore, sessionReader: configuredSessionReader ? sessionReader : undefined, sessionOptions, clock, policyPath: testPolicyPath });
+  const server = createAgentMemoryFabricServer({ backend, fabricStore, canonicalStore, contextVerifier, receiptCoordinator, sessionReader: configuredSessionReader ? sessionReader : undefined, sessionOptions, clock, policyPath: testPolicyPath });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const api = async (pathname, options = {}) => {
@@ -132,7 +133,7 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
   }
 }
 
-test('v2 REST uses envelopes, queues idempotently and reads encrypted proposals', async () => {
+test('v2 REST queues idempotently while canonical read never exposes proposal payloads', async () => {
   await withServer(async ({ api, fabricStore, getBackendAdds }) => {
     const request = {
       method: 'POST',
@@ -157,11 +158,44 @@ test('v2 REST uses envelopes, queues idempotently and reads encrypted proposals'
     assert.equal(status.body.data.status, 'queued');
     assert.equal(status.body.data.record, undefined);
     const read = await api(`/v2/memory/${first.body.data.proposalId}`);
-    assert.equal(read.response.status, 200);
-    assert.equal(Buffer.from(read.body.data.record.claim.ciphertext, 'base64').toString('utf8'), 'Remember the appointment');
-    assert.equal(read.body.data.rationale, 'test_evidence');
-    assert.ok(fabricStore.catalog.auditEvents.some(event => event.action === 'memory_read'));
+    assert.equal(read.response.status, 404);
+    assert.equal(read.body.error.code, 'memory_not_found');
+    assert.equal(JSON.stringify(read.body).includes('Remember the appointment'), false);
   });
+});
+
+test('canonical PAM search/read and conversation recall bind the exact signed context', async () => {
+  const canonical = canonicalRecord('Shared appointment', 'main-lab');
+  canonical.visibility = 'shared';
+  canonical.claim.aadSha256 = aadSha256For(canonical);
+  const canonicalStore = {
+    configured: true, kind: 'test-pam',
+    async search() { return { items: [canonical], nextCursor: null }; },
+    async read({ id }) { if (id !== canonical.id) throw Object.assign(new Error('memory_not_found'), { status: 404 }); return canonical; }
+  };
+  const keyRing = { currentKeyVersion: 'ctx-v1', keys: { 'ctx-v1': Buffer.alloc(32, 7).toString('base64') } };
+  const now = Date.now();
+  const contextVerifier = new ContextTokenVerifier({ keyRing, policyRevision: 'policy-test', clock: () => now });
+  const request = { operation: 'memory_search', query: 'appointment', scope: 'domain:main-lab', scopes: [] };
+  const contextToken = issueContextToken({
+    actor: 'test-actor', runtime: 'principia', profile: 'test', conversationKind: 'group',
+    contextTags: { room: [`hmac-sha256:routing-v1:${'a'.repeat(64)}`] }, purpose: 'conversation_recall', policyRevision: 'policy-test',
+    issuedAt: new Date(now - 1000).toISOString(), expiresAt: new Date(now + 60_000).toISOString(), nonce: 'nonce_1234567890abcdef', requestDigest: requestDigest(request)
+  }, keyRing);
+  await withServer(async ({ api }) => {
+    const missing = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ scope: 'domain:main-lab', query: 'appointment', purpose: 'conversation_recall' }) });
+    assert.equal(missing.response.status, 403);
+    assert.equal(missing.body.error.code, 'context_required');
+    const found = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ scope: 'domain:main-lab', query: 'appointment', purpose: 'conversation_recall', contextToken }) });
+    assert.equal(found.response.status, 200);
+    assert.deepEqual(found.body.data.items.map(item => item.id), [canonical.id]);
+    const replayChanged = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ scope: 'domain:main-lab', query: 'different', purpose: 'conversation_recall', contextToken }) });
+    assert.equal(replayChanged.response.status, 403);
+    assert.equal(replayChanged.body.error.code, 'context_invalid');
+    const read = await api(`/v2/memory/${canonical.id}?purpose=operator_review`);
+    assert.equal(read.response.status, 200);
+    assert.equal(read.body.data.record.id, canonical.id);
+  }, { canonicalStore, contextVerifier });
 });
 
 test('internal identity and retention APIs enforce the existing auth, ACL and audit envelope', async () => {
@@ -450,7 +484,7 @@ test('session reader capability is explicit and unconfigured access returns 503'
   await withServer(async ({ api }) => {
     const initialized = await api('/mcp/test-client/test-identity', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } }) });
     assert.equal(initialized.body.result.capabilities.experimental.sessionReader, false);
-    const unavailable = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ query: 'x', purpose: 'conversation_recall' }) });
+    const unavailable = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ query: 'x', purpose: 'continuity_resume' }) });
     assert.equal(unavailable.response.status, 503);
     assert.equal(unavailable.body.error.code, 'session_reader_unconfigured');
   }, { configuredSessionReader: false });
@@ -458,7 +492,7 @@ test('session reader capability is explicit and unconfigured access returns 503'
 
 test('session transcript defaults redacted and requires raw decrypt permission for original', async () => {
   await withServer(async ({ api }) => {
-    const transcript = await api('/v2/sessions/session-1/transcript?purpose=conversation_recall');
+    const transcript = await api('/v2/sessions/session-1/transcript?purpose=continuity_resume');
     assert.equal(transcript.response.status, 200);
     assert.equal(transcript.body.data.view, 'redacted');
     assert.match(transcript.response.headers.get('cache-control'), /no-store/);
@@ -469,7 +503,7 @@ test('session transcript defaults redacted and requires raw decrypt permission f
     assert.equal(forbidden.response.status, 403);
     assert.equal(forbidden.body.error.code, 'raw_decrypt_forbidden');
 
-    const hidden = await api('/v2/sessions/session-1?purpose=conversation_recall', {
+    const hidden = await api('/v2/sessions/session-1?purpose=operator_review', {
       headers: { authorization: 'Bearer tirrenia-token' }
     });
     assert.equal(hidden.response.status, 404);

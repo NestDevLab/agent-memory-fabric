@@ -81,6 +81,15 @@ test('projection v2 accepts every runtime and rejects literal context routing or
   assert.throws(() => deriveLogicalMessageIds({ canonicalSenderIdentity: 'person:alice', senderTag: tag('sender', 'alice'), conversationTag: tag('conversation', 'room'), direction: 'inbound' }, LOGICAL_KEYS), /strong_identifier_required/);
 });
 
+test('published conformance fixture and Codex/OpenClaw identifiers match executable derivation', () => {
+  const fixture = JSON.parse(fs.readFileSync(new URL('./fixtures/raw-projection-v2.conformance.json', import.meta.url), 'utf8'));
+  assert.equal(validateProjectionV2(fixture), fixture);
+  assert.match(deriveSessionIdV2({ sourceKind: 'codex', nativeSessionId: 'rollout-uuid' }), /^ses_[a-f0-9]{64}$/);
+  assert.equal(deriveSessionIdV2({ sourceKind: 'openclaw', nativeSessionId: 'agent:vitae:session:42' }), deriveSessionIdV2({ sourceKind: 'openclaw', nativeSessionId: 'agent:vitae:session:42' }));
+  assert.notEqual(deriveSessionIdV2({ sourceKind: 'codex', nativeSessionId: 'same' }), deriveSessionIdV2({ sourceKind: 'openclaw', nativeSessionId: 'same' }));
+  assert.match(deriveEventIdV2({ sourceKind: 'openclaw', nativeSessionId: 'session', nativeEventId: 'message', observationClass: 'native' }), /^evt_[a-f0-9]{64}$/);
+});
+
 test('logical selection is deterministic, native wins handoff, conflicts block and tombstones win', () => {
   const handoff = item({ runtime: 'principia', id: eventId('c'), observationClass: 'delivery-handoff', delivery: true }).projection;
   const native = item({ runtime: 'hermes', id: eventId('d'), nativeRevision: 2 }).projection;
