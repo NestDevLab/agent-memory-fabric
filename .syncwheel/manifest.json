@@ -66,6 +66,34 @@
       "meta": {
         "purpose": "Versioned identity merge split and retention enforcement"
       }
+    },
+    {
+      "id": "amf-raw-runtime-v2",
+      "branch": "amf/raw-runtime-v2",
+      "base": "fa74fe9f959b64bbe13551652f2544a191dd4298",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "d83bba3c83c16b8f4f36756e36dbdf0e3ba45c7f"
+      ],
+      "meta": {
+        "purpose": "RAW projection v2 and logical message selection"
+      }
+    },
+    {
+      "id": "amf-canonical-bridge",
+      "branch": "amf/canonical-bridge",
+      "base": "d83bba3c83c16b8f4f36756e36dbdf0e3ba45c7f",
+      "target_remote": "origin",
+      "target_branch": "amf/raw-runtime-v2",
+      "integration_branch": "main-integration",
+      "commits": [
+        "f0c1a84715305fb511c62fe83b4d75bb0587822a"
+      ],
+      "meta": {
+        "purpose": "Canonical PAM bridge, receipt recovery and context-bound API"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
