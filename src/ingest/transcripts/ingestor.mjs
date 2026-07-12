@@ -131,7 +131,7 @@ export class TranscriptIngestor {
       };
     };
     if (bootstrapTail) {
-      const offset = tailBootstrapOffset(filePath);
+      const offset = tailBootstrapOffset(filePath, { size: stat.size });
       const cursor = newCursor(0, { offset, initialHint: initialSessionHint(adapter, runtime, filePath, sessionHint), bootstrapped: true });
       this.cursorStore.write(key, cursor);
       return {

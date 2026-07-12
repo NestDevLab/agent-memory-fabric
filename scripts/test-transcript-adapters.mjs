@@ -245,6 +245,18 @@ test('partial final line remains unread until completed and does not advance the
   } finally { tree.cleanup(); }
 });
 
+test('tail bootstrap never advances beyond its captured size when a complete line arrives concurrently', () => {
+  const tree = tempTree();
+  const file = path.join(tree.root, 'concurrent-append.jsonl');
+  try {
+    fs.writeFileSync(file, '{"first":true}\n');
+    const capturedSize = fs.statSync(file).size;
+    fs.appendFileSync(file, '{"arrived":"after-snapshot"}\n');
+    assert.equal(tailBootstrapOffset(file, { size: capturedSize }), capturedSize);
+    assert.equal(tailBootstrapOffset(file), fs.statSync(file).size);
+  } finally { tree.cleanup(); }
+});
+
 test('tail bootstrap namespaces realtime from backfill, preserves Codex session identity and a partial line across rotation', async () => {
   const tree = tempTree();
   const file = path.join(tree.root, 'codex-active.jsonl');

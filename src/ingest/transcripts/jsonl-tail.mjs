@@ -12,15 +12,17 @@ function readWindow(filePath, start, length) {
   } finally { fs.closeSync(fd); }
 }
 
-export function tailBootstrapOffset(filePath, { maxLineBytes = MAX_TRANSCRIPT_JSONL_LINE_BYTES } = {}) {
+export function tailBootstrapOffset(filePath, { maxLineBytes = MAX_TRANSCRIPT_JSONL_LINE_BYTES, size = null } = {}) {
   if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes < 1 || maxLineBytes > MAX_TRANSCRIPT_JSONL_LINE_BYTES) throw new Error('transcript_line_limit_invalid');
   const stat = fs.statSync(filePath);
   if (!stat.isFile()) throw new Error('transcript_source_not_file');
-  if (stat.size === 0) return 0;
-  const last = readWindow(filePath, stat.size - 1, 1);
-  if (last[0] === 0x0a) return stat.size;
-  const windowStart = Math.max(0, stat.size - maxLineBytes);
-  const window = readWindow(filePath, windowStart, stat.size - windowStart);
+  const snapshotSize = size == null ? stat.size : Number(size);
+  if (!Number.isSafeInteger(snapshotSize) || snapshotSize < 0 || snapshotSize > stat.size) throw new Error('transcript_bootstrap_snapshot_invalid');
+  if (snapshotSize === 0) return 0;
+  const last = readWindow(filePath, snapshotSize - 1, 1);
+  if (last[0] === 0x0a) return snapshotSize;
+  const windowStart = Math.max(0, snapshotSize - maxLineBytes);
+  const window = readWindow(filePath, windowStart, snapshotSize - windowStart);
   const newline = window.lastIndexOf(0x0a);
   if (newline >= 0) return windowStart + newline + 1;
   if (windowStart > 0) throw new Error('transcript_line_exceeds_batch_limit');
