@@ -26,6 +26,46 @@
         "4ab9c621204fbc0668f8ef4a0ab423bc6ea520b8"
       ],
       "meta": {}
+    },
+    {
+      "id": "amf-raw-ingestion",
+      "branch": "amf/raw-ingestion",
+      "base": "4ab9c621204fbc0668f8ef4a0ab423bc6ea520b8",
+      "target_remote": "origin",
+      "target_branch": "amf/fabric-core",
+      "integration_branch": "main-integration",
+      "commits": [
+        "6d32fb48feb33d3ea5b7fafcbaab22d2c0056b7a"
+      ],
+      "meta": {
+        "purpose": "Codex and Claude encrypted RAW transcript ingestion"
+      }
+    },
+    {
+      "id": "amf-fabric-validation",
+      "branch": "amf/fabric-validation",
+      "base": "4ab9c621204fbc0668f8ef4a0ab423bc6ea520b8",
+      "target_remote": "origin",
+      "target_branch": "amf/fabric-core",
+      "integration_branch": "main-integration",
+      "commits": [],
+      "meta": {
+        "purpose": "Independent Fabric ACL retention crypto and outage validation"
+      }
+    },
+    {
+      "id": "amf-identity-retention",
+      "branch": "amf/identity-retention",
+      "base": "6d32fb48feb33d3ea5b7fafcbaab22d2c0056b7a",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "a0ad4b53b84a2cf6f3ecd8b0531d49b53673e9de"
+      ],
+      "meta": {
+        "purpose": "Versioned identity merge split and retention enforcement"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
