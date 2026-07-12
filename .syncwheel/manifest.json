@@ -11,7 +11,8 @@
     "base": "origin/main",
     "strategy": "cherry-pick",
     "stacks": [
-      "amf-fabric-core"
+      "amf-fabric-core",
+      "amf-ingestion-hardening"
     ]
   },
   "stacks": [
@@ -99,6 +100,18 @@
       "meta": {
         "purpose": "Canonical PAM bridge, receipt recovery and context-bound API"
       }
+    },
+    {
+      "id": "amf-ingestion-hardening",
+      "branch": "amf/ingestion-hardening",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "029f28c64bb7de0b61da5804614c4d86c90cc2e9"
+      ],
+      "meta": {}
     }
   ],
   "syncwheel_tracking": "git-tracked",
