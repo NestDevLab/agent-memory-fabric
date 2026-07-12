@@ -1,0 +1,33 @@
+{
+  "schema": "amf.raw-event-projection/v2",
+  "eventId": "evt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "sessionId": "ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "logicalMessageId": "lmsg_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "logicalMessageAliases": [
+    { "keyVersion": "logical-v1", "logicalMessageId": "lmsg_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }
+  ],
+  "derivationVersion": "amf-logical-message/v1",
+  "keyVersion": "logical-v2",
+  "sourceKind": "openclaw",
+  "observationClass": "native",
+  "direction": "inbound",
+  "conversationKind": "group",
+  "contextTags": {
+    "actor": ["hmac-sha256:routing-v1:1111111111111111111111111111111111111111111111111111111111111111"],
+    "sender": ["hmac-sha256:routing-v1:2222222222222222222222222222222222222222222222222222222222222222"],
+    "conversation": ["hmac-sha256:routing-v1:3333333333333333333333333333333333333333333333333333333333333333"],
+    "room": ["hmac-sha256:routing-v1:4444444444444444444444444444444444444444444444444444444444444444"]
+  },
+  "subtype": "message",
+  "occurredAt": "2026-07-12T12:00:00Z",
+  "editedAt": null,
+  "nativeRevision": 1,
+  "sourceSequence": 42,
+  "authoritativeDeletion": false,
+  "role": "user",
+  "contentType": "text",
+  "contentParts": 1,
+  "hasContent": true,
+  "normalizationVersion": "amf-observation-normalization/v1",
+  "normalizedPayloadDigest": "hmac-sha256:payload-v1:5555555555555555555555555555555555555555555555555555555555555555"
+}

@@ -4,6 +4,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import pg from 'pg';
 import { ciphertextContentId, ciphertextPayloadDigest, decryptClientCiphertext, normalizeIngestKeyRing, validateClientCiphertext } from './ingest/raw-event-contract.mjs';
+import { selectLogicalMessage, validateProjectionV2 } from './ingest/raw-projection-v2.mjs';
 import {
   retentionDeadline,
   retentionTombstone,
@@ -398,6 +399,9 @@ export class MemoryCatalog {
     this.idempotency = new Map();
     this.auditEvents = [];
     this.rawEvents = new Map();
+    this.rawEventsV2 = new Map();
+    this.logicalMessages = new Map();
+    this.logicalAliases = new Map();
     this.rawSessions = new Map();
     this.identities = new Map();
     this.identitiesByTag = new Map();
@@ -460,14 +464,51 @@ export class MemoryCatalog {
     this.auditEvents.push({ ...auditEvent, outcome: 'stored' });
     return { record: this.rawEvents.get(record.eventId), duplicate: false };
   }
-  getRawEvent(id) { return this.rawEvents.get(id) || null; }
+  findLogicalMessage(ids) {
+    for (const id of ids) {
+      const canonical = this.logicalAliases.get(id) || (this.logicalMessages.has(id) ? id : null);
+      if (canonical) return structuredClone(this.logicalMessages.get(canonical));
+    }
+    return null;
+  }
+  ingestRawEventV2(record, rawRecord, auditEvent) {
+    const existing = this.rawEventsV2.get(record.eventId) || this.rawEvents.get(record.eventId);
+    if (existing) { this.auditEvents.push({ ...auditEvent, outcome: 'duplicate' }); return { record: structuredClone(existing), duplicate: true, logical: this.findLogicalMessage([record.logicalMessageId]) }; }
+    const ids = [record.logicalMessageId, ...(record.projection.logicalMessageAliases || []).map(item => item.logicalMessageId)];
+    const matched = this.findLogicalMessage(ids);
+    const canonicalId = matched?.logicalMessageId || record.logicalMessageId;
+    this.rawObjects.set(rawRecord.contentId, { ...rawRecord });
+    const stored = structuredClone({ ...record, logicalMessageId: canonicalId });
+    this.rawEventsV2.set(record.eventId, stored);
+    const eventIds = [...new Set([...(matched?.eventIds || []), record.eventId])];
+    const observations = eventIds.map(eventId => this.rawEventsV2.get(eventId)).filter(Boolean).map(item => ({ ...item, projection: { ...item.projection, logicalMessageId: canonicalId } }));
+    const selection = selectLogicalMessage(observations);
+    const logical = { ...selection, logicalMessageId: canonicalId, eventIds, updatedAt: record.createdAt };
+    this.logicalMessages.set(canonicalId, logical);
+    for (const id of ids) this.logicalAliases.set(id, canonicalId);
+    const session = this.rawSessions.get(record.sessionId) || { id: record.sessionId, runtime: record.projection.sourceKind, ownerTag: record.ownerTag, sourceTag: record.sourceTag, conversationKind: record.projection.conversationKind, contextTags: structuredClone(record.projection.contextTags), firstOccurredAt: record.projection.occurredAt, lastOccurredAt: record.projection.occurredAt, eventCount: 0, createdAt: record.createdAt };
+    if (session.ownerTag !== record.ownerTag || session.sourceTag !== record.sourceTag || session.runtime !== record.projection.sourceKind
+      || canonicalJson(session.contextTags) !== canonicalJson(record.projection.contextTags) || session.conversationKind !== record.projection.conversationKind) throw createError('raw_session_binding_conflict', 409);
+    session.eventCount += 1;
+    session.firstOccurredAt = earlierTimestamp(session.firstOccurredAt, record.projection.occurredAt);
+    session.lastOccurredAt = laterTimestamp(session.lastOccurredAt, record.projection.occurredAt);
+    this.rawSessions.set(record.sessionId, session);
+    this.auditEvents.push({ ...auditEvent, outcome: 'stored' });
+    return { record: stored, duplicate: false, logical: structuredClone(logical) };
+  }
+  getRawEvent(id) { return this.rawEventsV2.get(id) || this.rawEvents.get(id) || null; }
   searchSessions({ ownerTags = [], query = '', limit = 20 }) {
     const needle = query.toLowerCase();
     const allowed = new Set(ownerTags);
     return [...this.rawSessions.values()].filter(item => allowed.has(item.ownerTag) && (!needle || `${item.id} ${item.runtime}`.toLowerCase().includes(needle))).sort(compareSessions).slice(0, limit);
   }
   getSession(id) { return this.rawSessions.get(id) || null; }
-  listSessionEvents(id) { return [...this.rawEvents.values()].filter(item => item.sessionId === id).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId)); }
+  listSessionEvents(id) { return [...this.rawEvents.values(), ...this.rawEventsV2.values()].filter(item => item.sessionId === id).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId)); }
+  rawV2Readiness() {
+    try { for (const item of this.rawEventsV2.values()) validateProjectionV2(item.projection); }
+    catch { return { safe: false, reason: 'literal_routing_scan_failed' }; }
+    return { safe: false, reason: 'production_postgres_required', evidence: { persisted: false, v1Count: this.rawEvents.size, v2Count: this.rawEventsV2.size, aliasCount: this.logicalAliases.size } };
+  }
   createIdentity(record, event, rawRecord) {
     const replay = this.identityIdempotency.get(event.idempotencyTag);
     if (replay) return { record: { ...this.identities.get(replay.identityId) }, event: { ...replay }, duplicate: true };
@@ -583,8 +624,12 @@ export class SqliteCatalog {
       CREATE TABLE IF NOT EXISTS raw_objects_v2 (content_id TEXT PRIMARY KEY, media_type TEXT NOT NULL, byte_length INTEGER NOT NULL, storage_ref TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS fabric_proposals (id TEXT PRIMARY KEY, owner_tag TEXT NOT NULL, scope_tag TEXT NOT NULL, status TEXT NOT NULL, content_id TEXT NOT NULL REFERENCES raw_objects_v2(content_id), idempotency_tag TEXT NOT NULL, source_tag TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(owner_tag, idempotency_tag));
       CREATE INDEX IF NOT EXISTS fabric_proposals_status_created_idx ON fabric_proposals(status, created_at);
-      CREATE TABLE IF NOT EXISTS raw_sessions_v1 (session_id TEXT PRIMARY KEY, runtime TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL, first_occurred_at TEXT, last_occurred_at TEXT, event_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS raw_sessions_v1 (session_id TEXT PRIMARY KEY, runtime TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL, conversation_kind TEXT, context_tags_json TEXT, first_occurred_at TEXT, last_occurred_at TEXT, event_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS raw_events_v1 (event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES raw_sessions_v1(session_id), content_id TEXT NOT NULL REFERENCES raw_objects_v2(content_id), payload_digest TEXT NOT NULL, projection_json TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS raw_events_v2 (event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES raw_sessions_v1(session_id), logical_message_id TEXT NOT NULL, content_id TEXT NOT NULL REFERENCES raw_objects_v2(content_id), payload_digest TEXT NOT NULL, projection_json TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS raw_events_v2_session_created_idx ON raw_events_v2(session_id,created_at,event_id);
+      CREATE TABLE IF NOT EXISTS logical_messages_v2 (logical_message_id TEXT PRIMARY KEY, preferred_observation_id TEXT NOT NULL, payload_conflict INTEGER NOT NULL, tombstoned INTEGER NOT NULL, selection_version TEXT NOT NULL, event_ids_json TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS logical_message_aliases_v2 (alias_id TEXT PRIMARY KEY, logical_message_id TEXT NOT NULL REFERENCES logical_messages_v2(logical_message_id));
       CREATE INDEX IF NOT EXISTS raw_sessions_v1_owner_tag_idx ON raw_sessions_v1(owner_tag,last_occurred_at);
       CREATE INDEX IF NOT EXISTS raw_events_v1_session_created_idx ON raw_events_v1(session_id,created_at,event_id);
       CREATE TABLE IF NOT EXISTS audit_events_v2 (id TEXT PRIMARY KEY, ts TEXT NOT NULL, actor_tag TEXT NOT NULL, action TEXT NOT NULL, outcome TEXT NOT NULL, request_id TEXT, target_id TEXT, scope_tag TEXT, details_json TEXT NOT NULL);
@@ -594,7 +639,11 @@ export class SqliteCatalog {
       CREATE INDEX IF NOT EXISTS raw_retention_v2_expiry_idx ON raw_retention_v2(lifecycle, expires_at);
       CREATE TABLE IF NOT EXISTS retention_tombstones_v2 (id TEXT PRIMARY KEY, content_id TEXT NOT NULL, content_checksum TEXT NOT NULL, source_pointer_tag TEXT, reason_code TEXT NOT NULL CHECK(reason_code IN ('retention_expired','revoked','forgotten')), original_created_at TEXT NOT NULL, expired_at TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS retention_operations_v2 (id TEXT PRIMARY KEY, idempotency_tag TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL, response_json TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS raw_projection_v2_migration_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, verified_at TEXT NOT NULL, v1_count INTEGER NOT NULL, v2_count INTEGER NOT NULL, alias_count INTEGER NOT NULL, alias_orphan_count INTEGER NOT NULL, legacy_field_count INTEGER NOT NULL, literal_scan_count INTEGER NOT NULL, backend TEXT NOT NULL);
     `);
+    const sessionColumns = new Set(this.db.prepare('PRAGMA table_info(raw_sessions_v1)').all().map(row => row.name));
+    if (!sessionColumns.has('conversation_kind')) this.db.exec('ALTER TABLE raw_sessions_v1 ADD COLUMN conversation_kind TEXT');
+    if (!sessionColumns.has('context_tags_json')) this.db.exec('ALTER TABLE raw_sessions_v1 ADD COLUMN context_tags_json TEXT');
     this.selectProposal = this.db.prepare('SELECT * FROM fabric_proposals WHERE id = ?');
     this.selectProposalByTags = this.db.prepare('SELECT * FROM fabric_proposals WHERE owner_tag = ? AND idempotency_tag = ?');
     this.insertBoth = this.db.transaction((record, raw) => {
@@ -620,6 +669,31 @@ export class SqliteCatalog {
       this.db.prepare("UPDATE raw_sessions_v1 SET event_count=event_count+1,first_occurred_at=CASE WHEN ? IS NULL THEN first_occurred_at WHEN first_occurred_at IS NULL OR julianday(?)<julianday(first_occurred_at) THEN ? ELSE first_occurred_at END,last_occurred_at=CASE WHEN ? IS NULL THEN last_occurred_at WHEN last_occurred_at IS NULL OR julianday(?)>julianday(last_occurred_at) THEN ? ELSE last_occurred_at END WHERE session_id=?").run(record.projection.occurredAt, record.projection.occurredAt, record.projection.occurredAt, record.projection.occurredAt, record.projection.occurredAt, record.projection.occurredAt, record.sessionId);
       this.db.prepare('INSERT INTO audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES (?,?,?,?,?,?,?,?,?)').run(auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, 'stored', auditEvent.requestId || null, auditEvent.targetId, null, JSON.stringify(auditEvent.details || {}));
       return { record, duplicate: false };
+    });
+    this.insertRawEventV2 = this.db.transaction((record, raw, auditEvent) => {
+      const existing = this.db.prepare('SELECT * FROM raw_events_v2 WHERE event_id=?').get(record.eventId) || this.db.prepare('SELECT * FROM raw_events_v1 WHERE event_id=?').get(record.eventId);
+      if (existing) {
+        this.db.prepare('INSERT INTO audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES (?,?,?,?,?,?,?,?,?)').run(auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, 'duplicate', auditEvent.requestId || null, auditEvent.targetId, null, JSON.stringify(auditEvent.details || {}));
+        return { record: this.mapRawEvent(existing), duplicate: true, logical: this.findLogicalMessage([record.logicalMessageId]) };
+      }
+      this.db.prepare('INSERT OR IGNORE INTO raw_objects_v2(content_id,media_type,byte_length,storage_ref,created_at) VALUES (@contentId,@mediaType,@byteLength,@storageRef,@createdAt)').run(raw);
+      this.db.prepare('INSERT OR IGNORE INTO raw_sessions_v1(session_id,runtime,owner_tag,source_tag,conversation_kind,context_tags_json,first_occurred_at,last_occurred_at,event_count,created_at) VALUES (?,?,?,?,?,?,?,?,0,?)').run(record.sessionId, record.projection.sourceKind, record.ownerTag, record.sourceTag, record.projection.conversationKind, JSON.stringify(record.projection.contextTags), record.projection.occurredAt, record.projection.occurredAt, record.createdAt);
+      const bound = this.db.prepare('SELECT * FROM raw_sessions_v1 WHERE session_id=?').get(record.sessionId);
+      if (bound.owner_tag !== record.ownerTag || bound.source_tag !== record.sourceTag || bound.runtime !== record.projection.sourceKind
+        || bound.conversation_kind !== record.projection.conversationKind || bound.context_tags_json !== JSON.stringify(record.projection.contextTags)) throw createError('raw_session_binding_conflict', 409);
+      const ids = [record.logicalMessageId, ...record.projection.logicalMessageAliases.map(item => item.logicalMessageId)];
+      const matched = this.findLogicalMessage(ids);
+      const canonicalId = matched?.logicalMessageId || record.logicalMessageId;
+      this.db.prepare('INSERT INTO raw_events_v2(event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(record.eventId, record.sessionId, canonicalId, record.contentId, record.payloadDigest, JSON.stringify(record.projection), record.ownerTag, record.sourceTag, record.createdAt);
+      const eventIds = [...new Set([...(matched?.eventIds || []), record.eventId])];
+      const observations = eventIds.map(id => this.mapRawEvent(this.db.prepare('SELECT * FROM raw_events_v2 WHERE event_id=?').get(id))).filter(Boolean).map(item => ({ ...item, projection: { ...item.projection, logicalMessageId: canonicalId } }));
+      const selection = selectLogicalMessage(observations);
+      const logical = { ...selection, logicalMessageId: canonicalId, eventIds, updatedAt: record.createdAt };
+      this.db.prepare('INSERT INTO logical_messages_v2(logical_message_id,preferred_observation_id,payload_conflict,tombstoned,selection_version,event_ids_json,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(logical_message_id) DO UPDATE SET preferred_observation_id=excluded.preferred_observation_id,payload_conflict=excluded.payload_conflict,tombstoned=excluded.tombstoned,selection_version=excluded.selection_version,event_ids_json=excluded.event_ids_json,updated_at=excluded.updated_at').run(canonicalId, logical.preferredObservationId, logical.payloadConflict ? 1 : 0, logical.tombstoned ? 1 : 0, logical.selectionVersion, JSON.stringify(eventIds), record.createdAt);
+      for (const id of ids) this.db.prepare('INSERT INTO logical_message_aliases_v2(alias_id,logical_message_id) VALUES (?,?) ON CONFLICT(alias_id) DO UPDATE SET logical_message_id=excluded.logical_message_id').run(id, canonicalId);
+      this.db.prepare("UPDATE raw_sessions_v1 SET event_count=event_count+1,first_occurred_at=CASE WHEN ? IS NULL THEN first_occurred_at WHEN first_occurred_at IS NULL OR julianday(?)<julianday(first_occurred_at) THEN ? ELSE first_occurred_at END,last_occurred_at=CASE WHEN ? IS NULL THEN last_occurred_at WHEN last_occurred_at IS NULL OR julianday(?)>julianday(last_occurred_at) THEN ? ELSE last_occurred_at END WHERE session_id=?").run(record.projection.occurredAt, record.projection.occurredAt, record.projection.occurredAt, record.projection.occurredAt, record.projection.occurredAt, record.projection.occurredAt, record.sessionId);
+      this.db.prepare('INSERT INTO audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES (?,?,?,?,?,?,?,?,?)').run(auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, 'stored', auditEvent.requestId || null, auditEvent.targetId, null, JSON.stringify(auditEvent.details || {}));
+      return { record: { ...record, logicalMessageId: canonicalId }, duplicate: false, logical };
     });
     this.selectIdentity = this.db.prepare('SELECT * FROM identity_records_v2 WHERE id = ?');
     this.selectIdentityEventByIdempotency = this.db.prepare('SELECT * FROM identity_events_v2 WHERE idempotency_tag = ?');
@@ -717,10 +791,19 @@ export class SqliteCatalog {
   appendAudit(event) {
     this.insertAudit.run({ id: event.id, ts: event.ts, actorTag: event.actorTag, action: event.action, outcome: event.outcome, requestId: event.requestId || null, targetId: event.targetId || null, scopeTag: event.scopeTag || null, detailsJson: JSON.stringify(event.details || {}) });
   }
-  mapRawEvent(row) { return row ? { eventId: row.event_id, sessionId: row.session_id, contentId: row.content_id, payloadDigest: row.payload_digest, projection: JSON.parse(row.projection_json), ownerTag: row.owner_tag, sourceTag: row.source_tag, createdAt: row.created_at } : null; }
+  mapRawEvent(row) { return row ? { eventId: row.event_id, sessionId: row.session_id, logicalMessageId: row.logical_message_id || null, contentId: row.content_id, payloadDigest: row.payload_digest, projection: JSON.parse(row.projection_json), ownerTag: row.owner_tag, sourceTag: row.source_tag, createdAt: row.created_at } : null; }
   ingestRawEvent(record, rawRecord, auditEvent) { return this.insertRawEvent(record, rawRecord, auditEvent); }
-  getRawEvent(id) { return this.mapRawEvent(this.db.prepare('SELECT * FROM raw_events_v1 WHERE event_id=?').get(id)); }
-  mapSession(row) { return row ? { id: row.session_id, runtime: row.runtime, ownerTag: row.owner_tag, sourceTag: row.source_tag, firstOccurredAt: row.first_occurred_at, lastOccurredAt: row.last_occurred_at, eventCount: row.event_count, createdAt: row.created_at } : null; }
+  ingestRawEventV2(record, rawRecord, auditEvent) { return this.insertRawEventV2(record, rawRecord, auditEvent); }
+  findLogicalMessage(ids) {
+    for (const id of ids) {
+      const alias = this.db.prepare('SELECT logical_message_id FROM logical_message_aliases_v2 WHERE alias_id=?').get(id);
+      const row = this.db.prepare('SELECT * FROM logical_messages_v2 WHERE logical_message_id=?').get(alias?.logical_message_id || id);
+      if (row) return { logicalMessageId: row.logical_message_id, preferredObservationId: row.preferred_observation_id, payloadConflict: Boolean(row.payload_conflict), tombstoned: Boolean(row.tombstoned), selectionVersion: row.selection_version, eventIds: JSON.parse(row.event_ids_json), updatedAt: row.updated_at };
+    }
+    return null;
+  }
+  getRawEvent(id) { return this.mapRawEvent(this.db.prepare('SELECT * FROM raw_events_v2 WHERE event_id=?').get(id) || this.db.prepare('SELECT * FROM raw_events_v1 WHERE event_id=?').get(id)); }
+  mapSession(row) { return row ? { id: row.session_id, runtime: row.runtime, ownerTag: row.owner_tag, sourceTag: row.source_tag, conversationKind: row.conversation_kind || null, contextTags: row.context_tags_json ? JSON.parse(row.context_tags_json) : null, firstOccurredAt: row.first_occurred_at, lastOccurredAt: row.last_occurred_at, eventCount: row.event_count, createdAt: row.created_at } : null; }
   searchSessions({ ownerTags = [], query = '', limit = 20 }) {
     if (!ownerTags.length) return [];
     const pattern = escapedLike(query);
@@ -728,7 +811,25 @@ export class SqliteCatalog {
     return this.db.prepare(`SELECT * FROM raw_sessions_v1 WHERE owner_tag IN (${placeholders}) AND (lower(session_id) LIKE lower(?) ESCAPE '\\' OR lower(runtime) LIKE lower(?) ESCAPE '\\') ORDER BY CASE WHEN last_occurred_at IS NULL THEN 1 ELSE 0 END,last_occurred_at DESC,created_at DESC,session_id ASC LIMIT ?`).all(...ownerTags, pattern, pattern, limit).map(row => this.mapSession(row));
   }
   getSession(id) { return this.mapSession(this.db.prepare('SELECT * FROM raw_sessions_v1 WHERE session_id=?').get(id)); }
-  listSessionEvents(id) { return this.db.prepare('SELECT * FROM raw_events_v1 WHERE session_id=? ORDER BY created_at,event_id').all(id).map(row => this.mapRawEvent(row)); }
+  listSessionEvents(id) { return [...this.db.prepare('SELECT * FROM raw_events_v1 WHERE session_id=?').all(id), ...this.db.prepare('SELECT * FROM raw_events_v2 WHERE session_id=?').all(id)].map(row => this.mapRawEvent(row)).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId)); }
+  rawV2Readiness() {
+    let counts;
+    try {
+      const rows = this.db.prepare('SELECT projection_json FROM raw_events_v2').all();
+      for (const row of rows) validateProjectionV2(JSON.parse(row.projection_json));
+      counts = {
+        v1Count: this.db.prepare('SELECT count(*) AS n FROM raw_events_v1').get().n,
+        v2Count: rows.length,
+        aliasCount: this.db.prepare('SELECT count(*) AS n FROM logical_message_aliases_v2').get().n,
+        aliasOrphanCount: this.db.prepare('SELECT count(*) AS n FROM logical_message_aliases_v2 a LEFT JOIN logical_messages_v2 l ON l.logical_message_id=a.logical_message_id WHERE l.logical_message_id IS NULL').get().n,
+        legacyFieldCount: rows.filter(row => /\"(?:nativeRoomId|nativePersonId|roomId|personId)\"\s*:/.test(row.projection_json)).length,
+        literalScanCount: rows.filter(row => !validateProjectionV2(JSON.parse(row.projection_json))).length
+      };
+      this.db.prepare('INSERT INTO raw_projection_v2_migration_state(singleton,schema_version,verified_at,v1_count,v2_count,alias_count,alias_orphan_count,legacy_field_count,literal_scan_count,backend) VALUES (1,5,?,?,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET schema_version=excluded.schema_version,verified_at=excluded.verified_at,v1_count=excluded.v1_count,v2_count=excluded.v2_count,alias_count=excluded.alias_count,alias_orphan_count=excluded.alias_orphan_count,legacy_field_count=excluded.legacy_field_count,literal_scan_count=excluded.literal_scan_count,backend=excluded.backend').run(new Date().toISOString(), counts.v1Count, counts.v2Count, counts.aliasCount, counts.aliasOrphanCount, counts.legacyFieldCount, counts.literalScanCount, 'sqlite');
+    }
+    catch { return { safe: false, reason: 'literal_routing_scan_failed' }; }
+    return { safe: false, reason: 'production_postgres_required', evidence: { persisted: true, ...counts } };
+  }
   createIdentity(record, event, rawRecord) { return this.createIdentityTransaction(record, event, rawRecord); }
   findIdentityOperation(idempotencyTags) {
     for (const tag of idempotencyTags) {
@@ -760,7 +861,7 @@ export class SqliteCatalog {
 }
 
 const POSTGRES_SCHEMA = 'agent_memory_fabric';
-const POSTGRES_SCHEMA_VERSION = 3;
+const POSTGRES_SCHEMA_VERSION = 5;
 const POSTGRES_SCHEMA_SQL = [
   `CREATE SCHEMA IF NOT EXISTS ${POSTGRES_SCHEMA}`,
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.schema_migrations (
@@ -809,12 +910,28 @@ const POSTGRES_SCHEMA_SQL = [
   )`,
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.raw_sessions_v1 (
     session_id TEXT PRIMARY KEY, runtime TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL,
-    first_occurred_at TIMESTAMPTZ, last_occurred_at TIMESTAMPTZ, event_count BIGINT NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL
+    conversation_kind TEXT, context_tags_json JSONB, first_occurred_at TIMESTAMPTZ, last_occurred_at TIMESTAMPTZ, event_count BIGINT NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL
   )`,
+  `ALTER TABLE ${POSTGRES_SCHEMA}.raw_sessions_v1 ADD COLUMN IF NOT EXISTS conversation_kind TEXT`,
+  `ALTER TABLE ${POSTGRES_SCHEMA}.raw_sessions_v1 ADD COLUMN IF NOT EXISTS context_tags_json JSONB`,
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.raw_events_v1 (
     event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES ${POSTGRES_SCHEMA}.raw_sessions_v1(session_id),
     content_id TEXT NOT NULL REFERENCES ${POSTGRES_SCHEMA}.raw_objects_v2(content_id), payload_digest TEXT NOT NULL,
     projection_json JSONB NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.raw_events_v2 (
+    event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES ${POSTGRES_SCHEMA}.raw_sessions_v1(session_id),
+    logical_message_id TEXT NOT NULL, content_id TEXT NOT NULL REFERENCES ${POSTGRES_SCHEMA}.raw_objects_v2(content_id),
+    payload_digest TEXT NOT NULL, projection_json JSONB NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS raw_events_v2_session_created_idx ON ${POSTGRES_SCHEMA}.raw_events_v2(session_id,created_at,event_id)`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.logical_messages_v2 (
+    logical_message_id TEXT PRIMARY KEY, preferred_observation_id TEXT NOT NULL, payload_conflict BOOLEAN NOT NULL,
+    tombstoned BOOLEAN NOT NULL, selection_version TEXT NOT NULL, event_ids JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.logical_message_aliases_v2 (
+    alias_id TEXT PRIMARY KEY, logical_message_id TEXT NOT NULL REFERENCES ${POSTGRES_SCHEMA}.logical_messages_v2(logical_message_id)
   )`,
   `CREATE INDEX IF NOT EXISTS raw_sessions_v1_owner_tag_idx ON ${POSTGRES_SCHEMA}.raw_sessions_v1(owner_tag,last_occurred_at)`,
   `CREATE INDEX IF NOT EXISTS raw_events_v1_session_created_idx ON ${POSTGRES_SCHEMA}.raw_events_v1(session_id,created_at,event_id)`,
@@ -894,6 +1011,11 @@ const POSTGRES_SCHEMA_SQL = [
     request_digest TEXT NOT NULL,
     response_json JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.raw_projection_v2_migration_state (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, verified_at TIMESTAMPTZ NOT NULL,
+    v1_count BIGINT NOT NULL, v2_count BIGINT NOT NULL, alias_count BIGINT NOT NULL, alias_orphan_count BIGINT NOT NULL,
+    legacy_field_count BIGINT NOT NULL, literal_scan_count BIGINT NOT NULL, backend TEXT NOT NULL
   )`
 ];
 
@@ -943,11 +1065,11 @@ function mapPostgresProposal(row) {
 }
 
 function mapPostgresRawEvent(row) {
-  return row ? { eventId: row.event_id, sessionId: row.session_id, contentId: row.content_id, payloadDigest: row.payload_digest, projection: typeof row.projection_json === 'string' ? JSON.parse(row.projection_json) : row.projection_json, ownerTag: row.owner_tag, sourceTag: row.source_tag, createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at) } : null;
+  return row ? { eventId: row.event_id, sessionId: row.session_id, logicalMessageId: row.logical_message_id || null, contentId: row.content_id, payloadDigest: row.payload_digest, projection: typeof row.projection_json === 'string' ? JSON.parse(row.projection_json) : row.projection_json, ownerTag: row.owner_tag, sourceTag: row.source_tag, createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at) } : null;
 }
 
 function mapPostgresSession(row) {
-  return row ? { id: row.session_id, runtime: row.runtime, ownerTag: row.owner_tag, sourceTag: row.source_tag, firstOccurredAt: row.first_occurred_at ? new Date(row.first_occurred_at).toISOString() : null, lastOccurredAt: row.last_occurred_at ? new Date(row.last_occurred_at).toISOString() : null, eventCount: Number(row.event_count), createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at) } : null;
+  return row ? { id: row.session_id, runtime: row.runtime, ownerTag: row.owner_tag, sourceTag: row.source_tag, conversationKind: row.conversation_kind || null, contextTags: row.context_tags_json ? (typeof row.context_tags_json === 'string' ? JSON.parse(row.context_tags_json) : row.context_tags_json) : null, firstOccurredAt: row.first_occurred_at ? new Date(row.first_occurred_at).toISOString() : null, lastOccurredAt: row.last_occurred_at ? new Date(row.last_occurred_at).toISOString() : null, eventCount: Number(row.event_count), createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at) } : null;
 }
 
 function mapPostgresIdentity(row) {
@@ -1266,10 +1388,90 @@ export class PostgresCatalog {
       throw ambiguousError;
     }
   }
-  async getRawEvent(id) { await this.ready(); return mapPostgresRawEvent((await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE event_id=$1`, [id])).rows[0]); }
+  async findLogicalMessage(ids, queryable = this.pool) {
+    await this.ready();
+    const alias = await this._query(queryable, `SELECT logical_message_id FROM ${POSTGRES_SCHEMA}.logical_message_aliases_v2 WHERE alias_id=ANY($1::text[]) LIMIT 1`, [ids]);
+    const canonical = alias.rows[0]?.logical_message_id || ids[0];
+    const result = await this._query(queryable, `SELECT * FROM ${POSTGRES_SCHEMA}.logical_messages_v2 WHERE logical_message_id=$1`, [canonical]);
+    const row = result.rows[0];
+    return row ? { logicalMessageId: row.logical_message_id, preferredObservationId: row.preferred_observation_id, payloadConflict: row.payload_conflict, tombstoned: row.tombstoned, selectionVersion: row.selection_version, eventIds: typeof row.event_ids === 'string' ? JSON.parse(row.event_ids) : row.event_ids, updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at) } : null;
+  }
+  async ingestRawEventV2(record, rawRecord, auditEvent) {
+    await this.ready();
+    const client = await this._connect();
+    let destroyClient = false;
+    try {
+      await this._begin(client);
+      const existingV2 = await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE event_id=$1`, [record.eventId]);
+      const existingV1 = existingV2.rows[0] ? { rows: [] } : await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE event_id=$1`, [record.eventId]);
+      const existing = existingV2.rows[0] || existingV1.rows[0];
+      if (existing) {
+        await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES ($1,$2,$3,$4,'duplicate',$5,$6,NULL,$7::jsonb)`, [auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, auditEvent.requestId || null, auditEvent.targetId, JSON.stringify(auditEvent.details || {})]);
+        await this._query(client, 'COMMIT');
+        return { record: mapPostgresRawEvent(existing), duplicate: true, logical: await this.findLogicalMessage([record.logicalMessageId]) };
+      }
+      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.raw_objects_v2(content_id,media_type,byte_length,storage_ref,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(content_id) DO NOTHING`, [rawRecord.contentId, rawRecord.mediaType, rawRecord.byteLength, rawRecord.storageRef, rawRecord.createdAt]);
+      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.raw_sessions_v1(session_id,runtime,owner_tag,source_tag,conversation_kind,context_tags_json,first_occurred_at,last_occurred_at,event_count,created_at) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$7,0,$8) ON CONFLICT(session_id) DO NOTHING`, [record.sessionId, record.projection.sourceKind, record.ownerTag, record.sourceTag, record.projection.conversationKind, JSON.stringify(record.projection.contextTags), record.projection.occurredAt, record.createdAt]);
+      const bound = (await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 WHERE session_id=$1`, [record.sessionId])).rows[0];
+      const boundTags = bound?.context_tags_json && (typeof bound.context_tags_json === 'string' ? JSON.parse(bound.context_tags_json) : bound.context_tags_json);
+      if (!bound || bound.owner_tag !== record.ownerTag || bound.source_tag !== record.sourceTag || bound.runtime !== record.projection.sourceKind
+        || bound.conversation_kind !== record.projection.conversationKind || canonicalJson(boundTags) !== canonicalJson(record.projection.contextTags)) throw createError('raw_session_binding_conflict', 409);
+      const ids = [record.logicalMessageId, ...record.projection.logicalMessageAliases.map(item => item.logicalMessageId)];
+      const matched = await this.findLogicalMessage(ids, client);
+      const canonicalId = matched?.logicalMessageId || record.logicalMessageId;
+      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.raw_events_v2(event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9)`, [record.eventId, record.sessionId, canonicalId, record.contentId, record.payloadDigest, JSON.stringify(record.projection), record.ownerTag, record.sourceTag, record.createdAt]);
+      const eventIds = [...new Set([...(matched?.eventIds || []), record.eventId])];
+      const observations = (await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE event_id=ANY($1::text[])`, [eventIds])).rows.map(mapPostgresRawEvent).map(item => ({ ...item, projection: { ...item.projection, logicalMessageId: canonicalId } }));
+      const selection = selectLogicalMessage(observations);
+      const logical = { ...selection, logicalMessageId: canonicalId, eventIds, updatedAt: record.createdAt };
+      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.logical_messages_v2(logical_message_id,preferred_observation_id,payload_conflict,tombstoned,selection_version,event_ids,updated_at) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7) ON CONFLICT(logical_message_id) DO UPDATE SET preferred_observation_id=EXCLUDED.preferred_observation_id,payload_conflict=EXCLUDED.payload_conflict,tombstoned=EXCLUDED.tombstoned,selection_version=EXCLUDED.selection_version,event_ids=EXCLUDED.event_ids,updated_at=EXCLUDED.updated_at`, [canonicalId, logical.preferredObservationId, logical.payloadConflict, logical.tombstoned, logical.selectionVersion, JSON.stringify(eventIds), record.createdAt]);
+      for (const id of ids) await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.logical_message_aliases_v2(alias_id,logical_message_id) VALUES ($1,$2) ON CONFLICT(alias_id) DO UPDATE SET logical_message_id=EXCLUDED.logical_message_id`, [id, canonicalId]);
+      await this._query(client, `UPDATE ${POSTGRES_SCHEMA}.raw_sessions_v1 SET event_count=event_count+1,first_occurred_at=CASE WHEN $1::timestamptz IS NULL THEN first_occurred_at ELSE least(coalesce(first_occurred_at,$1::timestamptz),$1::timestamptz) END,last_occurred_at=CASE WHEN $1::timestamptz IS NULL THEN last_occurred_at ELSE greatest(coalesce(last_occurred_at,$1::timestamptz),$1::timestamptz) END WHERE session_id=$2`, [record.projection.occurredAt, record.sessionId]);
+      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES ($1,$2,$3,$4,'stored',$5,$6,NULL,$7::jsonb)`, [auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, auditEvent.requestId || null, auditEvent.targetId, JSON.stringify(auditEvent.details || {})]);
+      await this._query(client, 'COMMIT');
+      return { record: { ...record, logicalMessageId: canonicalId }, duplicate: false, logical };
+    } catch (error) {
+      try { await this._query(client, 'ROLLBACK'); } catch { destroyClient = true; }
+      throw error;
+    } finally { client.release(destroyClient ? new Error('catalog_client_discarded') : undefined); }
+  }
+  async getRawEvent(id) {
+    await this.ready();
+    const v2 = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE event_id=$1`, [id]);
+    return mapPostgresRawEvent(v2.rows[0] || (await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE event_id=$1`, [id])).rows[0]);
+  }
   async searchSessions({ ownerTags = [], query = '', limit = 20 }) { if (!ownerTags.length) return []; await this.ready(); return (await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 WHERE owner_tag=ANY($1::text[]) AND (session_id ILIKE $2 ESCAPE '\\' OR runtime ILIKE $2 ESCAPE '\\') ORDER BY last_occurred_at DESC NULLS LAST,created_at DESC,session_id ASC LIMIT $3`, [ownerTags, escapedLike(query), limit])).rows.map(mapPostgresSession); }
   async getSession(id) { await this.ready(); return mapPostgresSession((await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 WHERE session_id=$1`, [id])).rows[0]); }
-  async listSessionEvents(id) { await this.ready(); return (await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE session_id=$1 ORDER BY created_at,event_id`, [id])).rows.map(mapPostgresRawEvent); }
+  async listSessionEvents(id) {
+    await this.ready();
+    const legacy = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE session_id=$1 ORDER BY created_at,event_id`, [id]);
+    const current = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE session_id=$1 ORDER BY created_at,event_id`, [id]);
+    return [...(legacy.rows || []), ...(current.rows || [])].map(mapPostgresRawEvent).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId));
+  }
+  async rawV2Readiness() {
+    await this.ready();
+    try {
+      const rows = await this._query(this.pool, `SELECT projection_json FROM ${POSTGRES_SCHEMA}.raw_events_v2`);
+      for (const row of rows.rows) validateProjectionV2(typeof row.projection_json === 'string' ? JSON.parse(row.projection_json) : row.projection_json);
+      const evidenceResult = await this._query(this.pool, `SELECT
+        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v1) AS v1_count,
+        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2) AS v2_count,
+        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.logical_message_aliases_v2) AS alias_count,
+        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.logical_message_aliases_v2 a LEFT JOIN ${POSTGRES_SCHEMA}.logical_messages_v2 l ON l.logical_message_id=a.logical_message_id WHERE l.logical_message_id IS NULL) AS alias_orphan_count,
+        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE projection_json ?| ARRAY['nativeRoomId','nativePersonId','roomId','personId']) AS legacy_field_count,
+        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2 e
+          CROSS JOIN LATERAL jsonb_each(e.projection_json->'contextTags') kv
+          CROSS JOIN LATERAL jsonb_array_elements_text(kv.value) tag
+          WHERE tag !~ '^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$') AS literal_scan_count`);
+      const row = evidenceResult.rows[0];
+      const evidence = Object.fromEntries(['v1Count','v2Count','aliasCount','aliasOrphanCount','legacyFieldCount','literalScanCount'].map((key, index) => [key, Number(row[['v1_count','v2_count','alias_count','alias_orphan_count','legacy_field_count','literal_scan_count'][index]] || 0)]));
+      if (evidence.aliasOrphanCount || evidence.legacyFieldCount || evidence.literalScanCount) return { safe: false, reason: 'migration_proof_failed', evidence: { persisted: false, ...evidence } };
+      await this._query(this.pool, `INSERT INTO ${POSTGRES_SCHEMA}.raw_projection_v2_migration_state(singleton,schema_version,verified_at,v1_count,v2_count,alias_count,alias_orphan_count,legacy_field_count,literal_scan_count,backend) VALUES (1,$1,now(),$2,$3,$4,$5,$6,$7,'postgres') ON CONFLICT(singleton) DO UPDATE SET schema_version=EXCLUDED.schema_version,verified_at=EXCLUDED.verified_at,v1_count=EXCLUDED.v1_count,v2_count=EXCLUDED.v2_count,alias_count=EXCLUDED.alias_count,alias_orphan_count=EXCLUDED.alias_orphan_count,legacy_field_count=EXCLUDED.legacy_field_count,literal_scan_count=EXCLUDED.literal_scan_count,backend=EXCLUDED.backend`, [POSTGRES_SCHEMA_VERSION, evidence.v1Count, evidence.v2Count, evidence.aliasCount, evidence.aliasOrphanCount, evidence.legacyFieldCount, evidence.literalScanCount]);
+      const proof = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_projection_v2_migration_state WHERE singleton=1 AND schema_version=$1 AND backend='postgres'`, [POSTGRES_SCHEMA_VERSION]);
+      if (!proof.rows[0]) return { safe: false, reason: 'migration_proof_missing', evidence: { persisted: false, ...evidence } };
+      return { safe: true, reason: null, evidence: { persisted: true, schemaVersion: POSTGRES_SCHEMA_VERSION, ...evidence } };
+    } catch { return { safe: false, reason: 'literal_routing_scan_failed' }; }
+  }
   async recallItemActive(refs, scopeTags) {
     await this.ready();
     if (refs.proposalId) {
@@ -1541,7 +1743,7 @@ export class PostgresCatalog {
 const SAFE_AUDIT_DETAIL_KEYS = new Set(['code', 'contentId', 'duplicate', 'resultCount', 'total', 'view', 'purpose', 'transport']);
 
 export class FabricStore {
-  constructor({ rawStore, catalog, ingestKeyRing = null, clock = () => new Date(), idFactory = () => crypto.randomUUID(), retentionPolicy = {}, identityPolicy = {} }) {
+  constructor({ rawStore, catalog, ingestKeyRing = null, legacyV1Writes = true, clock = () => new Date(), idFactory = () => crypto.randomUUID(), retentionPolicy = {}, identityPolicy = {} }) {
     this.rawStore = rawStore;
     this.catalog = catalog;
     this.clock = clock;
@@ -1552,6 +1754,8 @@ export class FabricStore {
     this.configured = true;
     this._proposalMutation = Promise.resolve();
     this.ingestKeys = ingestKeyRing ? normalizeIngestKeyRing(ingestKeyRing) : null;
+    this.legacyV1Writes = Boolean(legacyV1Writes);
+    this._rawV2Scan = { safe: false, reason: this.legacyV1Writes ? 'legacy_v1_writes_enabled' : 'literal_routing_scan_not_run' };
     this._identityMutation = Promise.resolve();
   }
 
@@ -1682,22 +1886,29 @@ export class FabricStore {
     if (!this.ingestKeys) throw createError('raw_ingest_unconfigured', 503);
     validateClientCiphertext({ ...input, actorId: input.actor }, { allowedKeyIds: new Set(this.ingestKeys.keys.keys()), authorizations: this.ingestKeys.authorizations });
     const { projection, envelope, sourceInstanceId, actor } = input;
+    const projectionV2 = projection.schema === 'amf.raw-event-projection/v2';
+    if (!projectionV2 && !this.legacyV1Writes) throw createError('raw_projection_v1_writes_disabled', 409);
     const contentId = ciphertextContentId(envelope);
     const payloadDigest = ciphertextPayloadDigest(envelope);
+    await this._catalogOperation(() => this.catalog.appendAudit({ id: this.idFactory(), ts: this.clock().toISOString(), actorTag: this.rawStore.opaqueTag('audit-actor', actor), action: 'raw_ingest_decrypt_intent', outcome: 'authorized', requestId, targetId: projection.eventId, scopeTag: null, details: { transport: 'raw_ingest' } }));
     decryptClientCiphertext({ actorId: actor, sourceInstanceId, projection, envelope }, this.ingestKeys);
     const ownerTags = new Set(this.rawStore.opaqueTags('raw-owner', actor));
     const sourceTags = new Set(this.rawStore.opaqueTags('raw-source', sourceInstanceId));
     const existing = await this._catalogOperation(() => this.catalog.getRawEvent(projection.eventId));
     const auditEvent = { id: this.idFactory(), ts: this.clock().toISOString(), actorTag: this.rawStore.opaqueTag('audit-actor', actor), action: 'raw_event_ingest', outcome: 'stored', requestId, targetId: projection.eventId, scopeTag: null, details: { contentId, duplicate: Boolean(existing) } };
     if (existing) {
-      if (!ownerTags.has(existing.ownerTag) || !sourceTags.has(existing.sourceTag) || existing.sessionId !== projection.sessionId || existing.projection.runtime !== projection.runtime) throw createError('raw_session_binding_conflict', 409);
+      const existingRuntime = existing.projection.sourceKind || existing.projection.runtime;
+      const requestedRuntime = projection.sourceKind || projection.runtime;
+      if (!ownerTags.has(existing.ownerTag) || !sourceTags.has(existing.sourceTag) || existing.sessionId !== projection.sessionId || existingRuntime !== requestedRuntime) throw createError('raw_session_binding_conflict', 409);
       if (existing.payloadDigest !== payloadDigest) throw createError('raw_event_conflict', 409);
-      await this._catalogOperation(() => this.catalog.ingestRawEvent(existing, null, auditEvent));
+      const duplicateWrite = projectionV2 ? this.catalog.ingestRawEventV2?.bind(this.catalog) : this.catalog.ingestRawEvent.bind(this.catalog);
+      if (!duplicateWrite) throw createError('raw_projection_v2_storage_unavailable', 503);
+      await this._catalogOperation(() => duplicateWrite(existing, null, auditEvent));
       return { status: 'duplicate', duplicate: true, eventId: projection.eventId, sessionId: projection.sessionId, contentId: existing.contentId };
     }
     const createdAt = this.clock().toISOString();
     const boundSession = await this._catalogOperation(() => this.catalog.getSession(projection.sessionId));
-    if (boundSession && (!ownerTags.has(boundSession.ownerTag) || !sourceTags.has(boundSession.sourceTag) || boundSession.runtime !== projection.runtime)) throw createError('raw_session_binding_conflict', 409);
+    if (boundSession && (!ownerTags.has(boundSession.ownerTag) || !sourceTags.has(boundSession.sourceTag) || boundSession.runtime !== (projection.sourceKind || projection.runtime))) throw createError('raw_session_binding_conflict', 409);
     // Reject a known binding conflict before creating an unreferenced ciphertext
     // object. A concurrent binding race is still resolved atomically by the
     // catalog; its ciphertext is retained for reference-aware reconciliation/GC.
@@ -1707,9 +1918,13 @@ export class FabricStore {
       ownerTag: boundSession?.ownerTag || this.rawStore.opaqueTag('raw-owner', actor),
       sourceTag: boundSession?.sourceTag || this.rawStore.opaqueTag('raw-source', sourceInstanceId), createdAt
     };
-    const stored = await this._catalogOperation(() => this.catalog.ingestRawEvent(record, { contentId, mediaType: 'application/vnd.agent-memory-fabric.raw-event-ciphertext+json', byteLength: raw.byteLength, storageRef: raw.storageRef, createdAt }, auditEvent));
+    if (projectionV2) record.logicalMessageId = projection.logicalMessageId;
+    const catalogWrite = projectionV2 ? this.catalog.ingestRawEventV2?.bind(this.catalog) : this.catalog.ingestRawEvent.bind(this.catalog);
+    if (!catalogWrite) throw createError('raw_projection_v2_storage_unavailable', 503);
+    const stored = await this._catalogOperation(() => catalogWrite(record, { contentId, mediaType: 'application/vnd.agent-memory-fabric.raw-event-ciphertext+json', byteLength: raw.byteLength, storageRef: raw.storageRef, createdAt }, auditEvent));
     if (stored.record.payloadDigest !== payloadDigest) throw createError('raw_event_conflict', 409);
-    return { status: stored.duplicate ? 'duplicate' : 'stored', duplicate: stored.duplicate, eventId: projection.eventId, sessionId: projection.sessionId, contentId: stored.record.contentId };
+    if (projectionV2) await this._refreshRawV2Readiness();
+    return { status: stored.duplicate ? 'duplicate' : 'stored', duplicate: stored.duplicate, eventId: projection.eventId, sessionId: projection.sessionId, contentId: stored.record.contentId, ...(projectionV2 ? { logicalMessageId: stored.record.logicalMessageId, preferredObservationId: stored.logical?.preferredObservationId, payloadConflict: stored.logical?.payloadConflict, tombstoned: stored.logical?.tombstoned } : {}) };
   }
 
   createSessionReader() {
@@ -1718,7 +1933,8 @@ export class FabricStore {
     const publicSession = session => ({
       id: session.id, runtime: session.runtime, firstOccurredAt: session.firstOccurredAt,
       lastOccurredAt: session.lastOccurredAt, eventCount: session.eventCount, createdAt: session.createdAt,
-      title: `${session.runtime} session`, scope: '', ownerSelf: true
+      title: `${session.runtime} session`, scope: '', ownerSelf: true,
+      conversationKind: session.conversationKind || null, contextTags: session.contextTags ? structuredClone(session.contextTags) : null
     });
     const ownedSession = async (actor, id) => {
       const session = await store._catalogOperation(() => store.catalog.getSession(id));
@@ -1739,7 +1955,8 @@ export class FabricStore {
       async transcript({ actor, id, view }) {
         await ownedSession(actor, id);
         const events = await store._catalogOperation(() => store.catalog.listSessionEvents(id));
-        if (view !== 'original') return { id, view: 'redacted', messages: events.map(event => ({ eventId: event.eventId, occurredAt: event.projection.occurredAt, role: event.projection.role, content: { redacted: true, contentType: event.projection.contentType, parts: event.projection.contentParts } })) };
+        if (view !== 'original') return { id, view: 'redacted', items: events.map(event => ({ eventId: event.eventId, occurredAt: event.projection.occurredAt, role: event.projection.role, content: { redacted: true, contentType: event.projection.contentType, parts: event.projection.contentParts } })) };
+        await store._catalogOperation(() => store.catalog.appendAudit({ id: store.idFactory(), ts: store.clock().toISOString(), actorTag: store.rawStore.opaqueTag('audit-actor', actor), action: 'raw_decrypt_intent', outcome: 'authorized', requestId: null, targetId: id, scopeTag: null, details: { view: 'original' } }));
         const messages = [];
         for (const event of events) {
           const envelope = await store.rawStore.getClientCiphertext(event.contentId);
@@ -1748,7 +1965,7 @@ export class FabricStore {
           const item = decryptClientCiphertext({ actorId: actor, sourceInstanceId: envelope.sourceInstanceId, projection: event.projection, envelope }, store.ingestKeys);
           messages.push({ eventId: event.eventId, occurredAt: event.projection.occurredAt, role: event.projection.role, raw: item.event.raw });
         }
-        return { id, view: 'original', messages };
+        return { id, view: 'original', items: messages };
       }
     };
   }
@@ -1964,10 +2181,15 @@ export class FabricStore {
     const safeDetails = Object.fromEntries(Object.entries(details).filter(([key]) => SAFE_AUDIT_DETAIL_KEYS.has(key)));
     await this._catalogOperation(() => this.catalog.appendAudit({ id: this.idFactory(), ts: this.clock().toISOString(), actorTag: this.rawStore.opaqueTag('audit-actor', actor), action, outcome, requestId, targetId, scopeTag: scope ? this.rawStore.opaqueTag('audit-scope', scope) : null, details: safeDetails }));
   }
-  async ready() { await this._catalogOperation(() => this.catalog.ready?.()); }
+  async _refreshRawV2Readiness() {
+    if (this.legacyV1Writes) { this._rawV2Scan = { safe: false, reason: 'legacy_v1_writes_enabled' }; return this._rawV2Scan; }
+    this._rawV2Scan = await this._catalogOperation(() => this.catalog.rawV2Readiness?.() || { safe: false, reason: 'literal_routing_scan_unavailable' });
+    return this._rawV2Scan;
+  }
+  async ready() { await this._catalogOperation(() => this.catalog.ready?.()); await this._refreshRawV2Readiness(); }
   async health() { return this._catalogOperation(() => this.catalog.health ? this.catalog.health() : this.status()); }
   async close() { await this.catalog.close?.(); }
-  status() { return { configured: true, rawIngestConfigured: Boolean(this.ingestKeys), physicalRawDeletionEnabled: false, ...this.catalog.status() }; }
+  status() { return { configured: true, rawIngestConfigured: Boolean(this.ingestKeys), rawProjectionV2Ready: Boolean(this._rawV2Scan.safe), rawProjectionV2ReadinessReason: this._rawV2Scan.reason, legacyV1WritesEnabled: this.legacyV1Writes, physicalRawDeletionEnabled: false, ...this.catalog.status() }; }
 }
 
 export function createUnconfiguredFabricStore(reason = 'raw_encryption_key_required') {
@@ -2028,7 +2250,9 @@ export function createFabricStoreFromEnv({ rootPath = process.cwd(), env = proce
   } else if (env.AMF_INGEST_KEY_RING_JSON) {
     try { ingestKeyRing = JSON.parse(env.AMF_INGEST_KEY_RING_JSON); } catch { throw createError('raw_ingest_key_ring_invalid', 500); }
   }
-  return new FabricStore({ rawStore, catalog, ingestKeyRing, ...lifecyclePolicies });
+  const cutover = String(env.AMF_RAW_V2_CUTOVER || 'false').trim().toLowerCase();
+  if (!['true', 'false'].includes(cutover)) throw createError('raw_v2_cutover_invalid', 500);
+  return new FabricStore({ rawStore, catalog, ingestKeyRing, legacyV1Writes: cutover !== 'true', ...lifecyclePolicies });
 }
 
 export { POSTGRES_SCHEMA, POSTGRES_SCHEMA_VERSION };

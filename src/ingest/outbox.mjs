@@ -50,8 +50,13 @@ function assertSafeItem(item) {
   const projection = item?.projection;
   const event = item?.event;
   if (Object.keys(item || {}).sort().join('\0') !== 'event\0projection') throw new Error('outbox_item_fields_invalid');
-  if (event?.schema !== 'amf.raw-event/v1' || projection?.schema !== 'amf.raw-event-projection/v1') throw new Error('outbox_item_schema_invalid');
+  const projectionV2 = projection?.schema === 'amf.raw-event-projection/v2';
+  if (event?.schema !== (projectionV2 ? 'amf.raw-event/v2' : 'amf.raw-event/v1')) throw new Error('outbox_item_schema_invalid');
   try { validateSafeProjection(projection); } catch { throw new Error('outbox_projection_fields_invalid'); }
+  if (projectionV2) {
+    if (event.eventId !== projection.eventId || event.sessionId !== projection.sessionId || !event.logical || typeof event.logical !== 'object') throw new Error('outbox_projection_identity_mismatch');
+    return item;
+  }
   const allowed = ['schema', 'eventId', 'sessionId', 'runtime', 'subtype', 'occurredAt', 'role', 'contentType', 'contentParts', 'hasContent'];
   if (Object.keys(projection).sort().join('\0') !== allowed.sort().join('\0')) throw new Error('outbox_projection_fields_invalid');
   if (event.eventId !== projection.eventId || event.sessionId !== projection.sessionId) throw new Error('outbox_projection_identity_mismatch');
