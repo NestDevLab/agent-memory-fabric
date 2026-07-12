@@ -11,7 +11,8 @@
     "base": "origin/main",
     "strategy": "cherry-pick",
     "stacks": [
-      "amf-fabric-core"
+      "amf-fabric-core",
+      "fix-session-reader-acl"
     ]
   },
   "stacks": [
@@ -98,6 +99,20 @@
       ],
       "meta": {
         "purpose": "Canonical PAM bridge, receipt recovery and context-bound API"
+      }
+    },
+    {
+      "id": "fix-session-reader-acl",
+      "branch": "fix/session-reader-acl",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "5726e763cfbdbb3d6a5fe305dd9d20132d6118cc"
+      ],
+      "meta": {
+        "purpose": "Make RAW multi-actor session reads ACL-coherent"
       }
     }
   ],
