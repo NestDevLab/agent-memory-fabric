@@ -12,7 +12,13 @@
     "main-lab": {
       "backendUserId": "openmemory"
     },
+    "domain:main-lab": {
+      "backendUserId": "openmemory"
+    },
     "tirrenia": {
+      "backendUserId": "openclaw_tirrenia"
+    },
+    "domain:tirrenia": {
       "backendUserId": "openclaw_tirrenia"
     }
   }

@@ -7,7 +7,12 @@ fi
 if [ -f /root/.openclaw/secrets/mem0-gateway-auth.env ]; then
   set -a; . /root/.openclaw/secrets/mem0-gateway-auth.env; set +a
 fi
-export MEM0_BACKEND_KIND="${MEM0_BACKEND_KIND:-mem0-oss}"
+export MEM0_BACKEND_KIND="${MEM0_BACKEND_KIND:-disabled}"
+export AMF_SERVER_ENABLED="${AMF_SERVER_ENABLED:-false}"
+if [ "$AMF_SERVER_ENABLED" != "true" ]; then
+  echo "agent-memory-fabric is disabled; set AMF_SERVER_ENABLED=true explicitly" >&2
+  exit 78
+fi
 export MEM0_LLM_MODEL="${MEM0_LLM_MODEL:-qwen3.5:9b}"
 export MEM0_LLM_BASE_URL="${MEM0_LLM_BASE_URL:-http://localhost:11434}"
 export MEM0_EMBEDDER_MODEL="${MEM0_EMBEDDER_MODEL:-nomic-embed-text:latest}"

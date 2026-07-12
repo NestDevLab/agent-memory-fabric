@@ -1,0 +1,12 @@
+.git
+.syncwheel
+node_modules
+var
+.env
+.env.*
+config
+docs
+scripts
+docker-compose*.yml
+compose*.yml
+README.md
