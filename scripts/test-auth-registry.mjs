@@ -9,8 +9,10 @@ import {
   getAuthRegistrySource,
   loadAuthRegistry,
   parseActive,
-  parseCsvList
+  parseCsvList,
+  validateContextActorBinding
 } from '../src/server.mjs';
+import { ContextTokenVerifier } from '../src/context-token.mjs';
 
 function requestWithToken(token) {
   return {
@@ -87,6 +89,60 @@ test('local auth registry loads rows without network access', async () => {
     globalThis.fetch = originalFetch;
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('delegated session owners and context key versions are strict, active and non-chainable', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-auth-delegation-'));
+  const registryPath = path.join(dir, 'auth.json'); const previous = process.env.MEM0_AUTH_REGISTRY_PATH;
+  const collector = { token: 'collector-token', active: true, actor: 'ct110-hermes-vitae', mode: 'scoped',
+    allowedScopes: ['agent:ct110-hermes-vitae'], permissions: ['raw:ingest'] };
+  const consumer = { token: 'consumer-token', active: true, actor: 'agent:vitae', mode: 'read_only_scoped',
+    allowedScopes: ['agent:vitae'], permissions: ['sessions:read', 'purpose:conversation_recall'],
+    sessionOwnerActors: ['ct110-hermes-vitae'], contextKeyVersions: ['ctx-vitae-v1'] };
+  try {
+    process.env.MEM0_AUTH_REGISTRY_PATH = registryPath;
+    const check = async rows => {
+      fs.writeFileSync(registryPath, JSON.stringify({ rows }));
+      return loadAuthRegistry({ forceRefresh: true });
+    };
+    assert.equal((await check([collector, consumer])).length, 2);
+    for (const rows of [
+      [collector, { ...consumer, sessionOwnerActors: ['missing-owner'] }],
+      [{ ...collector, active: false }, consumer],
+      [{ ...collector, permissions: ['memory:status'] }, consumer],
+      [{ ...collector, sessionOwnerActors: ['raw-root'] },
+        { token: 'root-token', active: true, actor: 'raw-root', mode: 'scoped', allowedScopes: ['agent:raw-root'],
+          permissions: ['raw:ingest'] }, consumer],
+      [collector, { ...consumer, sessionOwnerActors: ['agent:vitae'] }],
+      [collector, { ...consumer, contextKeyVersions: ['*'] }],
+      [collector, consumer, { token: 'other-consumer-token', active: true, actor: 'agent:other',
+        mode: 'read_only_scoped', allowedScopes: ['agent:other'], permissions: ['sessions:read'],
+        contextKeyVersions: ['ctx-vitae-v1'] }],
+      [collector, { ...consumer, actor: ['agent:vitae'] }]
+    ]) await assert.rejects(check(rows), /auth_registry_invalid_row/);
+  } finally {
+    if (previous === undefined) delete process.env.MEM0_AUTH_REGISTRY_PATH;
+    else process.env.MEM0_AUTH_REGISTRY_PATH = previous;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('context key versions are bound one-to-one across registry policy and verifier ring', () => {
+  const verifier = new ContextTokenVerifier({ keyRing: { currentKeyVersion: 'ctx-vitae-v1',
+    keys: { 'ctx-vitae-v1': Buffer.alloc(32, 9).toString('base64') } }, policyRevision: 'test' });
+  const policy = { contextKeyVersions: ['ctx-vitae-v1'] };
+  const policies = { actors: { 'agent:vitae': { contextKeyVersions: ['ctx-vitae-v1'] } } };
+  assert.doesNotThrow(() => validateContextActorBinding('agent:vitae', policy, policies, verifier));
+  assert.throws(() => validateContextActorBinding('agent:vitae', policy,
+    { actors: { 'agent:vitae': { contextKeyVersions: ['ctx-other-v1'] } } }, verifier),
+  /context_actor_binding_invalid/);
+  assert.throws(() => validateContextActorBinding('agent:vitae', policy,
+    { actors: { 'agent:vitae': { contextKeyVersions: ['ctx-vitae-v1'] },
+      'agent:other': { contextKeyVersions: ['ctx-vitae-v1'] } } }, verifier),
+  /context_actor_binding_invalid/);
+  assert.throws(() => validateContextActorBinding('agent:vitae', { contextKeyVersions: ['ctx-missing-v1'] },
+    { actors: { 'agent:vitae': { contextKeyVersions: ['ctx-missing-v1'] } } }, verifier),
+  /context_actor_binding_invalid/);
 });
 
 test('auth registry helpers preserve current CSV policy semantics', () => {

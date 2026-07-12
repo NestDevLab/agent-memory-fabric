@@ -84,14 +84,38 @@ class FakePool {
     if (compact.startsWith('SELECT s.* FROM agent_memory_fabric.raw_sessions_v1 s WHERE')) {
       const needle = String(values[1]).replaceAll('%', '').toLowerCase();
       const participantSessions = new Set([...this.rawEvents.values()].filter(row => values[0].includes(row.owner_tag)).map(row => row.session_id));
-      return { rows: [...this.rawSessions.values()].filter(row => participantSessions.has(row.session_id) && (!needle || `${row.session_id} ${row.runtime}`.toLowerCase().includes(needle))).slice(0, values[2]) };
+      const presented = values[4] ? JSON.parse(values[4]) : null;
+      const routingKeys = new Set(['conversation', 'room', 'person', 'relationship', 'thread']);
+      const after = values[5] ? { lastOccurredAt: values[5], createdAt: values[6], id: values[7] } : null;
+      return { rows: [...this.rawSessions.values()].filter(row => participantSessions.has(row.session_id)
+        && (!needle || `${row.session_id} ${row.runtime}`.toLowerCase().includes(needle))
+        && (!values[2] || Date.parse(row.last_occurred_at || row.created_at) >= Date.parse(values[2]))
+        && (!values[3] || Date.parse(row.first_occurred_at || row.created_at) <= Date.parse(values[3]))
+        && (!presented || (() => {
+          const binding = typeof row.session_binding_json === 'string'
+            ? JSON.parse(row.session_binding_json) : row.session_binding_json;
+          const entries = Object.entries(binding || {}).filter(([key]) => routingKeys.has(key));
+          return entries.length > 0 && entries.every(([key, tags]) => Array.isArray(tags)
+            && tags.some(tag => Array.isArray(presented[key]) && presented[key].includes(tag)));
+        })())
+        && (!after || Date.parse(row.last_occurred_at || row.created_at) < Date.parse(after.lastOccurredAt)
+          || (Date.parse(row.last_occurred_at || row.created_at) === Date.parse(after.lastOccurredAt)
+            && (row.created_at < after.createdAt || (row.created_at === after.createdAt && row.session_id > after.id)))))
+        .sort((a, b) => Date.parse(b.last_occurred_at || b.created_at) - Date.parse(a.last_occurred_at || a.created_at)
+          || b.created_at.localeCompare(a.created_at) || a.session_id.localeCompare(b.session_id))
+        .slice(0, values[8]) };
     }
     if (compact.startsWith('SELECT * FROM agent_memory_fabric.raw_sessions_v1 WHERE session_id=$1')) return { rows: [this.rawSessions.get(values[0])].filter(Boolean) };
     if (compact.startsWith('SELECT EXISTS ( SELECT 1 FROM agent_memory_fabric.raw_events_v1')) {
       return { rows: [{ present: [...this.rawEvents.values()].some(row => row.session_id === values[0] && values[1].includes(row.owner_tag)) }] };
     }
     if (compact.startsWith('SELECT * FROM ( SELECT event_id,session_id,NULL::text AS logical_message_id')) {
-      const rows = [...this.rawEvents.values()].filter(row => row.session_id === values[0]).sort((a, b) => a.created_at.localeCompare(b.created_at) || a.event_id.localeCompare(b.event_id)).slice(values[4], values[4] + values[3]);
+      const newest = compact.includes('ORDER BY effective_at_ms DESC,event_id DESC');
+      const rows = [...this.rawEvents.values()].filter(row => row.session_id === values[0]).sort((a, b) => newest
+        ? Date.parse(b.projection_json.occurredAt || b.created_at) - Date.parse(a.projection_json.occurredAt || a.created_at)
+          || b.event_id.localeCompare(a.event_id)
+        : a.created_at.localeCompare(b.created_at) || a.event_id.localeCompare(b.event_id))
+        .slice(values[4], values[4] + values[3]);
       return { rows };
     }
     if (compact.startsWith('SELECT * FROM agent_memory_fabric.raw_events_v1 WHERE session_id=$1')) return { rows: [...this.rawEvents.values()].filter(row => row.session_id === values[0]) };
@@ -242,7 +266,7 @@ test('PostgreSQL raw event/session catalog matches SQLite idempotency and safe p
   assert.deepEqual(await catalog.listSessionEventsPage({ id: record.sessionId, offset: 0, limit: 1 }).then(page => ({ count: page.items.length, hasMore: page.hasMore })), { count: 1, hasMore: false });
   const searchQuery = pool.queries.filter(entry => entry.text.includes('raw_sessions_v1') && entry.text.includes('ILIKE')).at(-1);
   assert.match(searchQuery.text, /ESCAPE '\\'/);
-  assert.match(searchQuery.text, /NULLS LAST/);
+  assert.match(searchQuery.text, /ORDER BY coalesce\(s\.last_occurred_at,s\.created_at\) DESC,s\.created_at DESC,s\.session_id ASC/);
   assert.equal(searchQuery.values[1], '%\\%\\_%');
   assert.equal((await catalog.getSession(record.sessionId)).eventCount, 1);
   assert.equal((await catalog.listSessionEvents(record.sessionId))[0].projection.role, 'user');
@@ -252,6 +276,53 @@ test('PostgreSQL raw event/session catalog matches SQLite idempotency and safe p
     assert.equal(query.text.includes('SYNTHETIC_PRIVATE'), false);
     assert.ok(Array.isArray(query.values));
   }
+  await catalog.close();
+});
+
+test('PostgreSQL session queries bind context, time and keyset before limit and order newest by effective time', async () => {
+  const pool = new FakePool(); const catalog = new PostgresCatalog({ pool });
+  await catalog.ready();
+  const room = `hmac-sha256:routing-v1:${'a'.repeat(64)}`;
+  const contextTags = { conversation: [room], room: [room] };
+  pool.rawSessions.set('session-1', { session_id: 'session-1', runtime: 'hermes', owner_tag: 'owner',
+    source_tag: 'source', conversation_kind: 'group', session_binding_json: contextTags,
+    first_occurred_at: '2026-07-12T12:00:00.000Z', last_occurred_at: '2026-07-12T12:00:02.000Z',
+    event_count: 3, created_at: '2026-07-12T12:00:00.000Z' });
+  for (const [index, eventId] of ['evt_a', 'evt_b', 'evt_c'].entries()) {
+    const occurredAt = index === 0 ? '2026-07-12T12:00:00.000Z' : '2026-07-12T12:00:02.000Z';
+    pool.rawEvents.set(eventId, { event_id: eventId, session_id: 'session-1', logical_message_id: `logical-${eventId}`,
+      content_id: String(index + 1).repeat(64), payload_digest: 'f'.repeat(64), projection_json: { occurredAt },
+      owner_tag: 'owner', source_tag: 'source', created_at: new Date(Date.parse('2026-07-12T13:00:00Z') - index).toISOString() });
+  }
+  const after = { lastOccurredAt: '2026-07-12T12:00:03.000Z',
+    createdAt: '2026-07-12T12:00:03.000Z', id: 'prior' };
+  await catalog.searchSessions({ ownerTags: ['owner'], query: '', limit: 10, contextTags,
+    from: '2026-07-12T11:00:00.000Z', to: '2026-07-12T13:00:00.000Z', after });
+  const query = pool.queries.findLast(entry => entry.text.includes('jsonb_each(s.session_binding_json)'));
+  assert.ok(query.text.indexOf('jsonb_each') < query.text.indexOf('LIMIT $9'));
+  assert.ok(query.text.indexOf('AND EXISTS (SELECT 1 FROM jsonb_each')
+    < query.text.indexOf('AND NOT EXISTS (', query.text.indexOf('AND EXISTS (SELECT 1 FROM jsonb_each')));
+  assert.match(query.text, /s\.session_id>\$8/);
+  assert.deepEqual(query.values.slice(2, 9), ['2026-07-12T11:00:00.000Z',
+    '2026-07-12T13:00:00.000Z', JSON.stringify(contextTags), after.lastOccurredAt,
+    after.createdAt, after.id, 10]);
+  assert.deepEqual((await catalog.listSessionEventsPage({ id: 'session-1', newest: true, limit: 3 })).items
+    .map(item => item.eventId), ['evt_c', 'evt_b', 'evt_a']);
+  const newestQuery = pool.queries.findLast(entry => entry.text.includes('effective_at_ms DESC'));
+  assert.match(newestQuery.text, /ORDER BY effective_at_ms DESC,event_id DESC/);
+  for (let index = 0; index < 65; index += 1) {
+    const id = `contextless-${String(index).padStart(2, '0')}`;
+    const occurredAt = new Date(Date.parse('2026-07-12T13:00:00.000Z') + index).toISOString();
+    pool.rawSessions.set(id, { session_id: id, runtime: 'hermes', owner_tag: 'owner', source_tag: 'source',
+      conversation_kind: 'group', session_binding_json: null, first_occurred_at: occurredAt,
+      last_occurred_at: occurredAt, event_count: 1, created_at: occurredAt });
+    pool.rawEvents.set(`contextless-event-${index}`, { event_id: `contextless-event-${index}`, session_id: id,
+      content_id: 'a'.repeat(64), payload_digest: 'b'.repeat(64), projection_json: { occurredAt },
+      owner_tag: 'owner', source_tag: 'source', created_at: occurredAt });
+  }
+  const prelimit = await catalog.searchSessions({ ownerTags: ['owner'], query: '', limit: 1, contextTags });
+  assert.deepEqual(prelimit.map(item => item.id), ['session-1'],
+    'contextless rows must be rejected before LIMIT so a valid older route remains visible');
   await catalog.close();
 });
 

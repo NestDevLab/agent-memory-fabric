@@ -172,7 +172,7 @@ test('legacy sessions fail closed at context authorization while direct owner de
     const sessionId = item.projection.sessionId;
     const reader = store.createSessionReader();
     const redacted = await reader.transcript({ actor: 'raw-owner', id: sessionId, view: 'redacted' });
-    assert.equal(redacted.items[0].content.redacted, true);
+    assert.deepEqual(redacted.items, [], 'legacy v1 observations have no authenticated normalized text');
     assert.equal(JSON.stringify(redacted).includes('SYNTHETIC_RAW_PRIVATE_TEXT'), false);
     const original = await reader.transcript({ actor: 'raw-owner', id: sessionId, view: 'original' });
     assert.equal(Buffer.from(original.items[0].raw.line, 'base64').toString('utf8').includes('SYNTHETIC_RAW_PRIVATE_TEXT'), true);

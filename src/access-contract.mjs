@@ -44,6 +44,8 @@ export function buildContextRequest(operation, input = {}) {
   if (operation === 'memory_read') return { operation, id: String(input.id || '') };
   if (operation === 'sessions_search') return { operation, query: String(input.query || ''), cursor: input.cursor || null, limit: Number(input.limit || 20), from: input.from || null, to: input.to || null };
   if (operation === 'session_get') return { operation, sessionId: String(input.sessionId || '') };
-  if (operation === 'session_transcript') return { operation, sessionId: String(input.sessionId || ''), view: input.view === 'original' ? 'original' : 'redacted', cursor: input.cursor || null, limit: Number(input.limit || 100), from: input.from || null, to: input.to || null };
+  if (operation === 'session_transcript') return { operation, sessionId: String(input.sessionId || ''),
+    view: input.view === 'original' ? 'original' : 'redacted', query: String(input.query || ''),
+    cursor: input.cursor || null, limit: Number(input.limit || 100), from: input.from || null, to: input.to || null };
   throw new Error('context_operation_invalid');
 }
