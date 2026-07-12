@@ -81,9 +81,13 @@ storage secrets.
 Proposal failures never locally delete content-addressed RAW, even after a proven
 rollback: another concurrent proposal may already reference the same blob. Orphan
 collection requires a separately approved, catalog-coordinated reference proof.
-RAW event ingestion rejects known session-binding conflicts before ciphertext
-commit. Failures or binding races after commit retain the encrypted object for
-reconciliation; physical deletion still requires the same catalog reference proof.
+RAW v2 sessions bind only stable routing invariants (`conversation`, optional
+`room`, optional `thread`), plus runtime and conversation kind. Actor, sender,
+person, relationship and source identity remain event-scoped, so user, system and
+assistant observations can share one conversation. A room/thread/conversation
+change is rejected before ciphertext commit. Failures or binding races after
+commit retain the encrypted object for reconciliation; physical deletion still
+requires the same catalog reference proof.
 
 Transcript clients encrypt each event before it reaches the HTTP boundary. Configure
 the server with `AMF_INGEST_KEY_RING_PATH`; the mounted JSON maps every key id to its

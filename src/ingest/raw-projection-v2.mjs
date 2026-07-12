@@ -16,6 +16,7 @@ const CONVERSATION_KINDS = new Set(['dm', 'group', 'channel', 'thread', 'session
 const ROLES = new Set(['user', 'assistant', 'system', 'tool', 'unknown']);
 const CONTENT_TYPES = new Set(['text', 'structured', 'tool', 'mixed', 'none', 'unknown']);
 const CONTEXT_TAG_KEYS = new Set(['actor', 'sender', 'conversation', 'room', 'person', 'relationship', 'thread']);
+const SESSION_BINDING_TAG_KEYS = ['conversation', 'room', 'thread'];
 const OPAQUE_TAG = /^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$/;
 const LOGICAL_ID = /^lmsg_[a-f0-9]{64}$/;
 const SAFE_ID = /^(?:evt|ses)_[a-f0-9]{64}$/;
@@ -39,6 +40,41 @@ export function normalizeContextTags(contextTags) {
   }
   if (!normalized.sender || !normalized.conversation) throw new Error('raw_projection_invalid');
   return normalized;
+}
+
+// A session can contain observations emitted by different actors and senders.
+// Bind only the routing coordinates that must remain stable for the lifetime of
+// the session. Event-level actor/sender/person/relationship tags stay in each
+// projection and must never participate in session ownership checks.
+export function sessionContextBinding(contextTags) {
+  if (!contextTags || typeof contextTags !== 'object' || Array.isArray(contextTags)) throw new Error('raw_session_binding_invalid');
+  const binding = {};
+  for (const key of SESSION_BINDING_TAG_KEYS) {
+    const values = contextTags[key];
+    if (values === undefined) continue;
+    if (!Array.isArray(values) || values.length === 0 || values.some(tag => !OPAQUE_TAG.test(tag))) throw new Error('raw_session_binding_invalid');
+    const exact = [...new Set(values)].sort();
+    if (exact.length !== values.length || exact.some((value, index) => value !== values[index])) throw new Error('raw_session_binding_invalid');
+    binding[key] = exact;
+  }
+  if (!binding.conversation) throw new Error('raw_session_binding_invalid');
+  return binding;
+}
+
+export function normalizeSessionContextBinding(binding) {
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding)
+    || Object.keys(binding).some(key => !SESSION_BINDING_TAG_KEYS.includes(key))) throw new Error('raw_session_binding_invalid');
+  const normalized = sessionContextBinding(binding);
+  if (Object.keys(normalized).length !== Object.keys(binding).length) throw new Error('raw_session_binding_invalid');
+  return normalized;
+}
+
+export function sessionBindingMatches(stored, projection) {
+  try {
+    return canonicalJson(normalizeSessionContextBinding(stored)) === canonicalJson(sessionContextBinding(projection.contextTags));
+  } catch {
+    return false;
+  }
 }
 
 export function contextTagsIntersect(stored, presented) {

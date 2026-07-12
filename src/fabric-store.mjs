@@ -4,7 +4,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import pg from 'pg';
 import { ciphertextContentId, ciphertextPayloadDigest, decryptClientCiphertext, normalizeIngestKeyRing, validateClientCiphertext } from './ingest/raw-event-contract.mjs';
-import { selectLogicalMessage, validateProjectionV2 } from './ingest/raw-projection-v2.mjs';
+import { normalizeSessionContextBinding, selectLogicalMessage, sessionBindingMatches, sessionContextBinding, validateProjectionV2 } from './ingest/raw-projection-v2.mjs';
 import {
   retentionDeadline,
   retentionTombstone,
@@ -503,6 +503,9 @@ export class MemoryCatalog {
   ingestRawEventV2(record, rawRecord, auditEvent) {
     const existing = this.rawEventsV2.get(record.eventId) || this.rawEvents.get(record.eventId);
     if (existing) { this.auditEvents.push({ ...auditEvent, outcome: 'duplicate' }); return { record: structuredClone(existing), duplicate: true, logical: this.findLogicalMessage([record.logicalMessageId]) }; }
+    const session = this.rawSessions.get(record.sessionId) || { id: record.sessionId, runtime: record.projection.sourceKind, ownerTag: record.ownerTag, sourceTag: record.sourceTag, conversationKind: record.projection.conversationKind, contextTags: sessionContextBinding(record.projection.contextTags), firstOccurredAt: record.projection.occurredAt, lastOccurredAt: record.projection.occurredAt, eventCount: 0, createdAt: record.createdAt };
+    if (session.runtime !== record.projection.sourceKind || !sessionBindingMatches(session.contextTags, record.projection)
+      || session.conversationKind !== record.projection.conversationKind) throw createError('raw_session_binding_conflict', 409);
     const ids = [record.logicalMessageId, ...(record.projection.logicalMessageAliases || []).map(item => item.logicalMessageId)];
     const matched = this.findLogicalMessage(ids);
     const canonicalId = matched?.logicalMessageId || record.logicalMessageId;
@@ -515,9 +518,6 @@ export class MemoryCatalog {
     const logical = { ...selection, logicalMessageId: canonicalId, eventIds, updatedAt: record.createdAt };
     this.logicalMessages.set(canonicalId, logical);
     for (const id of ids) this.logicalAliases.set(id, canonicalId);
-    const session = this.rawSessions.get(record.sessionId) || { id: record.sessionId, runtime: record.projection.sourceKind, ownerTag: record.ownerTag, sourceTag: record.sourceTag, conversationKind: record.projection.conversationKind, contextTags: structuredClone(record.projection.contextTags), firstOccurredAt: record.projection.occurredAt, lastOccurredAt: record.projection.occurredAt, eventCount: 0, createdAt: record.createdAt };
-    if (session.ownerTag !== record.ownerTag || session.sourceTag !== record.sourceTag || session.runtime !== record.projection.sourceKind
-      || canonicalJson(session.contextTags) !== canonicalJson(record.projection.contextTags) || session.conversationKind !== record.projection.conversationKind) throw createError('raw_session_binding_conflict', 409);
     session.eventCount += 1;
     session.firstOccurredAt = earlierTimestamp(session.firstOccurredAt, record.projection.occurredAt);
     session.lastOccurredAt = laterTimestamp(session.lastOccurredAt, record.projection.occurredAt);
@@ -668,7 +668,7 @@ export class SqliteCatalog {
       CREATE TABLE IF NOT EXISTS raw_objects_v2 (content_id TEXT PRIMARY KEY, media_type TEXT NOT NULL, byte_length INTEGER NOT NULL, storage_ref TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS fabric_proposals (id TEXT PRIMARY KEY, owner_tag TEXT NOT NULL, scope_tag TEXT NOT NULL, status TEXT NOT NULL, content_id TEXT NOT NULL REFERENCES raw_objects_v2(content_id), idempotency_tag TEXT NOT NULL, source_tag TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(owner_tag, idempotency_tag));
       CREATE INDEX IF NOT EXISTS fabric_proposals_status_created_idx ON fabric_proposals(status, created_at);
-      CREATE TABLE IF NOT EXISTS raw_sessions_v1 (session_id TEXT PRIMARY KEY, runtime TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL, conversation_kind TEXT, context_tags_json TEXT, first_occurred_at TEXT, last_occurred_at TEXT, event_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS raw_sessions_v1 (session_id TEXT PRIMARY KEY, runtime TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL, conversation_kind TEXT, context_tags_json TEXT, session_binding_json TEXT, first_occurred_at TEXT, last_occurred_at TEXT, event_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS raw_events_v1 (event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES raw_sessions_v1(session_id), content_id TEXT NOT NULL REFERENCES raw_objects_v2(content_id), payload_digest TEXT NOT NULL, projection_json TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS raw_events_v2 (event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES raw_sessions_v1(session_id), logical_message_id TEXT NOT NULL, content_id TEXT NOT NULL REFERENCES raw_objects_v2(content_id), payload_digest TEXT NOT NULL, projection_json TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS raw_events_v2_session_created_idx ON raw_events_v2(session_id,created_at,event_id);
@@ -689,6 +689,18 @@ export class SqliteCatalog {
     const sessionColumns = new Set(this.db.prepare('PRAGMA table_info(raw_sessions_v1)').all().map(row => row.name));
     if (!sessionColumns.has('conversation_kind')) this.db.exec('ALTER TABLE raw_sessions_v1 ADD COLUMN conversation_kind TEXT');
     if (!sessionColumns.has('context_tags_json')) this.db.exec('ALTER TABLE raw_sessions_v1 ADD COLUMN context_tags_json TEXT');
+    if (!sessionColumns.has('session_binding_json')) this.db.exec('ALTER TABLE raw_sessions_v1 ADD COLUMN session_binding_json TEXT');
+    const migrateSessionBindings = this.db.transaction(() => {
+      const rows = this.db.prepare('SELECT session_id,context_tags_json FROM raw_sessions_v1 WHERE context_tags_json IS NOT NULL AND session_binding_json IS NULL').all();
+      const update = this.db.prepare('UPDATE raw_sessions_v1 SET session_binding_json=? WHERE session_id=? AND session_binding_json IS NULL');
+      for (const row of rows) {
+        let binding;
+        try { binding = sessionContextBinding(JSON.parse(row.context_tags_json)); }
+        catch { throw createError('raw_session_binding_migration_invalid', 500); }
+        update.run(JSON.stringify(binding), row.session_id);
+      }
+    });
+    migrateSessionBindings();
     this.selectProposal = this.db.prepare('SELECT * FROM fabric_proposals WHERE id = ?');
     this.selectProposalByTags = this.db.prepare('SELECT * FROM fabric_proposals WHERE owner_tag = ? AND idempotency_tag = ?');
     this.insertBoth = this.db.transaction((record, raw) => {
@@ -748,10 +760,12 @@ export class SqliteCatalog {
         return { record: this.mapRawEvent(existing), duplicate: true, logical: this.findLogicalMessage([record.logicalMessageId]) };
       }
       this.db.prepare('INSERT OR IGNORE INTO raw_objects_v2(content_id,media_type,byte_length,storage_ref,created_at) VALUES (@contentId,@mediaType,@byteLength,@storageRef,@createdAt)').run(raw);
-      this.db.prepare('INSERT OR IGNORE INTO raw_sessions_v1(session_id,runtime,owner_tag,source_tag,conversation_kind,context_tags_json,first_occurred_at,last_occurred_at,event_count,created_at) VALUES (?,?,?,?,?,?,?,?,0,?)').run(record.sessionId, record.projection.sourceKind, record.ownerTag, record.sourceTag, record.projection.conversationKind, JSON.stringify(record.projection.contextTags), record.projection.occurredAt, record.projection.occurredAt, record.createdAt);
+      const sessionBinding = sessionContextBinding(record.projection.contextTags);
+      this.db.prepare('INSERT OR IGNORE INTO raw_sessions_v1(session_id,runtime,owner_tag,source_tag,conversation_kind,context_tags_json,session_binding_json,first_occurred_at,last_occurred_at,event_count,created_at) VALUES (?,?,?,?,?,?,?,?,?,0,?)').run(record.sessionId, record.projection.sourceKind, record.ownerTag, record.sourceTag, record.projection.conversationKind, JSON.stringify(record.projection.contextTags), JSON.stringify(sessionBinding), record.projection.occurredAt, record.projection.occurredAt, record.createdAt);
       const bound = this.db.prepare('SELECT * FROM raw_sessions_v1 WHERE session_id=?').get(record.sessionId);
-      if (bound.owner_tag !== record.ownerTag || bound.source_tag !== record.sourceTag || bound.runtime !== record.projection.sourceKind
-        || bound.conversation_kind !== record.projection.conversationKind || bound.context_tags_json !== JSON.stringify(record.projection.contextTags)) throw createError('raw_session_binding_conflict', 409);
+      const boundBinding = bound.session_binding_json ? JSON.parse(bound.session_binding_json) : null;
+      if (bound.runtime !== record.projection.sourceKind || bound.conversation_kind !== record.projection.conversationKind
+        || !sessionBindingMatches(boundBinding, record.projection)) throw createError('raw_session_binding_conflict', 409);
       const ids = [record.logicalMessageId, ...record.projection.logicalMessageAliases.map(item => item.logicalMessageId)];
       const matched = this.findLogicalMessage(ids);
       const canonicalId = matched?.logicalMessageId || record.logicalMessageId;
@@ -877,7 +891,7 @@ export class SqliteCatalog {
     return null;
   }
   getRawEvent(id) { return this.mapRawEvent(this.db.prepare('SELECT * FROM raw_events_v2 WHERE event_id=?').get(id) || this.db.prepare('SELECT * FROM raw_events_v1 WHERE event_id=?').get(id)); }
-  mapSession(row) { return row ? { id: row.session_id, runtime: row.runtime, ownerTag: row.owner_tag, sourceTag: row.source_tag, conversationKind: row.conversation_kind || null, contextTags: row.context_tags_json ? JSON.parse(row.context_tags_json) : null, firstOccurredAt: row.first_occurred_at, lastOccurredAt: row.last_occurred_at, eventCount: row.event_count, createdAt: row.created_at } : null; }
+  mapSession(row) { return row ? { id: row.session_id, runtime: row.runtime, ownerTag: row.owner_tag, sourceTag: row.source_tag, conversationKind: row.conversation_kind || null, contextTags: row.session_binding_json ? JSON.parse(row.session_binding_json) : null, firstOccurredAt: row.first_occurred_at, lastOccurredAt: row.last_occurred_at, eventCount: row.event_count, createdAt: row.created_at } : null; }
   searchSessions({ ownerTags = [], query = '', limit = 20 }) {
     if (!ownerTags.length) return [];
     const pattern = escapedLike(query);
@@ -935,7 +949,7 @@ export class SqliteCatalog {
 }
 
 const POSTGRES_SCHEMA = 'agent_memory_fabric';
-const POSTGRES_SCHEMA_VERSION = 6;
+const POSTGRES_SCHEMA_VERSION = 7;
 const POSTGRES_SCHEMA_SQL = [
   `CREATE SCHEMA IF NOT EXISTS ${POSTGRES_SCHEMA}`,
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.schema_migrations (
@@ -984,10 +998,17 @@ const POSTGRES_SCHEMA_SQL = [
   )`,
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.raw_sessions_v1 (
     session_id TEXT PRIMARY KEY, runtime TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL,
-    conversation_kind TEXT, context_tags_json JSONB, first_occurred_at TIMESTAMPTZ, last_occurred_at TIMESTAMPTZ, event_count BIGINT NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL
+    conversation_kind TEXT, context_tags_json JSONB, session_binding_json JSONB, first_occurred_at TIMESTAMPTZ, last_occurred_at TIMESTAMPTZ, event_count BIGINT NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL
   )`,
   `ALTER TABLE ${POSTGRES_SCHEMA}.raw_sessions_v1 ADD COLUMN IF NOT EXISTS conversation_kind TEXT`,
   `ALTER TABLE ${POSTGRES_SCHEMA}.raw_sessions_v1 ADD COLUMN IF NOT EXISTS context_tags_json JSONB`,
+  `ALTER TABLE ${POSTGRES_SCHEMA}.raw_sessions_v1 ADD COLUMN IF NOT EXISTS session_binding_json JSONB`,
+  `UPDATE ${POSTGRES_SCHEMA}.raw_sessions_v1
+    SET session_binding_json=jsonb_strip_nulls(jsonb_build_object(
+      'conversation',context_tags_json->'conversation',
+      'room',context_tags_json->'room',
+      'thread',context_tags_json->'thread'))
+    WHERE session_binding_json IS NULL AND context_tags_json IS NOT NULL`,
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.raw_events_v1 (
     event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES ${POSTGRES_SCHEMA}.raw_sessions_v1(session_id),
     content_id TEXT NOT NULL REFERENCES ${POSTGRES_SCHEMA}.raw_objects_v2(content_id), payload_digest TEXT NOT NULL,
@@ -1147,7 +1168,7 @@ function mapPostgresRawEvent(row) {
 }
 
 function mapPostgresSession(row) {
-  return row ? { id: row.session_id, runtime: row.runtime, ownerTag: row.owner_tag, sourceTag: row.source_tag, conversationKind: row.conversation_kind || null, contextTags: row.context_tags_json ? (typeof row.context_tags_json === 'string' ? JSON.parse(row.context_tags_json) : row.context_tags_json) : null, firstOccurredAt: row.first_occurred_at ? new Date(row.first_occurred_at).toISOString() : null, lastOccurredAt: row.last_occurred_at ? new Date(row.last_occurred_at).toISOString() : null, eventCount: Number(row.event_count), createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at) } : null;
+  return row ? { id: row.session_id, runtime: row.runtime, ownerTag: row.owner_tag, sourceTag: row.source_tag, conversationKind: row.conversation_kind || null, contextTags: row.session_binding_json ? (typeof row.session_binding_json === 'string' ? JSON.parse(row.session_binding_json) : row.session_binding_json) : null, firstOccurredAt: row.first_occurred_at ? new Date(row.first_occurred_at).toISOString() : null, lastOccurredAt: row.last_occurred_at ? new Date(row.last_occurred_at).toISOString() : null, eventCount: Number(row.event_count), createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at) } : null;
 }
 
 function mapPostgresIdentity(row) {
@@ -1489,11 +1510,12 @@ export class PostgresCatalog {
         return { record: mapPostgresRawEvent(existing), duplicate: true, logical: await this.findLogicalMessage([record.logicalMessageId]) };
       }
       await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.raw_objects_v2(content_id,media_type,byte_length,storage_ref,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(content_id) DO NOTHING`, [rawRecord.contentId, rawRecord.mediaType, rawRecord.byteLength, rawRecord.storageRef, rawRecord.createdAt]);
-      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.raw_sessions_v1(session_id,runtime,owner_tag,source_tag,conversation_kind,context_tags_json,first_occurred_at,last_occurred_at,event_count,created_at) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$7,0,$8) ON CONFLICT(session_id) DO NOTHING`, [record.sessionId, record.projection.sourceKind, record.ownerTag, record.sourceTag, record.projection.conversationKind, JSON.stringify(record.projection.contextTags), record.projection.occurredAt, record.createdAt]);
+      const sessionBinding = sessionContextBinding(record.projection.contextTags);
+      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.raw_sessions_v1(session_id,runtime,owner_tag,source_tag,conversation_kind,context_tags_json,session_binding_json,first_occurred_at,last_occurred_at,event_count,created_at) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$8,0,$9) ON CONFLICT(session_id) DO NOTHING`, [record.sessionId, record.projection.sourceKind, record.ownerTag, record.sourceTag, record.projection.conversationKind, JSON.stringify(record.projection.contextTags), JSON.stringify(sessionBinding), record.projection.occurredAt, record.createdAt]);
       const bound = (await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 WHERE session_id=$1`, [record.sessionId])).rows[0];
-      const boundTags = bound?.context_tags_json && (typeof bound.context_tags_json === 'string' ? JSON.parse(bound.context_tags_json) : bound.context_tags_json);
-      if (!bound || bound.owner_tag !== record.ownerTag || bound.source_tag !== record.sourceTag || bound.runtime !== record.projection.sourceKind
-        || bound.conversation_kind !== record.projection.conversationKind || canonicalJson(boundTags) !== canonicalJson(record.projection.contextTags)) throw createError('raw_session_binding_conflict', 409);
+      const boundBinding = bound?.session_binding_json && (typeof bound.session_binding_json === 'string' ? JSON.parse(bound.session_binding_json) : bound.session_binding_json);
+      if (!bound || bound.runtime !== record.projection.sourceKind || bound.conversation_kind !== record.projection.conversationKind
+        || !sessionBindingMatches(boundBinding, record.projection)) throw createError('raw_session_binding_conflict', 409);
       const ids = [record.logicalMessageId, ...record.projection.logicalMessageAliases.map(item => item.logicalMessageId)];
       const matched = await this.findLogicalMessage(ids, client);
       const canonicalId = matched?.logicalMessageId || record.logicalMessageId;
@@ -1531,6 +1553,10 @@ export class PostgresCatalog {
     try {
       const rows = await this._query(this.pool, `SELECT projection_json FROM ${POSTGRES_SCHEMA}.raw_events_v2`);
       for (const row of rows.rows) validateProjectionV2(typeof row.projection_json === 'string' ? JSON.parse(row.projection_json) : row.projection_json);
+      const bindings = await this._query(this.pool, `SELECT DISTINCT s.session_binding_json
+        FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 s
+        JOIN ${POSTGRES_SCHEMA}.raw_events_v2 e ON e.session_id=s.session_id`);
+      for (const row of bindings.rows) normalizeSessionContextBinding(typeof row.session_binding_json === 'string' ? JSON.parse(row.session_binding_json) : row.session_binding_json);
       const evidenceResult = await this._query(this.pool, `SELECT
         (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v1) AS v1_count,
         (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2) AS v2_count,
@@ -2046,7 +2072,13 @@ export class FabricStore {
       const existingRuntime = existing.projection.sourceKind || existing.projection.runtime;
       const requestedRuntime = projection.sourceKind || projection.runtime;
       if (!ownerTags.has(existing.ownerTag) || !sourceTags.has(existing.sourceTag) || existing.sessionId !== projection.sessionId || existingRuntime !== requestedRuntime) throw createError('raw_session_binding_conflict', 409);
+      if (projectionV2) {
+        let sameBinding = false;
+        try { sameBinding = sessionBindingMatches(sessionContextBinding(existing.projection.contextTags), projection); } catch {}
+        if (!sameBinding) throw createError('raw_session_binding_conflict', 409);
+      }
       if (existing.payloadDigest !== payloadDigest) throw createError('raw_event_conflict', 409);
+      if (canonicalJson(existing.projection) !== canonicalJson(projection)) throw createError('raw_event_conflict', 409);
       const duplicateWrite = projectionV2 ? this.catalog.ingestRawEventV2?.bind(this.catalog) : this.catalog.ingestRawEvent.bind(this.catalog);
       if (!duplicateWrite) throw createError('raw_projection_v2_storage_unavailable', 503);
       await this._catalogOperation(() => duplicateWrite(existing, null, auditEvent));
@@ -2054,15 +2086,20 @@ export class FabricStore {
     }
     const createdAt = this.clock().toISOString();
     const boundSession = await this._catalogOperation(() => this.catalog.getSession(projection.sessionId));
-    if (boundSession && (!ownerTags.has(boundSession.ownerTag) || !sourceTags.has(boundSession.sourceTag) || boundSession.runtime !== (projection.sourceKind || projection.runtime))) throw createError('raw_session_binding_conflict', 409);
+    if (boundSession) {
+      const runtimeConflict = boundSession.runtime !== (projection.sourceKind || projection.runtime);
+      const bindingConflict = projectionV2 && (!sessionBindingMatches(boundSession.contextTags, projection) || boundSession.conversationKind !== projection.conversationKind);
+      const legacyOwnershipConflict = !projectionV2 && (!ownerTags.has(boundSession.ownerTag) || !sourceTags.has(boundSession.sourceTag));
+      if (runtimeConflict || bindingConflict || legacyOwnershipConflict) throw createError('raw_session_binding_conflict', 409);
+    }
     // Reject a known binding conflict before creating an unreferenced ciphertext
     // object. A concurrent binding race is still resolved atomically by the
     // catalog; its ciphertext is retained for reference-aware reconciliation/GC.
     const raw = await this.rawStore.commitClientCiphertext(contentId, envelope);
     const record = {
       eventId: projection.eventId, sessionId: projection.sessionId, contentId, payloadDigest, projection,
-      ownerTag: boundSession?.ownerTag || this.rawStore.opaqueTag('raw-owner', actor),
-      sourceTag: boundSession?.sourceTag || this.rawStore.opaqueTag('raw-source', sourceInstanceId), createdAt
+      ownerTag: projectionV2 ? this.rawStore.opaqueTag('raw-owner', actor) : (boundSession?.ownerTag || this.rawStore.opaqueTag('raw-owner', actor)),
+      sourceTag: projectionV2 ? this.rawStore.opaqueTag('raw-source', sourceInstanceId) : (boundSession?.sourceTag || this.rawStore.opaqueTag('raw-source', sourceInstanceId)), createdAt
     };
     if (projectionV2) record.logicalMessageId = projection.logicalMessageId;
     const catalogWrite = projectionV2 ? this.catalog.ingestRawEventV2?.bind(this.catalog) : this.catalog.ingestRawEvent.bind(this.catalog);
