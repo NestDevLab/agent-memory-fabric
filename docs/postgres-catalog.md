@@ -64,7 +64,7 @@ stop for fleet rollout, even when ordinary health checks remain green.
 
 ## Schema and privacy boundary
 
-The adapter owns the fixed `agent_memory_fabric` schema. Migration version 4 is
+The adapter owns the fixed `agent_memory_fabric` schema. Migration version 7 is
 idempotent and protected by a PostgreSQL advisory transaction lock. A database
 whose migration version is newer than the running binary is rejected. Projection
 v2 and logical-message selection are introduced by migration version 4.
@@ -73,8 +73,10 @@ The schema contains:
 
 - encrypted RAW object metadata and storage references;
 - RAW event metadata with only an allowlisted projection and stable keyed digest;
-- session aggregates bound to opaque keyed owner/source tags and runtime; actor and
-  source instance literals remain only inside authenticated ciphertext;
+- session aggregates bound to runtime, conversation kind and the opaque
+  `conversation`/`room`/`thread` routing subset; actor, sender and source tags on
+  v2 event rows are event-scoped, while literals remain only inside authenticated
+  ciphertext;
 - proposal state with a unique opaque owner/idempotency pair;
 - versioned identity metadata using opaque tags;
 - encrypted ingestion cursor values;
@@ -88,16 +90,21 @@ with an opaque `response_json` snapshot for stable replay,
 reconciliation. See `identity-retention.md` for the mutation and
 deletion-safety contract.
 
+Schema version 7 adds `raw_sessions_v1.session_binding_json`. Startup backfills
+it idempotently from the existing `context_tags_json`, selecting only
+`conversation`, `room` and `thread`. The former full JSON is retained as
+compatibility metadata; it is not consulted for v2 binding. Missing or malformed
+v2 bindings fail readiness and subsequent writes closed.
+
 It does not contain proposal bodies, claims, transcripts, bearer tokens, people
 names, room names, or unencrypted cursor values. All runtime DML is parameterized.
 
 ## Migration and rollout
 
-This tranche does not migrate SQLite or legacy Mem0 data. It also does not
-provide an in-place upgrade for an existing PostgreSQL schema version 2.
-Applying version 3 to non-empty v2 state requires a separate isolated migration
-exercise, data/constraint verification, security review, backup and rollback
-proof, and an explicit migration/deployment gate.
+The v7 session-binding migration supports existing SQLite and PostgreSQL v2
+session rows in place. It does not migrate legacy Mem0 data. Take a consistent
+catalog backup before starting a v7 binary and verify the backfilled binding count
+against the v2 session count before enabling writers.
 
 1. Provision an empty, isolated PostgreSQL database and least-privilege role.
 2. Back up the SQLite catalog and encrypted RAW root.
@@ -111,13 +118,18 @@ proof, and an explicit migration/deployment gate.
 
 4. Start a shadow instance with Mem0 still disabled and verify `memory_status`,
    proposal retries, audit persistence, pool health, and outage behavior.
-5. Migrate/backfill only through an approved, separately reviewed migration job.
+5. Start the v7 binary with writers stopped; verify `session_binding_json` for
+   every v2 session and confirm `rawProjectionV2Ready` before enabling ingest.
 6. Change the production catalog kind and restart only after the deployment gate.
 
 ## Rollback
 
-Stop writers before rollback. Restore the previous catalog configuration and its
-matching RAW snapshot, then restart. Do not simply switch back to an older SQLite
+Stop writers before rollback. The v7 column and backfill are additive and retain
+the prior `context_tags_json`; do not drop or rewrite either column. An older
+binary can ignore the new column, but it will again reject multi-role session
+events, so replay must remain paused. For exact pre-upgrade semantics, restore the
+consistent catalog backup and its matching RAW snapshot, then restart. Do not
+simply switch back to an older SQLite
 file after PostgreSQL has accepted writes: replay the durable outbox or an approved
 export first, otherwise catalog events will be missing. Retain the PostgreSQL
 database for investigation until checksums, proposal counts, and audit continuity

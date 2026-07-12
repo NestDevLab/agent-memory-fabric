@@ -2,10 +2,35 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test from 'node:test';
 
-import { FabricStore, MemoryRawStore, PostgresCatalog } from '../src/fabric-store.mjs';
+import { FabricStore, MemoryRawStore, POSTGRES_SCHEMA_VERSION, PostgresCatalog } from '../src/fabric-store.mjs';
 
 const connectionString = String(process.env.AMF_TEST_POSTGRES_URL || '').trim();
 const enabled = connectionString && process.env.AMF_TEST_POSTGRES_ALLOW_MUTATION === 'true';
+
+function digest(value) { return crypto.createHash('sha256').update(String(value)).digest('hex'); }
+function opaque(namespace, value) { return `hmac-sha256:integration:${digest(`${namespace}:${value}`)}`; }
+function rawV2Fixture({ suffix, marker, sessionId, role, actor, sender, conversation = 'conversation-a', room = 'room-a', thread = null }) {
+  const eventId = `evt_${digest(`${suffix}:event:${marker}`)}`;
+  const logicalMessageId = `lmsg_${digest(`${suffix}:logical:${marker}`)}`;
+  const contentId = digest(`${suffix}:content:${marker}`);
+  const contextTags = {
+    actor: [opaque('actor', actor)], sender: [opaque('sender', sender)],
+    conversation: [opaque('conversation', conversation)], room: [opaque('room', room)],
+    ...(thread ? { thread: [opaque('thread', thread)] } : {})
+  };
+  const projection = {
+    schema: 'amf.raw-event-projection/v2', eventId, sessionId, logicalMessageId, logicalMessageAliases: [],
+    derivationVersion: 'amf-logical-message/v1', keyVersion: 'integration', sourceKind: 'hermes', observationClass: 'native',
+    direction: role === 'assistant' ? 'outbound' : 'inbound', conversationKind: 'group', contextTags, subtype: 'message',
+    occurredAt: `2026-07-12T12:00:0${marker}.000Z`, editedAt: null, nativeRevision: Number(marker), sourceSequence: Number(marker),
+    authoritativeDeletion: false, role, contentType: 'text', contentParts: 1, hasContent: true,
+    normalizationVersion: 'amf-observation-normalization/v1', normalizedPayloadDigest: `hmac-sha256:integration:${digest(`${suffix}:payload:${marker}`)}`
+  };
+  return {
+    record: { eventId, sessionId, logicalMessageId, contentId, payloadDigest: `hmac-sha256:integration:${digest(`${suffix}:cipher:${marker}`)}`, projection, ownerTag: opaque('owner', actor), sourceTag: opaque('source', actor), createdAt: projection.occurredAt },
+    raw: { contentId, mediaType: 'application/vnd.agent-memory-fabric.raw-event-ciphertext+json', byteLength: 1, storageRef: `integration/${contentId}.enc.json`, createdAt: projection.occurredAt }
+  };
+}
 
 test('real PostgreSQL catalog integration in an explicitly isolated test database', { skip: !enabled }, async () => {
   const databaseName = decodeURIComponent(new URL(connectionString).pathname.replace(/^\//, ''));
@@ -35,6 +60,7 @@ test('real PostgreSQL catalog integration in an explicitly isolated test databas
       : { ticketId: `ticket-${marker}`, assertion: `assertion-${marker}` }
   });
   const cleanupContentIds = new Set([contentId]);
+  const cleanupSessionIds = new Set();
   let catalogReady = false;
   try {
     await catalog.ready();
@@ -44,7 +70,50 @@ test('real PostgreSQL catalog integration in an explicitly isolated test databas
     assert.equal(readinessStore.status().rawProjectionV2Ready, true);
     assert.equal(readinessStore.status().rawProjectionV2ReadinessReason, null);
     const migrationProof = await catalog.pool.query('SELECT schema_version,backend,alias_orphan_count,legacy_field_count,literal_scan_count FROM agent_memory_fabric.raw_projection_v2_migration_state WHERE singleton=1');
-    assert.deepEqual({ schemaVersion: Number(migrationProof.rows[0].schema_version), backend: migrationProof.rows[0].backend, aliasOrphans: Number(migrationProof.rows[0].alias_orphan_count), legacyFields: Number(migrationProof.rows[0].legacy_field_count), literalTags: Number(migrationProof.rows[0].literal_scan_count) }, { schemaVersion: 6, backend: 'postgres', aliasOrphans: 0, legacyFields: 0, literalTags: 0 });
+    assert.deepEqual({ schemaVersion: Number(migrationProof.rows[0].schema_version), backend: migrationProof.rows[0].backend, aliasOrphans: Number(migrationProof.rows[0].alias_orphan_count), legacyFields: Number(migrationProof.rows[0].legacy_field_count), literalTags: Number(migrationProof.rows[0].literal_scan_count) }, { schemaVersion: POSTGRES_SCHEMA_VERSION, backend: 'postgres', aliasOrphans: 0, legacyFields: 0, literalTags: 0 });
+
+    // A schema-6 row is backfilled on startup while preserving the former
+    // full context metadata for binary rollback compatibility.
+    const legacySessionId = `ses_${digest(`${suffix}:legacy-session`)}`;
+    cleanupSessionIds.add(legacySessionId);
+    const legacyContext = { actor: [opaque('actor', 'legacy')], sender: [opaque('sender', 'legacy')], conversation: [opaque('conversation', 'legacy')], room: [opaque('room', 'legacy')] };
+    await catalog.pool.query({
+      text: `INSERT INTO agent_memory_fabric.raw_sessions_v1(session_id,runtime,owner_tag,source_tag,conversation_kind,context_tags_json,session_binding_json,first_occurred_at,last_occurred_at,event_count,created_at) VALUES ($1,'hermes',$2,$3,'group',$4::jsonb,NULL,now(),now(),0,now())`,
+      values: [legacySessionId, opaque('owner', 'legacy'), opaque('source', 'legacy'), JSON.stringify(legacyContext)]
+    });
+    const migrationCatalog = new PostgresCatalog({ connectionString, ssl: process.env.AMF_TEST_POSTGRES_SSL === 'disable' ? false : { rejectUnauthorized: true } });
+    await migrationCatalog.ready();
+    const migratedSession = await migrationCatalog.pool.query({ text: 'SELECT context_tags_json,session_binding_json FROM agent_memory_fabric.raw_sessions_v1 WHERE session_id=$1', values: [legacySessionId] });
+    assert.deepEqual(migratedSession.rows[0].context_tags_json, legacyContext);
+    assert.deepEqual(migratedSession.rows[0].session_binding_json, { conversation: legacyContext.conversation, room: legacyContext.room });
+    await migrationCatalog.close();
+
+    // Multi-role/realtime/backfill events share one session. Actor, sender and
+    // source tags remain event-local; room/thread changes fail closed.
+    const rawSessionId = `ses_${digest(`${suffix}:multi-role-session`)}`;
+    cleanupSessionIds.add(rawSessionId);
+    const userEvent = rawV2Fixture({ suffix, marker: '1', sessionId: rawSessionId, role: 'user', actor: 'person', sender: 'person' });
+    const systemEvent = rawV2Fixture({ suffix, marker: '2', sessionId: rawSessionId, role: 'system', actor: 'system', sender: 'system' });
+    const assistantEvent = rawV2Fixture({ suffix, marker: '3', sessionId: rawSessionId, role: 'assistant', actor: 'assistant', sender: 'assistant' });
+    for (const fixture of [userEvent, systemEvent, assistantEvent]) {
+      cleanupContentIds.add(fixture.record.contentId);
+      const result = await catalog.ingestRawEventV2(fixture.record, fixture.raw, { id: `${suffix}-raw-audit-${fixture.record.eventId}`, ts: fixture.record.createdAt, actorTag: fixture.record.ownerTag, action: 'raw_event_ingest', targetId: fixture.record.eventId, details: {} });
+      assert.equal(result.duplicate, false);
+    }
+    const retry = await catalog.ingestRawEventV2(assistantEvent.record, assistantEvent.raw, { id: `${suffix}-raw-audit-retry`, ts: assistantEvent.record.createdAt, actorTag: assistantEvent.record.ownerTag, action: 'raw_event_ingest', targetId: assistantEvent.record.eventId, details: {} });
+    assert.equal(retry.duplicate, true);
+    const persistedEvents = await catalog.listSessionEvents(rawSessionId);
+    assert.equal(persistedEvents.length, 3);
+    assert.equal(new Set(persistedEvents.map(event => event.ownerTag)).size, 3);
+    const rebindings = [
+      rawV2Fixture({ suffix, marker: '4', sessionId: rawSessionId, role: 'assistant', actor: 'assistant', sender: 'assistant', room: 'room-b' }),
+      rawV2Fixture({ suffix, marker: '5', sessionId: rawSessionId, role: 'assistant', actor: 'assistant', sender: 'assistant', conversation: 'conversation-b' }),
+      rawV2Fixture({ suffix, marker: '6', sessionId: rawSessionId, role: 'assistant', actor: 'assistant', sender: 'assistant', thread: 'thread-b' })
+    ];
+    for (const rebound of rebindings) {
+      cleanupContentIds.add(rebound.record.contentId);
+      await assert.rejects(catalog.ingestRawEventV2(rebound.record, rebound.raw, { id: `${suffix}-raw-audit-rebind-${rebound.record.eventId}`, ts: rebound.record.createdAt, actorTag: rebound.record.ownerTag, action: 'raw_event_ingest', targetId: rebound.record.eventId, details: {} }), /raw_session_binding_conflict/);
+    }
 
     // Existing proposal transaction/idempotency baseline.
     const results = await Promise.all(Array.from({ length: 8 }, (_, index) => catalog.enqueueProposalWithRaw({ ...record, id: `${record.id}-${index}` }, raw)));
@@ -149,6 +218,11 @@ test('real PostgreSQL catalog integration in an explicitly isolated test databas
         cleanupClient = await catalog.pool.connect();
         await cleanupClient.query('BEGIN');
         await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.curator_receipt_state_v1 WHERE proposal_id LIKE $1`, values: [`%${suffix}%`] });
+        await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.audit_events_v2 WHERE id LIKE $1`, values: [`${suffix}-%`] });
+        await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.logical_message_aliases_v2 WHERE logical_message_id IN (SELECT logical_message_id FROM agent_memory_fabric.raw_events_v2 WHERE session_id = ANY($1::text[]))`, values: [[...cleanupSessionIds]] });
+        await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.logical_messages_v2 WHERE logical_message_id IN (SELECT logical_message_id FROM agent_memory_fabric.raw_events_v2 WHERE session_id = ANY($1::text[]))`, values: [[...cleanupSessionIds]] });
+        await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.raw_events_v2 WHERE session_id = ANY($1::text[])`, values: [[...cleanupSessionIds]] });
+        await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.raw_sessions_v1 WHERE session_id = ANY($1::text[])`, values: [[...cleanupSessionIds]] });
         await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.retention_operations_v2 WHERE id LIKE $1`, values: [`${suffix}-%`] });
         await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.retention_tombstones_v2 WHERE content_id = ANY($1::text[])`, values: [ids] });
         await cleanupClient.query({ text: `DELETE FROM agent_memory_fabric.raw_retention_v2 WHERE content_id = ANY($1::text[])`, values: [ids] });

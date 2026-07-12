@@ -29,6 +29,18 @@ Logical-message derivation requires either the native platform message tuple or
 a durable delivery correlation id. Timestamp, role and content similarity are
 never accepted as strong coalescing evidence.
 
+## Session binding
+
+`contextTags` is event metadata, not a session-wide identity tuple. The persisted
+v2 session binding is the exact normalized subset `conversation`, `room` and
+`thread`; `conversation` is required and the other two keys are optional. Runtime
+and `conversationKind` are also invariant. A change to any present binding key is
+rejected fail-closed as `raw_session_binding_conflict`.
+
+`actor`, `sender`, `person` and `relationship` are deliberately excluded. They can
+change across `session_meta`, system, user, tool and assistant observations in the
+same native session. Their opaque values remain on the individual event projection.
+
 ## Readiness contract
 
 `GET /v2/status` returns the capability at exactly:
@@ -47,9 +59,10 @@ never accepted as strong coalescing evidence.
 
 Adapters and rollout automation must read that path. Readiness is false until
 v1 writes are disabled and the production PostgreSQL catalog has persisted a
-schema-v5 migration proof containing v1/v2/alias counts, zero orphan aliases,
+schema-v7 migration proof containing v1/v2/alias counts, zero orphan aliases,
 zero forbidden legacy fields, and a database-side scan proving that every
-context value is an opaque HMAC tag. Memory and SQLite catalogs remain useful
+context value is an opaque HMAC tag. Every v2 session binding is also parsed and
+validated before readiness can become true. Memory and SQLite catalogs remain useful
 for tests but deliberately report `production_postgres_required`; validating
 an in-memory JSON object is never production readiness. General service health
 does not override this gate.
