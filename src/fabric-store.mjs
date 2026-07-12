@@ -36,6 +36,10 @@ function canonicalJson(value) {
   return JSON.stringify(value);
 }
 
+function canonicalDigest(value) {
+  return crypto.createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex');
+}
+
 const DIRECTORY_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0) | (fs.constants.O_NOFOLLOW || 0);
 const READ_NOFOLLOW_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
 
@@ -431,6 +435,16 @@ export class MemoryCatalog {
     return { record: this.proposals.get(record.id), duplicate: false };
   }
   getProposal(id) { return this.proposals.get(id) || null; }
+  listProposals({ statuses, scopeTags = null, after = null, limit }) {
+    const allowedStatuses = new Set(statuses);
+    const allowedScopes = scopeTags ? new Set(scopeTags) : null;
+    return [...this.proposals.values()]
+      .filter(row => allowedStatuses.has(row.status) && (!allowedScopes || allowedScopes.has(row.scopeTag)))
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+      .filter(row => !after || row.createdAt > after.createdAt || (row.createdAt === after.createdAt && row.id > after.id))
+      .slice(0, limit)
+      .map(row => ({ ...row }));
+  }
   recallItemActive(refs, scopeTags) {
     const allowed = new Set(scopeTags);
     if (refs.proposalId) {
@@ -453,6 +467,9 @@ export class MemoryCatalog {
     const proposal = this.proposals.get(receipt.proposalId);
     if (!proposal) throw createError('receipt_proposal_unverified', 409);
     if (receipt.kind === 'decision') {
+      if (['rejected', 'revoked'].includes(proposal.status) && (!current?.decision || canonicalJson(current.decision) !== canonicalJson(receipt))) {
+        throw createError('receipt_transition_invalid', 409);
+      }
       if (current?.decision) {
         if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
         this.auditEvents.push({ ...auditEvent, outcome: 'duplicate' });
@@ -856,6 +873,9 @@ export class SqliteCatalog {
       const current = this.getCuratorReceipt(receipt.proposalId);
       let duplicate = false;
       if (receipt.kind === 'decision') {
+        if (['rejected', 'revoked'].includes(proposal.status) && (!current?.decision || canonicalJson(current.decision) !== canonicalJson(receipt))) {
+          throw createError('receipt_transition_invalid', 409);
+        }
         if (current) {
           if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
           duplicate = true;
@@ -996,6 +1016,14 @@ export class SqliteCatalog {
     return this.insertBoth(record, rawRecord);
   }
   getProposal(id) { return this.mapProposal(this.selectProposal.get(id)); }
+  listProposals({ statuses, scopeTags = null, after = null, limit }) {
+    const statusPlaceholders = statuses.map(() => '?').join(',');
+    const scopeClause = scopeTags ? ` AND scope_tag IN (${scopeTags.map(() => '?').join(',')})` : '';
+    const afterClause = after ? ' AND (created_at > ? OR (created_at = ? AND id > ?))' : '';
+    const sql = `SELECT * FROM fabric_proposals WHERE status IN (${statusPlaceholders})${scopeClause}${afterClause} ORDER BY created_at,id LIMIT ?`;
+    const args = [...statuses, ...(scopeTags || []), ...(after ? [after.createdAt, after.createdAt, after.id] : []), limit];
+    return this.db.prepare(sql).all(...args).map(row => this.mapProposal(row));
+  }
   recallItemActive(refs, scopeTags) {
     if (refs.proposalId) {
       const row = this.selectProposal.get(refs.proposalId);
@@ -1606,6 +1634,23 @@ export class PostgresCatalog {
     return mapPostgresProposal(result.rows[0]);
   }
 
+  async listProposals({ statuses, scopeTags = null, after = null, limit }) {
+    await this.ready();
+    const values = [statuses];
+    let where = 'status = ANY($1::text[])';
+    if (scopeTags) { values.push(scopeTags); where += ` AND scope_tag = ANY($${values.length}::text[])`; }
+    if (after) {
+      values.push(after.createdAt, after.id);
+      where += ` AND (created_at > $${values.length - 1} OR (created_at = $${values.length - 1} AND id > $${values.length}))`;
+    }
+    values.push(limit);
+    const result = await this._query(this.pool,
+      `SELECT * FROM ${POSTGRES_SCHEMA}.fabric_proposals WHERE ${where} ORDER BY created_at,id LIMIT $${values.length}`,
+      values
+    );
+    return result.rows.map(mapPostgresProposal);
+  }
+
   async ingestRawEvent(record, rawRecord, auditEvent) {
     await this.ready();
     const client = await this._connect();
@@ -1848,6 +1893,9 @@ export class PostgresCatalog {
       const current = await this.getCuratorReceipt(receipt.proposalId, client);
       let duplicate = false;
       if (receipt.kind === 'decision') {
+        if (['rejected', 'revoked'].includes(proposal.rows[0].status) && (!current?.decision || canonicalJson(current.decision) !== canonicalJson(receipt))) {
+          throw createError('receipt_transition_invalid', 409);
+        }
         if (current) {
           if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
           duplicate = true;
@@ -2241,7 +2289,39 @@ export class FabricStore {
     if (this.rawStore.opaqueTag('owner', payload.actor, record.ownerTag.split(':', 1)[0]) !== record.ownerTag || this.rawStore.opaqueTag('scope', payload.scope, record.scopeTag.split(':', 1)[0]) !== record.scopeTag) {
       throw createError('catalog_binding_mismatch', 500);
     }
-    return { id: record.id, status: record.status, contentId: record.contentId, scope: payload.scope, createdAt: record.createdAt, payload };
+    return { id: record.id, status: record.status, contentId: record.contentId, scope: payload.scope, createdAt: record.createdAt, payload, proposalDigest: canonicalDigest(payload) };
+  }
+
+  async readProposalForReceiptAuthorized(receipt, { actor, allowedScopes = [], allowAll = false }) {
+    const record = await this._catalogOperation(() => this.catalog.getProposal(receipt.proposalId));
+    const scopeTags = new Set(allowedScopes.flatMap(scope => this.rawStore.opaqueTags('scope', scope)));
+    const receiptScopeTags = new Set(this.rawStore.opaqueTags('scope', receipt.proposalScope));
+    if (!record || (!allowAll && !scopeTags.has(record.scopeTag)) || !receiptScopeTags.has(record.scopeTag)) throw createError('memory_not_found', 404);
+    if (['rejected', 'revoked'].includes(record.status)) {
+      const current = await this._catalogOperation(() => this.catalog.getCuratorReceipt(receipt.proposalId));
+      if (receipt.kind === 'decision' && current?.decision && canonicalJson(current.decision) === canonicalJson(receipt)) {
+        return { id: record.id, status: record.status, scope: receipt.proposalScope, proposalDigest: receipt.proposalDigest, terminalReplay: true };
+      }
+      throw createError('receipt_transition_invalid', 409);
+    }
+    const payload = await this.rawStore.get(record.contentId);
+    if (this.rawStore.opaqueTag('owner', payload.actor, record.ownerTag.split(':', 1)[0]) !== record.ownerTag
+        || this.rawStore.opaqueTag('scope', payload.scope, record.scopeTag.split(':', 1)[0]) !== record.scopeTag) throw createError('catalog_binding_mismatch', 500);
+    return { id: record.id, status: record.status, contentId: record.contentId, scope: payload.scope, createdAt: record.createdAt, payload, proposalDigest: canonicalDigest(payload) };
+  }
+
+  async listProposalsForCuration({ statuses = ['queued'], after = null, limit = 50 }, { allowedScopes = [], allowAll = false }) {
+    if (!Array.isArray(statuses) || statuses.length < 1 || statuses.some(status => !['queued', 'review', 'promoted', 'rejected', 'revoked'].includes(status))) throw createError('invalid_request', 400);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw createError('invalid_request', 400);
+    if (after && (typeof after.createdAt !== 'string' || !Number.isFinite(Date.parse(after.createdAt)) || typeof after.id !== 'string' || after.id.length < 1 || after.id.length > 128)) throw createError('invalid_request', 400);
+    const scopeTags = allowAll ? null : allowedScopes.flatMap(scope => this.rawStore.opaqueTags('scope', scope));
+    const rows = await this._catalogOperation(() => this.catalog.listProposals({ statuses: [...new Set(statuses)], scopeTags, after, limit: limit + 1 }));
+    const page = rows.slice(0, limit);
+    const tail = page.at(-1);
+    return {
+      items: page.map(row => ({ proposalId: row.id, status: row.status, createdAt: row.createdAt })),
+      next: rows.length > limit && tail ? { createdAt: tail.createdAt, id: tail.id } : null
+    };
   }
 
   async getProposalStatusAuthorized(id, { actor, allowedScopes = [], allowAll = false }) {
@@ -2255,8 +2335,9 @@ export class FabricStore {
 
   async readProposal(id) { return this.readProposalAuthorized(id, { actor: '', allowAll: true }); }
 
-  async assertPromotionEligible(proposalId, { actor = 'curator', requestId = null } = {}) {
-    const proposal = await this.readProposal(proposalId);
+  async assertPromotionEligible(proposalId, { actor = 'curator', requestId = null, authorization = null } = {}) {
+    if (!authorization) throw createError('memory_not_found', 404);
+    const proposal = await this.readProposalAuthorized(proposalId, authorization);
     const eventIds = proposal?.payload?.record?.provenance?.map(item => item.eventId).filter(id => /^evt_[a-f0-9]{64}$/.test(String(id))) || [];
     for (const eventId of eventIds) {
       const event = await this._catalogOperation(() => this.catalog.getRawEvent(eventId));
@@ -2762,7 +2843,7 @@ export class FabricStore {
 export function createUnconfiguredFabricStore(reason = 'raw_encryption_key_required') {
   const unavailable = async () => { throw createError('fabric_store_unconfigured', 503); };
   const rawUnavailable = async () => { throw createError('raw_ingest_unconfigured', 503); };
-  return { configured: false, reason, propose: unavailable, ingestRawEvent: rawUnavailable, createIdentity: unavailable, mergeIdentity: unavailable, splitIdentity: unavailable, readIdentityAuthorized: unavailable, planRetention: unavailable, applyRetention: unavailable, readProposalAuthorized: unavailable, getProposalStatusAuthorized: unavailable, readProposal: unavailable, createSessionReader() { return null; }, async filterRecallItems() { return []; }, async audit() {}, async ready() {}, async close() {}, status() { return { configured: false }; } };
+  return { configured: false, reason, propose: unavailable, ingestRawEvent: rawUnavailable, createIdentity: unavailable, mergeIdentity: unavailable, splitIdentity: unavailable, readIdentityAuthorized: unavailable, planRetention: unavailable, applyRetention: unavailable, readProposalAuthorized: unavailable, readProposalForReceiptAuthorized: unavailable, getProposalStatusAuthorized: unavailable, readProposal: unavailable, createSessionReader() { return null; }, async filterRecallItems() { return []; }, async audit() {}, async ready() {}, async close() {}, status() { return { configured: false }; } };
 }
 
 function loadLifecyclePolicies(env) {

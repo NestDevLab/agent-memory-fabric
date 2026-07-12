@@ -8,8 +8,8 @@ import { normalizeOpaqueTagMap } from './access-contract.mjs';
 const ACTIVE = new Set(['active']);
 const DECISION_STATUSES = new Set(['review_required', 'approved_pending_apply', 'rejected']);
 const RECEIPT_FIELDS = {
-  decision: ['kind', 'proposalId', 'decisionId', 'status', 'decisionDigest', 'proposalDigest', 'policyDigest', 'timestamp'],
-  apply: ['kind', 'proposalId', 'decisionId', 'decisionDigest', 'policyDigestAtApply', 'canonicalRecordId', 'revision', 'canonicalLifecycleAtDecision', 'proposalDigest', 'archiveDigest', 'targetDigest', 'timestamp']
+  decision: ['kind', 'proposalId', 'proposalScope', 'decisionId', 'status', 'decisionDigest', 'proposalDigest', 'policyDigest', 'timestamp'],
+  apply: ['kind', 'proposalId', 'proposalScope', 'decisionId', 'decisionDigest', 'policyDigestAtApply', 'canonicalRecordId', 'revision', 'canonicalLifecycleAtDecision', 'proposalDigest', 'archiveDigest', 'targetDigest', 'timestamp']
 };
 
 function canonicalJson(value) {
@@ -26,6 +26,93 @@ function digest(value) { return crypto.createHash('sha256').update(canonicalJson
 function validDigest(value) { return /^[a-f0-9]{64}$/.test(String(value || '')); }
 function validTimestamp(value) { return typeof value === 'string' && Number.isFinite(Date.parse(value)); }
 
+const CONTEXT_REF_KEYS = new Set(['conversation', 'room', 'person', 'relationship', 'thread']);
+
+function secureJsonFile(filename, label) {
+  const absolute = path.resolve(filename);
+  const parent = path.dirname(absolute);
+  const basename = path.basename(absolute);
+  let parentFd; let fd;
+  try {
+    parentFd = fs.openSync(parent, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0) | (fs.constants.O_NOFOLLOW || 0));
+    const parentStat = fs.fstatSync(parentFd);
+    const parentHandle = `/proc/self/fd/${parentFd}`;
+    if (!parentStat.isDirectory() || (parentStat.mode & 0o022) !== 0
+        || (typeof process.geteuid === 'function' && parentStat.uid !== process.geteuid())
+        || fs.realpathSync(parentHandle) !== parent) throw new Error('unsafe_parent');
+    fd = fs.openSync(`${parentHandle}/${basename}`, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600
+        || (typeof process.geteuid === 'function' && stat.uid !== process.geteuid())) throw new Error('unsafe_file');
+    if (stat.size < 2 || stat.size > 8 * 1024 * 1024) throw new Error('unsafe_size');
+    return JSON.parse(fs.readFileSync(fd, 'utf8'));
+  } catch {
+    throw new Error(`${label}_invalid`);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    if (parentFd !== undefined) fs.closeSync(parentFd);
+  }
+}
+
+function normalizeRoutingKeyRing(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+      || typeof value.currentKeyVersion !== 'string' || !value.keys || typeof value.keys !== 'object' || Array.isArray(value.keys)) throw new Error('pam_routing_key_ring_invalid');
+  const keys = new Map();
+  for (const [version, encoded] of Object.entries(value.keys)) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(version) || typeof encoded !== 'string' || !/^[A-Za-z0-9+/]{43}=$/.test(encoded)) throw new Error('pam_routing_key_ring_invalid');
+    const key = Buffer.from(encoded, 'base64');
+    if (key.length !== 32 || key.toString('base64') !== encoded) throw new Error('pam_routing_key_ring_invalid');
+    keys.set(version, key);
+  }
+  if (!keys.has(value.currentKeyVersion)) throw new Error('pam_routing_key_ring_invalid');
+  return { currentKeyVersion: value.currentKeyVersion, keys };
+}
+
+function normalizeContextRefs(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('pam_record_index_invalid');
+  const result = {};
+  for (const key of Object.keys(value).sort()) {
+    const refs = value[key];
+    if (!CONTEXT_REF_KEYS.has(key) || !Array.isArray(refs) || refs.length < 1
+        || refs.some(ref => typeof ref !== 'string' || ref.length < 1 || ref.length > 256 || /[\r\n\0]/.test(ref))) throw new Error('pam_record_index_invalid');
+    const normalized = [...new Set(refs)].sort();
+    if (canonicalJson(normalized) !== canonicalJson(refs)) throw new Error('pam_record_index_invalid');
+    result[key] = normalized;
+  }
+  if (!Object.keys(result).length) throw new Error('pam_record_index_invalid');
+  return result;
+}
+
+function deriveContextTags(refs, routingKeys) {
+  if (!routingKeys) throw new Error('pam_routing_key_ring_unconfigured');
+  const tags = {};
+  for (const [namespace, literals] of Object.entries(normalizeContextRefs(refs))) {
+    tags[namespace] = [...routingKeys.keys.entries()].flatMap(([version, key]) => literals.map(literal => {
+      const digestValue = crypto.createHmac('sha256', key).update(canonicalJson([namespace, literal]), 'utf8').digest('hex');
+      return `hmac-sha256:${version}:${digestValue}`;
+    })).sort();
+  }
+  return normalizeOpaqueTagMap(tags);
+}
+
+function normalizeRecordIndex(value, routingKeys, { allowLegacyContextTags = false } = {}) {
+  if (!value?.records || typeof value.records !== 'object' || Array.isArray(value.records)) throw new Error('pam_record_index_invalid');
+  const records = {};
+  for (const [id, input] of Object.entries(value.records)) {
+    if (!input || typeof input !== 'object' || Array.isArray(input) || typeof input.path !== 'string' || typeof input.scope !== 'string'
+        || path.isAbsolute(input.path) || input.path.split(/[\\/]/).includes('..')) throw new Error('pam_record_index_invalid');
+    const allowed = new Set(['path', 'scope', 'contextRefs', 'contextTags']);
+    if (Object.keys(input).some(key => !allowed.has(key)) || (input.contextRefs && input.contextTags)) throw new Error('pam_record_index_invalid');
+    const entry = { path: input.path, scope: input.scope };
+    if (input.contextRefs) { entry.contextRefs = normalizeContextRefs(input.contextRefs); entry.contextTags = deriveContextTags(entry.contextRefs, routingKeys); }
+    else if (input.contextTags && allowLegacyContextTags) entry.contextTags = normalizeOpaqueTagMap(input.contextTags);
+    else if (input.contextTags) throw new Error('pam_record_index_legacy_context_tags_forbidden');
+    if (/^(?:person|relationship|room):/.test(input.scope) && !input.contextRefs && !(allowLegacyContextTags && input.contextTags)) throw new Error('pam_record_index_sensitive_context_refs_required');
+    records[id] = entry;
+  }
+  return { records };
+}
+
 function decodeCursor(cursor, binding) {
   if (!cursor) return 0;
   if (typeof cursor !== 'string' || !cursor.startsWith('amf-cur-v1.')) throw Object.assign(new Error('invalid_request'), { status: 400 });
@@ -40,10 +127,11 @@ function encodeCursor(offset, binding) { return `amf-cur-v1.${Buffer.from(JSON.s
 export function validateCuratorReceipt(receipt) {
   const fields = RECEIPT_FIELDS[receipt?.kind];
   if (!fields || !exactFields(receipt, fields)) throw new Error('receipt_invalid');
-  if (!receipt.proposalId || !receipt.decisionId || !validTimestamp(receipt.timestamp)) throw new Error('receipt_invalid');
+  if (!receipt.proposalId || !receipt.decisionId || typeof receipt.proposalScope !== 'string' || receipt.proposalScope.length < 3
+      || receipt.proposalScope.length > 256 || /[\r\n\0]/.test(receipt.proposalScope) || !validTimestamp(receipt.timestamp)) throw new Error('receipt_invalid');
   if (receipt.kind === 'decision') {
     if (!DECISION_STATUSES.has(receipt.status) || ![receipt.decisionDigest, receipt.proposalDigest, receipt.policyDigest].every(validDigest)) throw new Error('receipt_invalid');
-    if (receipt.decisionDigest !== digest({ proposalId: receipt.proposalId, decisionId: receipt.decisionId, status: receipt.status, proposalDigest: receipt.proposalDigest, policyDigest: receipt.policyDigest })) throw new Error('receipt_invalid');
+    if (receipt.decisionDigest !== digest({ proposalId: receipt.proposalId, proposalScope: receipt.proposalScope, decisionId: receipt.decisionId, status: receipt.status, proposalDigest: receipt.proposalDigest, policyDigest: receipt.policyDigest })) throw new Error('receipt_invalid');
   } else if (!receipt.canonicalRecordId || !Number.isSafeInteger(receipt.revision) || receipt.revision < 1 || !['active', 'superseded', 'revoked', 'expired'].includes(receipt.canonicalLifecycleAtDecision) || ![receipt.decisionDigest, receipt.policyDigestAtApply, receipt.proposalDigest, receipt.archiveDigest, receipt.targetDigest].every(validDigest)) throw new Error('receipt_invalid');
   return structuredClone(receipt);
 }
@@ -86,17 +174,20 @@ export class CuratorReceiptCoordinator {
   constructor({ ledger, canonicalStore, proposalStore = null }) { this.ledger = ledger; this.canonicalStore = canonicalStore; this.proposalStore = proposalStore; }
   async record(receipt, context = {}) {
     const valid = validateCuratorReceipt(receipt);
+    const authorization = context.authorization;
+    if (!authorization || typeof this.proposalStore?.readProposalForReceiptAuthorized !== 'function') throw new Error('memory_not_found');
+    const proposal = await this.proposalStore.readProposalForReceiptAuthorized(valid, authorization);
+    if (proposal?.terminalReplay === true) return this.ledger.recordDecision(valid, context);
+    if (!proposal?.payload || proposal.scope !== valid.proposalScope || digest(proposal.payload) !== valid.proposalDigest) throw new Error('memory_not_found');
     if (valid.kind === 'decision') {
-      if (this.proposalStore) {
-        const proposal = await this.proposalStore.readProposal(valid.proposalId);
-        if (!proposal?.payload || digest(proposal.payload) !== valid.proposalDigest) throw new Error('receipt_proposal_unverified');
-      }
       return this.ledger.recordDecision(valid, context);
     }
     const current = await this.ledger.get(valid.proposalId);
-    if (!current?.decision || current.decision.decisionId !== valid.decisionId || current.decision.decisionDigest !== valid.decisionDigest || current.decision.proposalDigest !== valid.proposalDigest || current.decision.policyDigest !== valid.policyDigestAtApply) throw new Error('receipt_transition_invalid');
+    if (!current?.decision || current.decision.decisionId !== valid.decisionId || current.decision.decisionDigest !== valid.decisionDigest
+        || current.decision.proposalScope !== valid.proposalScope || current.decision.proposalDigest !== valid.proposalDigest
+        || current.decision.policyDigest !== valid.policyDigestAtApply) throw new Error('receipt_transition_invalid');
     if (typeof this.proposalStore?.assertPromotionEligible !== 'function') throw new Error('canonical_apply_unverified');
-    await this.proposalStore.assertPromotionEligible(valid.proposalId, context);
+    await this.proposalStore.assertPromotionEligible(valid.proposalId, { ...context, authorization });
     const record = await this.canonicalStore.read({ id: valid.canonicalRecordId });
     if (!record || record.id !== valid.canonicalRecordId || record.revision !== valid.revision || record.lifecycle?.status !== valid.canonicalLifecycleAtDecision || digest(record) !== valid.targetDigest) throw new Error('canonical_apply_unverified');
     if (typeof this.canonicalStore.verifyApplyReceipt !== 'function') throw new Error('canonical_apply_unverified');
@@ -163,23 +254,28 @@ export class PamMcpProcessClient {
 }
 
 export class CanonicalPamBridge {
-  constructor({ callTool, index }) {
-    this.callTool = callTool; this.index = index || { records: {} }; this.configured = true;
-    for (const entry of Object.values(this.index.records || {})) if (entry.contextTags) normalizeOpaqueTagMap(entry.contextTags);
+  constructor({ callTool, index, indexPath = null, routingKeys = null, allowLegacyContextTags = false }) {
+    this.callTool = callTool; this.indexPath = indexPath; this.routingKeys = routingKeys; this.allowLegacyContextTags = allowLegacyContextTags;
+    this.index = normalizeRecordIndex(index || { records: {} }, routingKeys, { allowLegacyContextTags }); this.configured = true;
+  }
+  refreshIndex() {
+    if (this.indexPath) this.index = normalizeRecordIndex(secureJsonFile(this.indexPath, 'pam_record_index'), this.routingKeys, { allowLegacyContextTags: this.allowLegacyContextTags });
+    return this.index;
   }
   routingContext(id) {
-    const tags = this.index.records?.[id]?.contextTags;
+    const tags = this.refreshIndex().records?.[id]?.contextTags;
     return tags ? structuredClone(tags) : null;
   }
   async read({ id }) {
-    const entry = this.index.records?.[id];
+    const entry = this.refreshIndex().records?.[id];
     if (!entry?.path) throw Object.assign(new Error('memory_not_found'), { status: 404 });
-    const result = await this.callTool('memory_read', { path: entry.path });
-    const record = result.record || (typeof result.content === 'string' ? JSON.parse(result.content) : null);
+    const result = await this.callTool('memory_record_validate', { path: entry.path });
+    const record = result.status === 'valid' ? result.metadata : null;
     if (!record || record.id !== id || !validateAmfMemoryRecord(record).ok) throw new Error('pam_record_binding_invalid');
     return structuredClone(record);
   }
   async search({ query, scopes, limit = 20, cursor = null, from = null, to = null }) {
+    this.refreshIndex();
     const allowed = new Set(scopes);
     const entries = Object.entries(this.index.records || {}).filter(([, entry]) => allowed.has(entry.scope)).slice(0, 1000);
     const paths = [...new Set(entries.map(([, entry]) => entry.path))];
@@ -214,11 +310,13 @@ export function createCanonicalPamBridgeFromEnv(env = process.env) {
   const workspace = String(env.AMF_PAM_WORKSPACE || '').trim();
   const indexPath = String(env.AMF_PAM_RECORD_INDEX_PATH || '').trim();
   if (!serverPath || !workspace || !indexPath) return createUnconfiguredCanonicalStore();
-  let index;
-  try { index = JSON.parse(fs.readFileSync(path.resolve(indexPath), 'utf8')); } catch { throw new Error('pam_record_index_invalid'); }
-  if (!index?.records || typeof index.records !== 'object') throw new Error('pam_record_index_invalid');
+  const routingPath = String(env.AMF_PAM_ROUTING_KEY_RING_PATH || '').trim();
+  const index = secureJsonFile(indexPath, 'pam_record_index');
+  if (!routingPath) throw new Error('pam_routing_key_ring_unconfigured');
+  const routingKeys = normalizeRoutingKeyRing(secureJsonFile(routingPath, 'pam_routing_key_ring'));
+  const allowLegacyContextTags = String(env.AMF_PAM_ALLOW_LEGACY_CONTEXT_TAGS_SHADOW || '').trim() === 'true';
   const client = new PamMcpProcessClient({ serverPath: path.resolve(serverPath), workspace: path.resolve(workspace) });
-  const bridge = new CanonicalPamBridge({ callTool: client.callTool.bind(client), index });
+  const bridge = new CanonicalPamBridge({ callTool: client.callTool.bind(client), index, indexPath: path.resolve(indexPath), routingKeys, allowLegacyContextTags });
   bridge.kind = 'pam-stdio';
   bridge.close = () => client.close();
   return bridge;

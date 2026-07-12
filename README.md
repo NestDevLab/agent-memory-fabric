@@ -119,6 +119,10 @@ Success uses `{ "ok": true, "data": ..., "meta": ... }`; errors use
 - `POST /v2/ingest/raw-events` (requires `raw:ingest`)
 - `GET /v2/memory/:id` (canonical record, rationale and expected revision)
 - `GET /v2/memory/proposals/:id` (status only; no record decryption)
+- `GET /v2/internal/curation/proposals?status=queued&limit=50&cursor=...`
+  (bounded metadata only; requires `memory:curate`)
+- `GET /v2/internal/curation/proposals/:id` (one proposal and canonical digest;
+  requires `memory:curate` and an audited decrypt intent)
 - `POST /v2/sessions/search` (requires `purpose`)
 - `GET /v2/sessions/:id?purpose=...`
 - `GET /v2/sessions/:id/transcript?purpose=...&view=redacted|original`
@@ -134,6 +138,16 @@ canonical base64, 12-byte IV, 16-byte tag, opaque `kekId`/`keyRef`, and the PAM
 canonical AAD digest. A successful REST or MCP acknowledgement exposes
 `{status,proposalId,duplicate,idempotencyKey}`; the last field is the exact
 authoritative retry key accepted or derived by the Fabric.
+
+Curation cursors bind actor, requested statuses, and the current scope ACL, so
+they cannot cross filters or credentials. Exact payload reads support
+`queued`, `review`, and `promoted` recovery, while rejected/revoked proposals
+return not-found before RAW decryption.
+
+The canonical index hot-reloads from
+`/srv/brain-shared/memory/amf/record-index.json`. PAM writes non-secret
+`contextRefs`; Fabric derives opaque HMAC tags with its dedicated routing key.
+Index and routing-key files must be owner-owned regular mode-`0600` files.
 
 Every memory/session transport, including MCP, errors and status, is private and
 `no-store`. Session calls require one opaque purpose code: `conversation_recall`,

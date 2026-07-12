@@ -25,6 +25,7 @@ class FakePool {
     this.rawObjects = new Map();
     this.proposals = new Map();
     this.proposalsByKey = new Map();
+    this.curatorReceipts = new Map();
     this.auditEvents = new Map();
     this.rawEvents = new Map();
     this.rawSessions = new Map();
@@ -145,6 +146,19 @@ class FakePool {
     if (compact.startsWith('SELECT * FROM agent_memory_fabric.fabric_proposals WHERE id=$1')) {
       return { rows: [this.proposals.get(values[0])].filter(Boolean) };
     }
+    if (compact.startsWith('SELECT * FROM agent_memory_fabric.curator_receipt_state_v1 WHERE proposal_id=$1')) {
+      return { rows: [this.curatorReceipts.get(values[0])].filter(Boolean) };
+    }
+    if (compact.startsWith('INSERT INTO agent_memory_fabric.curator_receipt_state_v1')) {
+      this.curatorReceipts.set(values[0], { proposal_id: values[0], status: values[1], decision_json: JSON.parse(values[2]), apply_json: null });
+      return { rows: [] };
+    }
+    if (compact.startsWith('UPDATE agent_memory_fabric.fabric_proposals SET status=$1')) {
+      const row = this.proposals.get(values[1]); if (row) row.status = values[0]; return { rows: [] };
+    }
+    if (compact.startsWith("UPDATE agent_memory_fabric.fabric_proposals SET status='promoted'")) {
+      const row = this.proposals.get(values[0]); if (row) row.status = 'promoted'; return { rows: [] };
+    }
     if (compact.startsWith('DELETE FROM agent_memory_fabric.raw_objects_v2')) {
       const referenced = [...this.proposals.values()].some((row) => row.content_id === values[0]);
       if (!referenced) this.rawObjects.delete(values[0]);
@@ -246,6 +260,25 @@ test('PostgreSQL proposal transaction resolves concurrent idempotency conflicts 
   await catalog.close();
   await catalog.close();
   assert.equal(pool.endCalls, 1);
+});
+
+test('PostgreSQL receipt transaction preserves rejected/revoked terminal state and permits only identical replay', async () => {
+  const pool = new FakePool(); const catalog = new PostgresCatalog({ pool });
+  const queued = proposal('proposal-terminal-pg', 'c'.repeat(64));
+  await catalog.enqueueProposalWithRaw(queued, raw('c'.repeat(64)));
+  const receipt = {
+    kind: 'decision', proposalId: queued.id, proposalScope: 'shared:global', decisionId: 'decision-terminal-pg', status: 'rejected',
+    decisionDigest: '1'.repeat(64), proposalDigest: '2'.repeat(64), policyDigest: '3'.repeat(64), timestamp: '2026-07-12T12:00:00Z'
+  };
+  const audit = suffix => ({ id: `audit-terminal-${suffix}`, ts: '2026-07-12T12:00:00Z', actorTag: 'actor-tag', action: 'curation_decision_receipt', requestId: suffix, targetId: queued.id, details: {} });
+  pool.proposals.get(queued.id).status = 'revoked';
+  await assert.rejects(catalog.recordCuratorReceipt({ ...receipt, status: 'review_required' }, audit('late')), /receipt_transition_invalid/);
+  assert.equal(pool.proposals.get(queued.id).status, 'revoked');
+  pool.proposals.get(queued.id).status = 'queued';
+  assert.equal((await catalog.recordCuratorReceipt(receipt, audit('first'))).status, 'rejected');
+  pool.proposals.get(queued.id).status = 'revoked';
+  assert.equal((await catalog.recordCuratorReceipt(receipt, audit('replay'))).duplicate, true);
+  assert.equal(pool.proposals.get(queued.id).status, 'revoked');
 });
 
 test('PostgreSQL raw event/session catalog matches SQLite idempotency and safe projection contract', async () => {
