@@ -345,6 +345,43 @@ test('receipt actors cannot advance cross-scope or unknown proposals and receive
   }, { fabricStore: store, receiptCoordinator: coordinator });
 });
 
+test('curation reconcile pages only actor-authorized receipts and binds cursors without cross-scope leaks', async () => {
+  const ledger = new MemoryReceiptLedger();
+  const digest = value => crypto.createHash('sha256').update(canonicalJson(value)).digest('hex');
+  const addPending = (proposalId, proposalScope) => {
+    const base = { proposalId, proposalScope, decisionId: `decision-${proposalId}`, status: 'approved_pending_apply', proposalDigest: digest(`payload-${proposalId}`), policyDigest: digest(`policy-${proposalId}`) };
+    ledger.recordDecision({ kind: 'decision', ...base, decisionDigest: digest(base), timestamp: '2026-07-12T12:00:00Z' });
+  };
+  addPending('proposal-main-a', 'domain:main-lab');
+  addPending('proposal-private-secret', 'domain:tirrenia');
+  addPending('proposal-main-b', 'domain:main-lab');
+  const coordinator = new CuratorReceiptCoordinator({ ledger, canonicalStore: { async read() { throw new Error('not_used'); } } });
+  await withServer(async ({ api }) => {
+    const denied = await api('/v2/internal/curation/reconcile', { method: 'POST', headers: { authorization: 'Bearer curator-token' }, body: '{}' });
+    assert.equal(denied.response.status, 403);
+
+    const first = await api('/v2/internal/curation/reconcile', { method: 'POST', headers: { authorization: 'Bearer applicator-token' }, body: JSON.stringify({ limit: 1 }) });
+    assert.equal(first.response.status, 409); assert.equal(first.body.data.scanned, 1); assert.equal(first.body.data.complete, false);
+    assert.deepEqual(first.body.data.findings, [{ proposalId: 'proposal-main-a', code: 'apply_receipt_pending' }]);
+    assert.equal(typeof first.body.data.nextCursor, 'string');
+    assert.doesNotMatch(JSON.stringify(first.body), /proposal-private-secret|domain:tirrenia/);
+
+    const second = await api('/v2/internal/curation/reconcile', { method: 'POST', headers: { authorization: 'Bearer applicator-token' }, body: JSON.stringify({ limit: 1, cursor: first.body.data.nextCursor }) });
+    assert.deepEqual(second.body.data.findings, [{ proposalId: 'proposal-main-b', code: 'apply_receipt_pending' }]);
+    assert.equal(second.body.data.complete, true); assert.equal(second.body.data.nextCursor, null);
+    assert.doesNotMatch(JSON.stringify(second.body), /proposal-private-secret|domain:tirrenia/);
+
+    const wrongActorCursor = await api('/v2/internal/curation/reconcile', { method: 'POST', body: JSON.stringify({ limit: 1, cursor: first.body.data.nextCursor }) });
+    assert.equal(wrongActorCursor.response.status, 400); assert.equal(wrongActorCursor.body.error.code, 'invalid_request');
+    const all = await api('/v2/internal/curation/reconcile', { method: 'POST', body: JSON.stringify({ limit: 100 }) });
+    assert.deepEqual(all.body.data.findings.map(item => item.proposalId), ['proposal-main-a', 'proposal-main-b', 'proposal-private-secret']);
+    const oversized = await api('/v2/internal/curation/reconcile', { method: 'POST', body: JSON.stringify({ limit: 101 }) });
+    assert.equal(oversized.response.status, 400);
+    const forged = await api('/v2/internal/curation/reconcile', { method: 'POST', headers: { authorization: 'Bearer applicator-token' }, body: JSON.stringify({ cursor: `${first.body.data.nextCursor}x` }) });
+    assert.equal(forged.response.status, 400);
+  }, { receiptCoordinator: coordinator });
+});
+
 test('curation exact read permits retry states but denies terminal rejected/revoked before decrypt', async () => {
   await withServer(async ({ api, fabricStore }) => {
     const ids = [];

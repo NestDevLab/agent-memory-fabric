@@ -7,6 +7,7 @@ import { normalizeOpaqueTagMap } from './access-contract.mjs';
 
 const ACTIVE = new Set(['active']);
 const DECISION_STATUSES = new Set(['review_required', 'approved_pending_apply', 'rejected']);
+const RECONCILE_MAX_PAGE_SIZE = 100;
 const RECEIPT_FIELDS = {
   decision: ['kind', 'proposalId', 'proposalScope', 'decisionId', 'status', 'decisionDigest', 'proposalDigest', 'policyDigest', 'timestamp'],
   apply: ['kind', 'proposalId', 'proposalScope', 'decisionId', 'decisionDigest', 'policyDigestAtApply', 'canonicalRecordId', 'revision', 'canonicalLifecycleAtDecision', 'proposalDigest', 'archiveDigest', 'targetDigest', 'timestamp']
@@ -159,13 +160,21 @@ export class MemoryReceiptLedger {
     current.status = 'promoted'; current.apply = structuredClone(receipt);
     return { ...structuredClone(current), duplicate: false };
   }
-  list() { return [...this.records.values()].map(item => structuredClone(item)); }
+  list({ authorization, offset = 0, limit = RECONCILE_MAX_PAGE_SIZE + 1 } = {}) {
+    const allowed = new Set(authorization?.allowedScopes || []);
+    if (!authorization || typeof authorization.allowAll !== 'boolean' || !Array.isArray(authorization.allowedScopes)) throw new Error('memory_not_found');
+    return [...this.records.values()]
+      .filter(row => authorization.allowAll || allowed.has(row?.decision?.proposalScope))
+      .sort((left, right) => String(left.proposalId).localeCompare(String(right.proposalId)))
+      .slice(offset, offset + limit)
+      .map(item => structuredClone(item));
+  }
 }
 
 export class FabricReceiptLedger {
   constructor({ fabricStore }) { this.fabricStore = fabricStore; }
   get(proposalId) { return this.fabricStore.getCuratorReceipt(proposalId); }
-  list() { return this.fabricStore.listCuratorReceipts(); }
+  list(options) { return this.fabricStore.listCuratorReceiptsAuthorized(options); }
   recordDecision(receipt, context) { return this.fabricStore.recordCuratorReceiptAtomic(receipt, context); }
   recordApply(receipt, context) { return this.fabricStore.recordCuratorReceiptAtomic(receipt, context); }
 }
@@ -195,15 +204,53 @@ export class CuratorReceiptCoordinator {
     if (!verification || verification.verified !== true || verification.archiveDigest !== valid.archiveDigest || verification.targetDigest !== valid.targetDigest || verification.revision !== valid.revision) throw new Error('canonical_apply_unverified');
     return this.ledger.recordApply(valid, context);
   }
-  async reconcile() {
+  async reconcile({ authorization, offset = 0, limit = 50 } = {}) {
+    if (!authorization || typeof authorization.actor !== 'string' || authorization.actor.length < 1 || authorization.actor.length > 192
+        || typeof authorization.allowAll !== 'boolean' || !Array.isArray(authorization.allowedScopes) || authorization.allowedScopes.length > 512
+        || authorization.allowedScopes.some(scope => typeof scope !== 'string' || scope.length < 1 || scope.length > 256 || /[\r\n\0]/.test(scope))
+        || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > RECONCILE_MAX_PAGE_SIZE) {
+      throw Object.assign(new Error('invalid_request'), { status: 400 });
+    }
+    const allowedScopes = new Set(authorization.allowedScopes);
     const findings = [];
-    for (const row of await this.ledger.list()) {
+    let invalidRows = 0;
+    const rows = await this.ledger.list({ authorization, offset, limit: limit + 1 });
+    const page = rows.slice(0, limit);
+    for (const row of page) {
+      let validDecision; let validApply = null;
+      try {
+        validDecision = validateCuratorReceipt(row?.decision);
+        if (typeof row.proposalId !== 'string' || row.proposalId.length < 1 || row.proposalId.length > 128 || /[\r\n\0]/.test(row.proposalId)
+            || row.proposalId !== validDecision.proposalId
+            || !['review_required', 'approved_pending_apply', 'rejected', 'promoted'].includes(row.status)
+            || (row.status === 'promoted' ? validDecision.status !== 'approved_pending_apply' || !row.apply : row.status !== validDecision.status || row.apply)) {
+          throw new Error('receipt_invalid');
+        }
+        if (row.apply) {
+          validApply = validateCuratorReceipt(row.apply);
+          if (validApply.proposalId !== row.proposalId || validApply.proposalScope !== validDecision.proposalScope) throw new Error('receipt_invalid');
+        }
+      } catch {
+        invalidRows += 1;
+        continue;
+      }
+      if (!authorization.allowAll && !allowedScopes.has(validDecision.proposalScope)) continue;
       if (row.status === 'promoted') {
-        try { await this.canonicalStore.read({ id: row.apply.canonicalRecordId }); }
+        try {
+          const target = await this.canonicalStore.read({ id: validApply.canonicalRecordId });
+          if (!target || target.id !== validApply.canonicalRecordId) throw new Error('canonical_target_missing');
+        }
         catch { findings.push({ proposalId: row.proposalId, code: 'canonical_target_missing' }); }
       } else if (row.status === 'approved_pending_apply') findings.push({ proposalId: row.proposalId, code: 'apply_receipt_pending' });
     }
-    return { ok: findings.length === 0, findings };
+    if (invalidRows) findings.push({ code: 'receipt_binding_invalid', count: invalidRows });
+    return {
+      ok: findings.length === 0,
+      findings,
+      scanned: page.length,
+      complete: rows.length <= limit,
+      nextOffset: rows.length > limit ? offset + page.length : null
+    };
   }
 }
 

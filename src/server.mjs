@@ -197,6 +197,35 @@ function encodeCurationCursor(value, binding, key) {
   return Buffer.from(JSON.stringify({ ...payload, mac: curationCursorMac(key, payload) }), 'utf8').toString('base64url');
 }
 
+function reconcileCursorMac(key, value) {
+  return crypto.createHmac('sha256', key).update(JSON.stringify({ offset: value.offset, binding: value.binding }), 'utf8').digest('hex');
+}
+
+function decodeReconcileCursor(cursor, binding, key) {
+  if (!cursor) return 0;
+  try {
+    if (typeof cursor !== 'string' || cursor.length > 2048) throw new Error('invalid');
+    const decoded = Buffer.from(cursor, 'base64url');
+    if (decoded.toString('base64url') !== cursor) throw new Error('invalid');
+    const parsed = JSON.parse(decoded.toString('utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+        || Object.keys(parsed).sort().join(',') !== 'binding,mac,offset'
+        || parsed.binding !== binding || !Number.isSafeInteger(parsed.offset) || parsed.offset < 0
+        || !/^[a-f0-9]{64}$/.test(String(parsed.mac || ''))) throw new Error('invalid');
+    const expected = reconcileCursorMac(key, parsed);
+    if (!crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(parsed.mac, 'hex'))) throw new Error('invalid');
+    return parsed.offset;
+  } catch {
+    throw Object.assign(new Error('invalid_request'), { status: 400 });
+  }
+}
+
+function encodeReconcileCursor(offset, binding, key) {
+  if (offset === null) return null;
+  const payload = { offset, binding };
+  return Buffer.from(JSON.stringify({ ...payload, mac: reconcileCursorMac(key, payload) }), 'utf8').toString('base64url');
+}
+
 function curationCursorBinding(actor, statuses, authorization) {
   const value = {
     actor,
@@ -1616,9 +1645,17 @@ const requestHandler = async (req, res) => {
     try {
       requirePermission(policy, 'memory:apply-receipt');
       if (!receiptCoordinator) throw Object.assign(new Error('service_unavailable'), { status: 503 });
-      const result = await receiptCoordinator.reconcile();
+      const body = await parseBody(req);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !['cursor', 'limit'].includes(key))) throw Object.assign(new Error('invalid_request'), { status: 400 });
+      const limit = body.limit === undefined ? 50 : body.limit;
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100
+          || (body.cursor !== undefined && (typeof body.cursor !== 'string' || body.cursor.length < 1 || body.cursor.length > 2048))) throw Object.assign(new Error('invalid_request'), { status: 400 });
+      const authorization = authorizationFor(actor, policy, policies);
+      const binding = curationCursorBinding(actor, ['reconcile'], authorization);
+      const result = await receiptCoordinator.reconcile({ authorization, offset: decodeReconcileCursor(body.cursor, binding, curationCursorKey), limit });
+      const response = { ok: result.ok, findings: result.findings, scanned: result.scanned, complete: result.complete, nextCursor: encodeReconcileCursor(result.nextOffset, binding, curationCursorKey) };
       await auditRequired(fabricStore, { actor, action: 'curation_reconcile', outcome: result.ok ? 'clean' : 'findings', requestId, details: { resultCount: result.findings.length } });
-      return jsonNoStore(res, result.ok ? 200 : 409, v2Envelope(requestId, result));
+      return jsonNoStore(res, result.ok ? 200 : 409, v2Envelope(requestId, response));
     } catch (error) {
       const reported = await auditInternalFailure(fabricStore, { actor, action: 'curation_reconcile', requestId, error });
       const failure = v2Error(requestId, reported, 500);

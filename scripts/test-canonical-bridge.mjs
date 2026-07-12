@@ -122,9 +122,63 @@ test('decision and apply receipts are strict, monotonic, idempotent and verify c
   };
   assert.equal((await coordinator.record(apply, { authorization })).status, 'promoted');
   assert.equal((await coordinator.record(apply, { authorization })).duplicate, true);
-  assert.deepEqual(await coordinator.reconcile(), { ok: true, findings: [] });
+  assert.deepEqual(await coordinator.reconcile({ authorization }), { ok: true, findings: [], scanned: 1, complete: true, nextOffset: null });
   await assert.rejects(coordinator.record({ ...apply, proposalId: 'unknown' }, { authorization }), /memory_not_found/);
   await assert.rejects(coordinator.record({ ...apply, revision: 3 }, { authorization }), /canonical_apply_unverified|receipt_conflict/);
+});
+
+test('receipt reconciliation is authorization-scoped, bounded and fail-closed', async () => {
+  const ledger = new MemoryReceiptLedger();
+  const makeDecision = (proposalId, proposalScope) => {
+    const base = { proposalId, proposalScope, decisionId: `decision-${proposalId}`, status: 'approved_pending_apply', proposalDigest: sha(`payload-${proposalId}`), policyDigest: sha(`policy-${proposalId}`) };
+    return { kind: 'decision', ...base, decisionDigest: sha(base), timestamp };
+  };
+  for (const [id, scope] of [['allowed-a', 'room:allowed'], ['denied', 'person:private'], ['allowed-b', 'room:allowed']]) ledger.recordDecision(makeDecision(id, scope));
+  const coordinator = new CuratorReceiptCoordinator({ ledger, canonicalStore: { async read() { throw new Error('not_used'); } } });
+  await assert.rejects(coordinator.reconcile(), /invalid_request/);
+  const scoped = { actor: 'applicator', allowAll: false, allowedScopes: ['room:allowed'] };
+  const first = await coordinator.reconcile({ authorization: scoped, limit: 1 });
+  assert.deepEqual(first.findings, [{ proposalId: 'allowed-a', code: 'apply_receipt_pending' }]);
+  assert.equal(first.scanned, 1); assert.equal(first.complete, false); assert.equal(first.nextOffset, 1);
+  const second = await coordinator.reconcile({ authorization: scoped, offset: first.nextOffset, limit: 1 });
+  assert.deepEqual(second.findings, [{ proposalId: 'allowed-b', code: 'apply_receipt_pending' }]);
+  assert.equal(second.complete, true); assert.equal(second.nextOffset, null);
+  assert.doesNotMatch(JSON.stringify([first, second]), /denied|person:private/);
+  const all = await coordinator.reconcile({ authorization: { actor: 'admin', allowAll: true, allowedScopes: [] }, limit: 100 });
+  assert.deepEqual(all.findings.map(item => item.proposalId), ['allowed-a', 'allowed-b', 'denied']);
+  await assert.rejects(coordinator.reconcile({ authorization: scoped, limit: 101 }), /invalid_request/);
+
+  ledger.records.set('corrupt-private-id', { proposalId: 'corrupt-private-id', status: 'approved_pending_apply', decision: { proposalScope: 'person:private' }, apply: null });
+  const corruptScoped = await coordinator.reconcile({ authorization: scoped, limit: 100 });
+  assert.doesNotMatch(JSON.stringify(corruptScoped), /corrupt-private-id|person:private/);
+  const corruptAll = await coordinator.reconcile({ authorization: { actor: 'admin', allowAll: true, allowedScopes: [] }, limit: 100 });
+  assert.ok(corruptAll.findings.some(item => item.code === 'receipt_binding_invalid' && item.count === 1));
+  assert.doesNotMatch(JSON.stringify(corruptAll.findings), /corrupt-private-id|person:private/);
+});
+
+test('Fabric receipt reconciliation applies scope filtering before pagination in memory and SQLite catalogs', async () => {
+  for (const kind of ['memory', 'sqlite']) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `amf-reconcile-${kind}-`));
+    const catalog = kind === 'memory' ? new MemoryCatalog() : new SqliteCatalog({ databasePath: path.join(root, 'fabric.sqlite') });
+    const store = new FabricStore({ rawStore: new MemoryRawStore({ encryptionKey: Buffer.alloc(32, 19).toString('base64') }), catalog });
+    const coordinator = new CuratorReceiptCoordinator({ ledger: new FabricReceiptLedger({ fabricStore: store }), proposalStore: store, canonicalStore: { async read() { throw new Error('not_used'); } } });
+    const admin = { actor: 'admin', allowAll: true, allowedScopes: [] };
+    try {
+      for (const [scope, suffix] of [['room:allowed', 'allowed'], ['person:private', 'private']]) {
+        const canonical = record({ id: `mem_${suffix.padEnd(8, '0')}-1111-4111-8111-111111111111`, scope: { type: scope.split(':')[0], id: scope } });
+        const proposal = await store.propose({ actor: 'curator', scope, record: canonical, rationale: 'scope filter', expectedRevision: canonical.revision - 1, idempotencyKey: `${kind}-${suffix}-reconcile` });
+        const persisted = await store.readProposal(proposal.id);
+        const base = { proposalId: proposal.id, proposalScope: scope, decisionId: `decision-${kind}-${suffix}`, status: 'approved_pending_apply', proposalDigest: sha(persisted.payload), policyDigest: sha(`${kind}-${suffix}-policy`) };
+        await coordinator.record({ kind: 'decision', ...base, decisionDigest: sha(base), timestamp }, { actor: 'admin', requestId: `request-${suffix}`, authorization: admin });
+      }
+      const scoped = await coordinator.reconcile({ authorization: { actor: 'applicator', allowAll: false, allowedScopes: ['room:allowed'] }, limit: 1 });
+      assert.equal(scoped.scanned, 1); assert.equal(scoped.nextOffset, null);
+      assert.equal(scoped.findings.length, 1); assert.equal(scoped.findings[0].code, 'apply_receipt_pending');
+      assert.doesNotMatch(JSON.stringify(scoped), /person:private/);
+      const all = await coordinator.reconcile({ authorization: admin, limit: 1 });
+      assert.equal(all.scanned, 1); assert.equal(all.nextOffset, 1, `${kind} allow_all page must remain bounded`);
+    } finally { await store.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  }
 });
 
 test('Fabric receipt transaction advances ledger, proposal and audit together and rolls back on audit outage', async () => {

@@ -123,6 +123,10 @@ Success uses `{ "ok": true, "data": ..., "meta": ... }`; errors use
   (bounded metadata only; requires `memory:curate`)
 - `GET /v2/internal/curation/proposals/:id` (one proposal and canonical digest;
   requires `memory:curate` and an audited decrypt intent)
+- `POST /v2/internal/curation/receipts` (scope-bound decision/apply receipt)
+- `POST /v2/internal/curation/reconcile` with `{limit?,cursor?}` (actor-scoped,
+  bounded receipt reconciliation; requires `memory:apply-receipt`; `allow_all`
+  remains an explicit administrative policy mode)
 - `POST /v2/sessions/search` (requires `purpose`)
 - `GET /v2/sessions/:id?purpose=...`
 - `GET /v2/sessions/:id/transcript?purpose=...&view=redacted|original`

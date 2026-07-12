@@ -149,6 +149,20 @@ class FakePool {
     if (compact.startsWith('SELECT * FROM agent_memory_fabric.curator_receipt_state_v1 WHERE proposal_id=$1')) {
       return { rows: [this.curatorReceipts.get(values[0])].filter(Boolean) };
     }
+    if (compact.startsWith('SELECT r.* FROM agent_memory_fabric.curator_receipt_state_v1 r JOIN agent_memory_fabric.fabric_proposals p')) {
+      const scoped = compact.includes('p.scope_tag = ANY($1::text[])');
+      const scopeTags = scoped ? values[0] : null;
+      const limit = scoped ? values[1] : values[0];
+      const offset = scoped ? values[2] : values[1];
+      const rows = [...this.curatorReceipts.values()]
+        .filter(row => {
+          const proposalRow = this.proposals.get(row.proposal_id);
+          return proposalRow && (!scopeTags || scopeTags.includes(proposalRow.scope_tag));
+        })
+        .sort((left, right) => left.proposal_id.localeCompare(right.proposal_id))
+        .slice(offset, offset + limit);
+      return { rows };
+    }
     if (compact.startsWith('INSERT INTO agent_memory_fabric.curator_receipt_state_v1')) {
       this.curatorReceipts.set(values[0], { proposal_id: values[0], status: values[1], decision_json: JSON.parse(values[2]), apply_json: null });
       return { rows: [] };
@@ -279,6 +293,15 @@ test('PostgreSQL receipt transaction preserves rejected/revoked terminal state a
   pool.proposals.get(queued.id).status = 'revoked';
   assert.equal((await catalog.recordCuratorReceipt(receipt, audit('replay'))).duplicate, true);
   assert.equal(pool.proposals.get(queued.id).status, 'revoked');
+
+  const other = proposal('proposal-terminal-pg-other', 'd'.repeat(64), 'owner-other', 'idem-other');
+  other.scopeTag = 'scope-other';
+  await catalog.enqueueProposalWithRaw(other, raw('d'.repeat(64)));
+  const otherReceipt = { ...receipt, proposalId: other.id, decisionId: 'decision-other' };
+  await catalog.recordCuratorReceipt(otherReceipt, audit('other'));
+  assert.deepEqual((await catalog.listCuratorReceipts({ scopeTags: ['scope-secret'], offset: 0, limit: 1 })).map(row => row.proposalId), [queued.id]);
+  assert.deepEqual((await catalog.listCuratorReceipts({ scopeTags: ['scope-other'], offset: 0, limit: 1 })).map(row => row.proposalId), [other.id]);
+  assert.equal((await catalog.listCuratorReceipts({ scopeTags: null, offset: 0, limit: 1 })).length, 1, 'allow_all remains bounded');
 });
 
 test('PostgreSQL raw event/session catalog matches SQLite idempotency and safe projection contract', async () => {

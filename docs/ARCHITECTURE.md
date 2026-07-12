@@ -56,6 +56,9 @@ Trust rules:
 - rejected/revoked proposals are terminal at both receipt preflight and catalog
   transaction boundaries; only an identical persisted receipt can replay
 - curation pagination cursors are server-HMAC-authenticated
+- receipt reconciliation filters by opaque proposal scope in the catalog before
+  pagination; its cursor is HMAC-bound to the actor and current scope grant, and
+  malformed receipt bindings return only a generic integrity finding
 - auth registries and encryption keys are runtime secrets, never tracked files
 - ingest keys are authorized per actor/source before decryption; those bindings and
   the stable logical digest are authenticated as AES-GCM AAD

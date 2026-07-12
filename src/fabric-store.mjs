@@ -492,7 +492,17 @@ export class MemoryCatalog {
     return { ...structuredClone(current), duplicate: false };
   }
   getCuratorReceipt(proposalId) { const row = this.curatorReceipts.get(proposalId); return row ? structuredClone(row) : null; }
-  listCuratorReceipts() { return [...this.curatorReceipts.values()].map(row => structuredClone(row)); }
+  listCuratorReceipts({ scopeTags = null, offset = 0, limit = 101 } = {}) {
+    const allowed = scopeTags === null ? null : new Set(scopeTags);
+    return [...this.curatorReceipts.values()]
+      .filter(row => {
+        const proposal = this.proposals.get(row.proposalId);
+        return proposal && (!allowed || allowed.has(proposal.scopeTag));
+      })
+      .sort((left, right) => left.proposalId.localeCompare(right.proposalId))
+      .slice(offset, offset + limit)
+      .map(row => structuredClone(row));
+  }
   ingestRawEvent(record, rawRecord, auditEvent) {
     const existing = this.rawEvents.get(record.eventId);
     if (existing) { this.auditEvents.push({ ...auditEvent, outcome: 'duplicate' }); return { record: existing, duplicate: true }; }
@@ -1044,7 +1054,13 @@ export class SqliteCatalog {
   }
   recordCuratorReceipt(receipt, auditEvent) { return this.recordCuratorReceiptTransaction(receipt, auditEvent); }
   getCuratorReceipt(proposalId) { const row = this.db.prepare('SELECT * FROM curator_receipt_state_v1 WHERE proposal_id=?').get(proposalId); return row ? { proposalId: row.proposal_id, status: row.status, decision: JSON.parse(row.decision_json), apply: row.apply_json ? JSON.parse(row.apply_json) : null } : null; }
-  listCuratorReceipts() { return this.db.prepare('SELECT * FROM curator_receipt_state_v1 ORDER BY proposal_id').all().map(row => ({ proposalId: row.proposal_id, status: row.status, decision: JSON.parse(row.decision_json), apply: row.apply_json ? JSON.parse(row.apply_json) : null })); }
+  listCuratorReceipts({ scopeTags = null, offset = 0, limit = 101 } = {}) {
+    if (scopeTags !== null && scopeTags.length === 0) return [];
+    const scopeClause = scopeTags === null ? '' : ` WHERE p.scope_tag IN (${scopeTags.map(() => '?').join(',')})`;
+    const rows = this.db.prepare(`SELECT r.* FROM curator_receipt_state_v1 r JOIN fabric_proposals p ON p.id=r.proposal_id${scopeClause} ORDER BY r.proposal_id LIMIT ? OFFSET ?`)
+      .all(...(scopeTags || []), limit, offset);
+    return rows.map(row => ({ proposalId: row.proposal_id, status: row.status, decision: JSON.parse(row.decision_json), apply: row.apply_json ? JSON.parse(row.apply_json) : null }));
+  }
   mapRawEvent(row) { return row ? { eventId: row.event_id, sessionId: row.session_id, logicalMessageId: row.logical_message_id || null, contentId: row.content_id, payloadDigest: row.payload_digest, projection: JSON.parse(row.projection_json), ownerTag: row.owner_tag, sourceTag: row.source_tag, createdAt: row.created_at } : null; }
   ingestRawEvent(record, rawRecord, auditEvent) { return this.insertRawEvent(record, rawRecord, auditEvent); }
   ingestRawEventV2(record, rawRecord, auditEvent) { return this.insertRawEventV2(record, rawRecord, auditEvent); }
@@ -1875,10 +1891,17 @@ export class PostgresCatalog {
     return row ? { proposalId: row.proposal_id, status: row.status, decision: typeof row.decision_json === 'string' ? JSON.parse(row.decision_json) : row.decision_json, apply: row.apply_json ? (typeof row.apply_json === 'string' ? JSON.parse(row.apply_json) : row.apply_json) : null } : null;
   }
 
-  async listCuratorReceipts() {
+  async listCuratorReceipts({ scopeTags = null, offset = 0, limit = 101 } = {}) {
     await this.ready();
-    const result = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.curator_receipt_state_v1 ORDER BY proposal_id`);
-    return Promise.all(result.rows.map(row => this.getCuratorReceipt(row.proposal_id)));
+    if (scopeTags !== null && scopeTags.length === 0) return [];
+    const values = scopeTags === null ? [limit, offset] : [scopeTags, limit, offset];
+    const filter = scopeTags === null ? '' : ' WHERE p.scope_tag = ANY($1::text[])';
+    const limitParameter = scopeTags === null ? '$1' : '$2';
+    const offsetParameter = scopeTags === null ? '$2' : '$3';
+    const result = await this._query(this.pool,
+      `SELECT r.* FROM ${POSTGRES_SCHEMA}.curator_receipt_state_v1 r JOIN ${POSTGRES_SCHEMA}.fabric_proposals p ON p.id=r.proposal_id${filter} ORDER BY r.proposal_id LIMIT ${limitParameter} OFFSET ${offsetParameter}`,
+      values);
+    return result.rows.map(row => ({ proposalId: row.proposal_id, status: row.status, decision: typeof row.decision_json === 'string' ? JSON.parse(row.decision_json) : row.decision_json, apply: row.apply_json ? (typeof row.apply_json === 'string' ? JSON.parse(row.apply_json) : row.apply_json) : null }));
   }
 
   async recordCuratorReceipt(receipt, auditEvent) {
@@ -2828,7 +2851,16 @@ export class FabricStore {
     return this._catalogOperation(() => this.catalog.recordCuratorReceipt(receipt, auditEvent));
   }
   async getCuratorReceipt(proposalId) { return this._catalogOperation(() => this.catalog.getCuratorReceipt(proposalId)); }
-  async listCuratorReceipts() { return this._catalogOperation(() => this.catalog.listCuratorReceipts()); }
+  async listCuratorReceiptsAuthorized({ authorization, offset = 0, limit = 101 } = {}) {
+    if (!authorization || typeof authorization.actor !== 'string' || authorization.actor.length < 1 || authorization.actor.length > 192
+        || typeof authorization.allowAll !== 'boolean' || !Array.isArray(authorization.allowedScopes) || authorization.allowedScopes.length > 512
+        || authorization.allowedScopes.some(scope => typeof scope !== 'string' || scope.length < 1 || scope.length > 256 || /[\r\n\0]/.test(scope))
+        || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 101) {
+      throw createError('invalid_request', 400);
+    }
+    const scopeTags = authorization.allowAll ? null : authorization.allowedScopes.flatMap(scope => this.rawStore.opaqueTags('scope', scope));
+    return this._catalogOperation(() => this.catalog.listCuratorReceipts({ scopeTags, offset, limit }));
+  }
   async _refreshRawV2Readiness() {
     if (this.legacyV1Writes) { this._rawV2Scan = { safe: false, reason: 'legacy_v1_writes_enabled' }; return this._rawV2Scan; }
     this._rawV2Scan = await this._catalogOperation(() => this.catalog.rawV2Readiness?.() || { safe: false, reason: 'literal_routing_scan_unavailable' });
