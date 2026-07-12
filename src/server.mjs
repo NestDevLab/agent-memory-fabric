@@ -26,7 +26,7 @@ const POLICY_PATH = process.env.AMF_POLICY_PATH || process.env.MEM0_GATEWAY_POLI
 const SESSION_ROUTE_MANIFEST_PATH = process.env.AMF_SESSION_ROUTE_MANIFEST_PATH || '';
 const PORT = envInteger('PORT', 8787, { min: 1, max: 65535 });
 const SERVICE_NAME = 'agent-memory-fabric';
-const SERVICE_VERSION = '0.5.4';
+const SERVICE_VERSION = '0.5.5';
 const LEGACY_SERVICE_ALIASES = ['mem0-gateway'];
 const LIMITS = Object.freeze({
   bodyBytes: envInteger('AMF_MAX_BODY_BYTES', 262144, { min: 1024, max: 16 * 1024 * 1024 }),

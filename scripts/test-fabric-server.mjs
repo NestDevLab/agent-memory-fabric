@@ -10,7 +10,7 @@ import { aadSha256For } from '../src/amf-memory-record-validator.mjs';
 import { createAgentMemoryFabricServer } from '../src/server.mjs';
 import { ContextTokenVerifier, issueContextToken, issueSessionRouteBinding, requestDigest } from '../src/context-token.mjs';
 import { buildContextRequest } from '../src/access-contract.mjs';
-import { CuratorReceiptCoordinator, MemoryReceiptLedger } from '../src/canonical-memory-bridge.mjs';
+import { CanonicalPamBridge, CuratorReceiptCoordinator, MemoryReceiptLedger } from '../src/canonical-memory-bridge.mjs';
 
 const testPolicyPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'config', 'policies.example.json');
 const CONTEXT_RING = { currentKeyVersion: 'ctx-v1', keys: { 'ctx-v1': Buffer.alloc(32, 7).toString('base64') } };
@@ -262,6 +262,59 @@ test('least-privilege curator polls bounded metadata and reads one digest-bound 
     assert.equal(selected.body.data.status, 'queued');
     assert.equal(selected.body.data.proposalDigest, crypto.createHash('sha256').update(canonicalJson(selected.body.data.payload)).digest('hex'));
     assert.equal(selected.body.data.payload.record.claim.encoding, 'sealed');
+  });
+});
+
+test('0.5.5 composes signed session routes, canonicalScopes, PAM contextRefs and scope-bound curation receipts', async () => {
+  const routingKey = Buffer.alloc(32, 21); const literal = 'room:team';
+  const tag = namespace => `hmac-sha256:routing-v1:${crypto.createHmac('sha256', routingKey).update(canonicalJson([namespace, literal])).digest('hex')}`;
+  const contextTags = { conversation: [tag('conversation')], room: [tag('room')] };
+  const record = canonicalRecord('Integrated recall', 'main-lab');
+  record.scope = { type: 'room', id: literal }; record.visibility = 'shared'; record.claim.aadSha256 = aadSha256For(record);
+  const recordPath = `memory/amf/records/${record.id}.md`;
+  const canonicalStore = new CanonicalPamBridge({
+    index: { records: { [record.id]: { path: recordPath, scope: literal, contextRefs: { conversation: [literal], room: [literal] } } } },
+    routingKeys: { currentKeyVersion: 'routing-v1', keys: new Map([['routing-v1', routingKey]]) },
+    async callTool(name) {
+      if (name === 'memory_search') return { results: [{ path: recordPath }] };
+      if (name === 'memory_record_validate') return { status: 'valid', metadata: record };
+      throw new Error('unexpected_tool');
+    }
+  });
+  const fabricStore = makeStore();
+  const receiptCoordinator = new CuratorReceiptCoordinator({ ledger: new MemoryReceiptLedger(), canonicalStore, proposalStore: fabricStore });
+  const sessionReader = {
+    configured: true, kind: 'integrated-route-reader',
+    async search() { return { items: [{ id: 'session-integrated', scope: 'main-lab', ownerActor: 'test-actor', conversationKind: 'group', contextTags }] }; },
+    async get({ id }) { return { id, scope: 'main-lab', ownerActor: 'test-actor', conversationKind: 'group', contextTags }; },
+    async transcript({ id, view }) { return { id, view, items: [], nextCursor: null }; }
+  };
+  await withServer(async ({ api }) => {
+    const sessionInput = { query: 'integrated', purpose: 'continuity_resume' };
+    const sessionToken = contextTokenFor({ purpose: sessionInput.purpose, operation: 'sessions_search', input: sessionInput, contextTags, canonicalScopes: [literal] });
+    const sessions = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ ...sessionInput, contextToken: sessionToken }) });
+    assert.deepEqual(sessions.body.data.items.map(item => [item.id, item.scope]), [['session-integrated', literal]]);
+
+    const recallInput = { query: 'Integrated', scopes: [literal], purpose: 'conversation_recall' };
+    const recallToken = contextTokenFor({ purpose: recallInput.purpose, operation: 'memory_search', input: recallInput, contextTags, canonicalScopes: [literal] });
+    const recalled = await api('/v2/memory/search', { method: 'POST', body: JSON.stringify({ ...recallInput, contextToken: recallToken }) });
+    assert.deepEqual(recalled.body.data.items.map(item => item.id), [record.id]);
+
+    const queued = await api('/v2/memory/proposals', { method: 'POST', headers: { 'idempotency-key': 'integrated-curation-0001' }, body: JSON.stringify(canonicalProposal('Integrated curation')) });
+    const persisted = await fabricStore.readProposal(queued.body.data.proposalId);
+    const digest = value => crypto.createHash('sha256').update(canonicalJson(value)).digest('hex');
+    const base = { proposalId: persisted.id, proposalScope: persisted.scope, decisionId: 'decision-integrated-0001', status: 'approved_pending_apply', proposalDigest: persisted.proposalDigest, policyDigest: digest('integrated-policy') };
+    const receipt = { kind: 'decision', ...base, decisionDigest: digest(base), timestamp: '2026-07-12T12:00:00Z' };
+    const accepted = await api('/v2/internal/curation/receipts', { method: 'POST', headers: { authorization: 'Bearer curator-token' }, body: JSON.stringify(receipt) });
+    assert.equal(accepted.response.status, 201); assert.equal(accepted.body.data.status, 'approved_pending_apply');
+  }, {
+    canonicalStore, fabricStore, receiptCoordinator, sessionReader,
+    routeManifestSetup({ routeManifestPath }) {
+      fs.writeFileSync(routeManifestPath, JSON.stringify({ schema: 'amf.session-route-manifest/v1', bindings: [
+        issueSessionRouteBinding({ actor: 'test-actor', canonicalScope: literal, conversationKind: 'group', contextTags }, CONTEXT_RING)
+      ] }), { mode: 0o600 });
+      fs.chmodSync(routeManifestPath, 0o600); return routeManifestPath;
+    }
   });
 });
 

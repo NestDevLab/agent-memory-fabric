@@ -1,7 +1,7 @@
 {
   "name": "agent-memory-fabric",
   "private": true,
-  "version": "0.5.4",
+  "version": "0.5.5",
   "type": "module",
   "description": "Shared REST/MCP memory fabric with encrypted RAW storage and scoped proposal curation",
   "scripts": {

@@ -1,6 +1,6 @@
 services:
   agent-memory-fabric:
-    image: agent-memory-fabric:0.5.4
+    image: agent-memory-fabric:0.5.5
     build:
       context: .
       dockerfile: Dockerfile

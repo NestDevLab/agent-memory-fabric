@@ -72,7 +72,8 @@ an explicit full-history audit mode.
 
 Compatibility:
 
-- recall hardening release identity is `0.5.4`
+- integrated recall + curation release identity is `0.5.5` (recall hardening
+  originated in `0.5.4`)
 - product identity is `agent-memory-fabric`; `mem0-gateway` is a legacy alias
 - `AMF_AUTH_REGISTRY_PATH` supersedes `MEM0_AUTH_REGISTRY_PATH`
 - `AMF_POLICY_PATH` supersedes `MEM0_GATEWAY_POLICY_PATH`
