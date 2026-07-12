@@ -98,6 +98,11 @@ changed plaintext under the same event id is a conflict. Actor, source instance,
 event, session, projection and key id are bound into AES-GCM AAD. The catalog event,
 session update and audit row commit in one transaction.
 
+Provision collector actors and per-client handoffs with the fail-closed
+[RAW collector provisioning runbook](docs/raw-collector-provisioning.md). The
+operator CLI stores only bearer digests server-side and fixes collector access
+to `memory:status` plus `raw:ingest`.
+
 ## API v2
 
 Success uses `{ "ok": true, "data": ..., "meta": ... }`; errors use
