@@ -529,7 +529,12 @@ export class MemoryCatalog {
   searchSessions({ ownerTags = [], query = '', limit = 20 }) {
     const needle = query.toLowerCase();
     const allowed = new Set(ownerTags);
-    return [...this.rawSessions.values()].filter(item => allowed.has(item.ownerTag) && (!needle || `${item.id} ${item.runtime}`.toLowerCase().includes(needle))).sort(compareSessions).slice(0, limit);
+    const participantSessions = new Set(
+      [...this.rawEvents.values(), ...this.rawEventsV2.values()]
+        .filter(event => allowed.has(event.ownerTag))
+        .map(event => event.sessionId)
+    );
+    return [...this.rawSessions.values()].filter(item => participantSessions.has(item.id) && (!needle || `${item.id} ${item.runtime}`.toLowerCase().includes(needle))).sort(compareSessions).slice(0, limit);
   }
   getSession(id) { return this.rawSessions.get(id) || null; }
   listSessionEvents(id) { return [...this.rawEvents.values(), ...this.rawEventsV2.values()].filter(item => item.sessionId === id).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId)); }
@@ -672,10 +677,12 @@ export class SqliteCatalog {
       CREATE TABLE IF NOT EXISTS raw_events_v1 (event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES raw_sessions_v1(session_id), content_id TEXT NOT NULL REFERENCES raw_objects_v2(content_id), payload_digest TEXT NOT NULL, projection_json TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS raw_events_v2 (event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES raw_sessions_v1(session_id), logical_message_id TEXT NOT NULL, content_id TEXT NOT NULL REFERENCES raw_objects_v2(content_id), payload_digest TEXT NOT NULL, projection_json TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS raw_events_v2_session_created_idx ON raw_events_v2(session_id,created_at,event_id);
+      CREATE INDEX IF NOT EXISTS raw_events_v2_owner_session_idx ON raw_events_v2(owner_tag,session_id);
       CREATE TABLE IF NOT EXISTS logical_messages_v2 (logical_message_id TEXT PRIMARY KEY, preferred_observation_id TEXT NOT NULL, payload_conflict INTEGER NOT NULL, tombstoned INTEGER NOT NULL, selection_version TEXT NOT NULL, event_ids_json TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS logical_message_aliases_v2 (alias_id TEXT PRIMARY KEY, logical_message_id TEXT NOT NULL REFERENCES logical_messages_v2(logical_message_id));
       CREATE INDEX IF NOT EXISTS raw_sessions_v1_owner_tag_idx ON raw_sessions_v1(owner_tag,last_occurred_at);
       CREATE INDEX IF NOT EXISTS raw_events_v1_session_created_idx ON raw_events_v1(session_id,created_at,event_id);
+      CREATE INDEX IF NOT EXISTS raw_events_v1_owner_session_idx ON raw_events_v1(owner_tag,session_id);
       CREATE TABLE IF NOT EXISTS audit_events_v2 (id TEXT PRIMARY KEY, ts TEXT NOT NULL, actor_tag TEXT NOT NULL, action TEXT NOT NULL, outcome TEXT NOT NULL, request_id TEXT, target_id TEXT, scope_tag TEXT, details_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS identity_records_v2 (id TEXT PRIMARY KEY, identity_tag TEXT NOT NULL UNIQUE, identity_kind TEXT NOT NULL CHECK(identity_kind IN ('agent','person','relationship','room','domain','shared')), scope_tag TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','merged','split','revoked')), canonical_identity_id TEXT REFERENCES identity_records_v2(id), revision INTEGER NOT NULL CHECK(revision >= 1), created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS identity_events_v2 (id TEXT PRIMARY KEY, identity_id TEXT NOT NULL REFERENCES identity_records_v2(id), revision INTEGER NOT NULL CHECK(revision >= 1), operation TEXT NOT NULL CHECK(operation IN ('create','merge','split','revoke')), target_identity_id TEXT REFERENCES identity_records_v2(id), evidence_content_id TEXT NOT NULL REFERENCES raw_objects_v2(content_id), evidence_strength TEXT NOT NULL CHECK(evidence_strength IN ('strong','weak')), automatic INTEGER NOT NULL CHECK(automatic IN (0,1)), actor_tag TEXT NOT NULL, idempotency_tag TEXT NOT NULL UNIQUE, response_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(identity_id,revision));
@@ -896,7 +903,7 @@ export class SqliteCatalog {
     if (!ownerTags.length) return [];
     const pattern = escapedLike(query);
     const placeholders = ownerTags.map(() => '?').join(',');
-    return this.db.prepare(`SELECT * FROM raw_sessions_v1 WHERE owner_tag IN (${placeholders}) AND (lower(session_id) LIKE lower(?) ESCAPE '\\' OR lower(runtime) LIKE lower(?) ESCAPE '\\') ORDER BY CASE WHEN last_occurred_at IS NULL THEN 1 ELSE 0 END,last_occurred_at DESC,created_at DESC,session_id ASC LIMIT ?`).all(...ownerTags, pattern, pattern, limit).map(row => this.mapSession(row));
+    return this.db.prepare(`SELECT s.* FROM raw_sessions_v1 s WHERE (EXISTS (SELECT 1 FROM raw_events_v1 e WHERE e.session_id=s.session_id AND e.owner_tag IN (${placeholders})) OR EXISTS (SELECT 1 FROM raw_events_v2 e WHERE e.session_id=s.session_id AND e.owner_tag IN (${placeholders}))) AND (lower(s.session_id) LIKE lower(?) ESCAPE '\\' OR lower(s.runtime) LIKE lower(?) ESCAPE '\\') ORDER BY CASE WHEN s.last_occurred_at IS NULL THEN 1 ELSE 0 END,s.last_occurred_at DESC,s.created_at DESC,s.session_id ASC LIMIT ?`).all(...ownerTags, ...ownerTags, pattern, pattern, limit).map(row => this.mapSession(row));
   }
   getSession(id) { return this.mapSession(this.db.prepare('SELECT * FROM raw_sessions_v1 WHERE session_id=?').get(id)); }
   listSessionEvents(id) { return [...this.db.prepare('SELECT * FROM raw_events_v1 WHERE session_id=?').all(id), ...this.db.prepare('SELECT * FROM raw_events_v2 WHERE session_id=?').all(id)].map(row => this.mapRawEvent(row)).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventId.localeCompare(b.eventId)); }
@@ -1021,6 +1028,7 @@ const POSTGRES_SCHEMA_SQL = [
     created_at TIMESTAMPTZ NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS raw_events_v2_session_created_idx ON ${POSTGRES_SCHEMA}.raw_events_v2(session_id,created_at,event_id)`,
+  `CREATE INDEX IF NOT EXISTS raw_events_v2_owner_session_idx ON ${POSTGRES_SCHEMA}.raw_events_v2(owner_tag,session_id)`,
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.logical_messages_v2 (
     logical_message_id TEXT PRIMARY KEY, preferred_observation_id TEXT NOT NULL, payload_conflict BOOLEAN NOT NULL,
     tombstoned BOOLEAN NOT NULL, selection_version TEXT NOT NULL, event_ids JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL
@@ -1030,6 +1038,7 @@ const POSTGRES_SCHEMA_SQL = [
   )`,
   `CREATE INDEX IF NOT EXISTS raw_sessions_v1_owner_tag_idx ON ${POSTGRES_SCHEMA}.raw_sessions_v1(owner_tag,last_occurred_at)`,
   `CREATE INDEX IF NOT EXISTS raw_events_v1_session_created_idx ON ${POSTGRES_SCHEMA}.raw_events_v1(session_id,created_at,event_id)`,
+  `CREATE INDEX IF NOT EXISTS raw_events_v1_owner_session_idx ON ${POSTGRES_SCHEMA}.raw_events_v1(owner_tag,session_id)`,
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.audit_events_v2 (
     id TEXT PRIMARY KEY,
     ts TIMESTAMPTZ NOT NULL,
@@ -1540,7 +1549,7 @@ export class PostgresCatalog {
     const v2 = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE event_id=$1`, [id]);
     return mapPostgresRawEvent(v2.rows[0] || (await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE event_id=$1`, [id])).rows[0]);
   }
-  async searchSessions({ ownerTags = [], query = '', limit = 20 }) { if (!ownerTags.length) return []; await this.ready(); return (await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 WHERE owner_tag=ANY($1::text[]) AND (session_id ILIKE $2 ESCAPE '\\' OR runtime ILIKE $2 ESCAPE '\\') ORDER BY last_occurred_at DESC NULLS LAST,created_at DESC,session_id ASC LIMIT $3`, [ownerTags, escapedLike(query), limit])).rows.map(mapPostgresSession); }
+  async searchSessions({ ownerTags = [], query = '', limit = 20 }) { if (!ownerTags.length) return []; await this.ready(); return (await this._query(this.pool, `SELECT s.* FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 s WHERE (EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v1 e WHERE e.session_id=s.session_id AND e.owner_tag=ANY($1::text[])) OR EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v2 e WHERE e.session_id=s.session_id AND e.owner_tag=ANY($1::text[]))) AND (s.session_id ILIKE $2 ESCAPE '\\' OR s.runtime ILIKE $2 ESCAPE '\\') ORDER BY s.last_occurred_at DESC NULLS LAST,s.created_at DESC,s.session_id ASC LIMIT $3`, [ownerTags, escapedLike(query), limit])).rows.map(mapPostgresSession); }
   async getSession(id) { await this.ready(); return mapPostgresSession((await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 WHERE session_id=$1`, [id])).rows[0]); }
   async listSessionEvents(id) {
     await this.ready();
@@ -2119,10 +2128,11 @@ export class FabricStore {
       title: `${session.runtime} session`, scope: '', ownerSelf: true,
       conversationKind: session.conversationKind || null, contextTags: session.contextTags ? structuredClone(session.contextTags) : null
     });
-    const ownedSession = async (actor, id) => {
+    const participantSession = async (actor, id) => {
       const session = await store._catalogOperation(() => store.catalog.getSession(id));
       const ownerTags = new Set(store.rawStore.opaqueTags('raw-owner', actor));
-      if (!session || !ownerTags.has(session.ownerTag)) throw createError('session_not_found', 404);
+      const events = session ? await store._catalogOperation(() => store.catalog.listSessionEvents(id)) : [];
+      if (!session || !events.some(event => ownerTags.has(event.ownerTag))) throw createError('session_not_found', 404);
       return session;
     };
     return {
@@ -2137,10 +2147,10 @@ export class FabricStore {
         return { items: page.map(publicSession), total: page.length, nextCursor: offset + page.length < filtered.length ? encodePageCursor(offset + page.length, binding) : null };
       },
       async get({ actor, id }) {
-        return publicSession(await ownedSession(actor, id));
+        return publicSession(await participantSession(actor, id));
       },
       async transcript({ actor, id, view, cursor = null, limit = 100, from = null, to = null }) {
-        await ownedSession(actor, id);
+        await participantSession(actor, id);
         const allEvents = await store._catalogOperation(() => store.catalog.listSessionEvents(id));
         const binding = pageBinding({ actor, id, view, from, to, operation: 'session_transcript' });
         const offset = decodePageCursor(cursor, binding);
@@ -2152,9 +2162,9 @@ export class FabricStore {
         const items = [];
         for (const event of events) {
           const envelope = await store.rawStore.getClientCiphertext(event.contentId);
-          if (envelope.actorId !== actor || !store.rawStore.opaqueTags('raw-owner', actor).includes(event.ownerTag)
+          if (!store.rawStore.opaqueTags('raw-owner', envelope.actorId).includes(event.ownerTag)
             || !store.rawStore.opaqueTags('raw-source', envelope.sourceInstanceId).includes(event.sourceTag)) throw createError('catalog_binding_mismatch', 500);
-          const item = decryptClientCiphertext({ actorId: actor, sourceInstanceId: envelope.sourceInstanceId, projection: event.projection, envelope }, store.ingestKeys);
+          const item = decryptClientCiphertext({ actorId: envelope.actorId, sourceInstanceId: envelope.sourceInstanceId, projection: event.projection, envelope }, store.ingestKeys);
           items.push({ eventId: event.eventId, occurredAt: event.projection.occurredAt, role: event.projection.role, raw: item.event.raw });
         }
         return { id, view: 'original', items, nextCursor };

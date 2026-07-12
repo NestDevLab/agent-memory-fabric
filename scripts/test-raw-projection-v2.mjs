@@ -231,6 +231,18 @@ test('v2 sessions accept multi-role events and retries but reject room/thread re
       const events = await catalog.listSessionEvents(session.id);
       assert.equal(new Set(events.map(event => event.ownerTag)).size, 3, 'actor ownership remains event-scoped');
       assert.equal(new Set(events.map(event => event.sourceTag)).size, 3, 'source identity remains event-scoped');
+      const reader = store.createSessionReader();
+      for (const actor of observations.map(observation => observation.actor)) {
+        assert.deepEqual((await reader.search({ actor, query: '', limit: 10 })).items.map(result => result.id), [session.id]);
+        assert.equal((await reader.get({ actor, id: session.id })).id, session.id);
+        assert.equal((await reader.transcript({ actor, id: session.id, view: 'redacted' })).items.length, 3);
+        const original = await reader.transcript({ actor, id: session.id, view: 'original' });
+        assert.equal(original.items.length, 3);
+        assert.deepEqual(new Set(original.items.map(result => Buffer.from(result.raw.line, 'base64').toString('utf8').match(/raw-(?:owner|system|assistant)/)?.[0])), new Set(['raw-owner', 'raw-system', 'raw-assistant']));
+      }
+      assert.equal((await reader.search({ actor: 'outsider', query: '', limit: 10 })).items.length, 0);
+      await assert.rejects(reader.get({ actor: 'outsider', id: session.id }), /session_not_found/);
+      await assert.rejects(reader.transcript({ actor: 'outsider', id: session.id, view: 'original' }), /session_not_found/);
 
       const changedRoom = item({ actor: 'raw-assistant', sender: 'agent:vitae', role: 'assistant', room: 'other-room', nativeRevision: 4, sourceSequence: 4 });
       await assert.rejects(store.ingestRawEvent({ actor: 'raw-assistant', sourceInstanceId: 'assistant-host', projection: changedRoom.projection, envelope: envelope(changedRoom, 'raw-assistant', 'assistant-host') }), /raw_session_binding_conflict/);

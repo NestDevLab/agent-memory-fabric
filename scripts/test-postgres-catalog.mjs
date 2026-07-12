@@ -81,9 +81,10 @@ class FakePool {
       }
       return { rows: [] };
     }
-    if (compact.startsWith('SELECT * FROM agent_memory_fabric.raw_sessions_v1 WHERE owner_tag=ANY')) {
+    if (compact.startsWith('SELECT s.* FROM agent_memory_fabric.raw_sessions_v1 s WHERE')) {
       const needle = String(values[1]).replaceAll('%', '').toLowerCase();
-      return { rows: [...this.rawSessions.values()].filter(row => values[0].includes(row.owner_tag) && (!needle || `${row.session_id} ${row.runtime}`.toLowerCase().includes(needle))).slice(0, values[2]) };
+      const participantSessions = new Set([...this.rawEvents.values()].filter(row => values[0].includes(row.owner_tag)).map(row => row.session_id));
+      return { rows: [...this.rawSessions.values()].filter(row => participantSessions.has(row.session_id) && (!needle || `${row.session_id} ${row.runtime}`.toLowerCase().includes(needle))).slice(0, values[2]) };
     }
     if (compact.startsWith('SELECT * FROM agent_memory_fabric.raw_sessions_v1 WHERE session_id=$1')) return { rows: [this.rawSessions.get(values[0])].filter(Boolean) };
     if (compact.startsWith('SELECT * FROM agent_memory_fabric.raw_events_v1 WHERE session_id=$1')) return { rows: [...this.rawEvents.values()].filter(row => row.session_id === values[0]) };

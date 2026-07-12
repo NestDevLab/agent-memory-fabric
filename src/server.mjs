@@ -24,7 +24,7 @@ function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } =
 const POLICY_PATH = process.env.AMF_POLICY_PATH || process.env.MEM0_GATEWAY_POLICY_PATH || '';
 const PORT = envInteger('PORT', 8787, { min: 1, max: 65535 });
 const SERVICE_NAME = 'agent-memory-fabric';
-const SERVICE_VERSION = '0.5.1';
+const SERVICE_VERSION = '0.5.2';
 const LEGACY_SERVICE_ALIASES = ['mem0-gateway'];
 const LIMITS = Object.freeze({
   bodyBytes: envInteger('AMF_MAX_BODY_BYTES', 262144, { min: 1024, max: 16 * 1024 * 1024 }),

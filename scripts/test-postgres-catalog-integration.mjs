@@ -105,6 +105,11 @@ test('real PostgreSQL catalog integration in an explicitly isolated test databas
     const persistedEvents = await catalog.listSessionEvents(rawSessionId);
     assert.equal(persistedEvents.length, 3);
     assert.equal(new Set(persistedEvents.map(event => event.ownerTag)).size, 3);
+    for (const actor of ['person', 'system', 'assistant']) {
+      const visible = await catalog.searchSessions({ ownerTags: [opaque('owner', actor)], query: '', limit: 10 });
+      assert.equal(visible.some(session => session.id === rawSessionId), true);
+    }
+    assert.equal((await catalog.searchSessions({ ownerTags: [opaque('owner', 'outsider')], query: '', limit: 10 })).some(session => session.id === rawSessionId), false);
     const rebindings = [
       rawV2Fixture({ suffix, marker: '4', sessionId: rawSessionId, role: 'assistant', actor: 'assistant', sender: 'assistant', room: 'room-b' }),
       rawV2Fixture({ suffix, marker: '5', sessionId: rawSessionId, role: 'assistant', actor: 'assistant', sender: 'assistant', conversation: 'conversation-b' }),
