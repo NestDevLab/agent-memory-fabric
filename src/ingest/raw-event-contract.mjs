@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 
 import { canonicalJson, strictIsoTimestamp } from './transcripts/canonical.mjs';
-import { deriveLogicalMessageIds, normalizeLogicalMessageKeyRing, validateProjectionV2 } from './raw-projection-v2.mjs';
+import { OBSERVATION_NORMALIZATION_VERSION, deriveEventIdV2, deriveLogicalMessageIds, deriveSessionIdV2, normalizeLogicalMessageKeyRing, validateProjectionV2 } from './raw-projection-v2.mjs';
 
 export const RAW_EVENT_CIPHERTEXT_VERSION = 3;
 export const RAW_EVENT_CIPHERTEXT_SCHEMA = 'amf.raw-event-ciphertext/v1';
@@ -49,6 +49,42 @@ export function projectionDigest(projection) {
 export function stablePayloadDigest(item, digestKey) {
   const hex = crypto.createHmac('sha256', digestKey).update(canonicalJson(item), 'utf8').digest('hex');
   return `hmac-sha256:v1:${hex}`;
+}
+
+export function normalizedObservationDigest(item, digestKey) {
+  const normalized = item?.event?.normalized;
+  if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) throw new Error('raw_observation_normalization_invalid');
+  const hex = crypto.createHmac('sha256', digestKey)
+    .update(canonicalJson([OBSERVATION_NORMALIZATION_VERSION, normalized]), 'utf8')
+    .digest('hex');
+  return `hmac-sha256:v1:${hex}`;
+}
+
+function rawObservationBytes(item) {
+  const line = item?.event?.raw?.line;
+  if (typeof line !== 'string') throw new Error('raw_event_derivation_invalid');
+  const decoded = Buffer.from(line, 'base64');
+  if (!decoded.length || decoded.toString('base64') !== line) throw new Error('raw_event_derivation_invalid');
+  return decoded;
+}
+
+function verifyProjectionDerivations(item, projection, digestKey) {
+  const sourceKind = projection.sourceKind;
+  const derivation = item?.event?.derivation;
+  const sessionCandidates = new Set([
+    deriveSessionIdV2({ sourceKind, conversationTag: projection.contextTags.conversation[0] })
+  ]);
+  const eventCandidates = new Set([
+    deriveEventIdV2({ sourceKind, observationClass: projection.observationClass, rawBytes: rawObservationBytes(item) })
+  ]);
+  if (derivation !== undefined) {
+    if (!derivation || typeof derivation !== 'object' || Array.isArray(derivation)
+      || Object.keys(derivation).some(key => !['nativeSessionId', 'nativeEventId'].includes(key))) throw new Error('raw_event_derivation_invalid');
+    if (derivation.nativeSessionId) sessionCandidates.add(deriveSessionIdV2({ sourceKind, nativeSessionId: String(derivation.nativeSessionId) }));
+    if (derivation.nativeEventId) eventCandidates.add(deriveEventIdV2({ sourceKind, nativeSessionId: derivation.nativeSessionId ? String(derivation.nativeSessionId) : null, nativeEventId: String(derivation.nativeEventId), observationClass: projection.observationClass }));
+  }
+  if (!sessionCandidates.has(projection.sessionId) || !eventCandidates.has(projection.eventId)) throw new Error('raw_event_derivation_invalid');
+  if (normalizedObservationDigest(item, digestKey) !== projection.normalizedPayloadDigest) throw new Error('raw_observation_normalization_invalid');
 }
 
 export function rawEventAad({ eventId, sessionId, keyId, projectionSha256, payloadDigest, sourceInstanceId, actorId }) {
@@ -121,6 +157,7 @@ export function decryptClientCiphertext({ actorId = null, sourceInstanceId, proj
   if (canonicalJson(item?.projection) !== canonicalJson(projection) || item?.event?.eventId !== projection.eventId || item?.event?.sessionId !== projection.sessionId) throw new Error('raw_envelope_binding_invalid');
   if (stablePayloadDigest(item, normalized.digestKey) !== envelope.payloadDigest) throw new Error('raw_payload_digest_invalid');
   if (projection.schema === 'amf.raw-event-projection/v2') {
+    verifyProjectionDerivations(item, projection, normalized.digestKey);
     const logical = item?.event?.logical;
     if (!logical || typeof logical !== 'object') throw new Error('logical_message_derivation_invalid');
     const derived = deriveLogicalMessageIds({

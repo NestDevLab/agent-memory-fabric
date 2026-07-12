@@ -6,6 +6,8 @@ export const RAW_PROJECTION_V2_SCHEMA = 'amf.raw-event-projection/v2';
 export const LOGICAL_DERIVATION_VERSION = 'amf-logical-message/v1';
 export const OBSERVATION_SELECTION_VERSION = 'amf-observation-selection/v1';
 export const OBSERVATION_NORMALIZATION_VERSION = 'amf-observation-normalization/v1';
+export const SESSION_DERIVATION_VERSION = 'amf-session/v2';
+export const EVENT_DERIVATION_VERSION = 'amf-observation/v2';
 
 const SOURCE_KINDS = new Set(['codex', 'claude', 'hermes', 'openclaw', 'principia']);
 const OBSERVATION_CLASSES = new Set(['native', 'delivery-handoff', 'provisional']);
@@ -24,6 +26,28 @@ const ALLOWED_FIELDS = [
   'nativeRevision', 'sourceSequence', 'authoritativeDeletion', 'role', 'contentType',
   'contentParts', 'hasContent', 'normalizationVersion', 'normalizedPayloadDigest'
 ];
+
+export function normalizeContextTags(contextTags) {
+  if (!contextTags || typeof contextTags !== 'object' || Array.isArray(contextTags)) throw new Error('raw_projection_invalid');
+  const normalized = {};
+  for (const key of Object.keys(contextTags).sort()) {
+    const values = contextTags[key];
+    if (!CONTEXT_TAG_KEYS.has(key) || !Array.isArray(values) || values.length === 0 || values.some(tag => !OPAQUE_TAG.test(tag))) throw new Error('raw_projection_invalid');
+    const exact = [...new Set(values)].sort();
+    if (exact.length !== values.length || exact.some((value, index) => value !== values[index])) throw new Error('raw_projection_invalid');
+    normalized[key] = exact;
+  }
+  if (!normalized.sender || !normalized.conversation) throw new Error('raw_projection_invalid');
+  return normalized;
+}
+
+export function contextTagsIntersect(stored, presented) {
+  const left = normalizeContextTags(stored);
+  const right = normalizeContextTags(presented);
+  const routingKeys = Object.keys(left).filter(key => ['conversation', 'room', 'person', 'relationship', 'thread'].includes(key));
+  if (routingKeys.length === 0) return false;
+  return routingKeys.every(key => Array.isArray(right[key]) && left[key].some(tag => right[key].includes(tag)));
+}
 
 function exactKeys(value, allowed) {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -51,6 +75,18 @@ export function normalizeLogicalMessageKeyRing(value) {
 export function opaqueContextTag(namespace, literal, key, keyVersion) {
   const digest = crypto.createHmac('sha256', parseKey(key)).update(canonicalJson([namespace, String(literal)]), 'utf8').digest('hex');
   return `hmac-sha256:${keyVersion}:${digest}`;
+}
+
+export function deriveSessionIdV2({ sourceKind, nativeSessionId = null, conversationTag = null }) {
+  if (!SOURCE_KINDS.has(sourceKind) || (!nativeSessionId && !OPAQUE_TAG.test(String(conversationTag || '')))) throw new Error('raw_session_derivation_invalid');
+  const material = canonicalJson([SESSION_DERIVATION_VERSION, sourceKind, nativeSessionId ? ['native', String(nativeSessionId)] : ['conversation', conversationTag]]);
+  return `ses_${crypto.createHash('sha256').update(material, 'utf8').digest('hex')}`;
+}
+
+export function deriveEventIdV2({ sourceKind, nativeSessionId = null, nativeEventId = null, observationClass, rawBytes = null }) {
+  if (!SOURCE_KINDS.has(sourceKind) || !OBSERVATION_CLASSES.has(observationClass) || (!nativeEventId && !Buffer.isBuffer(rawBytes))) throw new Error('raw_event_derivation_invalid');
+  const identity = nativeEventId ? ['native', String(nativeSessionId || ''), String(nativeEventId)] : ['bytes', crypto.createHash('sha256').update(rawBytes).digest('hex')];
+  return `evt_${crypto.createHash('sha256').update(canonicalJson([EVENT_DERIVATION_VERSION, sourceKind, observationClass, identity]), 'utf8').digest('hex')}`;
 }
 
 function strongTuple(input) {
@@ -88,11 +124,7 @@ export function validateProjectionV2(projection) {
   if (!Array.isArray(projection.logicalMessageAliases) || projection.logicalMessageAliases.some(item => !exactKeys(item, ['keyVersion', 'logicalMessageId']) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(item.keyVersion) || !LOGICAL_ID.test(item.logicalMessageId))) throw new Error('raw_projection_invalid');
   if (projection.derivationVersion !== LOGICAL_DERIVATION_VERSION || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(projection.keyVersion)) throw new Error('raw_projection_invalid');
   if (!SOURCE_KINDS.has(projection.sourceKind) || !OBSERVATION_CLASSES.has(projection.observationClass) || !DIRECTIONS.has(projection.direction) || !CONVERSATION_KINDS.has(projection.conversationKind)) throw new Error('raw_projection_invalid');
-  if (!projection.contextTags || typeof projection.contextTags !== 'object' || Array.isArray(projection.contextTags)) throw new Error('raw_projection_invalid');
-  for (const [key, value] of Object.entries(projection.contextTags)) {
-    if (!CONTEXT_TAG_KEYS.has(key) || !Array.isArray(value) || value.length === 0 || value.some(tag => !OPAQUE_TAG.test(tag))) throw new Error('raw_projection_invalid');
-  }
-  if (!projection.contextTags.sender || !projection.contextTags.conversation) throw new Error('raw_projection_invalid');
+  normalizeContextTags(projection.contextTags);
   if (typeof projection.subtype !== 'string' || projection.subtype.length < 1 || projection.subtype.length > 128 || !/^[A-Za-z0-9._:-]+$/.test(projection.subtype)) throw new Error('raw_projection_invalid');
   for (const field of ['occurredAt', 'editedAt']) if (projection[field] !== null && strictIsoTimestamp(projection[field]) !== projection[field]) throw new Error('raw_projection_invalid');
   if (projection.nativeRevision !== null && (!Number.isSafeInteger(projection.nativeRevision) || projection.nativeRevision < 0)) throw new Error('raw_projection_invalid');

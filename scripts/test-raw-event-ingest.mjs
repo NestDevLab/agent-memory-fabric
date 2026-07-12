@@ -136,12 +136,12 @@ test('catalog session reader returns placeholders/redaction and decrypts origina
     assert.equal(search.body.data.items[0].title, 'claude session');
     const sessionId = item.projection.sessionId;
     const redacted = await api(`/v2/sessions/${sessionId}/transcript?purpose=conversation_recall`, { token: 'reader-token' });
-    assert.equal(redacted.body.data.messages[0].content.redacted, true);
+    assert.equal(redacted.body.data.items[0].content.redacted, true);
     assert.equal(JSON.stringify(redacted.body).includes('SYNTHETIC_RAW_PRIVATE_TEXT'), false);
     const forbidden = await api(`/v2/sessions/${sessionId}/transcript?view=original&purpose=incident_debug`, { token: 'reader-token' });
     assert.equal(forbidden.body.error.code, 'raw_decrypt_forbidden');
     const original = await api(`/v2/sessions/${sessionId}/transcript?view=original&purpose=incident_debug`);
-    assert.equal(Buffer.from(original.body.data.messages[0].raw.line, 'base64').toString('utf8').includes('SYNTHETIC_RAW_PRIVATE_TEXT'), true);
+    assert.equal(Buffer.from(original.body.data.items[0].raw.line, 'base64').toString('utf8').includes('SYNTHETIC_RAW_PRIVATE_TEXT'), true);
     const attackerSearch = await api('/v2/sessions/search', { token: 'attacker-reader-token', method: 'POST', body: JSON.stringify({ query: '', purpose: 'conversation_recall' }) });
     assert.deepEqual(attackerSearch.body.data.items, []);
     const attackerGet = await api(`/v2/sessions/${sessionId}?purpose=incident_debug`, { token: 'attacker-reader-token' });

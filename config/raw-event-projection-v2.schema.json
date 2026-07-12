@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-memory-fabric.local/schemas/raw-event-projection-v2.json",
+  "title": "Agent Memory Fabric RAW event projection v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "eventId", "sessionId", "logicalMessageId", "logicalMessageAliases", "derivationVersion", "keyVersion", "sourceKind", "observationClass", "direction", "conversationKind", "contextTags", "subtype", "occurredAt", "editedAt", "nativeRevision", "sourceSequence", "authoritativeDeletion", "role", "contentType", "contentParts", "hasContent", "normalizationVersion", "normalizedPayloadDigest"],
+  "properties": {
+    "schema": { "const": "amf.raw-event-projection/v2" },
+    "eventId": { "type": "string", "pattern": "^evt_[a-f0-9]{64}$" },
+    "sessionId": { "type": "string", "pattern": "^ses_[a-f0-9]{64}$" },
+    "logicalMessageId": { "type": "string", "pattern": "^lmsg_[a-f0-9]{64}$" },
+    "logicalMessageAliases": { "type": "array", "items": { "$ref": "#/$defs/logicalAlias" } },
+    "derivationVersion": { "const": "amf-logical-message/v1" },
+    "keyVersion": { "$ref": "#/$defs/keyVersion" },
+    "sourceKind": { "enum": ["codex", "claude", "hermes", "openclaw", "principia"] },
+    "observationClass": { "enum": ["native", "delivery-handoff", "provisional"] },
+    "direction": { "enum": ["inbound", "outbound", "internal", "unknown"] },
+    "conversationKind": { "enum": ["dm", "group", "channel", "thread", "session", "unknown"] },
+    "contextTags": { "$ref": "#/$defs/contextTags" },
+    "subtype": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" },
+    "occurredAt": { "type": ["string", "null"], "format": "date-time" },
+    "editedAt": { "type": ["string", "null"], "format": "date-time" },
+    "nativeRevision": { "type": ["integer", "null"], "minimum": 0 },
+    "sourceSequence": { "type": ["integer", "null"], "minimum": 0 },
+    "authoritativeDeletion": { "type": "boolean" },
+    "role": { "enum": ["user", "assistant", "system", "tool", "unknown"] },
+    "contentType": { "enum": ["text", "structured", "tool", "mixed", "none", "unknown"] },
+    "contentParts": { "type": "integer", "minimum": 0, "maximum": 10000 },
+    "hasContent": { "type": "boolean" },
+    "normalizationVersion": { "const": "amf-observation-normalization/v1" },
+    "normalizedPayloadDigest": { "$ref": "#/$defs/opaqueTag" }
+  },
+  "$defs": {
+    "keyVersion": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "opaqueTag": { "type": "string", "pattern": "^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$" },
+    "logicalAlias": { "type": "object", "additionalProperties": false, "required": ["keyVersion", "logicalMessageId"], "properties": { "keyVersion": { "$ref": "#/$defs/keyVersion" }, "logicalMessageId": { "type": "string", "pattern": "^lmsg_[a-f0-9]{64}$" } } },
+    "tagArray": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/opaqueTag" } },
+    "contextTags": { "type": "object", "additionalProperties": false, "required": ["sender", "conversation"], "properties": { "actor": { "$ref": "#/$defs/tagArray" }, "sender": { "$ref": "#/$defs/tagArray" }, "conversation": { "$ref": "#/$defs/tagArray" }, "room": { "$ref": "#/$defs/tagArray" }, "person": { "$ref": "#/$defs/tagArray" }, "relationship": { "$ref": "#/$defs/tagArray" }, "thread": { "$ref": "#/$defs/tagArray" } } }
+  }
+}
+
