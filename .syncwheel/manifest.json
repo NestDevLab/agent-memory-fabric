@@ -76,7 +76,8 @@
       "integration_branch": "main-integration",
       "commits": [
         "d83bba3c83c16b8f4f36756e36dbdf0e3ba45c7f",
-        "a54158498e7b041da6205bda3db93beed529743e"
+        "a54158498e7b041da6205bda3db93beed529743e",
+        "fe25fa9d12a84d92b1d617ea20e9569d14c71a46"
       ],
       "meta": {
         "purpose": "RAW projection v2 and logical message selection"
@@ -85,14 +86,15 @@
     {
       "id": "amf-canonical-bridge",
       "branch": "amf/canonical-bridge",
-      "base": "a54158498e7b041da6205bda3db93beed529743e",
+      "base": "fe25fa9d12a84d92b1d617ea20e9569d14c71a46",
       "target_remote": "origin",
       "target_branch": "amf/raw-runtime-v2",
       "integration_branch": "main-integration",
       "commits": [
-        "82079f734554081dfce19848b987956fd8fbc76b",
-        "2dc05ebe44ffc2d2e78bb9ea40a29adde215328f",
-        "df9220502de43a4cb7ec9409cd136c37c3ca6f2a"
+        "757e6d78a86b5a296a4bac5da5ce70266915b2d5",
+        "34657726411403f508a7dda7358d69863a2773b1",
+        "4491c09912e709bdaf99ad62e063c65fb158b8f1",
+        "aefe6aff1d8e06bf988e2e228a2a0f8c066cf6d6"
       ],
       "meta": {
         "purpose": "Canonical PAM bridge, receipt recovery and context-bound API"
