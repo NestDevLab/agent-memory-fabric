@@ -287,10 +287,10 @@ function parseArgs(argv) {
     if (arg === "--json") options.json = true;
     else if (arg === "--deep") options.deep = true;
     else if (arg === "--offline") options.offline = true;
-    else if (["--config", "--endpoint", "--env-file", "--token-env", "--timeout-ms"].includes(arg)) {
+    else if (["--config", "--endpoint", "--deployment-env", "--token-env", "--timeout-ms"].includes(arg)) {
       const value = argv[++index];
       if (!value) throw new Error(`missing_value:${arg}`);
-      const key = { "--config": "config", "--endpoint": "endpoint", "--env-file": "envFile", "--token-env": "tokenEnv", "--timeout-ms": "timeoutMs" }[arg];
+      const key = { "--config": "config", "--endpoint": "endpoint", "--deployment-env": "envFile", "--token-env": "tokenEnv", "--timeout-ms": "timeoutMs" }[arg];
       options[key] = arg === "--timeout-ms" ? Number(value) : value;
     } else if (arg === "--help" || arg === "-h") options.help = true;
     else throw new Error(`unknown_argument:${arg}`);
@@ -299,7 +299,7 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  return `Usage: amf-health.mjs [--json] [--deep] [--offline] [--config FILE] [--endpoint URL] [--env-file FILE] [--token-env NAME] [--timeout-ms N]\n\nExit codes: 0 healthy, 1 degraded, 2 critical.`;
+  return `Usage: amf-health.mjs [--json] [--deep] [--offline] [--config FILE] [--endpoint URL] [--deployment-env FILE] [--token-env NAME] [--timeout-ms N]\n\nExit codes: 0 healthy, 1 degraded, 2 critical.`;
 }
 
 async function main() {
