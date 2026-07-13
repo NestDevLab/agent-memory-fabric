@@ -270,7 +270,8 @@
       "target_branch": "main",
       "integration_branch": "main-integration",
       "commits": [
-        "6bdce866556effdbd3bb8a98fd7a092f3524f637"
+        "6bdce866556effdbd3bb8a98fd7a092f3524f637",
+        "11e6fb9200d462a1b2cc2b087740c89687ab7d0f"
       ],
       "meta": {
         "purpose": "Provision scoped Obsidian document clients transactionally"
