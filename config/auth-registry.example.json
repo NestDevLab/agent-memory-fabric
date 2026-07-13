@@ -6,7 +6,8 @@
       "actor": "main-openclaw",
       "mode": "allow_all",
       "allowedScopes": "*",
-      "permissions": "memory:search,memory:read,memory:propose,memory:add,memory:status,sessions:read,raw:decrypt,raw:ingest"
+      "allowedVaults": ["vault-personal"],
+      "permissions": "memory:search,memory:read,memory:propose,memory:add,memory:status,sessions:read,raw:decrypt,raw:ingest,documents:search,documents:read,documents:write,purpose:operator_review"
     },
     {
       "tokenSha256": "bb02fe8c359c08e4a35e2372fc43713150bfc27a3b622812fc59f83b92366bc0",

@@ -9,6 +9,7 @@ import { createFabricStoreFromEnv, createUnconfiguredFabricStore } from './fabri
 import { validateAmfMemoryRecord } from './amf-memory-record-validator.mjs';
 import { createCanonicalPamBridgeFromEnv, createReceiptCoordinatorFromEnv, createUnconfiguredCanonicalStore } from './canonical-memory-bridge.mjs';
 import { createContextVerifierFromEnv, createUnconfiguredContextVerifier } from './context-token.mjs';
+import { createDocumentStoreFromEnv, createUnconfiguredDocumentStore } from './document-store.mjs';
 import { PURPOSES, buildContextRequest, exactContextIntersection, normalizeScopeList, scopeRequiresContext } from './access-contract.mjs';
 import { RAW_EVENT_HTTP_MAX_BODY_BYTES } from './ingest/raw-event-contract.mjs';
 import { validatePamRuntimePrivateDirFromEnv } from './operator/pam-runtime-private-dir.mjs';
@@ -63,6 +64,7 @@ const V1_HEADERS = Object.freeze({
 const PUBLIC_ERRORS = new Map([
   ['invalid_json', [400, 'invalid_json']], ['invalid_request', [400, 'invalid_request']], ['context_transport_invalid', [400, 'context_transport_invalid']], ['scope_required', [400, 'scope_required']], ['scope_unregistered', [400, 'scope_unregistered']],
   ['scope_unmapped', [400, 'scope_unmapped']], ['memory_text_required', [400, 'memory_text_required']], ['memory_id_required', [400, 'memory_id_required']],
+  ['document_invalid', [400, 'document_invalid']], ['document_id_required', [400, 'document_id_required']],
   ['canonical_record_required', [400, 'canonical_record_required']], ['canonical_record_invalid', [400, 'canonical_record_invalid']], ['rationale_required', [400, 'rationale_required']],
   ['revision_invalid', [400, 'revision_invalid']], ['idempotency_key_required', [400, 'idempotency_key_required']], ['purpose_required', [400, 'purpose_required']],
   ['purpose_invalid', [400, 'purpose_invalid']], ['context_required', [403, 'context_required']], ['context_invalid', [403, 'context_invalid']], ['session_limit_invalid', [400, 'session_limit_invalid']], ['raw_content_id_invalid', [400, 'raw_content_id_invalid']],
@@ -70,7 +72,9 @@ const PUBLIC_ERRORS = new Map([
   ['forbidden', [403, 'forbidden']], ['scope_forbidden', [403, 'scope_forbidden']], ['memory_search_forbidden', [403, 'memory_search_forbidden']],
   ['sessions_forbidden', [403, 'sessions_forbidden']], ['raw_decrypt_forbidden', [403, 'raw_decrypt_forbidden']],
   ['not_found', [404, 'not_found']], ['memory_not_found', [404, 'memory_not_found']], ['session_not_found', [404, 'session_not_found']], ['unknown_session', [404, 'unknown_session']],
+  ['document_not_found', [404, 'document_not_found']],
   ['idempotency_key_conflict', [409, 'idempotency_key_conflict']], ['body_too_large', [413, 'body_too_large']], ['query_too_large', [413, 'query_too_large']],
+  ['document_idempotency_conflict', [409, 'document_idempotency_conflict']], ['document_path_conflict', [409, 'document_path_conflict']],
   ['body_read_timeout', [408, 'body_read_timeout']],
   ['proposal_too_large', [413, 'proposal_too_large']], ['metadata_too_large', [413, 'metadata_too_large']], ['idempotency_key_too_large', [413, 'idempotency_key_too_large']],
   ['identity_invalid', [400, 'identity_invalid']], ['identity_kind_invalid', [400, 'identity_kind_invalid']], ['identity_external_key_invalid', [400, 'identity_external_key_invalid']],
@@ -85,6 +89,7 @@ const PUBLIC_ERRORS = new Map([
   ['receipt_invalid', [400, 'invalid_request']], ['receipt_transition_invalid', [409, 'conflict']], ['receipt_conflict', [409, 'conflict']], ['receipt_proposal_unverified', [409, 'conflict']], ['canonical_apply_unverified', [409, 'conflict']],
   ['raw_reconcile_required', [409, 'raw_reconcile_required']],
   ['session_capacity_exceeded', [429, 'session_capacity_exceeded']], ['fabric_store_unconfigured', [503, 'fabric_store_unconfigured']],
+  ['document_store_unconfigured', [503, 'document_store_unconfigured']],
   ['raw_projection_invalid', [400, 'raw_projection_invalid']], ['raw_envelope_invalid', [400, 'raw_envelope_invalid']], ['raw_envelope_binding_invalid', [400, 'raw_envelope_binding_invalid']],
   ['source_instance_invalid', [400, 'source_instance_invalid']], ['raw_event_conflict', [409, 'raw_event_conflict']], ['raw_ingest_key_unavailable', [503, 'raw_ingest_key_unavailable']],
     ['raw_session_binding_conflict', [409, 'raw_session_binding_conflict']], ['raw_envelope_authentication_failed', [400, 'raw_envelope_authentication_failed']],
@@ -528,6 +533,35 @@ function buildToolsListResult() {
         }
       },
       {
+        name: 'documents_search',
+        description: 'Search authorized editorial documents without treating them as canonical memories.',
+        inputSchema: {
+          type: 'object', additionalProperties: false,
+          properties: { query: { type: 'string' }, vaultIds: { type: 'array', minItems: 1, items: { type: 'string' } },
+            purpose: { type: 'string' }, contextToken: { type: 'string' }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 } },
+          required: ['query', 'vaultIds', 'purpose', 'contextToken']
+        }
+      },
+      {
+        name: 'document_read',
+        description: 'Read one authorized editorial document revision with provenance.',
+        inputSchema: {
+          type: 'object', additionalProperties: false,
+          properties: { documentId: { type: 'string' }, revision: { type: ['integer', 'null'], minimum: 1 }, purpose: { type: 'string' }, contextToken: { type: 'string' } },
+          required: ['documentId', 'purpose', 'contextToken']
+        }
+      },
+      {
+        name: 'document_upsert',
+        description: 'Ingest one revisioned editorial document. Requires documents:write.',
+        inputSchema: { type: 'object', additionalProperties: false, properties: { document: { type: 'object' }, text: { type: ['string', 'null'] }, expectedRevision: { type: ['integer', 'null'] }, idempotencyKey: { type: 'string' } }, required: ['document', 'text', 'expectedRevision', 'idempotencyKey'] }
+      },
+      {
+        name: 'document_delete',
+        description: 'Append a document tombstone revision. Requires documents:write.',
+        inputSchema: { type: 'object', additionalProperties: false, properties: { document: { type: 'object' }, expectedRevision: { type: 'integer', minimum: 1 }, idempotencyKey: { type: 'string' } }, required: ['document', 'expectedRevision', 'idempotencyKey'] }
+      },
+      {
         name: 'memory_propose',
         description: 'Queue a canonical, revision-aware memory proposal for later curation.',
         inputSchema: {
@@ -588,7 +622,7 @@ function buildToolsListResult() {
   };
 }
 
-async function executeMcpMethod({ body, actor, policy, policies, backend, fabricStore, canonicalStore,
+async function executeMcpMethod({ body, actor, policy, policies, backend, fabricStore, canonicalStore, documentStore,
   contextVerifier, routeManifestPath, sessionReader, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
   const method = body.method;
   const id = body.id ?? null;
@@ -627,7 +661,7 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
     if (name === 'memory_status') {
       requirePermission(policy, 'memory:status');
       await healthRequired(fabricStore);
-      const status = buildStatus({ backend, fabricStore, canonicalStore, contextVerifier, sessionReader });
+      const status = buildStatus({ backend, fabricStore, canonicalStore, documentStore, contextVerifier, sessionReader });
       await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] });
     }
@@ -689,6 +723,24 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: args.contextToken, request: buildContextRequest('memory_read', { id: targetId }), required: purpose === 'conversation_recall' });
       const memory = await performMemoryRead({ actor, policy, policies, fabricStore, canonicalStore, context, id: targetId, requestId });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(memory, null, 2) }] });
+    }
+
+    if (name === 'documents_search') {
+      const result = await performDocumentsSearch({ actor, policy, fabricStore, documentStore, contextVerifier,
+        request: args, requestId, transport: 'mcp' });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
+    }
+
+    if (name === 'document_read') {
+      const result = await performDocumentRead({ actor, policy, fabricStore, documentStore, contextVerifier,
+        request: args, requestId, transport: 'mcp' });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
+    }
+
+    if (name === 'document_upsert' || name === 'document_delete') {
+      const result = await performDocumentWrite({ actor, policy, fabricStore, documentStore, request: args,
+        deleting: name === 'document_delete', requestId, transport: 'mcp' });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
     }
 
     if (name === 'sessions_search') {
@@ -774,6 +826,80 @@ function requirePermission(policy, permission) {
   const error = new Error('forbidden');
   error.status = 403;
   throw error;
+}
+
+function documentVaultAllowed(policy, vaultId) {
+  if (policy.mode === 'allow_all') return true;
+  return Array.isArray(policy.allowedVaults) && policy.allowedVaults.includes(vaultId);
+}
+
+function requireDocumentVaults(policy, vaultIds) {
+  if (!Array.isArray(vaultIds) || !vaultIds.length || vaultIds.some(vaultId => !documentVaultAllowed(policy, vaultId))) {
+    throw Object.assign(new Error('forbidden'), { status: 403 });
+  }
+}
+
+function requireDocumentPurpose(value) {
+  const purpose = requirePurpose(value);
+  if (!['conversation_recall', 'continuity_resume', 'operator_review', 'memory_curation'].includes(purpose)) {
+    throw Object.assign(new Error('purpose_invalid'), { status: 400 });
+  }
+  return purpose;
+}
+
+async function performDocumentWrite({ actor, policy, fabricStore, documentStore, request, deleting, requestId, transport }) {
+  const action = deleting ? 'document_delete' : 'document_upsert';
+  try {
+    requirePermission(policy, 'documents:write');
+    requireDocumentVaults(policy, [request?.document?.vaultId]);
+    const result = deleting ? await documentStore.delete(request) : await documentStore.upsert(request);
+    await auditRequired(fabricStore, { actor, action, outcome: result.duplicate ? 'duplicate' : (deleting ? 'tombstoned' : 'stored'), requestId,
+      targetId: result.document.documentId, details: { vaultId: result.document.vaultId, revision: result.document.revision, transport } });
+    return result;
+  } catch (error) {
+    if (error?.message !== 'audit_unavailable') await auditRequired(fabricStore, { actor, action, outcome: 'failed', requestId,
+      targetId: request?.document?.documentId || null, details: { code: publicError(error).code, transport } });
+    throw error;
+  }
+}
+
+async function performDocumentsSearch({ actor, policy, fabricStore, documentStore, contextVerifier, request, contextToken = request.contextToken, requestId, transport }) {
+  try {
+    requirePermission(policy, 'documents:search');
+    const purpose = requireDocumentPurpose(request.purpose);
+    requirePurposePermission(policy, purpose);
+    requireDocumentVaults(policy, request.vaultIds);
+    requireAccessContext(contextVerifier, { actor, policy, purpose, token: contextToken,
+      request: buildContextRequest('documents_search', request), required: true });
+    const items = await documentStore.search(request);
+    await auditRequired(fabricStore, { actor, action: 'documents_search', outcome: 'allowed', requestId,
+      details: { vaultIds: [...request.vaultIds].sort(), resultCount: items.length, transport } });
+    return { items, nextCursor: null, vaultIds: [...request.vaultIds].sort() };
+  } catch (error) {
+    if (error?.message !== 'audit_unavailable') await auditRequired(fabricStore, { actor, action: 'documents_search',
+      outcome: Number(error?.status || 500) < 500 ? 'denied' : 'failed', requestId, details: { code: publicError(error).code, transport } });
+    throw error;
+  }
+}
+
+async function performDocumentRead({ actor, policy, fabricStore, documentStore, contextVerifier, request, contextToken = request.contextToken, requestId, transport }) {
+  try {
+    requirePermission(policy, 'documents:read');
+    const purpose = requireDocumentPurpose(request.purpose);
+    requirePurposePermission(policy, purpose);
+    requireAccessContext(contextVerifier, { actor, policy, purpose, token: contextToken,
+      request: buildContextRequest('document_read', request), required: true });
+    const document = await documentStore.read(request);
+    if (!documentVaultAllowed(policy, document.vaultId)) throw Object.assign(new Error('document_not_found'), { status: 404 });
+    await auditRequired(fabricStore, { actor, action: 'document_read', outcome: 'allowed', requestId, targetId: document.documentId,
+      details: { vaultId: document.vaultId, revision: document.revision, transport } });
+    return { document };
+  } catch (error) {
+    if (error?.message !== 'audit_unavailable') await auditRequired(fabricStore, { actor, action: 'document_read',
+      outcome: Number(error?.status || 500) < 500 ? 'denied' : 'failed', requestId, targetId: request?.documentId || null,
+      details: { code: publicError(error).code, transport } });
+    throw error;
+  }
 }
 
 function requirePurpose(value) {
@@ -897,7 +1023,7 @@ function createUnconfiguredSessionReader() {
   return { configured: false, kind: 'unconfigured', search: fail, get: fail, transcript: fail };
 }
 
-function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalStore, contextVerifier = defaultContextVerifier, sessionReader }) {
+function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, sessionReader }) {
   return {
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
@@ -905,6 +1031,7 @@ function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalSt
     backend: { kind: backend.kind, configured: backend.configured },
     fabricStore: fabricStore.status(),
     canonicalStore: { kind: canonicalStore.kind || 'unconfigured', configured: Boolean(canonicalStore.configured) },
+    documentStore: { kind: documentStore.kind || 'custom', configured: Boolean(documentStore.configured) },
     contextTokens: { configured: Boolean(contextVerifier.configured), conversationRecallRequired: true },
     sessionReader: { kind: sessionReader.kind || 'custom', configured: Boolean(sessionReader.configured) },
     compatibility: { restV1: true, mcpSse: true, mcpStreamableHttp: true },
@@ -1048,6 +1175,7 @@ function validateAuthRows(rows, sourceKind) {
       strictAuthList(row.permissions, { wildcard: true });
       strictAuthArray(row.sessionOwnerActors, { optional: true });
       strictAuthArray(row.contextKeyVersions, { optional: true });
+      strictAuthArray(row.allowedVaults, { optional: true });
     } catch { valid = false; }
     const credential = validDigest ? tokenSha256 : validToken ? crypto.createHash('sha256').update(token, 'utf8').digest('hex') : '';
     if (!valid || credentials.has(credential)) {
@@ -1219,6 +1347,9 @@ function authenticateDigest(candidate, rows) {
   }
   if (Object.hasOwn(row, 'contextKeyVersions')) {
     policy.contextKeyVersions = strictAuthArray(row.contextKeyVersions);
+  }
+  if (Object.hasOwn(row, 'allowedVaults')) {
+    policy.allowedVaults = strictAuthArray(row.allowedVaults);
   }
   return {
     actor: String(row.actor || 'anonymous'),
@@ -1397,8 +1528,9 @@ const defaultBackend = createBackendAdapter();
 const defaultSessionReader = createUnconfiguredSessionReader();
 const defaultCanonicalStore = createUnconfiguredCanonicalStore();
 const defaultContextVerifier = createUnconfiguredContextVerifier();
+const defaultDocumentStore = createUnconfiguredDocumentStore();
 
-function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH } = {}) {
+function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH } = {}) {
   if (!Buffer.isBuffer(curationCursorKey) || curationCursorKey.length < 32) throw new Error('curation_cursor_key_invalid');
 if (!Number.isSafeInteger(rawIngestBodyBytes) || rawIngestBodyBytes < 1024 || rawIngestBodyBytes > 16 * 1024 * 1024) throw new Error('raw_ingest_body_limit_invalid');
 sessionReader = sessionReader || fabricStore.createSessionReader?.() || defaultSessionReader;
@@ -1495,11 +1627,56 @@ const requestHandler = async (req, res) => {
     try {
       requirePermission(policy, 'memory:status');
       await healthRequired(fabricStore);
-      const response = buildStatus({ backend, fabricStore, canonicalStore, contextVerifier, sessionReader });
+      const response = buildStatus({ backend, fabricStore, canonicalStore, documentStore, contextVerifier, sessionReader });
       await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
       return json(res, 200, v2Envelope(requestId, response));
     } catch (error) {
       const failure = v2Error(requestId, error, 403);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (pathnameParts[0] === 'v2' && pathnameParts[1] === 'documents' && pathnameParts[2]
+      && pathnameParts.length === 3 && ['PUT', 'DELETE'].includes(req.method)) {
+    const deleting = req.method === 'DELETE';
+    try {
+      const body = await parseBody(req, { timeoutMs: bodyReadTimeoutMs });
+      if (body?.document?.documentId !== pathnameParts[2]) throw Object.assign(new Error('document_invalid'), { status: 400 });
+      const headerKey = String(req.headers['idempotency-key'] || '');
+      if (headerKey && headerKey !== body.idempotencyKey) throw Object.assign(new Error('document_idempotency_conflict'), { status: 409 });
+      const result = await performDocumentWrite({ actor, policy, fabricStore, documentStore, request: body,
+        deleting, requestId, transport: 'rest' });
+      return jsonNoStore(res, result.duplicate ? 200 : (deleting ? 200 : 201), v2Envelope(requestId, result));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/documents/search' && req.method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const allowed = new Set(['query', 'vaultIds', 'purpose', 'cursor', 'limit']);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !allowed.has(key))) throw Object.assign(new Error('document_invalid'), { status: 400 });
+      const result = await performDocumentsSearch({ actor, policy, fabricStore, documentStore, contextVerifier,
+        request: body, contextToken: getAccessContextToken(req, url, policy), requestId, transport: 'rest' });
+      return jsonNoStore(res, 200, v2Envelope(requestId, result));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/documents/read' && req.method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const allowed = new Set(['documentId', 'revision', 'purpose']);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !allowed.has(key))) throw Object.assign(new Error('document_invalid'), { status: 400 });
+      const result = await performDocumentRead({ actor, policy, fabricStore, documentStore, contextVerifier,
+        request: body, contextToken: getAccessContextToken(req, url, policy), requestId, transport: 'rest' });
+      return jsonNoStore(res, 200, v2Envelope(requestId, result));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 500);
       return jsonNoStore(res, failure.status, failure.body);
     }
   }
@@ -2053,6 +2230,7 @@ const requestHandler = async (req, res) => {
         backend,
         fabricStore,
         canonicalStore,
+        documentStore,
         contextVerifier,
         routeManifestPath,
         sessionReader,
@@ -2119,6 +2297,7 @@ const requestHandler = async (req, res) => {
         backend,
         fabricStore,
         canonicalStore,
+        documentStore,
         contextVerifier,
         routeManifestPath,
         sessionReader,
@@ -2183,6 +2362,9 @@ applicationServer.on('close', () => {
   Promise.resolve(canonicalStore.close?.()).catch((error) => {
     logEvent('canonical_store_close_failed', { error: safeError(error) });
   });
+  Promise.resolve(documentStore.close?.()).catch((error) => {
+    logEvent('document_store_close_failed', { error: safeError(error) });
+  });
   Promise.resolve(receiptCoordinator?.close?.()).catch((error) => {
     logEvent('receipt_coordinator_close_failed', { error: safeError(error) });
   });
@@ -2208,20 +2390,23 @@ if (isMain) {
   } else {
     let runtimeFabricStore;
     let runtimeCanonicalStore;
+    let runtimeDocumentStore;
     let runtimeReceiptCoordinator;
     let runtimeServer;
     try {
       validatePamRuntimePrivateDirFromEnv(process.env);
       runtimeFabricStore = createFabricStoreFromEnv({ rootPath: ROOT });
       runtimeCanonicalStore = createCanonicalPamBridgeFromEnv(process.env);
+      runtimeDocumentStore = process.env.AMF_DOCUMENT_BACKEND
+        ? createDocumentStoreFromEnv(process.env) : createUnconfiguredDocumentStore();
       const runtimeContextVerifier = createContextVerifierFromEnv(process.env);
       runtimeReceiptCoordinator = createReceiptCoordinatorFromEnv({ canonicalStore: runtimeCanonicalStore, proposalStore: runtimeFabricStore });
-      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore, canonicalStore: runtimeCanonicalStore, contextVerifier: runtimeContextVerifier, receiptCoordinator: runtimeReceiptCoordinator });
+      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore, canonicalStore: runtimeCanonicalStore, documentStore: runtimeDocumentStore, contextVerifier: runtimeContextVerifier, receiptCoordinator: runtimeReceiptCoordinator });
     } catch (error) {
       console.error(`agent-memory-fabric disabled: configuration failed: ${safeError(error)?.code || 'internal_error'}`);
       process.exitCode = 78;
     }
-    Promise.resolve(runtimeFabricStore?.ready?.()).then(() => {
+    Promise.all([Promise.resolve(runtimeFabricStore?.ready?.()), Promise.resolve(runtimeDocumentStore?.ready?.())]).then(() => {
       if (!runtimeServer) return;
       runtimeServer.listen(PORT, () => {
         console.log(`${SERVICE_NAME} listening on :${PORT}`);
@@ -2233,6 +2418,7 @@ if (isMain) {
       console.error(`agent-memory-fabric disabled: catalog initialization failed: ${safeError(error)?.code || 'internal_error'}`);
       try { await runtimeFabricStore?.close?.(); } catch {}
       try { await runtimeCanonicalStore?.close?.(); } catch {}
+      try { await runtimeDocumentStore?.close?.(); } catch {}
       try { await runtimeReceiptCoordinator?.close?.(); } catch {}
       process.exitCode = 78;
     });

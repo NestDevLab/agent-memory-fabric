@@ -11,12 +11,14 @@ import { createAgentMemoryFabricServer } from '../src/server.mjs';
 import { ContextTokenVerifier, issueContextToken, issueSessionRouteBinding, requestDigest } from '../src/context-token.mjs';
 import { buildContextRequest } from '../src/access-contract.mjs';
 import { CanonicalPamBridge, CuratorReceiptCoordinator, MemoryReceiptLedger } from '../src/canonical-memory-bridge.mjs';
+import { MemoryDocumentStore } from '../src/document-store.mjs';
 
 const testPolicyPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'config', 'policies.example.json');
 const CONTEXT_RING = { currentKeyVersion: 'ctx-v1', keys: { 'ctx-v1': Buffer.alloc(32, 7).toString('base64') } };
 const CONTEXT_NOW = Date.parse('2026-07-12T12:00:00Z');
 const ROOM_A = `hmac-sha256:routing-v1:${'a'.repeat(64)}`;
 const ROOM_B = `hmac-sha256:routing-v1:${'b'.repeat(64)}`;
+const documentFixture = JSON.parse(fs.readFileSync(new URL('./fixtures/contracts/obsidian-document-lifecycle.json', import.meta.url), 'utf8'));
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
@@ -61,7 +63,7 @@ function canonicalProposal(text, scope = 'main-lab', revision = 1) {
 
 async function withServer(run, { sessionOptions, clock, configuredSessionReader = true,
   sessionReader: sessionReaderOverride, fabricStore: fabricStoreOverride, backend: backendOverride,
-  canonicalStore, contextVerifier, receiptCoordinator, routeManifestSetup } = {}) {
+  canonicalStore, documentStore, contextVerifier, receiptCoordinator, routeManifestSetup } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-server-'));
   const registryPath = path.join(dir, 'auth.json');
   const registry = {
@@ -117,6 +119,11 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
         mode: 'scoped',
         allowedScopes: 'tirrenia',
         permissions: 'memory:read,sessions:read,purpose:operator_review'
+      },
+      {
+        token: 'doc-limited-token', active: true, actor: 'doc-limited-actor', mode: 'scoped',
+        allowedScopes: 'main-lab', allowedVaults: ['vault-other'],
+        permissions: 'documents:search,documents:read,purpose:operator_review'
       }
     ]
   };
@@ -163,6 +170,7 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
   const effectiveRouteManifestPath = routeManifestSetup
     ? routeManifestSetup({ dir, routeManifestPath }) || routeManifestPath : routeManifestPath;
   const server = createAgentMemoryFabricServer({ backend, fabricStore, canonicalStore,
+    documentStore,
     contextVerifier: effectiveContextVerifier, routeManifestPath: effectiveRouteManifestPath, receiptCoordinator,
     sessionReader: configuredSessionReader ? sessionReader : undefined, sessionOptions, clock,
     policyPath: testPolicyPath });
@@ -220,6 +228,48 @@ test('v2 REST queues idempotently while canonical read never exposes proposal pa
     assert.equal(read.body.error.code, 'canonical_store_unconfigured');
     assert.equal(JSON.stringify(read.body).includes('Remember the appointment'), false);
   });
+});
+
+test('document REST and MCP enforce revision, vault ACL, context binding, and audit', async () => {
+  const documentStore = new MemoryDocumentStore();
+  await withServer(async ({ api, fabricStore }) => {
+    const id = documentFixture.create.document.documentId;
+    const create = await api(`/v2/documents/${id}`, { method: 'PUT', body: JSON.stringify(documentFixture.create) });
+    const replay = await api(`/v2/documents/${id}`, { method: 'PUT', body: JSON.stringify(documentFixture.create) });
+    assert.equal(create.response.status, 201); assert.equal(replay.response.status, 200); assert.equal(replay.body.data.duplicate, true);
+    const renamed = await api(`/v2/documents/${id}`, { method: 'PUT', body: JSON.stringify(documentFixture.rename) });
+    assert.equal(renamed.body.data.document.path, documentFixture.rename.document.path);
+
+    const searchInput = { query: 'memory fabric', vaultIds: ['vault-personal'], purpose: 'operator_review' };
+    const searchToken = contextTokenFor({ purpose: searchInput.purpose, operation: 'documents_search', input: searchInput });
+    const searched = await api('/v2/documents/search', { method: 'POST', headers: { 'x-amf-context-token': searchToken }, body: JSON.stringify(searchInput) });
+    assert.equal(searched.response.status, 200); assert.deepEqual(searched.body.data.items.map(item => item.documentId), [id]);
+
+    const readInput = { documentId: id, revision: 1, purpose: 'operator_review' };
+    const readToken = contextTokenFor({ purpose: readInput.purpose, operation: 'document_read', input: readInput });
+    const read = await api('/v2/documents/read', { method: 'POST', headers: { 'x-amf-context-token': readToken }, body: JSON.stringify(readInput) });
+    assert.equal(read.body.data.document.path, documentFixture.create.document.path);
+
+    const listed = await api('/mcp/test-client/documents', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) });
+    const toolNames = listed.body.result.tools.map(tool => tool.name);
+    for (const name of ['documents_search', 'document_read', 'document_upsert', 'document_delete']) assert.ok(toolNames.includes(name));
+    const mcp = await api('/mcp/test-client/documents', { method: 'POST', headers: { 'mcp-session-id': listed.response.headers.get('mcp-session-id') },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'documents_search', arguments: { ...searchInput, contextToken: searchToken } } }) });
+    assert.equal(JSON.parse(mcp.body.result.content[0].text).items.length, 1);
+
+    const forbiddenSearch = await api('/v2/documents/search', { method: 'POST', headers: { authorization: 'Bearer doc-limited-token', 'x-amf-context-token': searchToken }, body: JSON.stringify(searchInput) });
+    assert.equal(forbiddenSearch.response.status, 403);
+    const limitedReadToken = contextTokenFor({ actor: 'doc-limited-actor', purpose: readInput.purpose, operation: 'document_read', input: readInput });
+    const forbiddenRead = await api('/v2/documents/read', { method: 'POST', headers: { authorization: 'Bearer doc-limited-token', 'x-amf-context-token': limitedReadToken }, body: JSON.stringify(readInput) });
+    assert.equal(forbiddenRead.response.status, 404, 'cross-vault reads expose no document existence oracle');
+
+    const removed = await api(`/v2/documents/${id}`, { method: 'DELETE', body: JSON.stringify(documentFixture.delete) });
+    assert.equal(removed.response.status, 200); assert.equal(removed.body.data.document.tombstone, true);
+    const afterDelete = await api('/v2/documents/search', { method: 'POST', headers: { 'x-amf-context-token': searchToken }, body: JSON.stringify(searchInput) });
+    assert.equal(afterDelete.body.data.items.length, 0);
+    const actions = fabricStore.catalog.auditEvents.map(event => event.action);
+    for (const action of ['document_upsert', 'documents_search', 'document_read', 'document_delete']) assert.ok(actions.includes(action));
+  }, { documentStore });
 });
 
 test('least-privilege curator polls bounded metadata and reads one digest-bound proposal', async () => {

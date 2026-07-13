@@ -39,6 +39,23 @@ retaining `kind`, provenance and revision. It must not change either canon.
 Document ingestion requires an idempotency key and a vault authorization; reads
 and searches use the same purpose-bound context token model as memory recall.
 
+REST search and read requests carry the purpose-bound token in the
+`X-AMF-Context-Token` header. MCP requests carry the same token in
+`contextToken`. Write requests require `documents:write`; search and read
+require `documents:search` and `documents:read` respectively. Purpose-specific
+permissions remain additive (for example, `purpose:operator_review`).
+
+Actors in `allow_all` mode may access every vault. All other actors must declare
+an `allowedVaults` array in the authorization registry; a missing array fails
+closed. Unauthorized reads return `document_not_found` so the API does not
+become a cross-vault existence oracle. Every allowed, denied and failed document
+operation is written to the existing durable audit store.
+
+The document API is disabled unless `AMF_DOCUMENT_BACKEND` is configured.
+Supported values are `sqlite` and `postgresql`; their connection settings are
+`AMF_DOCUMENT_SQLITE_PATH` and `AMF_DOCUMENT_POSTGRES_URL`. PostgreSQL reuses
+`AMF_CATALOG_DATABASE_URL` when the document-specific URL is absent.
+
 ## Deployment chains and providers
 
 Exactly one semantic owner is active in a stable deployment:
