@@ -15,16 +15,17 @@ test('published canonical contract exposes every authoritative transport definit
   assert.equal(JSON.stringify(schema.$defs.transcriptData).includes('"messages"'), false);
 });
 
-test('0.5.6 release identity is coordinated across package, server, image and fixtures', () => {
+test('0.6.0 release identity is coordinated across package, server, image and fixtures', () => {
   const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   const lock = JSON.parse(fs.readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8'));
   const server = fs.readFileSync(new URL('../src/server.mjs', import.meta.url), 'utf8');
   const compose = fs.readFileSync(new URL('../compose.agent-memory-fabric.yml', import.meta.url), 'utf8');
-  assert.equal(packageJson.version, '0.5.6'); assert.equal(lock.version, '0.5.6');
-  assert.equal(lock.packages[''].version, '0.5.6'); assert.match(server, /SERVICE_VERSION = '0\.5\.6'/);
-  assert.match(compose, /agent-memory-fabric:0\.5\.6/);
+  assert.equal(packageJson.version, '0.6.0'); assert.equal(lock.version, '0.6.0');
+  assert.equal(lock.packages[''].version, '0.6.0'); assert.match(server, /SERVICE_VERSION = '0\.6\.0'/);
   for (const response of [fixture.memorySearch.response, fixture.memoryRead.response,
-    fixture.sessionsSearch.response, fixture.transcript.redacted]) assert.equal(response.meta.version, '0.5.6');
+    fixture.sessionsSearch.response, fixture.transcript.redacted]) assert.equal(response.meta.version, '0.6.0');
+  assert.match(compose, /image: agent-memory-fabric:0\.6\.0/);
+  assert.match(compose, /AMF_DOCUMENT_BACKEND: postgresql/);
 });
 
 test('Principia fixture uses the executable request-digest shapes and canonical transcript items', () => {
