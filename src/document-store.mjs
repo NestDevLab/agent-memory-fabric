@@ -92,7 +92,7 @@ function searchRows(rows, { query, vaultIds, limit = 20 }) {
 }
 
 export class MemoryDocumentStore {
-  constructor() { this.heads = new Map(); this.revisions = new Map(); this.idempotency = new Map(); }
+  constructor() { this.configured = true; this.kind = 'memory'; this.heads = new Map(); this.revisions = new Map(); this.idempotency = new Map(); }
 
   write(request, { deleting = false } = {}) {
     validateDocumentRequest(request, { deleting });
@@ -135,6 +135,7 @@ function mapSqlite(row) {
 
 export class SqliteDocumentStore {
   constructor({ filename = ':memory:', database } = {}) {
+    this.configured = true; this.kind = 'sqlite';
     this.db = database || new Database(filename);
     this.db.pragma('foreign_keys = ON');
     this.db.exec(`
@@ -220,6 +221,7 @@ function mapPostgres(row) {
 
 export class PostgresDocumentStore {
   constructor({ pool, connectionString, poolFactory = config => new Pool(config) } = {}) {
+    this.configured = true; this.kind = 'postgresql';
     this.pool = pool || poolFactory({ connectionString, max: 10 });
     this.initialized = this.pool.query(POSTGRES_DDL);
   }
@@ -277,8 +279,14 @@ export function createDocumentStoreFromEnv(env = process.env) {
   const backend = String(env.AMF_DOCUMENT_BACKEND || '').trim();
   if (backend === 'sqlite') return new SqliteDocumentStore({ filename: env.AMF_DOCUMENT_SQLITE_PATH || ':memory:' });
   if (backend === 'postgresql') {
-    if (!env.AMF_POSTGRES_URL) failure('document_store_unconfigured', 503);
-    return new PostgresDocumentStore({ connectionString: env.AMF_POSTGRES_URL });
+    const connectionString = env.AMF_DOCUMENT_POSTGRES_URL || env.AMF_CATALOG_DATABASE_URL;
+    if (!connectionString) failure('document_store_unconfigured', 503);
+    return new PostgresDocumentStore({ connectionString });
   }
   failure('document_store_unconfigured', 503);
+}
+
+export function createUnconfiguredDocumentStore(reason = 'document_store_unconfigured') {
+  const fail = async () => failure(reason, 503);
+  return { configured: false, kind: 'unconfigured', upsert: fail, delete: fail, search: fail, read: fail, health: async () => ({ healthy: false, backend: 'unconfigured', reason }), close: async () => {} };
 }

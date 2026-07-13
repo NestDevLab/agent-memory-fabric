@@ -45,7 +45,8 @@ MEM0_AUTH_CACHE_TTL_MS=15000
       "actor": "main-openclaw",
       "mode": "allow_all",
       "allowedScopes": "*",
-      "permissions": "memory:search,memory:read,memory:propose,memory:add,memory:status,sessions:read,raw:decrypt,raw:ingest"
+      "allowedVaults": ["vault-personal"],
+      "permissions": "memory:search,memory:read,memory:propose,memory:add,memory:status,sessions:read,raw:decrypt,raw:ingest,documents:search,documents:read,documents:write,purpose:operator_review"
     }
   ]
 }
@@ -53,7 +54,8 @@ MEM0_AUTH_CACHE_TTL_MS=15000
 
 `tokenSha256` is the lowercase SHA-256 digest of the bearer token; bearer values are
 checked with a constant-time comparison and need not be stored in the registry.
-`allowedScopes` and `permissions` accept arrays or comma-separated strings. The
+`allowedScopes` and `permissions` accept arrays or comma-separated strings. `allowedVaults`
+is an optional array used by the document corpus; scoped actors fail closed when it is absent. The
 fabric also accepts a bare row array and the n8n-compatible `{ "data": [...] }`
 shape. When no local path is configured, n8n remains available as a compatibility
 source through `N8N_API_BASE_URL`, `N8N_AUTH_TABLE_ID`, and `N8N_API_KEY`.
