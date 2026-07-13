@@ -1,6 +1,6 @@
 ---
 name: agent-memory-health
-description: Check Agent Memory Fabric storage, capture, collector, provider, and recall health. Use when asked whether memory works, is enabled, healthy, degraded, or available in Codex, Claude, OpenClaw, Hermes, or a specialized agent.
+description: Check Agent Memory Fabric storage, document corpus, capture, provider, and recall health across Codex, Claude, OpenClaw, and Hermes.
 ---
 
 # Agent Memory Health
@@ -17,11 +17,12 @@ The probe also discovers the standard OpenClaw workspace harness map automatical
 
 Use `--deployment-env <path>` only for an authorized AMF deployment file; the script reads the token without printing it. Never source or display secrets.
 
-Interpret three independent layers:
+Interpret four independent layers:
 
 1. **Capture:** collectors are recent, successful, and have no pending/dead events.
-2. **Access:** the current session exposes `memory_status`, `memory_search`, `memory_read`, or equivalent native recall. Inspect the actual tool surface; the script cannot see tools injected into the session.
-3. **Recall:** a fresh session retrieves a benign unique fact with correct scope and provenance.
+2. **Corpus:** when `requireDocumentStore` is enabled, AMF reports a configured document backend and the Obsidian client reports no retrying delivery.
+3. **Access:** the current session exposes `memory_status`, `memory_search`, `memory_read`, or equivalent native recall. Inspect the actual tool surface; the script cannot see tools injected into the session.
+4. **Recall:** a fresh session retrieves a benign unique fact with correct scope and provenance.
 
 Report `HEALTHY` only when every required layer passes. Storage without access is `DEGRADED`; capture alone never proves recall. Preserve script exit semantics: `0` healthy, `1` degraded, `2` critical.
 

@@ -24,6 +24,7 @@ const healthyFabric = {
     version: "0.5.7",
     backend: { kind: "disabled", configured: false },
     canonicalStore: { kind: "pam-stdio", configured: true },
+    documentStore: { kind: "sqlite", configured: true },
     fabricStore: {
       healthy: true,
       closed: false,
@@ -40,7 +41,16 @@ const healthyFabric = {
 
 test("Fabric accepts healthy file-first operation and can require the semantic backend", () => {
   assert.equal(evaluateFabricPayload(healthyFabric).status, "healthy");
+  assert.equal(evaluateFabricPayload(healthyFabric, { requireDocumentStore: true }).status, "healthy");
   assert.equal(evaluateFabricPayload(healthyFabric, { requireSemanticBackend: true }).status, "degraded");
+});
+
+test("Fabric document corpus requirement fails closed when unconfigured", () => {
+  const withoutDocuments = structuredClone(healthyFabric);
+  withoutDocuments.data.documentStore = { kind: "unconfigured", configured: false };
+  const result = evaluateFabricPayload(withoutDocuments, { requireDocumentStore: true });
+  assert.equal(result.status, "degraded");
+  assert.match(result.summary, /Document corpus/);
 });
 
 test("Fabric fails closed on RAW readiness or store health", () => {
