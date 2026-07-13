@@ -261,6 +261,20 @@
       "meta": {
         "purpose": "Release the reviewed Obsidian document corpus and enable the production PostgreSQL document backend"
       }
+    },
+    {
+      "id": "obsidian-document-client-provisioner",
+      "branch": "feat/obsidian-document-client-provisioner",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "6bdce866556effdbd3bb8a98fd7a092f3524f637"
+      ],
+      "meta": {
+        "purpose": "Provision scoped Obsidian document clients transactionally"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
