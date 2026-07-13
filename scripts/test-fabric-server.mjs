@@ -272,6 +272,43 @@ test('document REST and MCP enforce revision, vault ACL, context binding, and au
   }, { documentStore });
 });
 
+test('context search interleaves canonical memories and bounded document candidates', async () => {
+  const documentStore = new MemoryDocumentStore();
+  documentStore.upsert(documentFixture.create);
+  const record = canonicalRecord('Memory architecture decision', 'main-lab');
+  const canonicalStore = {
+    configured: true, kind: 'test-canonical',
+    async search() { return { items: [record], nextCursor: null }; },
+    routingContext() { return null; },
+    async close() {}
+  };
+  await withServer(async ({ api, fabricStore }) => {
+    const input = { query: 'Memory', scopes: ['domain:main-lab'], vaultIds: ['vault-personal'], purpose: 'operator_review', limit: 10 };
+    const token = contextTokenFor({ purpose: input.purpose, operation: 'context_search', input,
+      conversationKind: 'session', canonicalScopes: ['domain:main-lab'] });
+    const searched = await api('/v2/context/search', { method: 'POST', headers: { 'x-amf-context-token': token }, body: JSON.stringify(input) });
+    assert.equal(searched.response.status, 200);
+    assert.deepEqual(searched.body.data.items.map(item => item.kind), ['memory', 'document']);
+    assert.equal(searched.body.data.items[0].record.id, record.id);
+    assert.equal(searched.body.data.items[1].path, documentFixture.create.document.path);
+    assert.match(searched.body.data.items[1].snippet, /Memory Fabric/);
+    assert.equal(searched.body.data.items[1].text, undefined);
+    assert.deepEqual(searched.body.data.sources, { memory: 1, document: 1 });
+
+    const listed = await api('/mcp/test-client/context-search', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) });
+    assert.ok(listed.body.result.tools.some(tool => tool.name === 'context_search'));
+    const mcp = await api('/mcp/test-client/context-search', { method: 'POST', headers: { 'mcp-session-id': listed.response.headers.get('mcp-session-id') },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'context_search', arguments: { ...input, contextToken: token } } }) });
+    assert.equal(JSON.parse(mcp.body.result.content[0].text).items.length, 2);
+
+    const limitedToken = contextTokenFor({ actor: 'doc-limited-actor', purpose: input.purpose, operation: 'context_search', input,
+      conversationKind: 'session', canonicalScopes: ['domain:main-lab'] });
+    const denied = await api('/v2/context/search', { method: 'POST', headers: { authorization: 'Bearer doc-limited-token', 'x-amf-context-token': limitedToken }, body: JSON.stringify(input) });
+    assert.equal(denied.response.status, 403);
+    assert.ok(fabricStore.catalog.auditEvents.some(event => event.action === 'context_search' && event.outcome === 'allowed'));
+  }, { documentStore, canonicalStore });
+});
+
 test('least-privilege curator polls bounded metadata and reads one digest-bound proposal', async () => {
   await withServer(async ({ api }) => {
     const proposalIds = [];

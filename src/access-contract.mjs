@@ -44,6 +44,8 @@ export function buildContextRequest(operation, input = {}) {
   if (operation === 'memory_read') return { operation, id: String(input.id || '') };
   if (operation === 'documents_search') return { operation, query: String(input.query || ''), vaultIds: [...new Set((Array.isArray(input.vaultIds) ? input.vaultIds : []).map(String))].sort(), cursor: input.cursor || null, limit: Number(input.limit || 20) };
   if (operation === 'document_read') return { operation, documentId: String(input.documentId || ''), revision: input.revision == null ? null : Number(input.revision) };
+  if (operation === 'context_search') return { operation, query: String(input.query || ''), scopes: normalizeScopeList(input.scope, input.scopes),
+    vaultIds: [...new Set((Array.isArray(input.vaultIds) ? input.vaultIds : []).map(String))].sort(), limit: Number(input.limit || 20) };
   if (operation === 'sessions_search') return { operation, query: String(input.query || ''), cursor: input.cursor || null, limit: Number(input.limit || 20), from: input.from || null, to: input.to || null };
   if (operation === 'session_get') return { operation, sessionId: String(input.sessionId || '') };
   if (operation === 'session_transcript') return { operation, sessionId: String(input.sessionId || ''),

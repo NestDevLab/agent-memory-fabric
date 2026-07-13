@@ -34,8 +34,11 @@ context. The document operations are:
 | Search | `POST /v2/documents/search` | `documents_search` | Search live authorized documents |
 | Read | `POST /v2/documents/read` | `document_read` | Read one authorized revision |
 
-`context_search` will later combine document and memory candidates while
-retaining `kind`, provenance and revision. It must not change either canon.
+`context_search` combines document and memory candidates while retaining
+`kind`, provenance and document revision. It interleaves each source's native
+order rather than inventing a cross-engine score, and it must not change either
+canon. Document results contain a bounded snippet rather than the stored full
+text.
 Document ingestion requires an idempotency key and a vault authorization; reads
 and searches use the same purpose-bound context token model as memory recall.
 
