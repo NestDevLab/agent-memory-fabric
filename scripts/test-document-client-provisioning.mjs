@@ -114,6 +114,7 @@ test('document client validation rejects wildcard scopes and non-Obsidian actors
     options => { options.actor = 'agent:unrelated'; },
     options => { options.vaultId = '*'; },
     options => { options.contextKeyVersion = 'ctx-unrelated-v1'; },
+    options => { options.contextKeyVersion = `ctx-obsidian-${'a'.repeat(116)}`; },
     options => { options.endpoint = 'https://user:pass@example.test/'; }
   ]) {
     const { root, options } = fixture();

@@ -75,7 +75,8 @@ function normalizeDocumentClientOptions({ actor, vaultId, scopes, contextKeyVers
   policyRevision, endpoint }) {
   if (typeof actor !== 'string' || !/^client:obsidian:[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(actor)
     || typeof vaultId !== 'string' || !SAFE_ID.test(vaultId) || vaultId.includes('*')
-    || typeof contextKeyVersion !== 'string' || !/^ctx-obsidian-[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(contextKeyVersion)
+    || typeof contextKeyVersion !== 'string' || contextKeyVersion.length > 128
+    || !/^ctx-obsidian-[A-Za-z0-9][A-Za-z0-9._-]*$/.test(contextKeyVersion)
     || typeof policyRevision !== 'string' || !SAFE_ID.test(policyRevision)
     || typeof endpoint !== 'string') throw fail('document_client_option_invalid');
   let parsedEndpoint;
