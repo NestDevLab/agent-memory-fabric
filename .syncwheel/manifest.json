@@ -219,6 +219,32 @@
       "meta": {
         "purpose": "Combine authorized PAM memories and Obsidian documents in contextual recall"
       }
+    },
+    {
+      "id": "obsidian-health",
+      "branch": "feat/obsidian-health",
+      "base": "origin/feat/obsidian-context-search",
+      "target_remote": "origin",
+      "target_branch": "feat/obsidian-context-search",
+      "integration_branch": "main-integration",
+      "commits": [
+        "271fb0cd724e5df3d4178a92047f8d07c65ec9b9"
+      ],
+      "meta": {
+        "purpose": "Extend AMF health with document corpus readiness"
+      }
+    },
+    {
+      "id": "obsidian-security-hardening",
+      "branch": "feat/obsidian-security-hardening",
+      "base": "origin/feat/obsidian-health",
+      "target_remote": "origin",
+      "target_branch": "feat/obsidian-health",
+      "integration_branch": "main-integration",
+      "commits": [],
+      "meta": {
+        "purpose": "Harden document search minimization, bounds, and PostgreSQL idempotency concurrency"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",

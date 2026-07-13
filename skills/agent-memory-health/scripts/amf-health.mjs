@@ -38,10 +38,11 @@ export function parseEnvText(text) {
   return values;
 }
 
-export function evaluateFabricPayload(payload, { requireSemanticBackend = false, maxQueuedProposals = null } = {}) {
+export function evaluateFabricPayload(payload, { requireSemanticBackend = false, requireDocumentStore = false, maxQueuedProposals = null } = {}) {
   const store = payload?.data?.fabricStore;
   const canonical = payload?.data?.canonicalStore;
   const backend = payload?.data?.backend;
+  const documents = payload?.data?.documentStore;
   if (payload?.ok !== true || !store) return check("fabric", "critical", "Fabric status payload is invalid");
   if (store.healthy !== true || store.closed === true) return check("fabric", "critical", "Fabric store is unhealthy or closed");
   if (store.rawProjectionV2Ready !== true || store.rawProjectionV2ReadinessReason !== null || store.legacyV1WritesEnabled !== false) {
@@ -49,11 +50,15 @@ export function evaluateFabricPayload(payload, { requireSemanticBackend = false,
   }
   if (canonical?.configured !== true) return check("fabric", "degraded", "Canonical memory store is not configured");
   if (requireSemanticBackend && backend?.configured !== true) return check("fabric", "degraded", "Semantic backend is required but disabled");
+  if (requireDocumentStore && documents?.configured !== true) {
+    return check("fabric", "degraded", "Document corpus store is required but not configured");
+  }
   if (Number.isFinite(maxQueuedProposals) && Number(store.queuedProposals ?? 0) > maxQueuedProposals) {
     return check("fabric", "degraded", `Queued proposals exceed threshold (${store.queuedProposals}/${maxQueuedProposals})`);
   }
   return check("fabric", "healthy", `Fabric ${payload.data?.version ?? "unknown"}: ${store.backend ?? "store"}, schema ${store.schemaVersion ?? "unknown"}`,
-    { rawObjects: finite(store.rawObjects), queuedProposals: finite(store.queuedProposals), backend: backend?.kind ?? "unknown" });
+    { rawObjects: finite(store.rawObjects), queuedProposals: finite(store.queuedProposals), backend: backend?.kind ?? "unknown",
+      documentBackend: documents?.configured ? documents.kind : "disabled" });
 }
 
 export function evaluateCollectorSnapshot(snapshot, { maxPending = 0, maxAgeMs = 15 * 60_000 } = {}) {
