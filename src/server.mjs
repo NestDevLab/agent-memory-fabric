@@ -888,7 +888,8 @@ async function performDocumentsSearch({ actor, policy, fabricStore, documentStor
     requireDocumentVaults(policy, request.vaultIds);
     requireAccessContext(contextVerifier, { actor, policy, purpose, token: contextToken,
       request: buildContextRequest('documents_search', request), required: true });
-    const items = await documentStore.search(request);
+    const documents = await documentStore.search(request);
+    const items = documents.map((document, index) => documentSearchItem(document, request.query, index + 1));
     await auditRequired(fabricStore, { actor, action: 'documents_search', outcome: 'allowed', requestId,
       details: { vaultIds: [...request.vaultIds].sort(), resultCount: items.length, transport } });
     return { items, nextCursor: null, vaultIds: [...request.vaultIds].sort() };
@@ -925,8 +926,19 @@ function documentSnippet(text, query, maxChars = 600) {
   const match = source.toLocaleLowerCase('en-US').indexOf(String(query || '').toLocaleLowerCase('en-US'));
   const start = Math.max(0, match < 0 ? 0 : match - Math.floor(maxChars / 3));
   const prefix = start > 0 ? '…' : '';
-  const suffix = start + maxChars < source.length ? '…' : '';
-  return `${prefix}${source.slice(start, start + maxChars)}${suffix}`;
+  const suffix = start + (maxChars - prefix.length) < source.length ? '…' : '';
+  const contentChars = Math.max(0, maxChars - prefix.length - suffix.length);
+  return `${prefix}${source.slice(start, start + contentChars)}${suffix}`;
+}
+
+function documentSearchItem(document, query, sourceRank) {
+  return {
+    kind: 'document', sourceRank, documentId: document.documentId, revision: document.revision,
+    vaultId: document.vaultId, path: document.path, previousPath: document.previousPath,
+    contentDigest: document.contentDigest, mediaType: document.mediaType,
+    sourceModifiedAt: document.sourceModifiedAt, extraction: document.extraction,
+    provenance: document.provenance, snippet: documentSnippet(document.text, query)
+  };
 }
 
 function interleaveContextResults(memories, documents, limit) {

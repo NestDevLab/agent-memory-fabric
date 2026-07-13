@@ -244,6 +244,9 @@ test('document REST and MCP enforce revision, vault ACL, context binding, and au
     const searchToken = contextTokenFor({ purpose: searchInput.purpose, operation: 'documents_search', input: searchInput });
     const searched = await api('/v2/documents/search', { method: 'POST', headers: { 'x-amf-context-token': searchToken }, body: JSON.stringify(searchInput) });
     assert.equal(searched.response.status, 200); assert.deepEqual(searched.body.data.items.map(item => item.documentId), [id]);
+    assert.equal(searched.body.data.items[0].text, undefined, 'search permission must not expose the complete document body');
+    assert.match(searched.body.data.items[0].snippet, /memory fabric/i);
+    assert.ok(searched.body.data.items[0].snippet.length <= 600);
 
     const readInput = { documentId: id, revision: 1, purpose: 'operator_review' };
     const readToken = contextTokenFor({ purpose: readInput.purpose, operation: 'document_read', input: readInput });
