@@ -185,7 +185,8 @@
       "target_branch": "feat/obsidian-document-contracts",
       "integration_branch": "main-integration",
       "commits": [
-        "d6b2e51cfa5e6d66e5e5d16aa13b8b5bef20f9ba"
+        "d6b2e51cfa5e6d66e5e5d16aa13b8b5bef20f9ba",
+        "647a79d896f9ba51e2ea533574a94745a3c5145a"
       ],
       "meta": {
         "purpose": "Implement the revisioned Obsidian document store for SQLite and PostgreSQL"
