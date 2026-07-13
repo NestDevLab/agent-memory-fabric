@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 2,
+  "name": "NestDevLab/agent-memory-fabric",
+  "version": "0.5.6",
+  "provides": [
+    {
+      "type": "skills",
+      "path": "skills",
+      "required": true
+    }
+  ]
+}
