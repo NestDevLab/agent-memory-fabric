@@ -19,6 +19,12 @@ legacy product alias while clients migrate to `agent-memory-fabric`.
 - one Fabric transaction for receipt state, proposal lifecycle and durable audit
 - authoritative REST/MCP/v1 schemas and Principia fixture under `config/contracts/` and `scripts/fixtures/contracts/`
 
+## Architecture and integrations
+
+- [Obsidian Second Brain integration](docs/obsidian-second-brain.md): planned
+  standalone, shadow, and active client architecture with swappable data,
+  memory, model, and retrieval backends.
+
 ## Auth registry
 
 Set `AMF_AUTH_REGISTRY_PATH` to a local JSON registry. The legacy
