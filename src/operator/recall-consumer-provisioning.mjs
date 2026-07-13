@@ -21,6 +21,15 @@ export const RECALL_CONSUMER_SCOPES = Object.freeze([
   'room:vitae:joseph-dm'
 ]);
 export const RECALL_CONSUMER_MAX_ADDITIONAL_SCOPES = 32;
+export const DOCUMENT_CLIENT_HANDOFF_SCHEMA = 'amf.document-client-handoff/v1';
+export const DOCUMENT_CLIENT_PERMISSIONS = Object.freeze([
+  'documents:write',
+  'documents:search',
+  'documents:read',
+  'memory:search',
+  'purpose:operator_review'
+]);
+export const DOCUMENT_CLIENT_MAX_SCOPES = 32;
 
 const HEX_DIGEST = /^[a-f0-9]{64}$/;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$/;
@@ -44,6 +53,56 @@ function exactKeys(value, allowed) {
 
 function canonicalBytes(value) {
   return Buffer.from(`${canonicalJson(value)}\n`, 'utf8');
+}
+
+function recallProfile() {
+  return {
+    actor: RECALL_CONSUMER_ACTOR,
+    contextKeyVersion: RECALL_CONSUMER_CONTEXT_KEY_VERSION,
+    permissions: RECALL_CONSUMER_PERMISSIONS,
+    sessionOwnerActors: RECALL_CONSUMER_SESSION_OWNER_ACTORS,
+    allowedVaults: null,
+    mode: 'read_only_scoped',
+    purpose: 'conversation_recall',
+    handoffSchema: RECALL_CONSUMER_HANDOFF_SCHEMA,
+    backupSlug: 'vitae-recall',
+    policyRevision: null,
+    endpoint: null
+  };
+}
+
+function normalizeDocumentClientOptions({ actor, vaultId, scopes, contextKeyVersion,
+  policyRevision, endpoint }) {
+  if (typeof actor !== 'string' || !/^client:obsidian:[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(actor)
+    || typeof vaultId !== 'string' || !SAFE_ID.test(vaultId) || vaultId.includes('*')
+    || typeof contextKeyVersion !== 'string' || !/^ctx-obsidian-[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(contextKeyVersion)
+    || typeof policyRevision !== 'string' || !SAFE_ID.test(policyRevision)
+    || typeof endpoint !== 'string') throw fail('document_client_option_invalid');
+  let parsedEndpoint;
+  try { parsedEndpoint = new URL(endpoint); } catch { throw fail('document_client_option_invalid'); }
+  if (!['http:', 'https:'].includes(parsedEndpoint.protocol) || parsedEndpoint.username || parsedEndpoint.password
+    || parsedEndpoint.hash || parsedEndpoint.search || parsedEndpoint.pathname !== '/') {
+    throw fail('document_client_option_invalid');
+  }
+  if (!Array.isArray(scopes) || !scopes.length || scopes.length > DOCUMENT_CLIENT_MAX_SCOPES
+    || scopes.some(scope => typeof scope !== 'string' || scope !== scope.trim() || !SAFE_ID.test(scope)
+      || scope.includes('*') || !/^(?:agent|person|relationship|room|domain|shared):/.test(scope))
+    || new Set(scopes).size !== scopes.length) throw fail('document_client_scope_invalid');
+  const normalizedScopes = [...scopes].sort();
+  return {
+    actor,
+    contextKeyVersion,
+    permissions: DOCUMENT_CLIENT_PERMISSIONS,
+    sessionOwnerActors: [],
+    allowedVaults: [vaultId],
+    mode: 'scoped',
+    purpose: 'operator_review',
+    handoffSchema: DOCUMENT_CLIENT_HANDOFF_SCHEMA,
+    backupSlug: `obsidian-${crypto.createHash('sha256').update(actor).digest('hex').slice(0, 12)}`,
+    policyRevision,
+    endpoint: parsedEndpoint.toString(),
+    scopes: normalizedScopes
+  };
 }
 
 export function normalizeRecallConsumerAdditionalScopes(value = []) {
@@ -184,7 +243,7 @@ function validateAuthRegistry(registry) {
       throw fail('recall_consumer_auth_registry_invalid');
     }
     normalizedList(row.allowedScopes, { wildcard: true }); normalizedList(row.permissions, { wildcard: true });
-    optionalList(row, 'sessionOwnerActors'); optionalList(row, 'contextKeyVersions');
+    optionalList(row, 'sessionOwnerActors'); optionalList(row, 'contextKeyVersions'); optionalList(row, 'allowedVaults');
     for (const version of optionalList(row, 'contextKeyVersions')) {
       const existing = contextVersionOwners.get(version);
       if (existing && existing !== row.actor) throw fail('recall_consumer_auth_registry_invalid');
@@ -280,26 +339,34 @@ function validateContextActorBindings(extracted, policy, contextRing) {
   }
 }
 
-function exactConsumerRow(row, scopes) {
+function exactConsumerRow(row, scopes, profile) {
   try {
-    return exactKeys(row, ['tokenSha256', 'active', 'actor', 'mode', 'allowedScopes', 'permissions',
-      'sessionOwnerActors', 'contextKeyVersions'])
-      && row.active === true && row.actor === RECALL_CONSUMER_ACTOR && row.mode === 'read_only_scoped'
+    const keys = ['tokenSha256', 'active', 'actor', 'mode', 'allowedScopes', 'permissions', 'contextKeyVersions'];
+    if (profile.sessionOwnerActors.length) keys.push('sessionOwnerActors');
+    if (profile.allowedVaults) keys.push('allowedVaults');
+    return exactKeys(row, keys)
+      && row.active === true && row.actor === profile.actor && row.mode === profile.mode
       && canonicalJson(normalizedList(row.allowedScopes)) === canonicalJson(scopes)
-      && canonicalJson(normalizedList(row.permissions)) === canonicalJson(RECALL_CONSUMER_PERMISSIONS)
-      && canonicalJson(normalizedList(row.sessionOwnerActors)) === canonicalJson(RECALL_CONSUMER_SESSION_OWNER_ACTORS)
-      && canonicalJson(normalizedList(row.contextKeyVersions)) === canonicalJson([RECALL_CONSUMER_CONTEXT_KEY_VERSION])
+      && canonicalJson(normalizedList(row.permissions)) === canonicalJson(profile.permissions)
+      && (!profile.sessionOwnerActors.length || canonicalJson(normalizedList(row.sessionOwnerActors))
+        === canonicalJson(profile.sessionOwnerActors))
+      && (!profile.allowedVaults || canonicalJson(normalizedList(row.allowedVaults))
+        === canonicalJson(profile.allowedVaults))
+      && canonicalJson(normalizedList(row.contextKeyVersions)) === canonicalJson([profile.contextKeyVersion])
       && typeof row.tokenSha256 === 'string' && HEX_DIGEST.test(row.tokenSha256) && !Object.hasOwn(row, 'token');
   } catch { return false; }
 }
 
-function exactPolicyActor(entry, scopes) {
+function exactPolicyActor(entry, scopes, profile) {
   try {
-    return exactKeys(entry, ['mode', 'allowedScopes', 'sessionOwnerActors', 'contextKeyVersions'])
-      && entry.mode === 'read_only_scoped'
+    const keys = ['mode', 'allowedScopes', 'contextKeyVersions'];
+    if (profile.sessionOwnerActors.length) keys.push('sessionOwnerActors');
+    return exactKeys(entry, keys)
+      && entry.mode === profile.mode
       && canonicalJson(normalizedList(entry.allowedScopes)) === canonicalJson(scopes)
-      && canonicalJson(normalizedList(entry.sessionOwnerActors)) === canonicalJson(RECALL_CONSUMER_SESSION_OWNER_ACTORS)
-      && canonicalJson(normalizedList(entry.contextKeyVersions)) === canonicalJson([RECALL_CONSUMER_CONTEXT_KEY_VERSION]);
+      && (!profile.sessionOwnerActors.length || canonicalJson(normalizedList(entry.sessionOwnerActors))
+        === canonicalJson(profile.sessionOwnerActors))
+      && canonicalJson(normalizedList(entry.contextKeyVersions)) === canonicalJson([profile.contextKeyVersion]);
   } catch { return false; }
 }
 
@@ -388,12 +455,12 @@ function restoreRecord(record) {
   } catch (error) { discardReplacement(record, prepared); throw error; }
 }
 
-function acquireLock(directory, lockName, clock) {
+function acquireLock(directory, lockName, clock, profile) {
   let fd;
   try {
     fd = fs.openSync(procChild(directory, lockName), 'wx', 0o600);
-    fs.writeFileSync(fd, canonicalBytes({ schema: 'amf.recall-consumer-provision-lock/v1', pid: process.pid,
-      actor: RECALL_CONSUMER_ACTOR, createdAt: clock().toISOString() }));
+    fs.writeFileSync(fd, canonicalBytes({ schema: 'amf.scoped-client-provision-lock/v1', pid: process.pid,
+      actor: profile.actor, createdAt: clock().toISOString() }));
     fs.fsyncSync(fd); const stat = fs.fstatSync(fd); fsyncDirectory(directory);
     return { fd, stat };
   } catch (error) {
@@ -422,8 +489,8 @@ function safeTimestamp(date) {
   return date.toISOString().replace(/[-:.]/g, '').replace('Z', 'Z');
 }
 
-function backupInputs(records, backupRoot, serviceOwnerUid, clock) {
-  const backupName = `${safeTimestamp(clock())}-vitae-recall-${crypto.randomUUID().slice(0, 8)}`;
+function backupInputs(records, backupRoot, serviceOwnerUid, clock, profile) {
+  const backupName = `${safeTimestamp(clock())}-${profile.backupSlug}-${crypto.randomUUID().slice(0, 8)}`;
   const backupDirectory = ensureDirectory(backupRoot, backupName, serviceOwnerUid, 'recall_consumer_backup_root_unsafe');
   try {
     for (const [name, record] of Object.entries(records)) writeExclusive(backupDirectory, `${name}.json`, record.bytes);
@@ -432,20 +499,24 @@ function backupInputs(records, backupRoot, serviceOwnerUid, clock) {
 }
 
 function stageHandoff({ handoffParent, handoffName, serviceOwnerUid, bearer, contextKey, scopes,
-  scopeSetSha256, clock }) {
+  scopeSetSha256, clock, profile }) {
   const finalPath = requireAbsent(handoffParent, handoffName,
     'recall_consumer_handoff_parent_unsafe', 'recall_consumer_handoff_exists');
   const stagingName = `${handoffName}.tmp-${process.pid}-${crypto.randomUUID()}`;
   const staging = ensureDirectory(handoffParent, stagingName, serviceOwnerUid, 'recall_consumer_handoff_parent_unsafe');
-  const contextRing = { currentKeyVersion: RECALL_CONSUMER_CONTEXT_KEY_VERSION,
-    keys: { [RECALL_CONSUMER_CONTEXT_KEY_VERSION]: contextKey } };
+  const contextRing = { currentKeyVersion: profile.contextKeyVersion,
+    keys: { [profile.contextKeyVersion]: contextKey } };
+  const manifest = { schema: profile.handoffSchema, actor: profile.actor,
+    contextKeyVersion: profile.contextKeyVersion, permissions: profile.permissions,
+    scopes, scopeSetSha256, purpose: profile.purpose, createdAt: clock().toISOString() };
+  if (profile.sessionOwnerActors.length) manifest.sessionOwnerActors = profile.sessionOwnerActors;
+  if (profile.allowedVaults) manifest.allowedVaults = profile.allowedVaults;
+  if (profile.policyRevision) manifest.policyRevision = profile.policyRevision;
+  if (profile.endpoint) manifest.endpoint = profile.endpoint;
   const files = {
     'bearer.token': Buffer.from(`${bearer}\n`, 'utf8'),
     'context-key-ring.json': canonicalBytes(contextRing),
-    'manifest.json': canonicalBytes({ schema: RECALL_CONSUMER_HANDOFF_SCHEMA, actor: RECALL_CONSUMER_ACTOR,
-      contextKeyVersion: RECALL_CONSUMER_CONTEXT_KEY_VERSION, permissions: RECALL_CONSUMER_PERMISSIONS,
-      scopes, scopeSetSha256, sessionOwnerActors: RECALL_CONSUMER_SESSION_OWNER_ACTORS,
-      purpose: 'conversation_recall', createdAt: clock().toISOString() })
+    'manifest.json': canonicalBytes(manifest)
   };
   try {
     for (const [name, bytes] of Object.entries(files)) writeExclusive(staging, name, bytes);
@@ -483,14 +554,15 @@ function invokeFault(faultAt, point) {
   }
 }
 
-export function provisionRecallConsumer({ authRegistryPath, policyPath, contextKeyRingPath, handoffPath,
+function provisionScopedConsumer({ authRegistryPath, policyPath, contextKeyRingPath, handoffPath,
   backupRoot, backendUserId, serviceOwnerUid, dryRun = false, clock = () => new Date(),
-  randomBytes = crypto.randomBytes, additionalScopes = [], faultAt = null } = {}) {
+  randomBytes = crypto.randomBytes, faultAt = null } = {}, profile) {
   if (![authRegistryPath, policyPath, contextKeyRingPath, handoffPath, backupRoot]
     .every(value => typeof value === 'string' && path.isAbsolute(value))) throw fail('recall_consumer_path_invalid');
   if (typeof backendUserId !== 'string' || !SAFE_ID.test(backendUserId) || !Number.isSafeInteger(serviceOwnerUid)
     || serviceOwnerUid < 0 || typeof dryRun !== 'boolean') throw fail('recall_consumer_option_invalid');
-  const { scopes, scopeSetSha256 } = scopeSet(additionalScopes);
+  const scopes = profile.scopes;
+  const scopeSetSha256 = crypto.createHash('sha256').update(canonicalJson(scopes), 'utf8').digest('hex');
   if (!dryRun && process.geteuid?.() !== 0) throw fail('recall_consumer_root_required');
 
   const resolved = {
@@ -517,7 +589,7 @@ export function provisionRecallConsumer({ authRegistryPath, policyPath, contextK
   try {
     requireAbsent(authParent, lockName, 'recall_consumer_lock_directory_unsafe', 'recall_consumer_provisioning_locked');
     requireAbsent(handoffParent, handoffName, 'recall_consumer_handoff_parent_unsafe', 'recall_consumer_handoff_exists');
-    if (!dryRun) lock = acquireLock(authParent, lockName, clock);
+    if (!dryRun) lock = acquireLock(authParent, lockName, clock, profile);
     const records = {
       'auth-registry': privateFile(authParent, path.basename(resolved.auth), serviceOwnerUid,
         'recall_consumer_auth_registry_file_unsafe'),
@@ -536,41 +608,46 @@ export function provisionRecallConsumer({ authRegistryPath, policyPath, contextK
     const { ring: contextRing, materials } = validateContextRing(parseJson(records['context-key-ring'],
       'recall_consumer_context_key_ring_invalid'));
     validateContextActorBindings(extracted, policy, contextRing);
-    const actorRow = extracted.rows.find(row => row.actor === RECALL_CONSUMER_ACTOR) || null;
-    const policyActor = policy.actors[RECALL_CONSUMER_ACTOR] || null;
+    const actorRow = extracted.rows.find(row => row.actor === profile.actor) || null;
+    const policyActor = policy.actors[profile.actor] || null;
     const scopeEntries = scopes.map(scope => policy.scopes[scope] || null);
-    const hasContextKey = Object.hasOwn(contextRing.keys, RECALL_CONSUMER_CONTEXT_KEY_VERSION);
+    const hasContextKey = Object.hasOwn(contextRing.keys, profile.contextKeyVersion);
     if (actorRow || policyActor || hasContextKey) {
       const scopesExact = scopeEntries.every(entry => object(entry));
-      if (exactConsumerRow(actorRow, scopes) && exactPolicyActor(policyActor, scopes) && scopesExact && hasContextKey) {
+      if (exactConsumerRow(actorRow, scopes, profile) && exactPolicyActor(policyActor, scopes, profile)
+        && scopesExact && hasContextKey) {
         throw fail('recall_consumer_already_provisioned');
       }
       throw fail('recall_consumer_provisioning_conflict');
     }
 
-    const safeResult = { ok: true, schema: RECALL_CONSUMER_HANDOFF_SCHEMA, action: 'provision', dryRun,
-      actor: RECALL_CONSUMER_ACTOR, contextKeyVersion: RECALL_CONSUMER_CONTEXT_KEY_VERSION,
-      permissions: RECALL_CONSUMER_PERMISSIONS, scopes, scopeSetSha256,
-      sessionOwnerActors: RECALL_CONSUMER_SESSION_OWNER_ACTORS,
+    const safeResult = { ok: true, schema: profile.handoffSchema, action: 'provision', dryRun,
+      actor: profile.actor, contextKeyVersion: profile.contextKeyVersion,
+      permissions: profile.permissions, scopes, scopeSetSha256,
       handoffPath: resolved.handoff, backupPath: null };
+    if (profile.sessionOwnerActors.length) safeResult.sessionOwnerActors = profile.sessionOwnerActors;
+    if (profile.allowedVaults) safeResult.allowedVaults = profile.allowedVaults;
     if (dryRun) return safeResult;
 
     const tokenDigests = new Set(extracted.rows.map(row => row.tokenSha256));
     const { bearer, tokenSha256, contextKey } = freshSecrets(randomBytes, tokenDigests, materials);
-    const newRow = { tokenSha256, active: true, actor: RECALL_CONSUMER_ACTOR, mode: 'read_only_scoped',
-      allowedScopes: scopes, permissions: RECALL_CONSUMER_PERMISSIONS,
-      sessionOwnerActors: RECALL_CONSUMER_SESSION_OWNER_ACTORS,
-      contextKeyVersions: [RECALL_CONSUMER_CONTEXT_KEY_VERSION] };
+    const newRow = { tokenSha256, active: true, actor: profile.actor, mode: profile.mode,
+      allowedScopes: scopes, permissions: profile.permissions,
+      contextKeyVersions: [profile.contextKeyVersion] };
+    if (profile.sessionOwnerActors.length) newRow.sessionOwnerActors = profile.sessionOwnerActors;
+    if (profile.allowedVaults) newRow.allowedVaults = profile.allowedVaults;
     const nextRegistry = withAuthRows(registry, extracted.wrapper, [...extracted.rows, newRow]);
     const newScopes = Object.fromEntries(scopes
       .map(scope => [scope, policy.scopes[scope] || { backendUserId }]));
     const nextPolicy = { ...policy,
-      actors: { ...policy.actors, [RECALL_CONSUMER_ACTOR]: { mode: 'read_only_scoped',
-        allowedScopes: scopes, sessionOwnerActors: RECALL_CONSUMER_SESSION_OWNER_ACTORS,
-        contextKeyVersions: [RECALL_CONSUMER_CONTEXT_KEY_VERSION] } },
+      actors: { ...policy.actors, [profile.actor]: { mode: profile.mode,
+        allowedScopes: scopes, contextKeyVersions: [profile.contextKeyVersion] } },
       scopes: { ...policy.scopes, ...newScopes } };
+    if (profile.sessionOwnerActors.length) {
+      nextPolicy.actors[profile.actor].sessionOwnerActors = profile.sessionOwnerActors;
+    }
     const nextContextRing = { ...contextRing, keys: { ...contextRing.keys,
-      [RECALL_CONSUMER_CONTEXT_KEY_VERSION]: contextKey } };
+      [profile.contextKeyVersion]: contextKey } };
     const nextExtracted = validateAuthRegistry(nextRegistry); const validatedNextPolicy = validatePolicy(nextPolicy);
     const { ring: validatedNextRing } = validateContextRing(nextContextRing);
     validateContextActorBindings(nextExtracted, validatedNextPolicy, validatedNextRing);
@@ -578,9 +655,9 @@ export function provisionRecallConsumer({ authRegistryPath, policyPath, contextK
     assertLockHeld(authParent, lockName, lock);
     for (const directory of directories) assertDirectoryStable(directory);
     for (const record of Object.values(records)) assertUnchanged(record, serviceOwnerUid);
-    const backupPath = backupInputs(records, backupDirectory, serviceOwnerUid, clock);
+    const backupPath = backupInputs(records, backupDirectory, serviceOwnerUid, clock, profile);
     const handoff = stageHandoff({ handoffParent, handoffName, serviceOwnerUid, bearer, contextKey,
-      scopes, scopeSetSha256, clock });
+      scopes, scopeSetSha256, clock, profile });
     const specs = [
       [records['context-key-ring'], canonicalBytes(nextContextRing), 'after-context-key-ring'],
       [records.policy, canonicalBytes(nextPolicy), 'after-policy'],
@@ -630,4 +707,14 @@ export function provisionRecallConsumer({ authRegistryPath, policyPath, contextK
     }
     finally { for (const directory of directories.reverse()) closeDirectory(directory); }
   }
+}
+
+export function provisionRecallConsumer(options = {}) {
+  const { scopes } = scopeSet(options.additionalScopes || []);
+  return provisionScopedConsumer(options, { ...recallProfile(), scopes });
+}
+
+export function provisionDocumentClient(options = {}) {
+  const profile = normalizeDocumentClientOptions(options);
+  return provisionScopedConsumer(options, profile);
 }
