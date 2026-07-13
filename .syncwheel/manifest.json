@@ -148,6 +148,20 @@
       "meta": {
         "purpose": "Record completed AMF health delivery stacks"
       }
+    },
+    {
+      "id": "obsidian-second-brain-docs",
+      "branch": "docs/obsidian-second-brain",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "12899946d6c037cb5532794cdb6c6dcb77e127c4"
+      ],
+      "meta": {
+        "purpose": "Document the modular Obsidian Second Brain integration"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
