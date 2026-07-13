@@ -1,6 +1,6 @@
 services:
   agent-memory-fabric:
-    image: agent-memory-fabric:0.5.6
+    image: agent-memory-fabric:0.6.0
     build:
       context: .
       dockerfile: Dockerfile
@@ -34,6 +34,7 @@ services:
       AMF_CATALOG_CONNECT_TIMEOUT_MS: "${AMF_CATALOG_CONNECT_TIMEOUT_MS:-5000}"
       AMF_CATALOG_QUERY_TIMEOUT_MS: "${AMF_CATALOG_QUERY_TIMEOUT_MS:-15000}"
       AMF_CATALOG_STATEMENT_TIMEOUT_MS: "${AMF_CATALOG_STATEMENT_TIMEOUT_MS:-10000}"
+      AMF_DOCUMENT_BACKEND: postgresql
       AMF_AUDIT_TIMEOUT_MS: "${AMF_AUDIT_TIMEOUT_MS:-2000}"
       AMF_CATALOG_HEALTH_TIMEOUT_MS: "${AMF_CATALOG_HEALTH_TIMEOUT_MS:-3000}"
       AMF_BODY_READ_TIMEOUT_MS: "${AMF_BODY_READ_TIMEOUT_MS:-10000}"

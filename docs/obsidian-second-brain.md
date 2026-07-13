@@ -186,3 +186,20 @@ not more authoritative memory.
 Obsidian content remains editorial source material. Indexing a document does not
 make every sentence canonical memory. Promotion still goes through an explicit
 proposal and the normal AMF curation lifecycle.
+
+## 0.6 rollout gate
+
+1. Back up the catalog and encrypted RAW store, then build the reviewed merge
+   commit as `agent-memory-fabric:0.6.0`.
+2. Select exactly one document backend. Shared deployments set
+   `AMF_DOCUMENT_BACKEND=postgresql` and reuse the least-privilege catalog URL;
+   local deployments use a distinct SQLite path.
+3. Start with Mem0 disabled and a synthetic vault in `shadow`. Require healthy
+   document-store status, idempotent retry, tombstone replay, bounded snippets,
+   cross-vault denial, and zero plaintext in logs.
+4. Enable a real vault only after the client outbox is empty and the selected
+   vault ID is present in the actor ACL. Vault paths and tokens remain external
+   configuration, never repository defaults.
+5. Roll back by stopping document delivery and restoring the prior image. Keep
+   the client outbox and additive document tables for reconciliation; do not
+   delete or rewrite source notes.
