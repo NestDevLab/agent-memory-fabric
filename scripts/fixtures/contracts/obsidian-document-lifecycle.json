@@ -1,0 +1,91 @@
+{
+  "create": {
+    "document": {
+      "schema": "amf.document/v1",
+      "documentId": "doc_01JZZZZZZZZZZZZZZZZZZZZZZZ",
+      "vaultId": "vault-personal",
+      "path": "Projects/Memory Fabric.md",
+      "previousPath": null,
+      "revision": 1,
+      "contentDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "mediaType": "text/markdown",
+      "sourceModifiedAt": "2026-07-13T12:00:00.000Z",
+      "tombstone": false,
+      "extraction": {
+        "status": "extracted",
+        "extractor": "markdown-v1",
+        "provider": "local-markdown",
+        "textDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "errorCode": null
+      },
+      "provenance": {
+        "sourceKind": "obsidian",
+        "sourceInstance": "obsidian-personal",
+        "observedAt": "2026-07-13T12:00:01.000Z",
+        "actor": "person:fixture-owner"
+      }
+    },
+    "text": "# Memory Fabric\n",
+    "expectedRevision": null,
+    "idempotencyKey": "doc:vault-personal:01JZZZZZZZZZZZZZZZZZZZZZZZ:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "rename": {
+    "document": {
+      "schema": "amf.document/v1",
+      "documentId": "doc_01JZZZZZZZZZZZZZZZZZZZZZZZ",
+      "vaultId": "vault-personal",
+      "path": "Architecture/Memory Fabric.md",
+      "previousPath": "Projects/Memory Fabric.md",
+      "revision": 2,
+      "contentDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "mediaType": "text/markdown",
+      "sourceModifiedAt": "2026-07-13T12:00:00.000Z",
+      "tombstone": false,
+      "extraction": {
+        "status": "extracted",
+        "extractor": "markdown-v1",
+        "provider": "local-markdown",
+        "textDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "errorCode": null
+      },
+      "provenance": {
+        "sourceKind": "obsidian",
+        "sourceInstance": "obsidian-personal",
+        "observedAt": "2026-07-13T12:05:00.000Z",
+        "actor": "person:fixture-owner"
+      }
+    },
+    "text": "# Memory Fabric\n",
+    "expectedRevision": 1,
+    "idempotencyKey": "doc:vault-personal:01JZZZZZZZZZZZZZZZZZZZZZZZ:2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "delete": {
+    "document": {
+      "schema": "amf.document/v1",
+      "documentId": "doc_01JZZZZZZZZZZZZZZZZZZZZZZZ",
+      "vaultId": "vault-personal",
+      "path": "Architecture/Memory Fabric.md",
+      "previousPath": null,
+      "revision": 3,
+      "contentDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "mediaType": "text/markdown",
+      "sourceModifiedAt": "2026-07-13T12:00:00.000Z",
+      "tombstone": true,
+      "extraction": {
+        "status": "not_requested",
+        "extractor": null,
+        "provider": null,
+        "textDigest": null,
+        "errorCode": null
+      },
+      "provenance": {
+        "sourceKind": "obsidian",
+        "sourceInstance": "obsidian-personal",
+        "observedAt": "2026-07-13T12:10:00.000Z",
+        "actor": "person:fixture-owner"
+      }
+    },
+    "expectedRevision": 2,
+    "idempotencyKey": "doc:vault-personal:01JZZZZZZZZZZZZZZZZZZZZZZZ:3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}

@@ -1,5 +1,9 @@
 # Obsidian Second Brain integration
 
+The normative document identity, lifecycle, API and deployment rules are in
+[Document corpus contract v1](document-contract-v1.md). Security controls and
+test gates are in the [Obsidian bridge threat model](obsidian-threat-model.md).
+
 Status: planned architecture; not implemented or enabled by default.
 
 [Obsidian Second Brain](https://github.com/NestDevLab/obsidian-second-brain) is an

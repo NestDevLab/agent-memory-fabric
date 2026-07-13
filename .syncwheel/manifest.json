@@ -162,6 +162,20 @@
       "meta": {
         "purpose": "Document the modular Obsidian Second Brain integration"
       }
+    },
+    {
+      "id": "obsidian-document-contracts",
+      "branch": "feat/obsidian-document-contracts",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "d4f539907254f78cb51db16b5a2dc503de818755"
+      ],
+      "meta": {
+        "purpose": "Define Obsidian document identity, lifecycle, API, backend, and security contracts"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
