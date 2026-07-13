@@ -219,6 +219,20 @@
       "meta": {
         "purpose": "Combine authorized PAM memories and Obsidian documents in contextual recall"
       }
+    },
+    {
+      "id": "obsidian-health",
+      "branch": "feat/obsidian-health",
+      "base": "origin/feat/obsidian-context-search",
+      "target_remote": "origin",
+      "target_branch": "feat/obsidian-context-search",
+      "integration_branch": "main-integration",
+      "commits": [
+        "271fb0cd724e5df3d4178a92047f8d07c65ec9b9"
+      ],
+      "meta": {
+        "purpose": "Extend AMF health with document corpus readiness"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
