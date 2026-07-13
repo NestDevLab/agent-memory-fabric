@@ -4,7 +4,8 @@ The normative document identity, lifecycle, API and deployment rules are in
 [Document corpus contract v1](document-contract-v1.md). Security controls and
 test gates are in the [Obsidian bridge threat model](obsidian-threat-model.md).
 
-Status: planned architecture; not implemented or enabled by default.
+Status: document store, API, bridge, request-bound signer, and operator
+provisioning are implemented; no real vault is enabled by default.
 
 [Obsidian Second Brain](https://github.com/NestDevLab/obsidian-second-brain) is an
 optional Agent Memory Fabric (AMF) client. It remains usable as a standalone
@@ -187,6 +188,46 @@ Obsidian content remains editorial source material. Indexing a document does not
 make every sentence canonical memory. Promotion still goes through an explicit
 proposal and the normal AMF curation lifecycle.
 
+## Provision a document client
+
+Provisioning is a root-only, fail-closed operation over the existing private
+auth registry, policy, and context-key ring. It creates one vault-bound actor,
+one dedicated context-signing key, backups of all three server inputs, and an
+owner-only handoff directory. It never prints bearer or signing material.
+
+Run the exact command first with `--dry-run`:
+
+```bash
+npm run operator:provision-document-client -- \
+  --auth-registry /private/amf/auth-registry.json \
+  --policy /private/amf/policy.json \
+  --context-key-ring /private/amf/context-key-ring.json \
+  --handoff /private/handoffs/obsidian-primary \
+  --backup-root /private/backups \
+  --backend-user-id obsidian-primary \
+  --service-owner-uid 1000 \
+  --actor client:obsidian:primary \
+  --vault vault:primary \
+  --scope domain:obsidian \
+  --key-version ctx-obsidian-primary-v1 \
+  --policy-revision policy-production-v1 \
+  --endpoint https://memory.example.test/ \
+  --dry-run
+```
+
+After reviewing the safe metadata, repeat without `--dry-run`. Restart AMF from
+the merged deployment so the process reloads the context-key ring, then copy the
+handoff through an approved private channel. Map its files to the client as:
+
+- `bearer.token` → `OBSIDIAN_AMF_TOKEN`
+- `context-key-ring.json` → `OBSIDIAN_AMF_CONTEXT_KEY_RING`
+- manifest `actor`, `allowedVaults`, `policyRevision`, and `endpoint` → the
+  corresponding Obsidian AMF settings
+
+The handoff key is intentionally actor-specific and cannot sign for another
+client. Context tokens are generated per request and expire quickly; a reusable
+literal context token is only a one-shot compatibility mechanism.
+
 ## 0.6 rollout gate
 
 1. Back up the catalog and encrypted RAW store, then build the reviewed merge
@@ -197,7 +238,8 @@ proposal and the normal AMF curation lifecycle.
 3. Start with Mem0 disabled and a synthetic vault in `shadow`. Require healthy
    document-store status, idempotent retry, tombstone replay, bounded snippets,
    cross-vault denial, and zero plaintext in logs.
-4. Enable a real vault only after the client outbox is empty and the selected
+4. Provision a dedicated actor/key handoff, restart AMF, and enable a real vault
+   only after the client outbox is empty and the selected
    vault ID is present in the actor ACL. Vault paths and tokens remain external
    configuration, never repository defaults.
 5. Roll back by stopping document delivery and restoring the prior image. Keep

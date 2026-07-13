@@ -10,6 +10,7 @@
     "check": "node src/server.mjs --check",
     "operator:provision-raw-collector": "node scripts/amf-provision-raw-collector.mjs",
     "operator:provision-recall-consumer": "node scripts/amf-provision-recall-consumer.mjs",
+    "operator:provision-document-client": "node scripts/amf-provision-document-client.mjs",
     "operator:provision-session-routes": "node scripts/amf-provision-session-routes.mjs",
     "operator:preflight-pam-runtime": "node src/operator/pam-runtime-private-dir.mjs",
     "test": "node --test scripts/test-*.mjs",
