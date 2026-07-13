@@ -112,6 +112,42 @@
         "c4d2b5084542409f15b77b118949a361e376c7db"
       ],
       "meta": {}
+    },
+    {
+      "id": "amf-health-fleet-wide",
+      "branch": "amf/health-fleet-wide",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [],
+      "meta": {
+        "purpose": "Make AMF health checks fleet-wide across Codex, Claude, OpenClaw, and Hermes"
+      }
+    },
+    {
+      "id": "amf-health-harness-map",
+      "branch": "amf/health-harness-map",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [],
+      "meta": {
+        "purpose": "Discover fleet health targets from the canonical harness map when fleet-control is unavailable"
+      }
+    },
+    {
+      "id": "amf-health-syncwheel-records",
+      "branch": "amf/health-syncwheel-records",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [],
+      "meta": {
+        "purpose": "Record completed AMF health delivery stacks"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
