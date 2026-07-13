@@ -14,7 +14,8 @@ import {
   evaluateOpenClawSnapshot,
   evaluateRuntimeCoverage,
   formatHuman,
-  parseEnvText
+  parseEnvText,
+  parseHarnessMap
 } from "../skills/agent-memory-health/scripts/amf-health.mjs";
 
 const healthyFabric = {
@@ -86,6 +87,25 @@ test("fleet coverage always requires Codex, Claude, OpenClaw, and Hermes", () =>
   const missingHermes = evaluateRuntimeCoverage(all.filter(target => target.kind !== "hermes"));
   assert.equal(missingHermes.status, "critical");
   assert.match(missingHermes.summary, /hermes/);
+});
+
+test("canonical harness map produces the four fleet targets and excludes Vitae", () => {
+  const topology = parseHarnessMap(`hosts:
+  ct107:
+    access:
+      ssh: administrator@10.0.0.107
+  ct110:
+    access:
+      ssh_from_ct107: administrator@10.0.0.110
+  ct111:
+    access:
+      ssh_alias: elsewhere
+canonical:
+`, "/srv/agent");
+  assert.deepEqual(topology.targets.map(target => target.kind), ["codex", "claude", "openclaw", "hermes"]);
+  assert.equal(topology.targets.some(target => /vitae/i.test(target.id)), false);
+  assert.equal(topology.collectors.length, 4);
+  assert.equal(topology.targets[3].host, "10.0.0.110");
 });
 
 test("Codex and Claude require materialized native memory", () => {
