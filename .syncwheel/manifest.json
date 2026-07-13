@@ -233,6 +233,18 @@
       "meta": {
         "purpose": "Extend AMF health with document corpus readiness"
       }
+    },
+    {
+      "id": "obsidian-security-hardening",
+      "branch": "feat/obsidian-security-hardening",
+      "base": "origin/feat/obsidian-health",
+      "target_remote": "origin",
+      "target_branch": "feat/obsidian-health",
+      "integration_branch": "main-integration",
+      "commits": [],
+      "meta": {
+        "purpose": "Harden document search minimization, bounds, and PostgreSQL idempotency concurrency"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
