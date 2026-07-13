@@ -241,7 +241,9 @@
       "target_remote": "origin",
       "target_branch": "feat/obsidian-health",
       "integration_branch": "main-integration",
-      "commits": [],
+      "commits": [
+        "c1119d30e2839d38be4f974c6781817781780233"
+      ],
       "meta": {
         "purpose": "Harden document search minimization, bounds, and PostgreSQL idempotency concurrency"
       }
