@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,13 @@ import { fileURLToPath } from "node:url";
 const REPORT_SCHEMA = "amf.health-report/v1";
 const CONFIG_SCHEMA = "amf.health/v1";
 const RANK = { healthy: 0, skipped: 0, degraded: 1, critical: 2 };
+const REQUIRED_RUNTIME_KINDS = ["codex", "claude", "openclaw", "hermes"];
+const SKILL_RELATIVE_PATHS = {
+  codex: ".agents/skills/agent-memory-health/SKILL.md",
+  claude: ".claude/skills/agent-memory-health/SKILL.md",
+  openclaw: ".openclaw/skills/agent-memory-health/SKILL.md",
+  hermes: ".hermes/skills/agent-memory-health/SKILL.md"
+};
 
 export function aggregateStatus(checks) {
   return checks.reduce((worst, check) => RANK[check.status] > RANK[worst] ? check.status : worst, "healthy");
@@ -70,6 +77,46 @@ export function formatHuman(report) {
   ].join("\n");
 }
 
+export function evaluateRuntimeCoverage(targets) {
+  const missing = REQUIRED_RUNTIME_KINDS.filter(kind => !targets.some(target => target.kind === kind));
+  return check("fleet:coverage", missing.length ? "critical" : "healthy",
+    missing.length ? `Required runtime target(s) missing: ${missing.join(", ")}` : `All required runtime kinds configured: ${REQUIRED_RUNTIME_KINDS.join(", ")}`);
+}
+
+export function evaluateCodexSnapshot(snapshot) {
+  if (!commandAvailable(snapshot.command)) return runtimeUnavailable(snapshot, "Codex CLI");
+  if (!/^memories\s+\S+\s+true\s*$/m.test(snapshot.command.stdout)) {
+    return check(snapshot.checkId, "degraded", "Codex native memories are disabled or unavailable");
+  }
+  if (!snapshot.materialized) return check(snapshot.checkId, "degraded", "Codex memories are enabled but no summary exists");
+  return check(snapshot.checkId, "healthy", "Codex native memories are enabled and materialized", snapshot.evidence);
+}
+
+export function evaluateClaudeSnapshot(snapshot) {
+  if (!commandAvailable(snapshot.command)) return runtimeUnavailable(snapshot, "Claude CLI");
+  if (!snapshot.materialized) return check(snapshot.checkId, "degraded", "Claude memory is not materialized in any project");
+  return check(snapshot.checkId, "healthy", "Claude memory is available and materialized", snapshot.evidence);
+}
+
+export function evaluateOpenClawSnapshot(snapshot) {
+  if (!commandAvailable(snapshot.command)) return runtimeUnavailable(snapshot, "OpenClaw CLI");
+  const output = `${snapshot.command.stdout}\n${snapshot.command.stderr}`;
+  if (/Memory search disabled|Vector search:\s*paused/i.test(output) || /Indexed:\s*0\//i.test(output)) {
+    return check(snapshot.checkId, "degraded", "OpenClaw memory search or index is unavailable");
+  }
+  return check(snapshot.checkId, snapshot.command.status === 0 ? "healthy" : "critical",
+    snapshot.command.status === 0 ? "OpenClaw memory status passed" : "OpenClaw memory status failed");
+}
+
+export function evaluateHermesSnapshot(snapshot) {
+  if (!commandAvailable(snapshot.command)) return runtimeUnavailable(snapshot, "Hermes CLI");
+  const output = `${snapshot.command.stdout}\n${snapshot.command.stderr}`;
+  if (/Status:\s+available/i.test(output) || /Built-in:\s+always active/i.test(output)) {
+    return check(snapshot.checkId, "healthy", "Hermes memory provider is available");
+  }
+  return check(snapshot.checkId, snapshot.command.status === 0 ? "degraded" : "critical", "Hermes memory provider is unavailable or unverified");
+}
+
 export async function runHealth(options = {}) {
   const config = loadConfig(options.config);
   const settings = { ...config, ...defined(options) };
@@ -99,8 +146,7 @@ export async function runHealth(options = {}) {
     }));
   }
 
-  checks.push(codexMemoryCheck(settings.home));
-  if (settings.deep) checks.push(...deepRuntimeChecks(settings));
+  checks.push(...fleetRuntimeChecks(settings));
 
   const overall = aggregateStatus(checks);
   return { schema: REPORT_SCHEMA, generatedAt: new Date().toISOString(), overall, exitCode: RANK[overall], checks };
@@ -179,8 +225,8 @@ async function fetchFabricStatus(endpoint, token, settings) {
 
 function collectorSnapshot(collector, stateRoot = "/var/lib/agent-memory-fabric/runtime-raw") {
   const id = String(collector.id);
-  const timer = systemctlShow(`agent-memory-fabric-runtime-raw@${id}.timer`);
-  const service = systemctlShow(`agent-memory-fabric-runtime-raw@${id}.service`);
+  const timer = systemctlShow(`agent-memory-fabric-runtime-raw@${id}.timer`, collector);
+  const service = systemctlShow(`agent-memory-fabric-runtime-raw@${id}.service`, collector);
   const outbox = collector.outbox || path.join(stateRoot, id, "outbox");
   return {
     id,
@@ -190,13 +236,13 @@ function collectorSnapshot(collector, stateRoot = "/var/lib/agent-memory-fabric/
     serviceState: service.ActiveState || "unknown",
     result: service.Result || "",
     execMainStatus: finiteOr(service.ExecMainStatus, 0),
-    pending: countFiles(path.join(outbox, "pending")),
-    dead: countFiles(path.join(outbox, "dead"))
+    pending: countFiles(path.join(outbox, "pending"), collector),
+    dead: countFiles(path.join(outbox, "dead"), collector)
   };
 }
 
-function systemctlShow(unit) {
-  const result = run("systemctl", ["show", unit, "-p", "ActiveState", "-p", "SubState", "-p", "LastTriggerUSec", "-p", "Result", "-p", "ExecMainStatus"]);
+function systemctlShow(unit, target = { transport: "local" }) {
+  const result = runTarget(target, "systemctl", ["show", unit, "-p", "ActiveState", "-p", "SubState", "-p", "LastTriggerUSec", "-p", "Result", "-p", "ExecMainStatus"]);
   if (result.error || result.status !== 0) return {};
   return Object.fromEntries(result.stdout.split(/\r?\n/).filter(Boolean).map(line => {
     const index = line.indexOf("=");
@@ -204,12 +250,12 @@ function systemctlShow(unit) {
   }));
 }
 
-function countFiles(directory) {
-  try {
-    return readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isFile()).length;
-  } catch {
-    return 0;
+function countFiles(directory, target = { transport: "local" }) {
+  if (target.transport === "ssh") {
+    const result = runTarget(target, "find", [directory, "-maxdepth", "1", "-type", "f", "-printf", "."]);
+    return result.status === 0 ? result.stdout.length : 0;
   }
+  try { return readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isFile()).length; } catch { return 0; }
 }
 
 function dateMs(value) {
@@ -229,46 +275,96 @@ function publicCollectorEvidence(snapshot) {
   };
 }
 
-function codexMemoryCheck(home = process.env.AMF_HEALTH_HOME || process.env.HOME || os.homedir()) {
-  const result = typeof process.getuid === "function" && process.getuid() === 0 && process.env.SUDO_USER
-    ? run("runuser", ["-u", process.env.SUDO_USER, "--", "codex", "features", "list"])
-    : run("codex", ["features", "list"]);
-  if (result.error?.code === "ENOENT") return check("codex:native-memory", "skipped", "Codex CLI is not installed locally");
-  const enabled = /^memories\s+\S+\s+true\s*$/m.test(result.stdout);
-  if (!enabled) return check("codex:native-memory", "degraded", "Codex native memories feature is disabled or unavailable");
-  const summary = path.join(home, ".codex", "memories", "memory_summary.md");
-  if (!existsSync(summary)) return check("codex:native-memory", "degraded", "Codex memories are enabled but no summary exists");
-  return check("codex:native-memory", "healthy", "Codex native memories are enabled and materialized", { summaryUpdatedAt: statSync(summary).mtime.toISOString() });
-}
-
-function deepRuntimeChecks(settings) {
+function fleetRuntimeChecks(settings) {
   const checks = [];
-  const runtimes = Array.isArray(settings.runtimes) ? settings.runtimes : [{ id: "openclaw", kind: "openclaw" }, { id: "hermes", kind: "hermes" }];
-  for (const runtime of runtimes) {
-    if (runtime.kind === "openclaw") checks.push(openClawCheck(runtime));
-    if (runtime.kind === "hermes") checks.push(hermesCheck(runtime));
+  const targets = runtimeTargets(settings);
+  checks.push(evaluateRuntimeCoverage(targets));
+  for (const target of targets) {
+    checks.push(skillInstallationCheck(target));
+    if (target.kind === "codex") checks.push(codexMemoryCheck(target));
+    if (target.kind === "claude") checks.push(claudeMemoryCheck(target));
+    if (target.kind === "openclaw") checks.push(openClawCheck(target));
+    if (target.kind === "hermes") checks.push(hermesCheck(target));
   }
   return checks;
 }
 
-function openClawCheck(runtime) {
-  const args = ["memory", "status", ...(runtime.agent ? ["--agent", runtime.agent] : [])];
-  const result = run("openclaw", args, 4 * 1024 * 1024);
-  if (result.error?.code === "ENOENT") return check(`runtime:${runtime.id}`, "skipped", "OpenClaw CLI is not installed locally");
-  const output = `${result.stdout}\n${result.stderr}`;
-  if (/Memory search disabled|Vector search: paused/i.test(output) || /Indexed:\s*0\//i.test(output)) {
-    return check(`runtime:${runtime.id}`, "degraded", "OpenClaw memory search or index is unavailable");
-  }
-  return check(`runtime:${runtime.id}`, result.status === 0 ? "healthy" : "critical", result.status === 0 ? "OpenClaw memory status passed" : "OpenClaw memory status failed");
+function runtimeTargets(settings) {
+  if (Array.isArray(settings.targets)) return settings.targets.map(validateTarget);
+  if (Array.isArray(settings.runtimes)) return settings.runtimes.map(runtime => validateTarget({ ...runtime, transport: runtime.transport || "local" }));
+  const home = settings.home || process.env.AMF_HEALTH_HOME || process.env.HOME || os.homedir();
+  return REQUIRED_RUNTIME_KINDS.map(kind => ({ id: `local-${kind}`, kind, transport: "local", home }));
 }
 
-function hermesCheck(runtime) {
-  const args = [...(runtime.profile ? ["--profile", runtime.profile] : []), "memory", "status"];
-  const result = run("hermes", args);
-  if (result.error?.code === "ENOENT") return check(`runtime:${runtime.id}`, "skipped", "Hermes CLI is not installed locally");
-  const output = `${result.stdout}\n${result.stderr}`;
-  if (/Status:\s+available/i.test(output) || /Built-in:\s+always active/i.test(output)) return check(`runtime:${runtime.id}`, "healthy", "Hermes memory provider is available");
-  return check(`runtime:${runtime.id}`, result.status === 0 ? "degraded" : "critical", "Hermes memory provider is unavailable or unverified");
+function validateTarget(target) {
+  const kind = String(target.kind || "");
+  const transport = target.transport || "local";
+  if (!REQUIRED_RUNTIME_KINDS.includes(kind)) throw new Error(`runtime_kind_invalid:${kind || "missing"}`);
+  if (!target.id || !/^[a-zA-Z0-9._-]+$/.test(String(target.id))) throw new Error(`runtime_id_invalid:${target.id || "missing"}`);
+  if (!["local", "ssh"].includes(transport)) throw new Error(`runtime_transport_invalid:${transport}`);
+  if (transport === "ssh" && !target.host) throw new Error(`runtime_ssh_host_missing:${target.id}`);
+  return { ...target, kind, transport, home: target.home || process.env.AMF_HEALTH_HOME || process.env.HOME || os.homedir() };
+}
+
+function skillInstallationCheck(target) {
+  const relativePath = target.skillPath || SKILL_RELATIVE_PATHS[target.kind];
+  const skillPath = path.isAbsolute(relativePath) ? relativePath : path.join(target.home, relativePath);
+  const result = runTarget(target, "test", ["-f", skillPath]);
+  if (transportFailed(result)) return check(`runtime:${target.id}:skill`, "critical", `Cannot reach ${target.id}`);
+  return check(`runtime:${target.id}:skill`, result.status === 0 ? "healthy" : "degraded",
+    result.status === 0 ? "agent-memory-health is installed" : "agent-memory-health is not installed");
+}
+
+function codexMemoryCheck(target) {
+  const result = runTarget(target, "codex", ["features", "list"]);
+  const summary = path.join(target.home, ".codex", "memories", "memory_summary.md");
+  const materialized = runTarget(target, "test", ["-f", summary]).status === 0;
+  const updated = materialized ? runTarget(target, "stat", ["-c", "%y", summary]).stdout.trim() : "";
+  return evaluateCodexSnapshot({ checkId: `runtime:${target.id}:memory`, command: result, materialized,
+    evidence: updated ? { summaryUpdatedAt: updated } : undefined });
+}
+
+function claudeMemoryCheck(target) {
+  const command = runTarget(target, "claude", ["--version"]);
+  const root = path.join(target.home, ".claude", "projects");
+  const found = runTarget(target, "find", [root, "-path", "*/memory/MEMORY.md", "-type", "f", "-print"]);
+  const files = found.status === 0 ? found.stdout.split(/\r?\n/).filter(Boolean) : [];
+  return evaluateClaudeSnapshot({ checkId: `runtime:${target.id}:memory`, command, materialized: files.length > 0,
+    evidence: files.length ? { projectMemories: files.length } : undefined });
+}
+
+function openClawCheck(target) {
+  const args = ["memory", "status", ...(target.agent ? ["--agent", target.agent] : [])];
+  return evaluateOpenClawSnapshot({ checkId: `runtime:${target.id}:memory`, command: runTarget(target, "openclaw", args, 4 * 1024 * 1024) });
+}
+
+function hermesCheck(target) {
+  const args = [...(target.profile ? ["--profile", target.profile] : []), "memory", "status"];
+  return evaluateHermesSnapshot({ checkId: `runtime:${target.id}:memory`, command: runTarget(target, "hermes", args) });
+}
+
+function commandAvailable(result) {
+  return !result.error && result.status !== 127 && !transportFailed(result);
+}
+
+function runtimeUnavailable(snapshot, label) {
+  return check(snapshot.checkId, transportFailed(snapshot.command) ? "critical" : "degraded",
+    transportFailed(snapshot.command) ? `Cannot reach runtime host for ${label}` : `${label} is not installed or executable`);
+}
+
+function transportFailed(result) {
+  return result.status === 255 || result.error?.code === "ETIMEDOUT";
+}
+
+function runTarget(target, command, args, maxBuffer = 1024 * 1024) {
+  if (target.transport !== "ssh") return run(command, args, maxBuffer);
+  const destination = `${target.user ? `${target.user}@` : ""}${target.host}`;
+  const remoteCommand = [command, ...args].map(shellQuote).join(" ");
+  return run("ssh", ["-o", "BatchMode=yes", "-o", `ConnectTimeout=${finiteOr(target.connectTimeoutSec, 5)}`, destination, remoteCommand], maxBuffer);
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
 function run(command, args, maxBuffer = 1024 * 1024) {
@@ -299,7 +395,7 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  return `Usage: amf-health.mjs [--json] [--deep] [--offline] [--config FILE] [--endpoint URL] [--deployment-env FILE] [--token-env NAME] [--timeout-ms N]\n\nExit codes: 0 healthy, 1 degraded, 2 critical.`;
+  return `Usage: amf-health.mjs [--json] [--offline] [--config FILE] [--endpoint URL] [--deployment-env FILE] [--token-env NAME] [--timeout-ms N]\n\nThe config may define fleet targets for Codex, Claude, OpenClaw, and Hermes. Exit codes: 0 healthy, 1 degraded, 2 critical.`;
 }
 
 async function main() {
