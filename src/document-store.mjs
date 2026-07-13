@@ -100,7 +100,7 @@ export class MemoryDocumentStore {
     const replay = this.idempotency.get(request.idempotencyKey);
     if (replay) {
       if (replay.requestDigest !== requestDigest) failure('document_idempotency_conflict', 409);
-      return { document: structuredClone(replay.document), duplicate: true };
+      return { document: structuredClone(replay), duplicate: true };
     }
     const current = this.heads.get(request.document.documentId) || null;
     assertTransition(current, request);

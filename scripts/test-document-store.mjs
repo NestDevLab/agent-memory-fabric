@@ -44,7 +44,9 @@ for (const [name, createStore] of [['memory', () => new MemoryDocumentStore()], 
     try {
       const created = await store.upsert(fixture.create);
       assert.equal(created.duplicate, false);
-      assert.equal((await store.upsert(fixture.create)).duplicate, true);
+      const replay = await store.upsert(fixture.create);
+      assert.equal(replay.duplicate, true);
+      assert.equal(replay.document.documentId, created.document.documentId);
       assert.equal((await store.read({ documentId: created.document.documentId })).path, fixture.create.document.path);
 
       const renamed = await store.upsert(fixture.rename);
