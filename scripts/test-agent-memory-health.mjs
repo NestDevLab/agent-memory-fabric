@@ -6,8 +6,13 @@ import { fileURLToPath } from "node:url";
 
 import {
   aggregateStatus,
+  evaluateClaudeSnapshot,
+  evaluateCodexSnapshot,
   evaluateCollectorSnapshot,
   evaluateFabricPayload,
+  evaluateHermesSnapshot,
+  evaluateOpenClawSnapshot,
+  evaluateRuntimeCoverage,
   formatHuman,
   parseEnvText
 } from "../skills/agent-memory-health/scripts/amf-health.mjs";
@@ -73,6 +78,34 @@ test("overall status and human output preserve severity", () => {
   const checks = [{ id: "a", status: "healthy", summary: "ok" }, { id: "b", status: "degraded", summary: "lag" }];
   assert.equal(aggregateStatus(checks), "degraded");
   assert.match(formatHuman({ overall: "degraded", checks }), /\[WARN\] b: lag/);
+});
+
+test("fleet coverage always requires Codex, Claude, OpenClaw, and Hermes", () => {
+  const all = ["codex", "claude", "openclaw", "hermes"].map(kind => ({ kind }));
+  assert.equal(evaluateRuntimeCoverage(all).status, "healthy");
+  const missingHermes = evaluateRuntimeCoverage(all.filter(target => target.kind !== "hermes"));
+  assert.equal(missingHermes.status, "critical");
+  assert.match(missingHermes.summary, /hermes/);
+});
+
+test("Codex and Claude require materialized native memory", () => {
+  const ok = { status: 0, stdout: "memories stable true\n", stderr: "" };
+  assert.equal(evaluateCodexSnapshot({ checkId: "codex", command: ok, materialized: true }).status, "healthy");
+  assert.equal(evaluateCodexSnapshot({ checkId: "codex", command: ok, materialized: false }).status, "degraded");
+  assert.equal(evaluateClaudeSnapshot({ checkId: "claude", command: { status: 0, stdout: "2.1.207", stderr: "" }, materialized: true }).status, "healthy");
+  assert.equal(evaluateClaudeSnapshot({ checkId: "claude", command: { status: 0, stdout: "2.1.207", stderr: "" }, materialized: false }).status, "degraded");
+});
+
+test("OpenClaw detects paused or empty indexes while Hermes detects its provider", () => {
+  const openclaw = evaluateOpenClawSnapshot({ checkId: "openclaw", command: { status: 0, stdout: "Indexed: 0/20\nVector search: paused", stderr: "" } });
+  assert.equal(openclaw.status, "degraded");
+  const hermes = evaluateHermesSnapshot({ checkId: "hermes", command: { status: 0, stdout: "Built-in: always active\nStatus: available", stderr: "" } });
+  assert.equal(hermes.status, "healthy");
+});
+
+test("unreachable remote runtime is critical", () => {
+  const result = evaluateHermesSnapshot({ checkId: "hermes", command: { status: 255, stdout: "", stderr: "timeout" } });
+  assert.equal(result.status, "critical");
 });
 
 test("CLI accepts deployment env files without colliding with Node options", () => {

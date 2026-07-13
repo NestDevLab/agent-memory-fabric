@@ -5,14 +5,16 @@ description: Check Agent Memory Fabric storage, capture, collector, provider, an
 
 # Agent Memory Health
 
-Run the bundled probe first:
+Locate the authoritative AMF health config in the fleet control plane named by the workspace instructions, then run:
 
 ```bash
 cd <this-skill-directory>
-node scripts/amf-health.mjs --json
+node scripts/amf-health.mjs --config <fleet-control>/config/agent-memory-health.json --json
 ```
 
-Add `--deep` for local OpenClaw/Hermes probes. Use `--deployment-env <path>` only for an authorized AMF deployment file; the script reads the token without printing it. Never source or display secrets.
+The fleet check always requires Codex, Claude, OpenClaw, and Hermes targets, regardless of the current harness. Vitae is intentionally excluded. A missing target is critical; a missing installed skill or unavailable provider is degraded. Without a fleet config the script probes all four kinds locally, but that fallback does not prove fleet health.
+
+Use `--deployment-env <path>` only for an authorized AMF deployment file; the script reads the token without printing it. Never source or display secrets.
 
 Interpret three independent layers:
 
@@ -24,4 +26,4 @@ Report `HEALTHY` only when every required layer passes. Storage without access i
 
 For an end-to-end canary, store a random non-sensitive token through the runtime's supported proposal/native-memory path, open a new session, retrieve it without repeating it, verify source and scope, then revoke/delete it when supported. Do not write a canary unless the user authorizes that run.
 
-Keep deployment topology outside this package. Fleet overlays may provide endpoint, token-file, collector, profile, and threshold configuration; never add private hosts, paths, actors, or credentials here.
+Keep deployment topology outside this package. Fleet configuration owns targets, transports, endpoint, token-file, collectors, profiles, and thresholds; never add private hosts, paths, actors, or credentials here.
