@@ -81,6 +81,29 @@
       "type": "object", "additionalProperties": false, "required": ["record"],
       "properties": { "record": { "type": "object" } }
     },
+    "contextSearchRequest": {
+      "type": "object", "additionalProperties": false, "required": ["query", "scopes", "vaultIds", "purpose"],
+      "properties": {
+        "query": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "scopes": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": { "type": "string" } },
+        "vaultIds": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": { "type": "string" } },
+        "purpose": { "enum": ["conversation_recall", "continuity_resume", "operator_review", "memory_curation"] },
+        "contextToken": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+      }
+    },
+    "contextSearchData": {
+      "type": "object", "additionalProperties": false, "required": ["items", "nextCursor", "scopes", "vaultIds", "sources"],
+      "properties": {
+        "items": { "type": "array", "items": { "type": "object" } },
+        "nextCursor": { "type": ["string", "null"] },
+        "scopes": { "type": "array", "items": { "type": "string" } },
+        "vaultIds": { "type": "array", "items": { "type": "string" } },
+        "sources": {
+          "type": "object", "additionalProperties": false, "required": ["memory", "document"],
+          "properties": { "memory": { "type": "integer", "minimum": 0 }, "document": { "type": "integer", "minimum": 0 } }
+        }
+      }
+    },
     "sessionsSearchRequest": {
       "type": "object", "additionalProperties": false, "required": ["query", "purpose"],
       "properties": {

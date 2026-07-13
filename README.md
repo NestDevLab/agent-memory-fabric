@@ -123,6 +123,7 @@ Success uses `{ "ok": true, "data": ..., "meta": ... }`; errors use
 `{ "ok": false, "error": { "code", "message", "details" }, "meta": ... }`.
 
 - `POST /v2/memory/search`
+- `POST /v2/context/search` (interleaved canonical-memory and editorial-document recall)
 - `POST /v2/memory/proposals` (requires `Idempotency-Key`)
 - `POST /v2/ingest/raw-events` (requires `raw:ingest`)
 - `GET /v2/memory/:id` (canonical record, rationale and expected revision)
@@ -183,7 +184,7 @@ the query string. The session reader is configured automatically when the
 ingest key ring and catalog are available; otherwise MCP advertises
 `sessionReader: false` and the routes return `session_reader_unconfigured` (`503`).
 
-MCP advertises `memory_search`, `memory_read`, `memory_propose`,
+MCP advertises `memory_search`, `memory_read`, `memory_propose`, `context_search`,
 `memory_proposal_status`, `sessions_search`,
 `session_get`, `session_transcript`, and `memory_status`, plus legacy
 `list_scopes` and `gateway_health` tools.

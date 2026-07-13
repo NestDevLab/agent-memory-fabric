@@ -562,6 +562,17 @@ function buildToolsListResult() {
         inputSchema: { type: 'object', additionalProperties: false, properties: { document: { type: 'object' }, expectedRevision: { type: 'integer', minimum: 1 }, idempotencyKey: { type: 'string' } }, required: ['document', 'expectedRevision', 'idempotencyKey'] }
       },
       {
+        name: 'context_search',
+        description: 'Interleave authorized canonical memories and editorial documents without changing either canon.',
+        inputSchema: {
+          type: 'object', additionalProperties: false,
+          properties: { query: { type: 'string' }, scopes: { type: 'array', items: { type: 'string' } },
+            vaultIds: { type: 'array', minItems: 1, items: { type: 'string' } }, purpose: { type: 'string' }, contextToken: { type: 'string' },
+            limit: { type: 'integer', minimum: 1, maximum: 100 } },
+          required: ['query', 'scopes', 'vaultIds', 'purpose', 'contextToken']
+        }
+      },
+      {
         name: 'memory_propose',
         description: 'Queue a canonical, revision-aware memory proposal for later curation.',
         inputSchema: {
@@ -743,6 +754,12 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
     }
 
+    if (name === 'context_search') {
+      const result = await performContextSearch({ actor, policy, policies, fabricStore, canonicalStore, documentStore,
+        contextVerifier, request: args, requestId, transport: 'mcp' });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
+    }
+
     if (name === 'sessions_search') {
       requireSessionPermission(policy);
       const purpose = requirePurpose(args.purpose);
@@ -897,6 +914,60 @@ async function performDocumentRead({ actor, policy, fabricStore, documentStore, 
   } catch (error) {
     if (error?.message !== 'audit_unavailable') await auditRequired(fabricStore, { actor, action: 'document_read',
       outcome: Number(error?.status || 500) < 500 ? 'denied' : 'failed', requestId, targetId: request?.documentId || null,
+      details: { code: publicError(error).code, transport } });
+    throw error;
+  }
+}
+
+function documentSnippet(text, query, maxChars = 600) {
+  const source = String(text || '');
+  if (!source) return '';
+  const match = source.toLocaleLowerCase('en-US').indexOf(String(query || '').toLocaleLowerCase('en-US'));
+  const start = Math.max(0, match < 0 ? 0 : match - Math.floor(maxChars / 3));
+  const prefix = start > 0 ? '…' : '';
+  const suffix = start + maxChars < source.length ? '…' : '';
+  return `${prefix}${source.slice(start, start + maxChars)}${suffix}`;
+}
+
+function interleaveContextResults(memories, documents, limit) {
+  const items = [];
+  for (let index = 0; items.length < limit && (index < memories.length || index < documents.length); index += 1) {
+    if (index < memories.length) items.push({ kind: 'memory', sourceRank: index + 1, id: memories[index].id,
+      scope: memories[index].scope, provenance: memories[index].provenance, record: memories[index] });
+    if (items.length < limit && index < documents.length) items.push({ kind: 'document', sourceRank: index + 1,
+      id: documents[index].documentId, revision: documents[index].revision, vaultId: documents[index].vaultId,
+      path: documents[index].path, provenance: documents[index].provenance,
+      snippet: documentSnippet(documents[index].text, documents[index].query) });
+  }
+  return items;
+}
+
+async function performContextSearch({ actor, policy, policies, fabricStore, canonicalStore, documentStore,
+  contextVerifier, request, contextToken = request.contextToken, requestId, transport }) {
+  try {
+    requirePermission(policy, 'memory:search');
+    requirePermission(policy, 'documents:search');
+    const purpose = requireDocumentPurpose(request.purpose);
+    requirePurposePermission(policy, purpose);
+    requireDocumentVaults(policy, request.vaultIds);
+    if (!canonicalStore.configured) throw Object.assign(new Error('canonical_store_unconfigured'), { status: 503 });
+    if (!documentStore.configured) throw Object.assign(new Error('document_store_unconfigured'), { status: 503 });
+    const limit = normalizeSessionLimit(request.limit);
+    const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: contextToken,
+      request: buildContextRequest('context_search', request), required: true });
+    const memoryResult = await performCanonicalSearch({ actor, scope: request.scope, scopes: request.scopes,
+      query: request.query, policy, policies, canonicalStore, context, limit });
+    const documents = await documentStore.search({ query: request.query, vaultIds: request.vaultIds, limit });
+    const preparedDocuments = documents.map(document => ({ ...document, query: request.query }));
+    const items = interleaveContextResults(memoryResult.items, preparedDocuments, limit);
+    const result = { items, nextCursor: null, scopes: memoryResult.scopes, vaultIds: [...request.vaultIds].sort(),
+      sources: { memory: memoryResult.items.length, document: documents.length } };
+    await auditRequired(fabricStore, { actor, action: 'context_search', outcome: 'allowed', requestId,
+      details: { scopes: result.scopes, vaultIds: result.vaultIds, resultCount: items.length, transport } });
+    return result;
+  } catch (error) {
+    if (error?.message !== 'audit_unavailable') await auditRequired(fabricStore, { actor, action: 'context_search',
+      outcome: Number(error?.status || 500) < 500 ? 'denied' : 'failed', requestId,
       details: { code: publicError(error).code, transport } });
     throw error;
   }
@@ -1674,6 +1745,20 @@ const requestHandler = async (req, res) => {
       if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !allowed.has(key))) throw Object.assign(new Error('document_invalid'), { status: 400 });
       const result = await performDocumentRead({ actor, policy, fabricStore, documentStore, contextVerifier,
         request: body, contextToken: getAccessContextToken(req, url, policy), requestId, transport: 'rest' });
+      return jsonNoStore(res, 200, v2Envelope(requestId, result));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/context/search' && req.method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const allowed = new Set(['query', 'scopes', 'vaultIds', 'purpose', 'limit']);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !allowed.has(key))) throw Object.assign(new Error('invalid_request'), { status: 400 });
+      const result = await performContextSearch({ actor, policy, policies, fabricStore, canonicalStore, documentStore,
+        contextVerifier, request: body, contextToken: getAccessContextToken(req, url, policy), requestId, transport: 'rest' });
       return jsonNoStore(res, 200, v2Envelope(requestId, result));
     } catch (error) {
       const failure = v2Error(requestId, error, 500);

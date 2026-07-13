@@ -205,6 +205,20 @@
       "meta": {
         "purpose": "Expose document upsert, delete, search, and read over REST and MCP with audit"
       }
+    },
+    {
+      "id": "obsidian-context-search",
+      "branch": "feat/obsidian-context-search",
+      "base": "origin/feat/obsidian-document-api",
+      "target_remote": "origin",
+      "target_branch": "feat/obsidian-document-api",
+      "integration_branch": "main-integration",
+      "commits": [
+        "22b6d1060d95227d8e2c3ff07e7a8206337095b3"
+      ],
+      "meta": {
+        "purpose": "Combine authorized PAM memories and Obsidian documents in contextual recall"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
