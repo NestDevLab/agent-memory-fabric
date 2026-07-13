@@ -5,14 +5,15 @@ description: Check Agent Memory Fabric storage, capture, collector, provider, an
 
 # Agent Memory Health
 
-Locate the authoritative AMF health config in the fleet control plane named by the workspace instructions, then run:
+Locate the authoritative AMF health config or canonical harness map named by the workspace instructions, then run one of:
 
 ```bash
 cd <this-skill-directory>
 node scripts/amf-health.mjs --config <fleet-control>/config/agent-memory-health.json --json
+node scripts/amf-health.mjs --harness-map <shared-brain>/mappings/harnesses.yaml --json
 ```
 
-The fleet check always requires Codex, Claude, OpenClaw, and Hermes targets, regardless of the current harness. Vitae is intentionally excluded. A missing target is critical; a missing installed skill or unavailable provider is degraded. Without a fleet config the script probes all four kinds locally, but that fallback does not prove fleet health.
+The probe also discovers the standard OpenClaw workspace harness map automatically. It always requires Codex, Claude, OpenClaw, and Hermes targets, regardless of the current harness. Vitae is intentionally excluded. A missing target is critical; a missing installed skill or unavailable provider is degraded. A local-only fallback does not prove fleet health.
 
 Use `--deployment-env <path>` only for an authorized AMF deployment file; the script reads the token without printing it. Never source or display secrets.
 

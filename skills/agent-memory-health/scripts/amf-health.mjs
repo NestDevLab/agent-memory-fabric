@@ -83,6 +83,20 @@ export function evaluateRuntimeCoverage(targets) {
     missing.length ? `Required runtime target(s) missing: ${missing.join(", ")}` : `All required runtime kinds configured: ${REQUIRED_RUNTIME_KINDS.join(", ")}`);
 }
 
+export function parseHarnessMap(text, home = process.env.AMF_HEALTH_HOME || process.env.HOME || os.homedir()) {
+  const ct107 = harnessDestination(text, "ct107", "ssh");
+  const ct110 = harnessDestination(text, "ct110", "ssh_from_ct107");
+  if (!ct107 || !ct110) throw new Error("harness_map_missing_ct107_or_ct110_access");
+  const target = (id, kind, destination) => ({ id, kind, transport: "ssh", ...destination, home });
+  const collector = (id, destination) => ({ id, transport: "ssh", ...destination });
+  return {
+    targets: [target("ct107-codex", "codex", ct107), target("ct107-claude", "claude", ct107),
+      target("ct110-openclaw", "openclaw", ct110), target("ct110-hermes", "hermes", ct110)],
+    collectors: [collector("ct107-codex", ct107), collector("ct107-claude", ct107),
+      collector("ct110-openclaw", ct110), collector("ct110-hermes", ct110)]
+  };
+}
+
 export function evaluateCodexSnapshot(snapshot) {
   if (!commandAvailable(snapshot.command)) return runtimeUnavailable(snapshot, "Codex CLI");
   if (!/^memories\s+\S+\s+true\s*$/m.test(snapshot.command.stdout)) {
@@ -119,7 +133,7 @@ export function evaluateHermesSnapshot(snapshot) {
 
 export async function runHealth(options = {}) {
   const config = loadConfig(options.config);
-  const settings = { ...config, ...defined(options) };
+  const settings = applyDiscoveredTopology({ ...config, ...defined(options) });
   const checks = [];
   const endpoint = settings.endpoint || process.env.AMF_BASE_URL || process.env.AGENT_MEMORY_FABRIC_URL || discoverEndpoint(settings.configRoot);
   const tokenEnv = settings.tokenEnv || "AMF_RAW_INGEST_TOKEN";
@@ -175,6 +189,27 @@ function loadConfig(configPath) {
   const parsed = JSON.parse(readFileSync(configPath, "utf8"));
   if (parsed.schema !== CONFIG_SCHEMA) throw new Error(`health_config_schema_invalid:${parsed.schema ?? "missing"}`);
   return parsed;
+}
+
+function applyDiscoveredTopology(settings) {
+  if (Array.isArray(settings.targets)) return { ...settings, topologySource: "fleet-config" };
+  const mapPath = discoverHarnessMap(settings.harnessMap, settings.home);
+  if (!mapPath) return { ...settings, topologySource: "local-fallback" };
+  const topology = parseHarnessMap(readFileSync(mapPath, "utf8"), settings.home);
+  return { ...settings, ...topology, topologySource: "harness-map", harnessMap: mapPath };
+}
+
+function discoverHarnessMap(explicitPath, home = process.env.AMF_HEALTH_HOME || process.env.HOME || os.homedir()) {
+  const candidates = [explicitPath, process.env.AMF_HARNESS_MAP, path.join(home, ".openclaw", "workspace", "mappings", "harnesses.yaml")].filter(Boolean);
+  return candidates.find(candidate => existsSync(candidate)) || "";
+}
+
+function harnessDestination(text, hostId, field) {
+  const section = String(text).match(new RegExp(`^  ${hostId}:\\s*$([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:\\s*$|^canonical:\\s*$)`, "m"))?.[1] || "";
+  const value = section.match(new RegExp(`^\\s+${field}:\\s*["']?([^"'\\s#]+)`, "m"))?.[1];
+  if (!value) return null;
+  const split = value.lastIndexOf("@");
+  return split > 0 ? { user: value.slice(0, split), host: value.slice(split + 1) } : { host: value };
 }
 
 function discoverEndpoint(configRoot = "/etc/agent-memory-fabric") {
@@ -278,6 +313,8 @@ function publicCollectorEvidence(snapshot) {
 function fleetRuntimeChecks(settings) {
   const checks = [];
   const targets = runtimeTargets(settings);
+  checks.push(check("fleet:topology", settings.topologySource === "local-fallback" ? "degraded" : "healthy",
+    settings.topologySource === "local-fallback" ? "No fleet config or canonical harness map was found; probing only the local host" : `Fleet topology loaded from ${settings.topologySource}`));
   checks.push(evaluateRuntimeCoverage(targets));
   for (const target of targets) {
     checks.push(skillInstallationCheck(target));
@@ -383,10 +420,10 @@ function parseArgs(argv) {
     if (arg === "--json") options.json = true;
     else if (arg === "--deep") options.deep = true;
     else if (arg === "--offline") options.offline = true;
-    else if (["--config", "--endpoint", "--deployment-env", "--token-env", "--timeout-ms"].includes(arg)) {
+    else if (["--config", "--harness-map", "--endpoint", "--deployment-env", "--token-env", "--timeout-ms"].includes(arg)) {
       const value = argv[++index];
       if (!value) throw new Error(`missing_value:${arg}`);
-      const key = { "--config": "config", "--endpoint": "endpoint", "--deployment-env": "envFile", "--token-env": "tokenEnv", "--timeout-ms": "timeoutMs" }[arg];
+      const key = { "--config": "config", "--harness-map": "harnessMap", "--endpoint": "endpoint", "--deployment-env": "envFile", "--token-env": "tokenEnv", "--timeout-ms": "timeoutMs" }[arg];
       options[key] = arg === "--timeout-ms" ? Number(value) : value;
     } else if (arg === "--help" || arg === "-h") options.help = true;
     else throw new Error(`unknown_argument:${arg}`);
@@ -395,7 +432,7 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  return `Usage: amf-health.mjs [--json] [--offline] [--config FILE] [--endpoint URL] [--deployment-env FILE] [--token-env NAME] [--timeout-ms N]\n\nThe config may define fleet targets for Codex, Claude, OpenClaw, and Hermes. Exit codes: 0 healthy, 1 degraded, 2 critical.`;
+  return `Usage: amf-health.mjs [--json] [--offline] [--config FILE] [--harness-map FILE] [--endpoint URL] [--deployment-env FILE] [--token-env NAME] [--timeout-ms N]\n\nFleet topology may come from a health config or canonical harness map. Exit codes: 0 healthy, 1 degraded, 2 critical.`;
 }
 
 async function main() {
