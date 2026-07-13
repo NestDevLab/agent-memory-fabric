@@ -176,6 +176,20 @@
       "meta": {
         "purpose": "Define Obsidian document identity, lifecycle, API, backend, and security contracts"
       }
+    },
+    {
+      "id": "obsidian-document-store",
+      "branch": "feat/obsidian-document-store",
+      "base": "origin/feat/obsidian-document-contracts",
+      "target_remote": "origin",
+      "target_branch": "feat/obsidian-document-contracts",
+      "integration_branch": "main-integration",
+      "commits": [
+        "d6b2e51cfa5e6d66e5e5d16aa13b8b5bef20f9ba"
+      ],
+      "meta": {
+        "purpose": "Implement the revisioned Obsidian document store for SQLite and PostgreSQL"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
