@@ -74,6 +74,9 @@ test('document store rejects stale revisions, path collisions, traversal, and id
   other.document.documentId = 'doc_01JYYYYYYYYYYYYYYYYYYYYYYY';
   other.idempotencyKey = `doc:vault-personal:${other.document.documentId.slice(4)}:1:${other.document.contentDigest.slice(7)}`;
   assert.throws(() => store.upsert(other), /document_path_conflict/);
+  assert.throws(() => store.search({ query: 'memory', vaultIds: [] }), /document_invalid/);
+  assert.throws(() => store.search({ query: 'memory', vaultIds: ['vault-personal', 'vault-personal'] }), /document_invalid/);
+  assert.throws(() => store.search({ query: 'memory', vaultIds: Array.from({ length: 65 }, (_, index) => `vault-${index}`) }), /document_invalid/);
 });
 
 test('PostgreSQL store conforms to the same lifecycle with parameterized transactions', async () => {

@@ -82,9 +82,15 @@ function assertTransition(current, request) {
   if (current.vaultId !== document.vaultId || expectedRevision !== current.revision || document.revision !== current.revision + 1) failure('revision_conflict', 409);
 }
 
-function searchRows(rows, { query, vaultIds, limit = 20 }) {
-  if (typeof query !== 'string' || !query || query.length > 4096 || !Array.isArray(vaultIds) || !vaultIds.length || vaultIds.some(value => !IDENTIFIER.test(value))
+function validateSearchRequest({ query, vaultIds, limit = 20 } = {}) {
+  if (typeof query !== 'string' || !query || query.length > 4096 || !Array.isArray(vaultIds) || !vaultIds.length || vaultIds.length > 64
+    || new Set(vaultIds).size !== vaultIds.length || vaultIds.some(value => !IDENTIFIER.test(value))
     || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) failure('document_invalid');
+}
+
+function searchRows(rows, request) {
+  validateSearchRequest(request);
+  const { query, vaultIds, limit = 20 } = request;
   const needle = query.toLocaleLowerCase('en-US');
   const allowed = new Set(vaultIds);
   return rows.filter(row => !row.tombstone && allowed.has(row.vaultId) && `${row.path}\n${row.text || ''}`.toLocaleLowerCase('en-US').includes(needle))
@@ -189,9 +195,12 @@ export class SqliteDocumentStore {
     return mapSqlite(row);
   }
   search(request) {
+    validateSearchRequest(request);
     const placeholders = request.vaultIds.map(() => '?').join(',');
     const rows = this.db.prepare(`SELECT r.* FROM document_heads_v1 h JOIN document_revisions_v1 r ON r.document_id=h.document_id AND r.revision=h.revision
-      WHERE h.tombstone=0 AND h.vault_id IN (${placeholders})`).all(...request.vaultIds).map(mapSqlite);
+      WHERE h.tombstone=0 AND h.vault_id IN (${placeholders})
+        AND (instr(lower(r.path),lower(?))>0 OR instr(lower(coalesce(r.text_content,'')),lower(?))>0)
+      ORDER BY r.path,r.document_id LIMIT ?`).all(...request.vaultIds, request.query, request.query, request.limit ?? 20).map(mapSqlite);
     return searchRows(rows, request);
   }
   health() { return { healthy: true, backend: 'sqlite', documents: this.db.prepare('SELECT count(*) AS count FROM document_heads_v1').get().count }; }
@@ -231,7 +240,9 @@ export class PostgresDocumentStore {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [request.document.documentId]);
+      for (const lockKey of [`document:${request.document.documentId}`, `idempotency:${request.idempotencyKey}`].sort()) {
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [lockKey]);
+      }
       const replay = (await client.query('SELECT * FROM agent_memory_fabric.document_revisions_v1 WHERE idempotency_key=$1', [request.idempotencyKey])).rows[0];
       const requestDigest = digest(request);
       if (replay) {
@@ -268,7 +279,10 @@ export class PostgresDocumentStore {
   async search(request) {
     searchRows([], request); await this.ready();
     const rows = (await this.pool.query(`SELECT r.* FROM agent_memory_fabric.document_heads_v1 h JOIN agent_memory_fabric.document_revisions_v1 r
-      ON r.document_id=h.document_id AND r.revision=h.revision WHERE h.tombstone=false AND h.vault_id=ANY($1::text[])`, [request.vaultIds])).rows.map(mapPostgres);
+      ON r.document_id=h.document_id AND r.revision=h.revision
+      WHERE h.tombstone=false AND h.vault_id=ANY($1::text[])
+        AND (strpos(lower(r.path),lower($2))>0 OR strpos(lower(coalesce(r.text_content,'')),lower($2))>0)
+      ORDER BY r.path,r.document_id LIMIT $3`, [request.vaultIds, request.query, request.limit ?? 20])).rows.map(mapPostgres);
     return searchRows(rows, request);
   }
   async health() { await this.ready(); const result = await this.pool.query('SELECT count(*)::bigint AS count FROM agent_memory_fabric.document_heads_v1'); return { healthy: true, backend: 'postgresql', documents: Number(result.rows[0].count) }; }
