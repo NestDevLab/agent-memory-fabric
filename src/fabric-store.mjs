@@ -2427,7 +2427,6 @@ export class FabricStore {
     if (!catalogWrite) throw createError('raw_projection_v2_storage_unavailable', 503);
     const stored = await this._catalogOperation(() => catalogWrite(record, { contentId, mediaType: 'application/vnd.agent-memory-fabric.raw-event-ciphertext+json', byteLength: raw.byteLength, storageRef: raw.storageRef, createdAt }, auditEvent));
     if (stored.record.payloadDigest !== payloadDigest) throw createError('raw_event_conflict', 409);
-    if (projectionV2) await this._refreshRawV2Readiness();
     return { status: stored.duplicate ? 'duplicate' : 'stored', duplicate: stored.duplicate, eventId: projection.eventId, sessionId: projection.sessionId, contentId: stored.record.contentId, ...(projectionV2 ? { logicalMessageId: stored.record.logicalMessageId, preferredObservationId: stored.logical?.preferredObservationId, payloadConflict: stored.logical?.payloadConflict, tombstoned: stored.logical?.tombstoned } : {}) };
   }
 

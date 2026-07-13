@@ -76,6 +76,14 @@ function envelope(rawItem, actor = 'raw-owner', sourceInstanceId = 'host') {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }
 
+class CountingReadyCatalog extends MemoryCatalog {
+  constructor() { super(); this.readinessChecks = 0; }
+  rawV2Readiness() {
+    this.readinessChecks += 1;
+    return { safe: true, reason: null, evidence: { catalog: 'test' } };
+  }
+}
+
 test('projection v2 accepts every runtime and rejects literal context routing or extra fields', () => {
   for (const runtime of ['codex', 'claude', 'hermes', 'openclaw', 'principia']) assert.equal(validateProjectionV2(item({ runtime }).projection).sourceKind, runtime);
   assert.throws(() => validateProjectionV2({ ...item().projection, contextTags: { sender: ['Alice'], conversation: [tag('conversation', 'room')] } }), /raw_projection_invalid/);
@@ -140,6 +148,20 @@ test('Fabric v2 joins K1 backfill to K2 realtime, keeps v1 dual-read and fails r
   await migrationStore.ready();
   assert.equal(migrationStore.status().rawProjectionV2Ready, false);
   assert.equal(migrationStore.status().rawProjectionV2ReadinessReason, 'legacy_v1_writes_enabled');
+});
+
+test('successful v2 ingest preserves startup readiness without rescanning the full catalog', async () => {
+  const catalog = new CountingReadyCatalog();
+  const store = new FabricStore({ rawStore: new MemoryRawStore({ encryptionKey: Buffer.alloc(32, 5).toString('base64') }), catalog, ingestKeyRing: KEY_RING, legacyV1Writes: false });
+  await store.ready();
+  assert.equal(catalog.readinessChecks, 1);
+  assert.equal(store.status().rawProjectionV2Ready, true);
+
+  const rawItem = item({ runtime: 'codex' });
+  const result = await store.ingestRawEvent({ actor: 'raw-owner', sourceInstanceId: 'host', projection: rawItem.projection, envelope: envelope(rawItem) });
+  assert.equal(result.status, 'stored');
+  assert.equal(catalog.readinessChecks, 1);
+  assert.equal(store.status().rawProjectionV2Ready, true);
 });
 
 test('SQLite v2 persists opaque routing only and dual-reads the session catalog', async () => {
