@@ -112,6 +112,18 @@
         "c4d2b5084542409f15b77b118949a361e376c7db"
       ],
       "meta": {}
+    },
+    {
+      "id": "agent-memory-health",
+      "branch": "amf/agent-memory-health",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "82e5c1b6c7ce234749c17d74665c5780214031bc"
+      ],
+      "meta": {}
     }
   ],
   "syncwheel_tracking": "git-tracked",
