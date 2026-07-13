@@ -12,7 +12,7 @@ cd <this-skill-directory>
 node scripts/amf-health.mjs --json
 ```
 
-Add `--deep` for local OpenClaw/Hermes probes. Use `--env-file <path>` only for an authorized AMF deployment file; the script reads the token without printing it. Never source or display secrets.
+Add `--deep` for local OpenClaw/Hermes probes. Use `--deployment-env <path>` only for an authorized AMF deployment file; the script reads the token without printing it. Never source or display secrets.
 
 Interpret three independent layers:
 

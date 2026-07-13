@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   aggregateStatus,
@@ -70,4 +73,12 @@ test("overall status and human output preserve severity", () => {
   const checks = [{ id: "a", status: "healthy", summary: "ok" }, { id: "b", status: "degraded", summary: "lag" }];
   assert.equal(aggregateStatus(checks), "degraded");
   assert.match(formatHuman({ overall: "degraded", checks }), /\[WARN\] b: lag/);
+});
+
+test("CLI accepts deployment env files without colliding with Node options", () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const script = path.join(here, "../skills/agent-memory-health/scripts/amf-health.mjs");
+  const result = spawnSync(process.execPath, [script, "--deployment-env", "/dev/null", "--offline", "--json"], { encoding: "utf8" });
+  assert.ok([0, 1, 2].includes(result.status), result.stderr);
+  assert.equal(JSON.parse(result.stdout).schema, "amf.health-report/v1");
 });
