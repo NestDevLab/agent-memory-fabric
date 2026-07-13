@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-memory-fabric.local/contracts/document-v1.schema.json",
+  "title": "Agent Memory Fabric document corpus contract v1",
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\u0000).+$"
+    },
+    "extraction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "extractor", "provider", "textDigest", "errorCode"],
+      "properties": {
+        "status": { "enum": ["not_requested", "pending", "extracted", "unsupported", "failed"] },
+        "extractor": { "type": ["string", "null"], "maxLength": 128 },
+        "provider": { "type": ["string", "null"], "maxLength": 128 },
+        "textDigest": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+        "errorCode": { "type": ["string", "null"], "maxLength": 128 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "extracted" } }, "required": ["status"] },
+          "then": { "properties": { "textDigest": { "$ref": "#/$defs/digest" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "failed" } }, "required": ["status"] },
+          "then": { "properties": { "errorCode": { "type": "string", "minLength": 1, "maxLength": 128 } } }
+        }
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceKind", "sourceInstance", "observedAt", "actor"],
+      "properties": {
+        "sourceKind": { "const": "obsidian" },
+        "sourceInstance": { "$ref": "#/$defs/identifier" },
+        "observedAt": { "type": "string", "format": "date-time" },
+        "actor": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "documentId", "vaultId", "path", "revision", "contentDigest",
+        "mediaType", "sourceModifiedAt", "tombstone", "extraction", "provenance"
+      ],
+      "properties": {
+        "schema": { "const": "amf.document/v1" },
+        "documentId": { "type": "string", "pattern": "^doc_[A-Za-z0-9_-]{16,128}$" },
+        "vaultId": { "$ref": "#/$defs/identifier" },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "previousPath": { "oneOf": [{ "$ref": "#/$defs/relativePath" }, { "type": "null" }] },
+        "revision": { "type": "integer", "minimum": 1 },
+        "contentDigest": { "$ref": "#/$defs/digest" },
+        "mediaType": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "sourceModifiedAt": { "type": ["string", "null"], "format": "date-time" },
+        "tombstone": { "type": "boolean" },
+        "extraction": { "$ref": "#/$defs/extraction" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "upsertRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document", "text", "expectedRevision", "idempotencyKey"],
+      "properties": {
+        "document": { "$ref": "#/$defs/document" },
+        "text": { "type": ["string", "null"], "maxLength": 16777216 },
+        "expectedRevision": { "type": ["integer", "null"], "minimum": 0 },
+        "idempotencyKey": { "type": "string", "pattern": "^doc:[A-Za-z0-9._-]+:[A-Za-z0-9_-]+:[1-9][0-9]*:[a-f0-9]{64}$", "maxLength": 512 }
+      }
+    },
+    "deleteRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document", "expectedRevision", "idempotencyKey"],
+      "properties": {
+        "document": { "$ref": "#/$defs/document" },
+        "expectedRevision": { "type": "integer", "minimum": 1 },
+        "idempotencyKey": { "type": "string", "pattern": "^doc:[A-Za-z0-9._-]+:[A-Za-z0-9_-]+:[1-9][0-9]*:[a-f0-9]{64}$", "maxLength": 512 }
+      }
+    },
+    "searchRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["query", "vaultIds", "purpose"],
+      "properties": {
+        "query": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "vaultIds": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } },
+        "purpose": { "enum": ["conversation_recall", "continuity_resume", "operator_review", "memory_curation"] },
+        "cursor": { "type": ["string", "null"], "maxLength": 512 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+      }
+    },
+    "readRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["documentId", "revision", "purpose"],
+      "properties": {
+        "documentId": { "type": "string", "pattern": "^doc_[A-Za-z0-9_-]{16,128}$" },
+        "revision": { "type": ["integer", "null"], "minimum": 1 },
+        "purpose": { "enum": ["conversation_recall", "continuity_resume", "operator_review", "memory_curation"] }
+      }
+    },
+    "backendSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "backend", "semanticOwner", "provider", "allowProviderFallback"],
+      "properties": {
+        "mode": { "enum": ["standalone", "shadow", "active"] },
+        "backend": { "enum": ["direct_sqlite", "amf_sqlite", "amf_postgresql"] },
+        "semanticOwner": { "enum": ["obsidian", "amf"] },
+        "provider": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "allowProviderFallback": { "const": false }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "backend": { "const": "direct_sqlite" } }, "required": ["backend"] },
+          "then": { "properties": { "semanticOwner": { "const": "obsidian" } } }
+        },
+        {
+          "if": { "properties": { "backend": { "enum": ["amf_sqlite", "amf_postgresql"] } }, "required": ["backend"] },
+          "then": { "properties": { "semanticOwner": { "const": "amf" } } }
+        }
+      ]
+    }
+  }
+}

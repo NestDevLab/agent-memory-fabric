@@ -1,0 +1,7 @@
+{
+  "mode": "shadow",
+  "backend": "amf_sqlite",
+  "semanticOwner": "amf",
+  "provider": "configured-provider-id",
+  "allowProviderFallback": false
+}
