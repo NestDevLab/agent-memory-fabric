@@ -264,7 +264,7 @@ test('unsafe permissions, duplicate crypto and held locks fail before handoff', 
         typeof value === 'string' && value.startsWith(root) ? `${alias}${value.slice(root.length)}` : value]));
       assert.throws(() => asRoot(() => provisionRawCollector(throughAlias)), /collector_lock_directory_unsafe/);
       assert.equal(fs.existsSync(options.handoffPath), false);
-    } finally { fs.rmSync(alias, { force: true }); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { fs.unlinkSync(alias); fs.rmSync(root, { recursive: true, force: true }); }
   }
   {
     const { root, options } = fixture();

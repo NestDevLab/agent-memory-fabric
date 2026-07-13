@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Memory Health"
+  short_description: "Check Agent Memory Fabric health safely"
+  default_prompt: "Use $agent-memory-health to check memory capture, access, and recall health."
