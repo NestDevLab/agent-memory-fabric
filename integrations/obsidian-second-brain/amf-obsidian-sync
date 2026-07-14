@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${OBSIDIAN_VAULT_PATH:?missing OBSIDIAN_VAULT_PATH}"
+: "${OBSIDIAN_AMF_VAULT_ID:?missing OBSIDIAN_AMF_VAULT_ID}"
+: "${OBSIDIAN_AMF_MODE:?missing OBSIDIAN_AMF_MODE}"
+: "${OBSIDIAN_AMF_URL:?missing OBSIDIAN_AMF_URL}"
+: "${OBSIDIAN_AMF_ACTOR:?missing OBSIDIAN_AMF_ACTOR}"
+: "${OBSIDIAN_AMF_SOURCE_INSTANCE:?missing OBSIDIAN_AMF_SOURCE_INSTANCE}"
+: "${OBSIDIAN_AMF_CLIENT_ROOT:?missing OBSIDIAN_AMF_CLIENT_ROOT}"
+
+if [[ "$OBSIDIAN_AMF_MODE" != "shadow" ]]; then
+  echo "amf_obsidian_sync_mode_must_be_shadow" >&2
+  exit 64
+fi
+if [[ ! -d "$OBSIDIAN_VAULT_PATH" || -L "$OBSIDIAN_VAULT_PATH" ]]; then
+  echo "amf_obsidian_sync_vault_invalid" >&2
+  exit 65
+fi
+if [[ ! -d "$OBSIDIAN_VAULT_PATH/.amf" || -L "$OBSIDIAN_VAULT_PATH/.amf" ]]; then
+  echo "amf_obsidian_sync_state_dir_invalid" >&2
+  exit 65
+fi
+if [[ ! -f "$OBSIDIAN_AMF_CLIENT_ROOT/scripts/obsidian_amf/__main__.py" ]]; then
+  echo "amf_obsidian_sync_client_missing" >&2
+  exit 66
+fi
+if [[ -z "${CREDENTIALS_DIRECTORY:-}" || ! -r "$CREDENTIALS_DIRECTORY/amf-token" ]]; then
+  echo "amf_obsidian_sync_credential_missing" >&2
+  exit 67
+fi
+
+export PYTHONPATH="$OBSIDIAN_AMF_CLIENT_ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
+export OBSIDIAN_AMF_TOKEN_FILE="$CREDENTIALS_DIRECTORY/amf-token"
+
+if [[ "${1:-}" == "--check" ]]; then
+  echo "amf_obsidian_sync_ready vault=$OBSIDIAN_AMF_VAULT_ID mode=$OBSIDIAN_AMF_MODE"
+  exit 0
+fi
+
+if [[ "${1:-}" != "scan" && "${1:-}" != "status" && "${1:-}" != "drain" ]]; then
+  echo "usage: amf-obsidian-sync [--check|scan|status|drain]" >&2
+  exit 64
+fi
+
+exec 9>"$OBSIDIAN_VAULT_PATH/.amf/amf-sync.lock"
+if ! flock -n 9; then
+  echo "amf_obsidian_sync_already_running vault=$OBSIDIAN_AMF_VAULT_ID"
+  exit 0
+fi
+exec /usr/bin/python3 -m obsidian_amf "$1"

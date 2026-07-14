@@ -1,0 +1,25 @@
+[Unit]
+Description=Agent Memory Fabric Obsidian shadow sync (@@INSTANCE@@)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=@@MARKER_PATH@@
+
+[Service]
+Type=oneshot
+User=@@SERVICE_USER@@
+Group=@@SERVICE_GROUP@@
+UMask=0077
+EnvironmentFile=@@ENV_PATH@@
+LoadCredential=amf-token:@@TOKEN_PATH@@
+ExecStartPre=@@WRAPPER_PATH@@ --check
+ExecStart=@@WRAPPER_PATH@@ scan
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ReadWritePaths=@@VAULT_STATE_PATH@@
+TimeoutStartSec=10min

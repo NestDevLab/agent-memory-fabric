@@ -1,0 +1,12 @@
+[Unit]
+Description=Schedule Agent Memory Fabric Obsidian shadow sync (@@INSTANCE@@)
+
+[Timer]
+OnBootSec=120
+OnUnitInactiveSec=@@INTERVAL_SEC@@
+RandomizedDelaySec=@@JITTER_SEC@@
+Persistent=true
+Unit=@@SERVICE_UNIT@@
+
+[Install]
+WantedBy=timers.target

@@ -12,7 +12,8 @@
     "strategy": "cherry-pick",
     "stacks": [
       "amf-fabric-core",
-      "amf-route-key-version"
+      "amf-route-key-version",
+      "amf-integration-framework"
     ]
   },
   "stacks": [
@@ -276,6 +277,18 @@
       "meta": {
         "purpose": "Provision scoped Obsidian document clients transactionally"
       }
+    },
+    {
+      "id": "amf-integration-framework",
+      "branch": "branch/amf-integration-framework",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "941eebe183f047c14a5440b14bc1641e214da3c9"
+      ],
+      "meta": {}
     }
   ],
   "syncwheel_tracking": "git-tracked",
