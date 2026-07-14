@@ -1,0 +1,45 @@
+{
+  "schema": "amf.integration/v1",
+  "id": "obsidian-second-brain",
+  "category": "document-client",
+  "version": "1.0.0",
+  "source": "NestDevLab/obsidian-second-brain",
+  "clientRelease": {
+    "schema": "obsidian-amf-client/v1",
+    "name": "obsidian_amf",
+    "version": "1.0.0",
+    "sourceDigest": "sha256:1c3a04b6f39c9af116b82f1657e14b689db08041982069c1990f3dcf01a85b4a",
+    "files": [
+      {"path": "__init__.py", "size": 595, "digest": "sha256:5f135568f2242a0656476258fc8818a1b44ea0723c6f1bb18967de6ffa78bc63"},
+      {"path": "__main__.py", "size": 6084, "digest": "sha256:491b82c77ed72e08fbfbdaac2075b56c94f5907562e66cd94def0af95df5f0f0"},
+      {"path": "bridge.py", "size": 32986, "digest": "sha256:b5f981f0070cc77d9527bc01ade55ab66b942355e6c49c6eff3bf8f1e0906e47"},
+      {"path": "context_signer.py", "size": 7227, "digest": "sha256:39ad47f0315bca84ca93fdf9fc99052df7c8353b103a4e3e05c689d577eab52b"},
+      {"path": "credentials.py", "size": 2816, "digest": "sha256:0d1aa588a8d99225ee469829109bd28c3bf00dcef6d4f4c67e494f2855f6f24c"},
+      {"path": "metadata.py", "size": 2607, "digest": "sha256:f7b27e24ccec6e1911f2dbd8eef827d284cccb87eaa4aca6e81b192f31979e2e"},
+      {"path": "projections.py", "size": 7284, "digest": "sha256:995b64afe80fbedd21089d043e1951fa4fccabe7114413ef8999bffadcedb065"}
+    ]
+  },
+  "agentwheel": {
+    "package": "NestDevLab/obsidian-second-brain",
+    "resources": ["skill:obsidian-memory"],
+    "supportedRuntimes": ["codex", "claude", "openclaw", "hermes"],
+    "excludedRuntimes": ["vitae"]
+  },
+  "capabilities": [
+    "document-capture",
+    "contextual-search",
+    "memory-proposals",
+    "selected-projections",
+    "scheduled-polling"
+  ],
+  "modes": ["standalone", "shadow", "active"],
+  "automatedModes": ["shadow"],
+  "schedulers": ["manual", "systemd"],
+  "lifecycle": ["plan", "install", "adopt", "run", "status", "enable", "disable", "uninstall"],
+  "health": {
+    "command": "status",
+    "healthyWhen": ["mode=shadow", "healthy=true", "pending=0", "retrying=0", "quarantined=0"]
+  },
+  "dataPreservation": ["vault", ".amf", "outbox", "token", "actor"],
+  "secretSlots": ["amf-token"]
+}

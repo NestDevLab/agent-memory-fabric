@@ -21,6 +21,8 @@ legacy product alias while clients migrate to `agent-memory-fabric`.
 
 ## Architecture and integrations
 
+- [Optional integration framework](docs/integration-framework.md): versioned
+  catalog plus plan-gated install, adoption, health and removal lifecycle.
 - [Obsidian Second Brain integration](docs/obsidian-second-brain.md): implemented, opt-in
   standalone, shadow, and active client architecture with swappable data,
   memory, model, and retrieval backends.
