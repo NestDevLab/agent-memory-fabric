@@ -13,10 +13,12 @@
     "check": "node src/server.mjs --check",
     "operator:provision-raw-collector": "node scripts/amf-provision-raw-collector.mjs",
     "operator:provision-recall-consumer": "node scripts/amf-provision-recall-consumer.mjs",
+    "operator:provision-interactive-recall": "node scripts/amf-provision-interactive-recall.mjs",
     "operator:provision-document-client": "node scripts/amf-provision-document-client.mjs",
     "operator:provision-session-routes": "node scripts/amf-provision-session-routes.mjs",
     "operator:preflight-pam-runtime": "node src/operator/pam-runtime-private-dir.mjs",
     "integrations": "node scripts/amf-integrations.mjs",
+    "mcp:interactive-recall": "node scripts/amf-interactive-recall-mcp.mjs",
     "test": "node --test scripts/test-*.mjs",
     "test:auth": "node --test scripts/test-auth-registry.mjs"
   },
