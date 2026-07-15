@@ -406,6 +406,34 @@ function writeExclusive(directory, fileName, bytes) {
   try { fs.writeFileSync(fd, bytes); fs.fchmodSync(fd, 0o600); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
 
+function transferHandoffOwnership(directory, fileNames, serviceOwnerUid, serviceOwnerGid) {
+  if (process.geteuid?.() !== 0) return;
+  for (const fileName of fileNames) {
+    let fd;
+    try {
+      fd = fs.openSync(procChild(directory, fileName), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600) {
+        throw fail('recall_consumer_handoff_parent_unsafe');
+      }
+      fs.fchownSync(fd, serviceOwnerUid, serviceOwnerGid); fs.fchmodSync(fd, 0o600);
+      const transferred = fs.fstatSync(fd);
+      if (transferred.uid !== serviceOwnerUid || transferred.gid !== serviceOwnerGid
+        || (transferred.mode & 0o777) !== 0o600) throw fail('recall_consumer_handoff_parent_unsafe');
+      fs.fsyncSync(fd);
+    } catch (error) {
+      if (error?.message === 'recall_consumer_handoff_parent_unsafe') throw error;
+      throw fail('recall_consumer_handoff_parent_unsafe', error);
+    } finally { if (fd !== undefined) fs.closeSync(fd); }
+  }
+  fs.fchownSync(directory.fd, serviceOwnerUid, serviceOwnerGid); fs.fchmodSync(directory.fd, 0o700);
+  const stat = fs.fstatSync(directory.fd);
+  if (stat.uid !== serviceOwnerUid || stat.gid !== serviceOwnerGid || (stat.mode & 0o777) !== 0o700) {
+    throw fail('recall_consumer_handoff_parent_unsafe');
+  }
+  fs.fsyncSync(directory.fd);
+}
+
 function writeReplacement(record, bytes) {
   const name = `.${record.fileName}.${process.pid}.${crypto.randomUUID()}.tmp`;
   const temporaryPath = procChild(record.directory, name);
@@ -512,6 +540,9 @@ function stageHandoff({ handoffParent, handoffName, serviceOwnerUid, bearer, con
     scopes, scopeSetSha256, purpose: profile.purpose, createdAt: clock().toISOString() };
   if (profile.sessionOwnerActors.length) manifest.sessionOwnerActors = profile.sessionOwnerActors;
   if (profile.allowedVaults) manifest.allowedVaults = profile.allowedVaults;
+  if (profile.runtime) manifest.runtime = profile.runtime;
+  if (profile.profile) manifest.profile = profile.profile;
+  if (profile.sessionDescriptor) manifest.sessionDescriptor = profile.sessionDescriptor;
   if (profile.policyRevision) manifest.policyRevision = profile.policyRevision;
   if (profile.endpoint) manifest.endpoint = profile.endpoint;
   const files = {
@@ -521,6 +552,7 @@ function stageHandoff({ handoffParent, handoffName, serviceOwnerUid, bearer, con
   };
   try {
     for (const [name, bytes] of Object.entries(files)) writeExclusive(staging, name, bytes);
+    transferHandoffOwnership(staging, Object.keys(files), serviceOwnerUid, handoffParent.stat.gid);
     fsyncDirectory(staging); closeDirectory(staging);
     return { parent: handoffParent, stagingName, finalName: handoffName, finalPath };
   } catch (error) {
@@ -555,7 +587,7 @@ function invokeFault(faultAt, point) {
   }
 }
 
-function provisionScopedConsumer({ authRegistryPath, policyPath, contextKeyRingPath, handoffPath,
+export function provisionScopedConsumer({ authRegistryPath, policyPath, contextKeyRingPath, handoffPath,
   backupRoot, backendUserId, serviceOwnerUid, dryRun = false, clock = () => new Date(),
   randomBytes = crypto.randomBytes, faultAt = null } = {}, profile) {
   if (![authRegistryPath, policyPath, contextKeyRingPath, handoffPath, backupRoot]
