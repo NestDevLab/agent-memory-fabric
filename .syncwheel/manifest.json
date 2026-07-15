@@ -289,6 +289,20 @@
         "941eebe183f047c14a5440b14bc1641e214da3c9"
       ],
       "meta": {}
+    },
+    {
+      "id": "batch1-interactive-recall",
+      "branch": "feat/batch1-interactive-recall",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "fc5d99ab734f2e61df52631e80ecf1e676eb1c83"
+      ],
+      "meta": {
+        "purpose": "Batch 1 read-only interactive recall plumbing source"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
