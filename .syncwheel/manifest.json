@@ -289,20 +289,6 @@
         "941eebe183f047c14a5440b14bc1641e214da3c9"
       ],
       "meta": {}
-    },
-    {
-      "id": "batch2-canonical-search-fix",
-      "branch": "fix/batch2-canonical-search",
-      "base": "origin/main",
-      "target_remote": "origin",
-      "target_branch": "main",
-      "integration_branch": "main-integration",
-      "commits": [
-        "379481c1c1e2672ccc793623ecc3b30ded06290f"
-      ],
-      "meta": {
-        "purpose": "Fix PAM matches response handling for Batch 2 interactive recall"
-      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
