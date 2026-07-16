@@ -59,14 +59,14 @@ test('context tokens bind actor, purpose, policy, room context and exact request
   assert.throws(() => verifier.verify(duplicateTags, { actor: 'vitae', purpose: 'conversation_recall', request }), /context_invalid/);
 });
 
-test('canonical PAM bridge returns only indexed, valid, active records', async () => {
+test('canonical PAM bridge returns only indexed, valid, active records from PAM matches', async () => {
   const canonical = record();
   const calls = [];
   const bridge = new CanonicalPamBridge({
     index: { records: { [canonical.id]: { path: 'memory/records/shared.json', scope: 'shared:global' } } },
     async callTool(name, args) {
       calls.push({ name, args });
-      if (name === 'memory_search') return { results: [{ path: 'memory/records/shared.json', line: 1 }] };
+      if (name === 'memory_search') return { matches: [{ path: 'memory/records/shared.json', line: 1 }] };
       if (name === 'memory_record_validate') return { status: 'valid', metadata: canonical };
       throw new Error('unexpected_tool');
     }

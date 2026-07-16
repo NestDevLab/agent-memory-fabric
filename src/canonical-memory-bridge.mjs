@@ -328,7 +328,7 @@ export class CanonicalPamBridge {
     const paths = [...new Set(entries.map(([, entry]) => entry.path))];
     if (!paths.length) return { items: [], nextCursor: null };
     const result = await this.callTool('memory_search', { query, paths, maxResults: Math.min(limit * 4, 100) });
-    const ids = new Set((result.results || result.items || []).flatMap(hit => entries.filter(([, entry]) => entry.path === hit.path).map(([id]) => id)));
+    const ids = new Set((result.matches || result.results || result.items || []).flatMap(hit => entries.filter(([, entry]) => entry.path === hit.path).map(([id]) => id)));
     const records = [];
     for (const id of ids) {
       const record = await this.read({ id });
