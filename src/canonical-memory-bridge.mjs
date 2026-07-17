@@ -262,6 +262,21 @@ export class CuratorReceiptCoordinator {
   }
 }
 
+const SEARCH_STOPWORDS = new Set([
+  'la', 'il', 'lo', 'le', 'gli', 'un', 'una', 'uno', 'di', 'da', 'del', 'della', 'dei', 'delle',
+  'che', 'chi', 'con', 'per', 'tra', 'fra', 'mia', 'mio', 'mie', 'miei', 'tua', 'tuo', 'sua', 'suo',
+  'the', 'a', 'an', 'of', 'to', 'in', 'on', 'and', 'or', 'is', 'are', 'my', 'your', 'her', 'his'
+]);
+
+function searchTokens(value) {
+  return String(value ?? '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .split(/[^a-z0-9]+/)
+    .filter(token => token.length >= 3 && !SEARCH_STOPWORDS.has(token));
+}
+
 function unwrapToolResult(result) {
   const text = result?.content?.find(item => item?.type === 'text')?.text;
   if (typeof text !== 'string') throw new Error('pam_response_invalid');
@@ -336,8 +351,24 @@ export class CanonicalPamBridge {
     const entries = Object.entries(this.index.records || {}).filter(([, entry]) => allowed.has(entry.scope)).slice(0, 1000);
     const paths = [...new Set(entries.map(([, entry]) => entry.path))];
     if (!paths.length) return { items: [], nextCursor: null };
+    // Substring hits from the PAM tool are unioned with token-ranked matches so
+    // multi-word natural queries ("la mia gatta") reach records that contain
+    // any distinctive token rather than the exact phrase.
     const result = await this.callTool('memory_search', { query, paths, maxResults: Math.min(limit * 4, 100) });
     const ids = new Set((result.matches || result.results || result.items || []).flatMap(hit => entries.filter(([, entry]) => entry.path === hit.path).map(([id]) => id)));
+    const queryTokens = searchTokens(query);
+    if (queryTokens.length) {
+      for (const [id, entry] of entries) {
+        if (ids.has(id)) continue;
+        try {
+          const validated = await this.callTool('memory_record_validate', { path: entry.path });
+          const text = validated?.status === 'valid' ? String(validated.metadata?.claim?.text ?? '') : '';
+          if (!text) continue;
+          const recordTokens = new Set(searchTokens(text));
+          if (queryTokens.some(token => recordTokens.has(token))) ids.add(id);
+        } catch { /* unreadable records simply stay out of the result */ }
+      }
+    }
     const records = [];
     for (const id of ids) {
       const record = await this.read({ id });
