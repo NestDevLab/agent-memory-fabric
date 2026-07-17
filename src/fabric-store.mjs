@@ -2964,4 +2964,4 @@ export function createFabricStoreFromEnv({ rootPath = process.cwd(), env = proce
   return new FabricStore({ rawStore, catalog, ingestKeyRing, legacyV1Writes: cutover !== 'true', ...lifecyclePolicies });
 }
 
-export { POSTGRES_SCHEMA, POSTGRES_SCHEMA_VERSION };
+export { POSTGRES_SCHEMA, POSTGRES_SCHEMA_VERSION, postgresSslConfig };

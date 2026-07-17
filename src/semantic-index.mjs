@@ -1,5 +1,7 @@
 import pg from 'pg';
 
+import { postgresSslConfig } from './fabric-store.mjs';
+
 const { Pool } = pg;
 
 const DEFAULT_DIMS = 768;
@@ -98,6 +100,21 @@ export class SemanticIndex {
     this.pool.on?.('error', () => {});
   }
 
+  // Idempotent table + index provisioning. The `vector` extension is a
+  // superuser prerequisite (documented) — the app role cannot CREATE EXTENSION,
+  // so this asserts the table and cosine HNSW index only.
+  async ensureSchema() {
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS ${SCHEMA}.${TABLE} (
+      record_id  text PRIMARY KEY,
+      scope      text NOT NULL,
+      claim_text text NOT NULL,
+      embedding  vector(${this.dims}) NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS ${TABLE}_scope_idx ON ${SCHEMA}.${TABLE} (scope)`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS ${TABLE}_hnsw ON ${SCHEMA}.${TABLE} USING hnsw (embedding vector_cosine_ops)`);
+  }
+
   async upsert({ recordId, scope, claimText }) {
     if (!SAFE_RECORD_ID.test(String(recordId ?? ''))) throw error('semantic_record_id_invalid', 400);
     if (!SAFE_SCOPE.test(String(scope ?? ''))) throw error('semantic_scope_invalid', 400);
@@ -177,10 +194,9 @@ export function createSemanticIndexFromEnv(env = process.env) {
   if (!embedder) throw error('semantic_embedder_unconfigured');
   const connectionString = String(env.AMF_SEMANTIC_DATABASE_URL || env.AMF_CATALOG_DATABASE_URL || '').trim();
   if (!connectionString) throw error('semantic_database_url_required');
-  const sslMode = String(env.AMF_CATALOG_SSL_MODE || '').trim();
   return new SemanticIndex({
     connectionString,
-    ssl: sslMode === 'disable' ? false : undefined,
+    ssl: postgresSslConfig(env),
     embedder,
     dims,
     topK: boundedInteger(env.AMF_SEMANTIC_TOP_K, DEFAULT_TOP_K, { min: 1, max: 100 }),
@@ -197,11 +213,13 @@ export function embeddableClaimText(record) {
 
 export async function reindexSemanticIndex({ semanticIndex, bridge, log = () => {} }) {
   if (!semanticIndex?.configured) return { ok: false, reason: 'semantic_index_unconfigured' };
+  if (typeof semanticIndex.ensureSchema === 'function') await semanticIndex.ensureSchema();
   const index = bridge.refreshIndex();
   const entries = Object.entries(index.records || {});
   const present = new Set();
   let upserted = 0;
   let skipped = 0;
+  let failed = 0;
   for (const [id, entry] of entries) {
     let record;
     try {
@@ -212,14 +230,21 @@ export async function reindexSemanticIndex({ semanticIndex, bridge, log = () => 
     }
     const text = embeddableClaimText(record);
     if (!text) { skipped += 1; continue; }
-    await semanticIndex.upsert({ recordId: id, scope: entry.scope, claimText: text });
-    present.add(id);
-    upserted += 1;
+    // One poison record (embed hiccup, malformed scope/id) must not abort the
+    // whole batch; upsert is idempotent so a later run recovers it.
+    try {
+      await semanticIndex.upsert({ recordId: id, scope: entry.scope, claimText: text });
+      present.add(id);
+      upserted += 1;
+    } catch (error) {
+      failed += 1;
+      log(`semantic reindex: skip ${id}: ${String(error?.message || 'upsert_failed')}`);
+    }
   }
   let removed = 0;
   for (const id of await semanticIndex.listRecordIds()) {
     if (!present.has(id)) { await semanticIndex.remove(id); removed += 1; }
   }
-  log(`semantic reindex: upserted=${upserted} skipped=${skipped} removed=${removed}`);
-  return { ok: true, upserted, skipped, removed };
+  log(`semantic reindex: upserted=${upserted} skipped=${skipped} failed=${failed} removed=${removed}`);
+  return { ok: true, upserted, skipped, failed, removed };
 }

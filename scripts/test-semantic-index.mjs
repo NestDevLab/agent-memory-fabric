@@ -35,6 +35,7 @@ class FakePgvector {
   async query(text, values = []) {
     this.queries.push({ text, values });
     const compact = text.replace(/\s+/g, ' ').trim();
+    if (compact.startsWith('CREATE TABLE') || compact.startsWith('CREATE INDEX')) return { rows: [] };
     if (compact.startsWith('INSERT INTO agent_memory_fabric.canonical_embeddings_v1')) {
       const [recordId, scope, claimText, literal] = values;
       this.rows.set(recordId, { record_id: recordId, scope, claim_text: claimText, embedding: JSON.parse(literal) });
@@ -148,11 +149,31 @@ test('reindex upserts plain records, skips sealed, and prunes vanished ids', asy
   pool.rows.set('mem_staleaaaaaaaaaaa', { record_id: 'mem_staleaaaaaaaaaaa', scope: 'agent:vitae', claim_text: 'old', embedding: unitVector(8) });
 
   const result = await reindexSemanticIndex({ semanticIndex: index, bridge });
-  assert.deepEqual(result, { ok: true, upserted: 2, skipped: 1, removed: 1 });
+  assert.deepEqual(result, { ok: true, upserted: 2, skipped: 1, failed: 0, removed: 1 });
   assert.ok(pool.rows.has('mem_r1aaaaaaaaaaaaaa'));
   assert.ok(pool.rows.has('mem_r2aaaaaaaaaaaaaa'));
   assert.equal(pool.rows.has('mem_sealedaaaaaaaaaa'), false);
   assert.equal(pool.rows.has('mem_staleaaaaaaaaaaa'), false);
+});
+
+test('reindex counts a poison record as failed and continues the batch', async () => {
+  const records = {
+    mem_good1aaaaaaaaaaa: { path: 'memory/records/good1.md', text: 'Utrecht' },
+    mem_good2aaaaaaaaaaa: { path: 'memory/records/good2.md', text: 'moka' }
+  };
+  const bridge = new CanonicalPamBridge({
+    index: { records: Object.fromEntries(Object.entries(records).map(([id, r]) => [id, { path: r.path, scope: 'agent:vitae' }])) },
+    async callTool() { return { matches: [] }; }
+  });
+  bridge.read = async ({ id }) => ({ id, revision: 1, lifecycle: { status: 'active' }, claim: { encoding: 'plain', text: records[id].text } });
+  const { index, pool } = makeIndex({ embedder: fakeEmbedder(() => unitVector(11)) });
+  const realUpsert = index.upsert.bind(index);
+  index.upsert = async (args) => { if (args.recordId === 'mem_good1aaaaaaaaaaa') throw new Error('embed_hiccup'); return realUpsert(args); };
+  const result = await reindexSemanticIndex({ semanticIndex: index, bridge });
+  assert.equal(result.ok, true);
+  assert.equal(result.failed, 1);
+  assert.equal(result.upserted, 1);
+  assert.ok(pool.rows.has('mem_good2aaaaaaaaaaa'));
 });
 
 test('unconfigured index is inert and reindex refuses', async () => {
