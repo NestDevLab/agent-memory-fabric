@@ -378,3 +378,42 @@ test('canonical search reaches token matches beyond exact substrings', async () 
   const stopOnly = await bridge.search({ query: 'la di', scopes: ['shared:global'] });
   assert.deepEqual(stopOnly.items, []);
 });
+
+test('canonical search unions semantic hits with no shared tokens', async () => {
+  const city = record({ id: 'mem_city11111111111111111111111111111111', claim: { encoding: 'plain', text: '{"factKey":"home.city","value":"Utrecht, da tre anni"}' } });
+  const byPath = { 'memory/records/city.json': city };
+  const semanticIndex = {
+    configured: true,
+    async searchIds({ query, scopes }) {
+      return (query === 'dove abita' && scopes.includes('shared:global')) ? [city.id] : [];
+    }
+  };
+  const bridge = new CanonicalPamBridge({
+    index: { records: { [city.id]: { path: 'memory/records/city.json', scope: 'shared:global' } } },
+    semanticIndex,
+    async callTool(name, args) {
+      if (name === 'memory_search') return { matches: [] };
+      if (name === 'memory_record_validate') return { status: 'valid', metadata: byPath[args.path] };
+      throw new Error('unexpected_tool');
+    }
+  });
+  const semantic = await bridge.search({ query: 'dove abita', scopes: ['shared:global'] });
+  assert.deepEqual(semantic.items.map(item => item.id), [city.id]);
+  const miss = await bridge.search({ query: 'argomento scollegato', scopes: ['shared:global'] });
+  assert.deepEqual(miss.items, []);
+});
+
+test('semantic backend errors never break lexical search', async () => {
+  const moka = record({ id: 'mem_moka11111111111111111111111111111111', claim: { encoding: 'plain', text: 'moka non le cialde' } });
+  const bridge = new CanonicalPamBridge({
+    index: { records: { [moka.id]: { path: 'memory/records/moka.json', scope: 'shared:global' } } },
+    semanticIndex: { configured: true, async searchIds() { throw new Error('embedder_down'); } },
+    async callTool(name) {
+      if (name === 'memory_search') return { matches: [] };
+      if (name === 'memory_record_validate') return { status: 'valid', metadata: moka };
+      throw new Error('unexpected_tool');
+    }
+  });
+  const lexical = await bridge.search({ query: 'moka', scopes: ['shared:global'] });
+  assert.deepEqual(lexical.items.map(item => item.id), [moka.id]);
+});
