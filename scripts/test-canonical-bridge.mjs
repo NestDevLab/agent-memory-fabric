@@ -283,3 +283,73 @@ test('raw reconciliation conflict is audited and blocks canonical promotion', as
   assert.equal((await store.getCuratorReceipt(proposal.id)).status, 'approved_pending_apply');
   assert.ok(catalog.auditEvents.some(event => event.action === 'raw_reconcile' && event.outcome === 'blocked'));
 });
+
+test('a post-review decision supersedes review_required and only review_required', async () => {
+  for (const kind of ['memory', 'sqlite']) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `amf-supersede-${kind}-`));
+    const catalog = kind === 'memory' ? new MemoryCatalog() : new SqliteCatalog({ databasePath: path.join(root, 'fabric.sqlite') });
+    const store = new FabricStore({ rawStore: new MemoryRawStore({ encryptionKey: Buffer.alloc(32, 23).toString('base64') }), catalog });
+    const coordinator = new CuratorReceiptCoordinator({ ledger: new FabricReceiptLedger({ fabricStore: store }), proposalStore: store, canonicalStore: { async read() { throw new Error('not_used'); } } });
+    const authorization = { actor: 'curator', allowAll: true, allowedScopes: [] };
+    const scope = 'room:supersede';
+    const canonical = record({ id: `mem_super${kind.padEnd(8, '0')}11114111811111111111`.slice(0, 40), scope: { type: 'room', id: scope } });
+    const proposal = await store.propose({ actor: 'curator', scope, record: canonical, rationale: 'supersession', expectedRevision: canonical.revision - 1, idempotencyKey: `${kind}-supersede` });
+    const persisted = await store.readProposal(proposal.id);
+    const reviewBase = { proposalId: proposal.id, proposalScope: scope, decisionId: `decision-${'a'.repeat(35)}${kind === 'memory' ? '1'.repeat(5) : '2'.repeat(5)}`.slice(0, 49), status: 'review_required', proposalDigest: sha(persisted.payload), policyDigest: sha('policy-v1') };
+    const review = { kind: 'decision', ...reviewBase, decisionDigest: sha(reviewBase), timestamp };
+    assert.equal((await coordinator.record(review, { actor: 'curator', requestId: 'req-1', authorization })).status, 'review_required');
+
+    const approvedBase = { ...reviewBase, decisionId: `decision-${'b'.repeat(40)}`.slice(0, 49), status: 'approved_pending_apply' };
+    const approved = { kind: 'decision', ...approvedBase, decisionDigest: sha(approvedBase), timestamp };
+    const superseded = await coordinator.record(approved, { actor: 'curator', requestId: 'req-2', authorization });
+    assert.equal(superseded.status, 'approved_pending_apply');
+    assert.equal(superseded.duplicate, false);
+    assert.equal(superseded.superseded, true);
+    assert.equal((await store.getCuratorReceipt(proposal.id)).decision.decisionId, approved.decisionId);
+    if (kind === 'memory') assert.ok(catalog.auditEvents.some(event => event.outcome === 'superseded'));
+
+    await assert.rejects(coordinator.record(review, { actor: 'curator', requestId: 'req-3', authorization }), /conflict/);
+    assert.equal((await coordinator.record(approved, { actor: 'curator', requestId: 'req-4', authorization })).duplicate, true);
+
+    const lateReviewBase = { ...reviewBase, decisionId: `decision-${'c'.repeat(40)}`.slice(0, 49), status: 'review_required' };
+    const lateReview = { kind: 'decision', ...lateReviewBase, decisionDigest: sha(lateReviewBase), timestamp };
+    await assert.rejects(coordinator.record(lateReview, { actor: 'curator', requestId: 'req-5', authorization }), /conflict/);
+
+    const flipBase = { ...reviewBase, decisionId: `decision-${'d'.repeat(40)}`.slice(0, 49), status: 'rejected' };
+    const flip = { kind: 'decision', ...flipBase, decisionDigest: sha(flipBase), timestamp };
+    await assert.rejects(coordinator.record(flip, { actor: 'curator', requestId: 'req-6', authorization }), /conflict/);
+  }
+});
+
+test('a review_required decision superseded by rejection stays terminal', async () => {
+  const catalog = new MemoryCatalog();
+  const store = new FabricStore({ rawStore: new MemoryRawStore({ encryptionKey: Buffer.alloc(32, 29).toString('base64') }), catalog });
+  const coordinator = new CuratorReceiptCoordinator({ ledger: new FabricReceiptLedger({ fabricStore: store }), proposalStore: store, canonicalStore: { async read() { throw new Error('not_used'); } } });
+  const authorization = { actor: 'curator', allowAll: true, allowedScopes: [] };
+  const scope = 'room:supersede-reject';
+  const canonical = record({ id: `mem_${'e'.repeat(36)}`, scope: { type: 'room', id: scope } });
+  const proposal = await store.propose({ actor: 'curator', scope, record: canonical, rationale: 'supersession reject', expectedRevision: canonical.revision - 1, idempotencyKey: 'memory-supersede-reject' });
+  const persisted = await store.readProposal(proposal.id);
+  const reviewBase = { proposalId: proposal.id, proposalScope: scope, decisionId: `decision-${'f'.repeat(40)}`, status: 'review_required', proposalDigest: sha(persisted.payload), policyDigest: sha('policy-v1') };
+  const review = { kind: 'decision', ...reviewBase, decisionDigest: sha(reviewBase), timestamp };
+  await coordinator.record(review, { actor: 'curator', requestId: 'req-r1', authorization });
+  const rejectBase = { ...reviewBase, decisionId: `decision-${'0'.repeat(40)}`, status: 'rejected' };
+  const reject = { kind: 'decision', ...rejectBase, decisionDigest: sha(rejectBase), timestamp };
+  assert.equal((await coordinator.record(reject, { actor: 'curator', requestId: 'req-r2', authorization })).status, 'rejected');
+  assert.equal((await coordinator.record(reject, { actor: 'curator', requestId: 'req-r3', authorization })).duplicate, true);
+  const resurrectBase = { ...reviewBase, decisionId: `decision-${'1'.repeat(40)}`, status: 'approved_pending_apply' };
+  const resurrect = { kind: 'decision', ...resurrectBase, decisionDigest: sha(resurrectBase), timestamp };
+  await assert.rejects(coordinator.record(resurrect, { actor: 'curator', requestId: 'req-r4', authorization }), /conflict|receipt_transition_invalid/);
+});
+
+test('memory receipt ledger supports post-review supersession with the same bounds', () => {
+  const ledger = new MemoryReceiptLedger();
+  const base = { proposalId: 'proposal-supersede', proposalScope: 'room:x', decisionId: `decision-${'2'.repeat(40)}`, status: 'review_required', proposalDigest: sha('payload'), policyDigest: sha('policy') };
+  ledger.recordDecision({ kind: 'decision', ...base, decisionDigest: sha(base), timestamp });
+  const approvedBase = { ...base, decisionId: `decision-${'3'.repeat(40)}`, status: 'approved_pending_apply' };
+  const approved = { kind: 'decision', ...approvedBase, decisionDigest: sha(approvedBase), timestamp };
+  assert.equal(ledger.recordDecision(approved).status, 'approved_pending_apply');
+  assert.equal(ledger.recordDecision(approved).duplicate, true);
+  const otherBase = { ...base, decisionId: `decision-${'4'.repeat(40)}`, status: 'rejected' };
+  assert.throws(() => ledger.recordDecision({ kind: 'decision', ...otherBase, decisionDigest: sha(otherBase), timestamp }), /receipt_conflict/);
+});

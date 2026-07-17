@@ -68,7 +68,7 @@ function isScopeId(type, id) {
   return typeof id === 'string' && id.startsWith(`${type}:`) && OPAQUE_REF_RE.test(id);
 }
 
-function validateAmfMemoryRecord(record) {
+function validateAmfMemoryRecord(record, { allowPlainSensitiveClaims = false } = {}) {
   const errors = [];
   if (!exactObject(record, 'record', RECORD_FIELDS, errors)) return { ok: false, errors };
   if (record.schema !== 'amf-memory/v1') errors.push('schema must be amf-memory/v1');
@@ -97,7 +97,10 @@ function validateAmfMemoryRecord(record) {
   else {
     exactObject(record.claim, 'claim', claimFields, errors);
     const subjectRequiresSealing = Array.isArray(record.subjects) && record.subjects.some(subject => /^(?:person|relationship):/.test(String(subject?.identityId ?? '')));
-    const mustSeal = ['person', 'relationship'].includes(record.scope?.type) || record.claimType === 'relationship' || ['confidential', 'restricted'].includes(record.visibility) || subjectRequiresSealing;
+    // Single-tenant deployments may opt out of at-rest sealing for
+    // person-related claims via AMF_ALLOW_PLAIN_SENSITIVE_CLAIMS.
+    const mustSeal = !allowPlainSensitiveClaims
+      && (['person', 'relationship'].includes(record.scope?.type) || record.claimType === 'relationship' || ['confidential', 'restricted'].includes(record.visibility) || subjectRequiresSealing);
     if (mustSeal && record.claim.encoding !== 'sealed') errors.push('record requires a sealed claim');
     if (record.claim.encoding === 'plain' && (typeof record.claim.text !== 'string' || !record.claim.text.trim())) errors.push('plain claim.text must not be empty');
     if (record.claim.encoding === 'sealed') {

@@ -167,6 +167,11 @@ class FakePool {
       this.curatorReceipts.set(values[0], { proposal_id: values[0], status: values[1], decision_json: JSON.parse(values[2]), apply_json: null });
       return { rows: [] };
     }
+    if (compact.startsWith('UPDATE agent_memory_fabric.curator_receipt_state_v1 SET status=$1,decision_json=$2::jsonb,apply_json=NULL')) {
+      const row = this.curatorReceipts.get(values[2]);
+      if (row) { row.status = values[0]; row.decision_json = JSON.parse(values[1]); row.apply_json = null; }
+      return { rows: [] };
+    }
     if (compact.startsWith('UPDATE agent_memory_fabric.fabric_proposals SET status=$1')) {
       const row = this.proposals.get(values[1]); if (row) row.status = values[0]; return { rows: [] };
     }
@@ -538,4 +543,30 @@ test('PostgreSQL reciprocal merges acquire the same direction-independent pair l
   const reverse = pool.queries.find(entry => entry.text.includes('hashtextextended($1, 1)'));
   assert.deepEqual(reverse.values, first.values);
   await catalog.close();
+});
+
+test('PostgreSQL decision supersession rewrites only review_required and audits it as superseded', async () => {
+  const pool = new FakePool(); const catalog = new PostgresCatalog({ pool });
+  const queued = proposal('proposal-supersede-pg', 'e'.repeat(64));
+  await catalog.enqueueProposalWithRaw(queued, raw('e'.repeat(64)));
+  const review = {
+    kind: 'decision', proposalId: queued.id, proposalScope: 'shared:global', decisionId: 'decision-review-pg', status: 'review_required',
+    decisionDigest: '4'.repeat(64), proposalDigest: '5'.repeat(64), policyDigest: '6'.repeat(64), timestamp: '2026-07-12T12:00:00Z'
+  };
+  const audit = suffix => ({ id: `audit-supersede-${suffix}`, ts: '2026-07-12T12:00:00Z', actorTag: 'actor-tag', action: 'curation_decision_receipt', requestId: suffix, targetId: queued.id, details: {} });
+  assert.equal((await catalog.recordCuratorReceipt(review, audit('review'))).status, 'review_required');
+
+  const approved = { ...review, decisionId: 'decision-approved-pg', status: 'approved_pending_apply', decisionDigest: '7'.repeat(64) };
+  const result = await catalog.recordCuratorReceipt(approved, audit('approve'));
+  assert.equal(result.status, 'approved_pending_apply');
+  assert.equal(result.duplicate, false);
+  assert.equal(result.superseded, true);
+  assert.equal(result.decision.decisionId, 'decision-approved-pg');
+  assert.equal(pool.curatorReceipts.get(queued.id).apply_json, null);
+  assert.equal(pool.auditEvents.get('audit-supersede-approve')[4], 'superseded');
+
+  await assert.rejects(catalog.recordCuratorReceipt(review, audit('replay-old')), /conflict/);
+  assert.equal((await catalog.recordCuratorReceipt(approved, audit('replay-new'))).duplicate, true);
+  const flip = { ...review, decisionId: 'decision-flip-pg', status: 'rejected', decisionDigest: '8'.repeat(64) };
+  await assert.rejects(catalog.recordCuratorReceipt(flip, audit('flip')), /conflict/);
 });

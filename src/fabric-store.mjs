@@ -471,9 +471,21 @@ export class MemoryCatalog {
         throw createError('receipt_transition_invalid', 409);
       }
       if (current?.decision) {
-        if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
-        this.auditEvents.push({ ...auditEvent, outcome: 'duplicate' });
-        return { ...structuredClone(current), duplicate: true };
+        if (canonicalJson(current.decision) === canonicalJson(receipt)) {
+          this.auditEvents.push({ ...auditEvent, outcome: 'duplicate' });
+          return { ...structuredClone(current), duplicate: true };
+        }
+        // Post-review supersession: only review_required may be rewritten, and
+        // only toward a terminal-ward decision.
+        if (current.decision.status === 'review_required' && !current.apply
+            && ['approved_pending_apply', 'rejected'].includes(receipt.status)) {
+          const superseding = { proposalId: receipt.proposalId, status: receipt.status, decision: structuredClone(receipt), apply: null };
+          this.curatorReceipts.set(receipt.proposalId, superseding);
+          proposal.status = receipt.status === 'rejected' ? 'rejected' : 'review';
+          this.auditEvents.push({ ...auditEvent, outcome: 'superseded' });
+          return { ...structuredClone(superseding), duplicate: false, superseded: true };
+        }
+        throw createError('receipt_conflict', 409);
       }
       const row = { proposalId: receipt.proposalId, status: receipt.status, decision: structuredClone(receipt), apply: null };
       this.curatorReceipts.set(receipt.proposalId, row);
@@ -882,13 +894,22 @@ export class SqliteCatalog {
       if (!proposal) throw createError('receipt_proposal_unverified', 409);
       const current = this.getCuratorReceipt(receipt.proposalId);
       let duplicate = false;
+      let superseded = false;
       if (receipt.kind === 'decision') {
         if (['rejected', 'revoked'].includes(proposal.status) && (!current?.decision || canonicalJson(current.decision) !== canonicalJson(receipt))) {
           throw createError('receipt_transition_invalid', 409);
         }
         if (current) {
-          if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
-          duplicate = true;
+          if (canonicalJson(current.decision) === canonicalJson(receipt)) {
+            duplicate = true;
+          } else if (current.decision.status === 'review_required' && !current.apply
+              && ['approved_pending_apply', 'rejected'].includes(receipt.status)) {
+            this.db.prepare('UPDATE curator_receipt_state_v1 SET status=?,decision_json=?,apply_json=NULL WHERE proposal_id=?').run(receipt.status, JSON.stringify(receipt), receipt.proposalId);
+            this.db.prepare('UPDATE fabric_proposals SET status=? WHERE id=?').run(receipt.status === 'rejected' ? 'rejected' : 'review', receipt.proposalId);
+            superseded = true;
+          } else {
+            throw createError('receipt_conflict', 409);
+          }
         } else {
           this.db.prepare('INSERT INTO curator_receipt_state_v1(proposal_id,status,decision_json,apply_json) VALUES (?,?,?,NULL)').run(receipt.proposalId, receipt.status, JSON.stringify(receipt));
           this.db.prepare('UPDATE fabric_proposals SET status=? WHERE id=?').run(receipt.status === 'rejected' ? 'rejected' : 'review', receipt.proposalId);
@@ -903,8 +924,8 @@ export class SqliteCatalog {
           this.db.prepare("UPDATE fabric_proposals SET status='promoted' WHERE id=?").run(receipt.proposalId);
         }
       }
-      this.db.prepare('INSERT INTO audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES (?,?,?,?,?,?,?,?,?)').run(auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, duplicate ? 'duplicate' : 'recorded', auditEvent.requestId || null, receipt.proposalId, null, JSON.stringify(auditEvent.details || {}));
-      return { ...this.getCuratorReceipt(receipt.proposalId), duplicate };
+      this.db.prepare('INSERT INTO audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES (?,?,?,?,?,?,?,?,?)').run(auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, duplicate ? 'duplicate' : superseded ? 'superseded' : 'recorded', auditEvent.requestId || null, receipt.proposalId, null, JSON.stringify(auditEvent.details || {}));
+      return { ...this.getCuratorReceipt(receipt.proposalId), duplicate, ...(superseded ? { superseded: true } : {}) };
     });
     this.insertRawEvent = this.db.transaction((record, raw, auditEvent) => {
       const existing = this.db.prepare('SELECT * FROM raw_events_v1 WHERE event_id=?').get(record.eventId);
@@ -1915,13 +1936,22 @@ export class PostgresCatalog {
       if (!proposal.rows[0]) throw createError('receipt_proposal_unverified', 409);
       const current = await this.getCuratorReceipt(receipt.proposalId, client);
       let duplicate = false;
+      let superseded = false;
       if (receipt.kind === 'decision') {
         if (['rejected', 'revoked'].includes(proposal.rows[0].status) && (!current?.decision || canonicalJson(current.decision) !== canonicalJson(receipt))) {
           throw createError('receipt_transition_invalid', 409);
         }
         if (current) {
-          if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
-          duplicate = true;
+          if (canonicalJson(current.decision) === canonicalJson(receipt)) {
+            duplicate = true;
+          } else if (current.decision.status === 'review_required' && !current.apply
+              && ['approved_pending_apply', 'rejected'].includes(receipt.status)) {
+            await this._query(client, `UPDATE ${POSTGRES_SCHEMA}.curator_receipt_state_v1 SET status=$1,decision_json=$2::jsonb,apply_json=NULL WHERE proposal_id=$3`, [receipt.status, JSON.stringify(receipt), receipt.proposalId]);
+            await this._query(client, `UPDATE ${POSTGRES_SCHEMA}.fabric_proposals SET status=$1 WHERE id=$2`, [receipt.status === 'rejected' ? 'rejected' : 'review', receipt.proposalId]);
+            superseded = true;
+          } else {
+            throw createError('receipt_conflict', 409);
+          }
         } else {
           await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.curator_receipt_state_v1(proposal_id,status,decision_json,apply_json) VALUES ($1,$2,$3::jsonb,NULL)`, [receipt.proposalId, receipt.status, JSON.stringify(receipt)]);
           await this._query(client, `UPDATE ${POSTGRES_SCHEMA}.fabric_proposals SET status=$1 WHERE id=$2`, [receipt.status === 'rejected' ? 'rejected' : 'review', receipt.proposalId]);
@@ -1936,10 +1966,10 @@ export class PostgresCatalog {
           await this._query(client, `UPDATE ${POSTGRES_SCHEMA}.fabric_proposals SET status='promoted' WHERE id=$1`, [receipt.proposalId]);
         }
       }
-      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,$8::jsonb)`, [auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, duplicate ? 'duplicate' : 'recorded', auditEvent.requestId || null, receipt.proposalId, JSON.stringify(auditEvent.details || {})]);
+      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,$8::jsonb)`, [auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, duplicate ? 'duplicate' : superseded ? 'superseded' : 'recorded', auditEvent.requestId || null, receipt.proposalId, JSON.stringify(auditEvent.details || {})]);
       const result = await this.getCuratorReceipt(receipt.proposalId, client);
       await this._query(client, 'COMMIT');
-      return { ...result, duplicate };
+      return { ...result, duplicate, ...(superseded ? { superseded: true } : {}) };
     } catch (error) {
       try { await this._query(client, 'ROLLBACK'); } catch { destroyClient = true; }
       throw error;
