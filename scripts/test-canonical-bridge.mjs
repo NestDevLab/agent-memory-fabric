@@ -353,3 +353,28 @@ test('memory receipt ledger supports post-review supersession with the same boun
   const otherBase = { ...base, decisionId: `decision-${'4'.repeat(40)}`, status: 'rejected' };
   assert.throws(() => ledger.recordDecision({ kind: 'decision', ...otherBase, decisionDigest: sha(otherBase), timestamp }), /receipt_conflict/);
 });
+
+test('canonical search reaches token matches beyond exact substrings', async () => {
+  const gatta = record({ id: 'mem_gatta111111111111111111111111111111', claim: { encoding: 'plain', text: '{"factKey":"home.pet","value":"Mirtilla, la gatta trovata a Bologna"}' } });
+  const moka = record({ id: 'mem_moka1111111111111111111111111111111', claim: { encoding: 'plain', text: '{"factKey":"preferences.coffee","value":"moka, non le cialde"}' } });
+  const byPath = { 'memory/records/gatta.json': gatta, 'memory/records/moka.json': moka };
+  const bridge = new CanonicalPamBridge({
+    index: { records: {
+      [gatta.id]: { path: 'memory/records/gatta.json', scope: 'shared:global' },
+      [moka.id]: { path: 'memory/records/moka.json', scope: 'shared:global' }
+    } },
+    async callTool(name, args) {
+      if (name === 'memory_search') return { matches: [] };
+      if (name === 'memory_record_validate') return { status: 'valid', metadata: byPath[args.path] };
+      throw new Error('unexpected_tool');
+    }
+  });
+  const multiWord = await bridge.search({ query: 'la mia gatta', scopes: ['shared:global'] });
+  assert.deepEqual(multiWord.items.map(item => item.id), [gatta.id]);
+  const accented = await bridge.search({ query: 'GATTÀ', scopes: ['shared:global'] });
+  assert.deepEqual(accented.items.map(item => item.id), [gatta.id]);
+  const none = await bridge.search({ query: 'inesistente', scopes: ['shared:global'] });
+  assert.deepEqual(none.items, []);
+  const stopOnly = await bridge.search({ query: 'la di', scopes: ['shared:global'] });
+  assert.deepEqual(stopOnly.items, []);
+});
