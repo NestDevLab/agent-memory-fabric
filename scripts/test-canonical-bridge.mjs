@@ -304,7 +304,9 @@ test('a post-review decision supersedes review_required and only review_required
     const superseded = await coordinator.record(approved, { actor: 'curator', requestId: 'req-2', authorization });
     assert.equal(superseded.status, 'approved_pending_apply');
     assert.equal(superseded.duplicate, false);
+    assert.equal(superseded.superseded, true);
     assert.equal((await store.getCuratorReceipt(proposal.id)).decision.decisionId, approved.decisionId);
+    if (kind === 'memory') assert.ok(catalog.auditEvents.some(event => event.outcome === 'superseded'));
 
     await assert.rejects(coordinator.record(review, { actor: 'curator', requestId: 'req-3', authorization }), /conflict/);
     assert.equal((await coordinator.record(approved, { actor: 'curator', requestId: 'req-4', authorization })).duplicate, true);
