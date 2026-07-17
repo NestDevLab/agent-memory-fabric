@@ -471,9 +471,21 @@ export class MemoryCatalog {
         throw createError('receipt_transition_invalid', 409);
       }
       if (current?.decision) {
-        if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
-        this.auditEvents.push({ ...auditEvent, outcome: 'duplicate' });
-        return { ...structuredClone(current), duplicate: true };
+        if (canonicalJson(current.decision) === canonicalJson(receipt)) {
+          this.auditEvents.push({ ...auditEvent, outcome: 'duplicate' });
+          return { ...structuredClone(current), duplicate: true };
+        }
+        // Post-review supersession: only review_required may be rewritten, and
+        // only toward a terminal-ward decision.
+        if (current.decision.status === 'review_required' && !current.apply
+            && ['approved_pending_apply', 'rejected'].includes(receipt.status)) {
+          const superseding = { proposalId: receipt.proposalId, status: receipt.status, decision: structuredClone(receipt), apply: null };
+          this.curatorReceipts.set(receipt.proposalId, superseding);
+          proposal.status = receipt.status === 'rejected' ? 'rejected' : 'review';
+          this.auditEvents.push({ ...auditEvent, outcome: 'superseded' });
+          return { ...structuredClone(superseding), duplicate: false };
+        }
+        throw createError('receipt_conflict', 409);
       }
       const row = { proposalId: receipt.proposalId, status: receipt.status, decision: structuredClone(receipt), apply: null };
       this.curatorReceipts.set(receipt.proposalId, row);
@@ -887,8 +899,15 @@ export class SqliteCatalog {
           throw createError('receipt_transition_invalid', 409);
         }
         if (current) {
-          if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
-          duplicate = true;
+          if (canonicalJson(current.decision) === canonicalJson(receipt)) {
+            duplicate = true;
+          } else if (current.decision.status === 'review_required' && !current.apply
+              && ['approved_pending_apply', 'rejected'].includes(receipt.status)) {
+            this.db.prepare('UPDATE curator_receipt_state_v1 SET status=?,decision_json=?,apply_json=NULL WHERE proposal_id=?').run(receipt.status, JSON.stringify(receipt), receipt.proposalId);
+            this.db.prepare('UPDATE fabric_proposals SET status=? WHERE id=?').run(receipt.status === 'rejected' ? 'rejected' : 'review', receipt.proposalId);
+          } else {
+            throw createError('receipt_conflict', 409);
+          }
         } else {
           this.db.prepare('INSERT INTO curator_receipt_state_v1(proposal_id,status,decision_json,apply_json) VALUES (?,?,?,NULL)').run(receipt.proposalId, receipt.status, JSON.stringify(receipt));
           this.db.prepare('UPDATE fabric_proposals SET status=? WHERE id=?').run(receipt.status === 'rejected' ? 'rejected' : 'review', receipt.proposalId);
@@ -1920,8 +1939,15 @@ export class PostgresCatalog {
           throw createError('receipt_transition_invalid', 409);
         }
         if (current) {
-          if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw createError('receipt_conflict', 409);
-          duplicate = true;
+          if (canonicalJson(current.decision) === canonicalJson(receipt)) {
+            duplicate = true;
+          } else if (current.decision.status === 'review_required' && !current.apply
+              && ['approved_pending_apply', 'rejected'].includes(receipt.status)) {
+            await this._query(client, `UPDATE ${POSTGRES_SCHEMA}.curator_receipt_state_v1 SET status=$1,decision_json=$2::jsonb,apply_json=NULL WHERE proposal_id=$3`, [receipt.status, JSON.stringify(receipt), receipt.proposalId]);
+            await this._query(client, `UPDATE ${POSTGRES_SCHEMA}.fabric_proposals SET status=$1 WHERE id=$2`, [receipt.status === 'rejected' ? 'rejected' : 'review', receipt.proposalId]);
+          } else {
+            throw createError('receipt_conflict', 409);
+          }
         } else {
           await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.curator_receipt_state_v1(proposal_id,status,decision_json,apply_json) VALUES ($1,$2,$3::jsonb,NULL)`, [receipt.proposalId, receipt.status, JSON.stringify(receipt)]);
           await this._query(client, `UPDATE ${POSTGRES_SCHEMA}.fabric_proposals SET status=$1 WHERE id=$2`, [receipt.status === 'rejected' ? 'rejected' : 'review', receipt.proposalId]);

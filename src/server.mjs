@@ -432,10 +432,12 @@ function validateProposalInput({ scope, text, metadata, idempotencyKey, requireI
   }
 }
 
+const ALLOW_PLAIN_SENSITIVE_CLAIMS = String(process.env.AMF_ALLOW_PLAIN_SENSITIVE_CLAIMS || '').trim() === 'true';
+
 function validateCanonicalProposal(record, rationale, expectedRevision) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) throw Object.assign(new Error('canonical_record_required'), { status: 400 });
   const revision = Number(record.revision);
-  const validation = validateAmfMemoryRecord(record);
+  const validation = validateAmfMemoryRecord(record, { allowPlainSensitiveClaims: ALLOW_PLAIN_SENSITIVE_CLAIMS });
   if (!validation.ok) throw Object.assign(new Error('canonical_record_invalid'), { status: 400 });
   const recordBytes = Buffer.byteLength(canonicalJson(record), 'utf8') + Buffer.byteLength(String(rationale || ''), 'utf8');
   if (recordBytes > LIMITS.proposalChars) throw Object.assign(new Error('proposal_too_large'), { status: 413 });

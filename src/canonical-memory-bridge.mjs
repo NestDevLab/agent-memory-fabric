@@ -143,8 +143,16 @@ export class MemoryReceiptLedger {
   recordDecision(receipt) {
     const current = this.records.get(receipt.proposalId);
     if (current?.decision) {
-      if (canonicalJson(current.decision) !== canonicalJson(receipt)) throw new Error('receipt_conflict');
-      return { ...structuredClone(current), duplicate: true };
+      if (canonicalJson(current.decision) === canonicalJson(receipt)) return { ...structuredClone(current), duplicate: true };
+      // A post-review decision supersedes an earlier review_required one; no
+      // other decision transition may ever be rewritten.
+      if (current.decision.status === 'review_required' && !current.apply
+          && ['approved_pending_apply', 'rejected'].includes(receipt.status)) {
+        const superseding = { proposalId: receipt.proposalId, status: receipt.status, decision: structuredClone(receipt), apply: null };
+        this.records.set(receipt.proposalId, superseding);
+        return { ...structuredClone(superseding), duplicate: false, superseded: true };
+      }
+      throw new Error('receipt_conflict');
     }
     const record = { proposalId: receipt.proposalId, status: receipt.status, decision: structuredClone(receipt), apply: null };
     this.records.set(receipt.proposalId, record);
@@ -301,8 +309,9 @@ export class PamMcpProcessClient {
 }
 
 export class CanonicalPamBridge {
-  constructor({ callTool, index, indexPath = null, routingKeys = null, allowLegacyContextTags = false }) {
+  constructor({ callTool, index, indexPath = null, routingKeys = null, allowLegacyContextTags = false, allowPlainSensitiveClaims = false }) {
     this.callTool = callTool; this.indexPath = indexPath; this.routingKeys = routingKeys; this.allowLegacyContextTags = allowLegacyContextTags;
+    this.allowPlainSensitiveClaims = allowPlainSensitiveClaims;
     this.index = normalizeRecordIndex(index || { records: {} }, routingKeys, { allowLegacyContextTags }); this.configured = true;
   }
   refreshIndex() {
@@ -318,7 +327,7 @@ export class CanonicalPamBridge {
     if (!entry?.path) throw Object.assign(new Error('memory_not_found'), { status: 404 });
     const result = await this.callTool('memory_record_validate', { path: entry.path });
     const record = result.status === 'valid' ? result.metadata : null;
-    if (!record || record.id !== id || !validateAmfMemoryRecord(record).ok) throw new Error('pam_record_binding_invalid');
+    if (!record || record.id !== id || !validateAmfMemoryRecord(record, { allowPlainSensitiveClaims: this.allowPlainSensitiveClaims }).ok) throw new Error('pam_record_binding_invalid');
     return structuredClone(record);
   }
   async search({ query, scopes, limit = 20, cursor = null, from = null, to = null }) {
@@ -362,8 +371,9 @@ export function createCanonicalPamBridgeFromEnv(env = process.env) {
   if (!routingPath) throw new Error('pam_routing_key_ring_unconfigured');
   const routingKeys = normalizeRoutingKeyRing(secureJsonFile(routingPath, 'pam_routing_key_ring'));
   const allowLegacyContextTags = String(env.AMF_PAM_ALLOW_LEGACY_CONTEXT_TAGS_SHADOW || '').trim() === 'true';
+  const allowPlainSensitiveClaims = String(env.AMF_ALLOW_PLAIN_SENSITIVE_CLAIMS || '').trim() === 'true';
   const client = new PamMcpProcessClient({ serverPath: path.resolve(serverPath), workspace: path.resolve(workspace) });
-  const bridge = new CanonicalPamBridge({ callTool: client.callTool.bind(client), index, indexPath: path.resolve(indexPath), routingKeys, allowLegacyContextTags });
+  const bridge = new CanonicalPamBridge({ callTool: client.callTool.bind(client), index, indexPath: path.resolve(indexPath), routingKeys, allowLegacyContextTags, allowPlainSensitiveClaims });
   bridge.kind = 'pam-stdio';
   bridge.close = () => client.close();
   return bridge;

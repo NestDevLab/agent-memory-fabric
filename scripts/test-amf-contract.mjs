@@ -103,3 +103,28 @@ test('sealed canonical AAD authenticates confidence score, basis and assessment 
     assert.match(validation.errors.join('\n'), /canonical AAD/);
   }
 });
+
+test('plain sensitive claims are rejected by default and accepted only with the explicit opt-out', () => {
+  const relational = {
+    ...baseRecord(),
+    claimType: 'relationship',
+    scope: { type: 'relationship', id: 'relationship:vitae:joseph' },
+    visibility: 'restricted',
+    subjects: [
+      { identityId: 'agent:vitae', role: 'owner' },
+      { identityId: 'person:joseph', role: 'participant' }
+    ]
+  };
+  const strict = validateAmfMemoryRecord(relational);
+  assert.equal(strict.ok, false);
+  assert.ok(strict.errors.includes('record requires a sealed claim'));
+  assert.deepEqual(validateAmfMemoryRecord(relational, { allowPlainSensitiveClaims: true }), { ok: true, errors: [] });
+
+  const personScoped = { ...baseRecord(), scope: { type: 'person', id: 'person:joseph' }, visibility: 'private' };
+  assert.equal(validateAmfMemoryRecord(personScoped).ok, false);
+  assert.equal(validateAmfMemoryRecord(personScoped, { allowPlainSensitiveClaims: true }).ok, true);
+
+  assert.deepEqual(validateAmfMemoryRecord(restrictedSealedRecord(), { allowPlainSensitiveClaims: true }), { ok: true, errors: [] });
+  const emptyPlain = { ...personScoped, claim: { encoding: 'plain', text: '   ' } };
+  assert.equal(validateAmfMemoryRecord(emptyPlain, { allowPlainSensitiveClaims: true }).ok, false);
+});
