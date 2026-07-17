@@ -12,10 +12,11 @@ const VALUE_OPTIONS = new Map([
   ['--backup-root', 'backupRoot'],
   ['--service-owner-uid', 'serviceOwnerUid'],
   ['--service-owner-gid', 'serviceOwnerGid'],
+  ['--service-user', 'serviceUserName'],
   ['--workspace-root', 'workspaceRoot'],
   ['--timer-interval-sec', 'timerIntervalSec']
 ]);
-const REQUIRED = ['authRegistryPath', 'pamConfigPath', 'referenceWorkerEnvPath', 'curationRoot', 'backupRoot', 'serviceOwnerUid', 'serviceOwnerGid'];
+const REQUIRED = ['authRegistryPath', 'referenceWorkerEnvPath', 'curationRoot', 'backupRoot', 'serviceOwnerUid', 'serviceOwnerGid'];
 
 function parseArguments(argv) {
   const output = {};
@@ -43,6 +44,8 @@ function safeError(error) {
 try {
   process.stdout.write(`${JSON.stringify(provisionAgentCurationLane(parseArguments(process.argv.slice(2))))}\n`);
 } catch (error) {
-  process.stderr.write(`${JSON.stringify({ ok: false, error: safeError(error) })}\n`);
+  const failure = { ok: false, error: safeError(error) };
+  if (error?.backups) failure.backups = error.backups;
+  process.stderr.write(`${JSON.stringify(failure)}\n`);
   process.exitCode = 1;
 }

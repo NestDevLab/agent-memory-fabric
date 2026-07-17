@@ -88,19 +88,33 @@ function parseEnvFile(filePath) {
   return entries;
 }
 
-function backupFile(sourcePath, backupRoot, stamp, ownership) {
-  const name = `${path.basename(sourcePath)}.bak-${stamp}`;
+function backupFile(sourcePath, backupRoot, stamp, sequence) {
+  const name = `${path.basename(sourcePath)}.bak-${stamp}-${sequence}`;
   const target = path.join(backupRoot, name);
-  fs.copyFileSync(sourcePath, target);
+  fs.copyFileSync(sourcePath, target, fs.constants.COPYFILE_EXCL);
   fs.chmodSync(target, 0o600);
-  if (ownership) fs.chownSync(target, ownership.uid, ownership.gid);
   return target;
 }
 
 function writePrivateFile(filePath, content, mode, ownership) {
-  fs.writeFileSync(filePath, content, { mode });
+  fs.writeFileSync(filePath, content, { mode, flag: 'wx' });
   fs.chmodSync(filePath, mode);
   if (ownership) fs.chownSync(filePath, ownership.uid, ownership.gid);
+}
+
+// Bind-mounted live files must keep their inode and must never be observable
+// empty: write at offset 0, verify the byte count, shrink, then fsync.
+function rewriteInPlace(filePath, payload) {
+  const bytes = Buffer.byteLength(payload, 'utf8');
+  const handle = fs.openSync(filePath, 'r+');
+  try {
+    const written = fs.writeSync(handle, payload, 0, 'utf8');
+    if (written !== bytes) throw fail('live_file_write_incomplete');
+    fs.ftruncateSync(handle, bytes);
+    fs.fsyncSync(handle);
+  } finally {
+    fs.closeSync(handle);
+  }
 }
 
 const REQUIRED_SHARED_ENV = Object.freeze([
@@ -117,22 +131,23 @@ export function planAgentCurationLane(options = {}) {
     laneName = 'agent-vitae',
     scope = 'agent:vitae',
     authRegistryPath,
-    pamConfigPath,
+    pamConfigPath = null,
     referenceWorkerEnvPath,
     curationRoot,
     unitDir = '/etc/systemd/system',
     serviceOwnerUid,
     serviceOwnerGid,
+    serviceUserName = 'stt',
     nodeBin = '/usr/bin/node',
-    workspaceRoot = '/srv/brain-shared',
+    workspaceRoot = null,
     timerIntervalSec = 120
   } = options;
 
   if (!SAFE_LANE_NAME.test(String(laneName ?? ''))) throw fail('lane_name_invalid');
   if (!SAFE_SCOPE.test(String(scope ?? ''))) throw fail('lane_scope_invalid');
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(String(serviceUserName ?? ''))) throw fail('service_user_invalid');
   for (const [label, value] of [
     ['auth_registry_path', authRegistryPath],
-    ['pam_config_path', pamConfigPath],
     ['reference_worker_env_path', referenceWorkerEnvPath],
     ['curation_root', curationRoot]
   ]) {
@@ -144,14 +159,24 @@ export function planAgentCurationLane(options = {}) {
   const interval = Number(timerIntervalSec);
   if (!Number.isSafeInteger(interval) || interval < 30 || interval > 86_400) throw fail('timer_interval_invalid');
 
-  const registry = readJson(authRegistryPath, 'auth_registry_unreadable');
-  validateRegistry(registry);
-  const pamConfig = readJson(pamConfigPath, 'pam_config_unreadable');
-  validatePamConfig(pamConfig);
   const referenceEnv = parseEnvFile(referenceWorkerEnvPath);
   for (const key of REQUIRED_SHARED_ENV) {
     if (!referenceEnv.get(key)) throw fail('worker_env_shared_entry_missing');
   }
+  // The config the workers actually load is authoritative; an explicit
+  // pam-config argument must agree with it.
+  const workerPamConfig = referenceEnv.get('PAM_WORKSPACE_CONFIG');
+  const resolvedPamConfigPath = pamConfigPath ?? workerPamConfig;
+  if (typeof resolvedPamConfigPath !== 'string' || !path.isAbsolute(resolvedPamConfigPath)) throw fail('pam_config_path_invalid');
+  if (pamConfigPath != null && pamConfigPath !== workerPamConfig) throw fail('pam_config_path_mismatch');
+  const resolvedWorkspaceRoot = workspaceRoot ?? referenceEnv.get('PAM_GIT_WRITER_REPO_ROOT');
+  if (typeof resolvedWorkspaceRoot !== 'string' || !path.isAbsolute(resolvedWorkspaceRoot)) throw fail('workspace_root_invalid');
+  if (workspaceRoot != null && workspaceRoot !== referenceEnv.get('PAM_GIT_WRITER_REPO_ROOT')) throw fail('workspace_root_mismatch');
+
+  const registry = readJson(authRegistryPath, 'auth_registry_unreadable');
+  validateRegistry(registry);
+  const pamConfig = readJson(resolvedPamConfigPath, 'pam_config_unreadable');
+  validatePamConfig(pamConfig);
 
   const curatorActor = `service:memory-curator-${laneName}`;
   const applicatorRow = registry.rows.find((row) => row.actor === LANE_APPLICATOR_ACTOR);
@@ -160,6 +185,13 @@ export function planAgentCurationLane(options = {}) {
   if (existingCurator) throw fail('lane_curator_already_provisioned');
 
   const secretsDir = path.join(curationRoot, 'secrets');
+  let secretsDirStat;
+  try {
+    secretsDirStat = fs.statSync(secretsDir);
+  } catch {
+    throw fail('secrets_dir_missing');
+  }
+  if (!secretsDirStat.isDirectory()) throw fail('secrets_dir_missing');
   const stateDir = path.join(curationRoot, `state-${laneName}`);
   const plan = {
     schema: AGENT_CURATION_LANE_SCHEMA,
@@ -181,21 +213,26 @@ export function planAgentCurationLane(options = {}) {
       timerUnit: path.join(unitDir, `amf-curation-${laneName}.timer`)
     },
     ownership: { uid, gid },
+    serviceUserName,
     nodeBin,
-    workspaceRoot,
+    curationRoot,
+    workspaceRoot: resolvedWorkspaceRoot,
     timerIntervalSec: interval,
     registry,
     pamConfig,
     referenceEnv,
     authRegistryPath,
-    pamConfigPath
+    pamConfigPath: resolvedPamConfigPath
   };
   for (const filePath of [
     plan.files.fabricCuratorTokenFile,
     plan.files.pamReviewerTokenFile,
     plan.files.pamLedgerKeyFile,
     plan.files.workerEnvFile,
-    plan.files.tickScriptFile
+    plan.files.tickScriptFile,
+    plan.files.stateDir,
+    plan.files.serviceUnit,
+    plan.files.timerUnit
   ]) {
     if (fs.existsSync(filePath)) throw fail('lane_artifact_already_exists');
   }
@@ -257,7 +294,11 @@ function approvedDecisionsForScope() {
   const selected = [];
   for (const name of fs.readdirSync(DECISION_DIR).sort()) {
     if (!/^decision-[0-9a-f]{40}\\.json$/.test(name)) continue;
-    const value = JSON.parse(fs.readFileSync(path.join(DECISION_DIR, name), "utf8"));
+    let value;
+    // The receipts dir is shared across lanes; one foreign corrupt receipt
+    // must not stall this lane.
+    try { value = JSON.parse(fs.readFileSync(path.join(DECISION_DIR, name), "utf8")); }
+    catch { continue; }
     if (value.outcome === "approved_pending_apply" && value.fabricProposalScope === EXPECTED_SCOPE
         && /^decision-[0-9a-f]{40}$/.test(String(value.decisionId || ""))
         && gitDeliveryStatus(value.decisionId) !== "pushed") selected.push(value.decisionId);
@@ -378,8 +419,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=stt
-Group=stt
+User=${plan.serviceUserName}
+Group=${plan.serviceUserName}
 EnvironmentFile=${plan.files.workerEnvFile}
 WorkingDirectory=/opt/portable-agent-memory
 ExecStart=/usr/bin/flock -n ${plan.files.stateDir}/tick.lock ${plan.nodeBin} ${plan.files.tickScriptFile}
@@ -407,7 +448,6 @@ OnBootSec=2min
 OnUnitActiveSec=${plan.timerIntervalSec}s
 RandomizedDelaySec=15s
 AccuracySec=5s
-Persistent=true
 Unit=amf-curation-${plan.laneName}.service
 
 [Install]
@@ -415,12 +455,8 @@ WantedBy=timers.target
 `;
 }
 
-export function provisionAgentCurationLane(options = {}) {
-  const { dryRun = false, backupRoot } = options;
-  const plan = planAgentCurationLane(options);
-  if (typeof backupRoot !== 'string' || !path.isAbsolute(backupRoot)) throw fail('backup_root_invalid');
-
-  const report = {
+function laneReport(plan, dryRun) {
+  return {
     ok: true,
     schema: AGENT_CURATION_LANE_SCHEMA,
     dryRun,
@@ -437,69 +473,111 @@ export function provisionAgentCurationLane(options = {}) {
       `systemctl enable --now amf-curation-${plan.laneName}.timer`
     ]
   };
-  if (dryRun) return report;
+}
 
-  fs.mkdirSync(backupRoot, { recursive: true, mode: 0o700 });
-  const stamp = new Date().toISOString().replace(/[:.]/g, '').slice(0, 15);
-  report.backups = {
-    authRegistry: backupFile(plan.authRegistryPath, backupRoot, stamp, plan.ownership),
-    pamConfig: backupFile(plan.pamConfigPath, backupRoot, stamp, plan.ownership)
-  };
+export function provisionAgentCurationLane(options = {}) {
+  const { dryRun = false, backupRoot } = options;
+  const preflight = planAgentCurationLane(options);
+  if (typeof backupRoot !== 'string' || !path.isAbsolute(backupRoot)) throw fail('backup_root_invalid');
+  if (dryRun) return laneReport(preflight, true);
 
-  const secrets = {
-    fabricCuratorToken: mintToken(),
-    pamReviewerToken: mintToken(),
-    pamLedgerKey: mintToken()
-  };
-
-  const curatorRow = {
-    active: true,
-    actor: plan.curatorActor,
-    allowedScopes: [plan.scope],
-    mode: 'scoped',
-    permissions: [...LANE_CURATOR_PERMISSIONS],
-    tokenSha256: sha256Hex(secrets.fabricCuratorToken)
-  };
-  plan.registry.rows.push(curatorRow);
-  const applicatorRow = plan.registry.rows.find((row) => row.actor === LANE_APPLICATOR_ACTOR);
-  if (!applicatorRow.allowedScopes.includes(plan.scope)) applicatorRow.allowedScopes.push(plan.scope);
-
-  const curatorPolicy = plan.pamConfig.amfCurator;
-  if (!curatorPolicy.autoScopes.includes(LANE_AUTO_SCOPE_TYPE)) curatorPolicy.autoScopes.push(LANE_AUTO_SCOPE_TYPE);
-  if (!curatorPolicy.autoVisibilities.includes(LANE_AUTO_VISIBILITY)) curatorPolicy.autoVisibilities.push(LANE_AUTO_VISIBILITY);
-  curatorPolicy.reviewers.push({
-    tokenSha256: sha256Hex(secrets.pamReviewerToken),
-    actorId: plan.curatorActor,
-    capabilities: ['memory:curate']
-  });
-
-  // Bind-mounted files must keep their inode: write in place, never rename over.
-  const registryHandle = fs.openSync(plan.authRegistryPath, 'r+');
+  // One shared lock per registry file: concurrent lane provisioning would
+  // rewrite from a stale parse. The plan is re-read under the lock.
+  const lockPath = path.join(preflight.curationRoot, `.provision-${path.basename(preflight.authRegistryPath)}.lock`);
+  let lockHandle;
   try {
-    const payload = `${JSON.stringify(plan.registry, null, 2)}\n`;
-    fs.ftruncateSync(registryHandle, 0);
-    fs.writeSync(registryHandle, payload, 0, 'utf8');
-  } finally {
-    fs.closeSync(registryHandle);
+    lockHandle = fs.openSync(lockPath, 'wx');
+  } catch {
+    throw fail('lane_provisioning_locked');
   }
-  const pamHandle = fs.openSync(plan.pamConfigPath, 'r+');
+  let plan;
   try {
-    const payload = `${JSON.stringify(plan.pamConfig, null, 2)}\n`;
-    fs.ftruncateSync(pamHandle, 0);
-    fs.writeSync(pamHandle, payload, 0, 'utf8');
-  } finally {
-    fs.closeSync(pamHandle);
+    plan = planAgentCurationLane(options);
+  } catch (error) {
+    fs.closeSync(lockHandle);
+    fs.rmSync(lockPath, { force: true });
+    throw error;
   }
+  const report = laneReport(plan, false);
 
-  writePrivateFile(plan.files.fabricCuratorTokenFile, `${secrets.fabricCuratorToken}\n`, 0o600, plan.ownership);
-  writePrivateFile(plan.files.pamReviewerTokenFile, `${secrets.pamReviewerToken}\n`, 0o600, plan.ownership);
-  writePrivateFile(plan.files.pamLedgerKeyFile, `${secrets.pamLedgerKey}\n`, 0o600, plan.ownership);
-  writePrivateFile(plan.files.workerEnvFile, workerEnvContent(plan, secrets), 0o600, plan.ownership);
-  writePrivateFile(plan.files.tickScriptFile, tickScriptContent(plan), 0o750, plan.ownership);
-  fs.mkdirSync(plan.files.stateDir, { recursive: true, mode: 0o700 });
-  fs.chownSync(plan.files.stateDir, plan.ownership.uid, plan.ownership.gid);
-  fs.writeFileSync(plan.files.serviceUnit, serviceUnitContent(plan), { mode: 0o644 });
-  fs.writeFileSync(plan.files.timerUnit, timerUnitContent(plan), { mode: 0o644 });
+  const pristine = {
+    registry: fs.readFileSync(plan.authRegistryPath),
+    pamConfig: fs.readFileSync(plan.pamConfigPath)
+  };
+  try {
+    fs.mkdirSync(backupRoot, { recursive: true, mode: 0o700 });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '').slice(0, 17);
+    report.backups = {
+      authRegistry: backupFile(plan.authRegistryPath, backupRoot, stamp, 'reg'),
+      pamConfig: backupFile(plan.pamConfigPath, backupRoot, stamp, 'pam')
+    };
+
+    const secrets = {
+      fabricCuratorToken: mintToken(),
+      pamReviewerToken: mintToken(),
+      pamLedgerKey: mintToken()
+    };
+
+    const curatorRow = {
+      active: true,
+      actor: plan.curatorActor,
+      allowedScopes: [plan.scope],
+      mode: 'scoped',
+      permissions: [...LANE_CURATOR_PERMISSIONS],
+      tokenSha256: sha256Hex(secrets.fabricCuratorToken)
+    };
+    plan.registry.rows.push(curatorRow);
+    const applicatorRow = plan.registry.rows.find((row) => row.actor === LANE_APPLICATOR_ACTOR);
+    if (!applicatorRow.allowedScopes.includes(plan.scope)) applicatorRow.allowedScopes.push(plan.scope);
+
+    const curatorPolicy = plan.pamConfig.amfCurator;
+    if (!curatorPolicy.autoScopes.includes(LANE_AUTO_SCOPE_TYPE)) curatorPolicy.autoScopes.push(LANE_AUTO_SCOPE_TYPE);
+    if (!curatorPolicy.autoVisibilities.includes(LANE_AUTO_VISIBILITY)) curatorPolicy.autoVisibilities.push(LANE_AUTO_VISIBILITY);
+    curatorPolicy.reviewers.push({
+      tokenSha256: sha256Hex(secrets.pamReviewerToken),
+      actorId: plan.curatorActor,
+      capabilities: ['memory:curate']
+    });
+
+    try {
+      rewriteInPlace(plan.authRegistryPath, `${JSON.stringify(plan.registry, null, 2)}\n`);
+      rewriteInPlace(plan.pamConfigPath, `${JSON.stringify(plan.pamConfig, null, 2)}\n`);
+
+      writePrivateFile(plan.files.fabricCuratorTokenFile, `${secrets.fabricCuratorToken}\n`, 0o600, plan.ownership);
+      writePrivateFile(plan.files.pamReviewerTokenFile, `${secrets.pamReviewerToken}\n`, 0o600, plan.ownership);
+      writePrivateFile(plan.files.pamLedgerKeyFile, `${secrets.pamLedgerKey}\n`, 0o600, plan.ownership);
+      writePrivateFile(plan.files.workerEnvFile, workerEnvContent(plan, secrets), 0o600, plan.ownership);
+      writePrivateFile(plan.files.tickScriptFile, tickScriptContent(plan), 0o750, plan.ownership);
+      fs.mkdirSync(plan.files.stateDir, { mode: 0o700 });
+      fs.chownSync(plan.files.stateDir, plan.ownership.uid, plan.ownership.gid);
+      fs.writeFileSync(plan.files.serviceUnit, serviceUnitContent(plan), { mode: 0o644, flag: 'wx' });
+      fs.writeFileSync(plan.files.timerUnit, timerUnitContent(plan), { mode: 0o644, flag: 'wx' });
+    } catch (cause) {
+      // Restore both live files before surfacing the failure; generated lane
+      // artifacts are inert without registry/policy entries and are removed
+      // best-effort.
+      rewriteInPlace(plan.authRegistryPath, pristine.registry.toString('utf8'));
+      rewriteInPlace(plan.pamConfigPath, pristine.pamConfig.toString('utf8'));
+      for (const filePath of [
+        plan.files.fabricCuratorTokenFile,
+        plan.files.pamReviewerTokenFile,
+        plan.files.pamLedgerKeyFile,
+        plan.files.workerEnvFile,
+        plan.files.tickScriptFile,
+        plan.files.serviceUnit,
+        plan.files.timerUnit
+      ]) {
+        try { fs.rmSync(filePath, { force: true }); } catch { /* best-effort cleanup */ }
+      }
+      try { fs.rmSync(plan.files.stateDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
+      const error = fail('lane_provisioning_rolled_back', cause);
+      error.backups = { ...report.backups };
+      throw error;
+    }
+  } finally {
+    fs.closeSync(lockHandle);
+    fs.rmSync(lockPath, { force: true });
+  }
 
   return report;
 }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -60,6 +61,7 @@ function fixture() {
     }
   }, null, 2)}\n`, { mode: 0o600 });
 
+  const workspaceRoot = path.join(root, 'workspace');
   const referenceWorkerEnvPath = path.join(root, 'worker.env');
   fs.writeFileSync(referenceWorkerEnvPath, [
     `PAM_WORKSPACE_CONFIG=${pamConfigPath}`,
@@ -71,7 +73,7 @@ function fixture() {
     'PAM_FABRIC_BASE_URL=http://127.0.0.1:8787',
     `PAM_FABRIC_CURATOR_TOKEN_FILE=${path.join(root, 'shared-curator.token')}`,
     `PAM_FABRIC_APPLICATOR_TOKEN_FILE=${path.join(root, 'shared-applicator.token')}`,
-    'PAM_GIT_WRITER_REPO_ROOT=/srv/brain-shared',
+    `PAM_GIT_WRITER_REPO_ROOT=${workspaceRoot}`,
     ''
   ].join('\n'), { mode: 0o600 });
 
@@ -84,7 +86,6 @@ function fixture() {
       curationRoot,
       unitDir,
       backupRoot,
-      workspaceRoot: path.join(root, 'workspace'),
       ...OWNER
     }
   };
@@ -187,4 +188,74 @@ test('refuses invalid lane names and scopes', () => {
   const { options } = fixture();
   assert.throws(() => planAgentCurationLane({ ...options, laneName: 'Bad Name' }), /lane_name_invalid/);
   assert.throws(() => planAgentCurationLane({ ...options, scope: 'room:vitae:x' }), /lane_scope_invalid/);
+});
+
+test('refuses a missing secrets dir before any mutation', () => {
+  const { options } = fixture();
+  fs.rmSync(path.join(options.curationRoot, 'secrets'), { recursive: true });
+  const before = fs.readFileSync(options.authRegistryPath, 'utf8');
+  assert.throws(() => provisionAgentCurationLane(options), /secrets_dir_missing/);
+  assert.equal(fs.readFileSync(options.authRegistryPath, 'utf8'), before);
+});
+
+test('refuses an explicit pam-config that disagrees with the worker env', () => {
+  const { options } = fixture();
+  assert.throws(
+    () => planAgentCurationLane({ ...options, pamConfigPath: path.join(options.curationRoot, 'other.json') }),
+    /pam_config_path_mismatch/
+  );
+});
+
+test('refuses when the applicator actor is missing', () => {
+  const { options } = fixture();
+  const registry = JSON.parse(fs.readFileSync(options.authRegistryPath, 'utf8'));
+  registry.rows = registry.rows.filter((row) => row.actor !== 'service:memory-applicator');
+  fs.writeFileSync(options.authRegistryPath, `${JSON.stringify(registry)}\n`);
+  assert.throws(() => planAgentCurationLane(options), /applicator_actor_missing/);
+});
+
+test('rolls back both live files when a late artifact write fails', () => {
+  const { options } = fixture();
+  const registryBefore = fs.readFileSync(options.authRegistryPath, 'utf8');
+  const pamBefore = fs.readFileSync(options.pamConfigPath, 'utf8');
+  fs.rmSync(options.unitDir, { recursive: true });
+  fs.writeFileSync(options.unitDir, 'not a directory\n');
+  assert.throws(() => provisionAgentCurationLane(options), /lane_provisioning_rolled_back/);
+  assert.equal(fs.readFileSync(options.authRegistryPath, 'utf8'), registryBefore);
+  assert.equal(fs.readFileSync(options.pamConfigPath, 'utf8'), pamBefore);
+  const secretsDir = path.join(options.curationRoot, 'secrets');
+  assert.deepEqual(fs.readdirSync(secretsDir), []);
+  assert.equal(fs.existsSync(path.join(options.curationRoot, 'worker-agent-vitae.env')), false);
+  assert.equal(fs.existsSync(path.join(options.curationRoot, 'state-agent-vitae')), false);
+  fs.rmSync(options.unitDir);
+  fs.mkdirSync(options.unitDir, { recursive: true });
+  const rerun = provisionAgentCurationLane({ ...options, dryRun: true });
+  assert.equal(rerun.ok, true);
+});
+
+test('apply preserves the pam config inode and generated tick script parses', () => {
+  const { options } = fixture();
+  const before = fs.statSync(options.pamConfigPath).ino;
+  const report = provisionAgentCurationLane(options);
+  assert.equal(fs.statSync(options.pamConfigPath).ino, before);
+  execFileSync(process.execPath, ['--check', report.files.tickScriptFile]);
+  const service = fs.readFileSync(report.files.serviceUnit, 'utf8');
+  assert.match(service, /User=stt/);
+  const custom = fixture();
+  const customReport = provisionAgentCurationLane({ ...custom.options, serviceUserName: 'svc_user' });
+  assert.match(fs.readFileSync(customReport.files.serviceUnit, 'utf8'), /User=svc_user/);
+});
+
+test('reports already-present applicator scope and policy values', () => {
+  const { options } = fixture();
+  const registry = JSON.parse(fs.readFileSync(options.authRegistryPath, 'utf8'));
+  registry.rows.find((row) => row.actor === 'service:memory-applicator').allowedScopes.push('agent:vitae');
+  fs.writeFileSync(options.authRegistryPath, `${JSON.stringify(registry)}\n`);
+  const pam = JSON.parse(fs.readFileSync(options.pamConfigPath, 'utf8'));
+  pam.amfCurator.autoScopes.push('agent');
+  fs.writeFileSync(options.pamConfigPath, `${JSON.stringify(pam)}\n`);
+  const report = provisionAgentCurationLane({ ...options, dryRun: true });
+  assert.equal(report.applicatorScopeExtended, false);
+  assert.equal(report.autoScopeExtended, false);
+  assert.equal(report.autoVisibilityExtended, true);
 });
