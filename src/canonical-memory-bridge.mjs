@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { validateAmfMemoryRecord } from './amf-memory-record-validator.mjs';
 import { normalizeOpaqueTagMap } from './access-contract.mjs';
+import { createSemanticIndexFromEnv } from './semantic-index.mjs';
 
 const ACTIVE = new Set(['active']);
 const DECISION_STATUSES = new Set(['review_required', 'approved_pending_apply', 'rejected']);
@@ -324,9 +325,10 @@ export class PamMcpProcessClient {
 }
 
 export class CanonicalPamBridge {
-  constructor({ callTool, index, indexPath = null, routingKeys = null, allowLegacyContextTags = false, allowPlainSensitiveClaims = false }) {
+  constructor({ callTool, index, indexPath = null, routingKeys = null, allowLegacyContextTags = false, allowPlainSensitiveClaims = false, semanticIndex = null }) {
     this.callTool = callTool; this.indexPath = indexPath; this.routingKeys = routingKeys; this.allowLegacyContextTags = allowLegacyContextTags;
     this.allowPlainSensitiveClaims = allowPlainSensitiveClaims;
+    this.semanticIndex = semanticIndex;
     this.index = normalizeRecordIndex(index || { records: {} }, routingKeys, { allowLegacyContextTags }); this.configured = true;
   }
   refreshIndex() {
@@ -369,6 +371,17 @@ export class CanonicalPamBridge {
         } catch { /* unreadable records simply stay out of the result */ }
       }
     }
+    // Semantic recall reaches concept-level matches with no shared tokens; it
+    // only adds candidates known to this scope's index, and privacy/scope
+    // filters run downstream on every candidate.
+    if (this.semanticIndex?.configured && query) {
+      try {
+        const known = new Map(entries.map(([id, entry]) => [id, entry]));
+        for (const id of await this.semanticIndex.searchIds({ query, scopes: [...allowed] })) {
+          if (known.has(id)) ids.add(id);
+        }
+      } catch { /* semantic backend degradation must not fail lexical search */ }
+    }
     const records = [];
     for (const id of ids) {
       const record = await this.read({ id });
@@ -403,10 +416,12 @@ export function createCanonicalPamBridgeFromEnv(env = process.env) {
   const routingKeys = normalizeRoutingKeyRing(secureJsonFile(routingPath, 'pam_routing_key_ring'));
   const allowLegacyContextTags = String(env.AMF_PAM_ALLOW_LEGACY_CONTEXT_TAGS_SHADOW || '').trim() === 'true';
   const allowPlainSensitiveClaims = String(env.AMF_ALLOW_PLAIN_SENSITIVE_CLAIMS || '').trim() === 'true';
+  const semanticIndex = createSemanticIndexFromEnv(env);
   const client = new PamMcpProcessClient({ serverPath: path.resolve(serverPath), workspace: path.resolve(workspace) });
-  const bridge = new CanonicalPamBridge({ callTool: client.callTool.bind(client), index, indexPath: path.resolve(indexPath), routingKeys, allowLegacyContextTags, allowPlainSensitiveClaims });
+  const bridge = new CanonicalPamBridge({ callTool: client.callTool.bind(client), index, indexPath: path.resolve(indexPath), routingKeys, allowLegacyContextTags, allowPlainSensitiveClaims, semanticIndex: semanticIndex.configured ? semanticIndex : null });
   bridge.kind = 'pam-stdio';
-  bridge.close = () => client.close();
+  bridge.semanticIndex = semanticIndex.configured ? semanticIndex : null;
+  bridge.close = async () => { await client.close(); if (semanticIndex.configured) await semanticIndex.close(); };
   return bridge;
 }
 
