@@ -8,6 +8,7 @@ npm-debug.log*
 .DS_Store
 
 config/auth-registry.local.json
+deploy/secrets.local/
 
 # syncwheel managed metadata
 .syncwheel/ledger/
