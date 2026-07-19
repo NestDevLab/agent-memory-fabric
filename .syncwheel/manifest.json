@@ -297,7 +297,9 @@
       "target_remote": "origin",
       "target_branch": "main",
       "integration_branch": "main-integration",
-      "commits": [],
+      "commits": [
+        "6351793b06b1b359349a85c2c1d10a67b458e7e1"
+      ],
       "meta": {
         "purpose": "Remove Compose shadowing of AMF_RAW_V2_CUTOVER so .env.runtime is authoritative"
       }
