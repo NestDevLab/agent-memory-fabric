@@ -289,6 +289,18 @@
         "941eebe183f047c14a5440b14bc1641e214da3c9"
       ],
       "meta": {}
+    },
+    {
+      "id": "raw-v2-cutover-compose",
+      "branch": "fix/raw-v2-cutover-compose",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [],
+      "meta": {
+        "purpose": "Remove Compose shadowing of AMF_RAW_V2_CUTOVER so .env.runtime is authoritative"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",

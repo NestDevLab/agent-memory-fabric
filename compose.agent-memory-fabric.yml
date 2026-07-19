@@ -17,7 +17,6 @@ services:
       AMF_CONTEXT_KEY_RING_PATH: /run/secrets/agent-memory-fabric-context-key-ring.json
       AMF_SESSION_ROUTE_MANIFEST_PATH: /run/amf-session-routes/session-route-manifest.json
       AMF_POLICY_REVISION: "${AMF_POLICY_REVISION:?set the reviewed policy revision}"
-      AMF_RAW_V2_CUTOVER: "${AMF_RAW_V2_CUTOVER:-false}"
       AMF_PAM_MCP_SERVER_PATH: /opt/portable-agent-memory/tools/pam-mcp-server.mjs
       AMF_PAM_WORKSPACE: /srv/brain-shared
       AMF_PAM_RECORD_INDEX_PATH: /srv/brain-shared/memory/amf/record-index.json
