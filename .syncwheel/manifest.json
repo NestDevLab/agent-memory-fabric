@@ -16,7 +16,8 @@
       "amf-integration-framework",
       "semantic-reindex-timer",
       "amf-safe-deploy",
-      "amf-roadmap-plan"
+      "amf-roadmap-plan",
+      "amf-compose-v2-reconciliation"
     ]
   },
   "stacks": [
@@ -344,6 +345,20 @@
         "0d86d942a06a0ed833233cb9b4a5c942080082bf"
       ],
       "meta": {}
+    },
+    {
+      "id": "amf-compose-v2-reconciliation",
+      "branch": "fix/amf-compose-v2-reconciliation",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "d6af31d8dc5bfabba1ca47ce5b97f88854055e1e"
+      ],
+      "meta": {
+        "purpose": "Reconcile the legacy v2 compose example with deployment, privacy, migration, and neutral MCP contracts"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
