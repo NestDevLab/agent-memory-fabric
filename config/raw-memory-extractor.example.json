@@ -2,12 +2,15 @@
   "baseUrl": "https://memory.example",
   "tokenFile": "/etc/agent-memory-fabric/raw-extractor.token",
   "stateFile": "/var/lib/agent-memory-fabric/raw-extractor/state.json",
-  "openaiApiKeyFile": "/etc/agent-memory-fabric/raw-extractor-openai.token",
+  "codexWorkDir": "/var/lib/agent-memory-fabric/raw-extractor/codex",
   "model": "gpt-5.6-luna",
   "dailyInputTokens": 20000,
   "dailyOutputTokens": 4000,
   "maxInputTokensPerConversation": 2500,
   "maxOutputTokensPerConversation": 350,
   "maxClaimsPerConversation": 2,
-  "transcriptItemLimit": 100
+  "transcriptItemLimit": 100,
+  "planMinRemainingPercent": 25,
+  "codexTimeoutMs": 90000,
+  "codexRateLimitTimeoutMs": 15000
 }
