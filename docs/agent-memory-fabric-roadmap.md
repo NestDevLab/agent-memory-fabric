@@ -224,9 +224,9 @@ indexing runs on schedule, and a failed deploy cannot truncate application data.
 - [x] Publish the content protection policy and canonical-memory schema revision.
 - [x] Publish the archive adapter interface and shared conformance fixtures.
 - [x] Publish the provider-neutral MCP schema and authorization matrix.
-- [ ] Define idempotency conflict visibility, operator notification, and resolution.
-- [ ] Define pause, rollback, reconciliation, and exact cleanup manifests.
-- [ ] Threat-model plaintext storage, integrity, authorization, audit, and optional encryption.
+- [x] Define idempotency conflict visibility, operator notification, and resolution.
+- [x] Define pause, rollback, reconciliation, and exact cleanup manifests.
+- [x] Threat-model plaintext storage, integrity, authorization, audit, and optional encryption.
 
 Acceptance: contracts are versioned, examples contain no private context, and
 security review has no unresolved blocking finding.
