@@ -60,8 +60,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_started
+      ollama-model-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "node", "-e", "require('net').connect(8787,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
       interval: 10s
@@ -78,6 +78,7 @@ services:
       POSTGRES_PASSWORD: "${AMF_DB_PASSWORD:?required}"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U agent_memory_fabric -d agent_memory_fabric"]
       interval: 5s
@@ -89,6 +90,24 @@ services:
     restart: unless-stopped
     volumes:
       - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  ollama-model-init:
+    image: ollama/ollama@sha256:a6149234667efc71d37766d61c1a16f24c33e4cd7a0bf4125c44a7e47e2419c4
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["pull", "nomic-embed-text@${NOMIC_EMBED_TEXT_DIGEST:?required}"]
+    volumes:
+      - ollama-models:/root/.ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
 
 volumes:
   # New named volumes start empty. They are never substitutes for an existing

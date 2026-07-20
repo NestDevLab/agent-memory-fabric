@@ -39,9 +39,9 @@ restore proof, and single-writer validation. It must not use this local/shadow
 reference as a migration procedure. Follow the deployment procedure and the
 roadmap before planning that work.
 
-## MCP transition
+## Planned MCP transition
 
-The advertised capability MCP surface is exactly:
+Milestone M6 in the roadmap plans this advertised capability surface:
 
 - `search`
 - `read`
@@ -49,6 +49,7 @@ The advertised capability MCP surface is exactly:
 - `proposal_status`
 - `status`
 
-Product-specific `amf_*` adapter tools are temporary, unadvertised
-compatibility aliases. They are not part of the advertised API for new
-clients.
+These names are not the current server surface. Existing clients retain their
+current tools until M6 is implemented. Product-specific `amf_*` adapter names
+may remain as temporary, unadvertised compatibility aliases during migration;
+they are not names for new integrations.

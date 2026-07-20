@@ -37,13 +37,16 @@ docker compose config
 ```
 
 The compose file includes PostgreSQL with pgvector and a local embedding
-service. Keep the embedding digest pinned when comparing shadow results. This
-reference intentionally makes no claim that a local configuration is ready for
-production.
+service. On a new PostgreSQL volume, the bootstrap SQL enables the `vector`
+extension. The one-shot model initializer pulls the digest recorded in `.env`
+before the AMF server starts. Keep that digest pinned when comparing shadow
+results. This reference intentionally makes no claim that a local configuration
+is ready for production.
 
 ## MCP compatibility
 
-The target advertised MCP tools are `search`, `read`, `propose`,
-`proposal_status`, and `status`. Product-specific `amf_*` adapter tools are
-temporary, unadvertised compatibility aliases only; new clients must use the
-provider-neutral target tools.
+The planned M6 advertised MCP tools are `search`, `read`, `propose`,
+`proposal_status`, and `status`; they are not the current server surface. Until
+M6 is implemented, existing clients retain their current compatibility tools.
+Product-specific `amf_*` adapter names are candidates for temporary,
+unadvertised aliases during migration, not names for new integrations.
