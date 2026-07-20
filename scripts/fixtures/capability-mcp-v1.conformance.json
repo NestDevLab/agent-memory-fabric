@@ -1,0 +1,26 @@
+{
+  "schema": "amf.capability-mcp-conformance/v1",
+  "advertisedTools": ["search", "read", "propose", "proposal_status", "status"],
+  "authorizationMatrix": [
+    { "tool": "search", "capability": "search", "permission": "fabric:search", "purpose": ["memory_recall", "conversation_recall"], "scopeBinding": "required", "failure": "forbidden" },
+    { "tool": "read", "capability": "read", "permission": "fabric:read", "purpose": ["memory_recall", "conversation_recall"], "scopeBinding": "required", "failure": "not_found" },
+    { "tool": "propose", "capability": "propose", "permission": "fabric:propose", "purpose": ["memory_curation"], "scopeBinding": "required", "failure": "forbidden" },
+    { "tool": "proposal_status", "capability": "proposal_status", "permission": "fabric:proposal_status", "purpose": ["memory_curation"], "scopeBinding": "required", "failure": "not_found" },
+    { "tool": "status", "capability": "status", "permission": "fabric:status", "purpose": [], "scopeBinding": "none", "failure": "forbidden" }
+  ],
+  "scenarios": [
+    { "id": "valid_defaults", "request": { "name": "search", "arguments": { "query": "Find a summary", "scopes": ["team:synthetic"], "purpose": "memory_recall", "limit": 10 } }, "expected": { "ok": true, "outcome": "found", "items": [{ "id": "rid_alpha0001", "kind": "canonical_memory", "text": "A synthetic memory result." }, { "id": "rid_beta00002", "kind": "document", "text": "A synthetic document result." }], "nextCursor": null } },
+    { "id": "explicit_conversation", "request": { "name": "search", "arguments": { "query": "Find a message", "kinds": ["conversation"], "scopes": ["team:synthetic"], "purpose": "conversation_recall", "limit": 10 } }, "expected": { "ok": true, "outcome": "found", "items": [{ "id": "rid_gamma0003", "kind": "conversation", "text": "A synthetic visible message." }], "nextCursor": null } },
+    { "id": "denied_conversation_purpose", "request": { "name": "search", "arguments": { "query": "Find a message", "kinds": ["conversation"], "scopes": ["team:synthetic"], "purpose": "memory_recall" } }, "expected": { "ok": false, "outcome": "forbidden" } },
+    { "id": "denied_conversation_scope", "request": { "name": "search", "arguments": { "query": "Find a message", "kinds": ["conversation"], "scopes": ["team:outside"], "purpose": "conversation_recall" } }, "expected": { "ok": false, "outcome": "forbidden" } },
+    { "id": "read_found", "request": { "name": "read", "arguments": { "id": "rid_alpha0001", "scopes": ["team:synthetic"], "purpose": "memory_recall" } }, "expected": { "ok": true, "outcome": "found", "resource": { "id": "rid_alpha0001", "kind": "canonical_memory", "text": "A synthetic memory result." } } },
+    { "id": "read_no_existence_oracle", "request": { "name": "read", "arguments": { "id": "rid_alpha0001", "scopes": ["team:outside"], "purpose": "memory_recall" } }, "expected": { "ok": false, "outcome": "not_found" } },
+    { "id": "proposal_queued", "request": { "name": "propose", "arguments": { "scope": "team:synthetic", "claim": "A synthetic proposed fact.", "purpose": "memory_curation", "idempotencyKey": "req_proposal0001" } }, "expected": { "ok": true, "outcome": "queued", "id": "rid_delta0004" } },
+    { "id": "proposal_lifecycle", "request": { "name": "proposal_status", "arguments": { "id": "rid_delta0004", "scopes": ["team:synthetic"], "purpose": "memory_curation" } }, "expected": { "ok": true, "outcome": "pending", "proposal": { "id": "rid_delta0004", "state": "pending" } } },
+    { "id": "status_redaction", "request": { "name": "status", "arguments": {} }, "expected": { "ok": true, "outcome": "ready", "capabilities": [{ "name": "search", "state": "ready" }, { "name": "read", "state": "ready" }, { "name": "propose", "state": "ready" }, { "name": "proposal_status", "state": "ready" }, { "name": "status", "state": "ready" }] } },
+    { "id": "missing_provider_startup", "request": { "name": "status", "arguments": {} }, "registry": { "enabledCapabilities": ["search"], "providerAssignments": [] }, "expected": { "ok": false, "outcome": "unavailable", "capabilities": [{ "name": "search", "state": "unavailable" }] } },
+    { "id": "ambiguous_provider_startup", "request": { "name": "status", "arguments": {} }, "registry": { "enabledCapabilities": ["search"], "providerAssignments": [{ "capability": "search", "providerId": "source_one" }, { "capability": "search", "providerId": "source_two" }] }, "expected": { "ok": false, "outcome": "unavailable", "capabilities": [{ "name": "search", "state": "unavailable" }] } },
+    { "id": "disabled_provider_assignment", "request": { "name": "status", "arguments": {} }, "registry": { "enabledCapabilities": ["read"], "providerAssignments": [{ "capability": "search", "providerId": "source_one" }] }, "expected": { "ok": false, "outcome": "unavailable", "capabilities": [{ "name": "read", "state": "unavailable" }] } },
+    { "id": "alias_non_advertisement", "request": { "name": "search", "arguments": { "query": "Find a summary", "scopes": ["team:synthetic"], "purpose": "memory_recall" } }, "alias": "legacy_search", "expected": { "ok": true, "outcome": "found", "items": [], "nextCursor": null } }
+  ]
+}

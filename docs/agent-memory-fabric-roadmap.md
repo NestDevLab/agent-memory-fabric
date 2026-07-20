@@ -223,7 +223,7 @@ indexing runs on schedule, and a failed deploy cannot truncate application data.
 - [x] Publish attachment-reference and tombstone semantics.
 - [x] Publish the content protection policy and canonical-memory schema revision.
 - [x] Publish the archive adapter interface and shared conformance fixtures.
-- [ ] Publish the provider-neutral MCP schema and authorization matrix.
+- [x] Publish the provider-neutral MCP schema and authorization matrix.
 - [ ] Define idempotency conflict visibility, operator notification, and resolution.
 - [ ] Define pause, rollback, reconciliation, and exact cleanup manifests.
 - [ ] Threat-model plaintext storage, integrity, authorization, audit, and optional encryption.
