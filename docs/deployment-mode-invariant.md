@@ -9,8 +9,9 @@ traversal and makes every curation tick fail before its script starts. `0711`
 does not grant `stt` directory listing or read access; it grants only the
 required traversal permission.
 
-Every deployment must install the shipped tmpfiles policy and run the checked
-guard after the release directory has been recreated:
+Every deployment must use the in-place, persistent-data-safe procedure in
+[`deployment-procedure.md`](deployment-procedure.md), install the shipped
+tmpfiles policy, and run the checked guard after source has been refreshed:
 
 ```sh
 install -m 0644 deploy/tmpfiles.d/agent-memory-fabric.conf /etc/tmpfiles.d/
