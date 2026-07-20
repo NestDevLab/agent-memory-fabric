@@ -354,7 +354,8 @@
       "target_branch": "main",
       "integration_branch": "main-integration",
       "commits": [
-        "d6af31d8dc5bfabba1ca47ce5b97f88854055e1e"
+        "d6af31d8dc5bfabba1ca47ce5b97f88854055e1e",
+        "ef77a5e8319b92a5926b31a9b086cf0ac0a83687"
       ],
       "meta": {
         "purpose": "Reconcile the legacy v2 compose example with deployment, privacy, migration, and neutral MCP contracts"
