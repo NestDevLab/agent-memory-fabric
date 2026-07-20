@@ -17,7 +17,8 @@
       "semantic-reindex-timer",
       "amf-safe-deploy",
       "amf-roadmap-plan",
-      "amf-compose-v2-reconciliation"
+      "amf-compose-v2-reconciliation",
+      "amf-v3-contracts"
     ]
   },
   "stacks": [
@@ -359,6 +360,20 @@
       ],
       "meta": {
         "purpose": "Reconcile the legacy v2 compose example with deployment, privacy, migration, and neutral MCP contracts"
+      }
+    },
+    {
+      "id": "amf-v3-contracts",
+      "branch": "feat/amf-v3-contracts",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "6a3d3b3025921f3c4545e72480a0a459008cca4d"
+      ],
+      "meta": {
+        "purpose": "Freeze AMF v3 contracts and safety gates"
       }
     }
   ],
