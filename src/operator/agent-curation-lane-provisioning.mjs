@@ -13,7 +13,7 @@ export const LANE_AUTO_SCOPE_TYPE = 'agent';
 export const LANE_AUTO_VISIBILITY = 'private';
 
 const SAFE_LANE_NAME = /^[a-z][a-z0-9-]{2,48}$/;
-const SAFE_SCOPE = /^agent:[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$/;
+const SAFE_SCOPE = /^(?:agent:[A-Za-z0-9][A-Za-z0-9._:-]{2,127}|shared:global)$/;
 const HEX_DIGEST = /^[a-f0-9]{64}$/;
 const AUTH_MODES = new Set(['allow_all', 'scoped', 'read_only_scoped', 'deny']);
 
@@ -145,6 +145,8 @@ export function planAgentCurationLane(options = {}) {
 
   if (!SAFE_LANE_NAME.test(String(laneName ?? ''))) throw fail('lane_name_invalid');
   if (!SAFE_SCOPE.test(String(scope ?? ''))) throw fail('lane_scope_invalid');
+  const autoScopeType = scope === 'shared:global' ? 'shared' : LANE_AUTO_SCOPE_TYPE;
+  const autoVisibility = scope === 'shared:global' ? 'shared' : LANE_AUTO_VISIBILITY;
   if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(String(serviceUserName ?? ''))) throw fail('service_user_invalid');
   for (const [label, value] of [
     ['auth_registry_path', authRegistryPath],
@@ -197,11 +199,13 @@ export function planAgentCurationLane(options = {}) {
     schema: AGENT_CURATION_LANE_SCHEMA,
     laneName,
     scope,
+    autoScopeType,
+    autoVisibility,
     curatorActor,
     applicatorActor: LANE_APPLICATOR_ACTOR,
     applicatorScopeAlreadyPresent: applicatorRow.allowedScopes.includes(scope),
-    autoScopeAlreadyPresent: pamConfig.amfCurator.autoScopes.includes(LANE_AUTO_SCOPE_TYPE),
-    autoVisibilityAlreadyPresent: pamConfig.amfCurator.autoVisibilities.includes(LANE_AUTO_VISIBILITY),
+    autoScopeAlreadyPresent: pamConfig.amfCurator.autoScopes.includes(autoScopeType),
+    autoVisibilityAlreadyPresent: pamConfig.amfCurator.autoVisibilities.includes(autoVisibility),
     files: {
       fabricCuratorTokenFile: path.join(secretsDir, `fabric-curator-${laneName}.token`),
       pamReviewerTokenFile: path.join(secretsDir, `pam-reviewer-${laneName}.token`),
@@ -277,8 +281,8 @@ function assertPolicy(config) {
   const curator = config.amfCurator || {};
   const writer = config.amfApplicator?.gitWriter || {};
   if (curator.autoPromote !== true || curator.minimumConfidence !== 0.98) fail("lane curator policy mismatch");
-  if (!curator.autoScopes?.includes(${JSON.stringify(LANE_AUTO_SCOPE_TYPE)})) fail("agent auto-promotion scope is unavailable");
-  if (!curator.autoVisibilities?.includes(${JSON.stringify(LANE_AUTO_VISIBILITY)})) fail("private auto-promotion visibility is unavailable");
+  if (!curator.autoScopes?.includes(${JSON.stringify(plan.autoScopeType)})) fail("lane auto-promotion scope is unavailable");
+  if (!curator.autoVisibilities?.includes(${JSON.stringify(plan.autoVisibility)})) fail("lane auto-promotion visibility is unavailable");
   if (curator.requireReviewForLifecycleChange !== true || curator.requireReviewForSupersession !== true || curator.rejectOnWarnings !== true) fail("review safety gates are not enabled");
   if (writer.enabled !== true || writer.allowedBranches?.length !== 1 || writer.allowedBranches[0] !== "main") fail("Git writer branch policy mismatch");
   if (writer.push?.enabled !== true || writer.push.remote !== "origin" || writer.push.allowedRemotes?.length !== 1 || writer.push.allowedRemotes[0] !== "origin") fail("Git push policy mismatch");
@@ -531,8 +535,8 @@ export function provisionAgentCurationLane(options = {}) {
     if (!applicatorRow.allowedScopes.includes(plan.scope)) applicatorRow.allowedScopes.push(plan.scope);
 
     const curatorPolicy = plan.pamConfig.amfCurator;
-    if (!curatorPolicy.autoScopes.includes(LANE_AUTO_SCOPE_TYPE)) curatorPolicy.autoScopes.push(LANE_AUTO_SCOPE_TYPE);
-    if (!curatorPolicy.autoVisibilities.includes(LANE_AUTO_VISIBILITY)) curatorPolicy.autoVisibilities.push(LANE_AUTO_VISIBILITY);
+    if (!curatorPolicy.autoScopes.includes(plan.autoScopeType)) curatorPolicy.autoScopes.push(plan.autoScopeType);
+    if (!curatorPolicy.autoVisibilities.includes(plan.autoVisibility)) curatorPolicy.autoVisibilities.push(plan.autoVisibility);
     curatorPolicy.reviewers.push({
       tokenSha256: sha256Hex(secrets.pamReviewerToken),
       actorId: plan.curatorActor,

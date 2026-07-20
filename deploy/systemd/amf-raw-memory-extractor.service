@@ -1,0 +1,19 @@
+[Unit]
+Description=Agent Memory Fabric slow RAW-to-memory extractor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=amf
+Group=amf
+WorkingDirectory=/opt/agent-memory-fabric
+ExecStart=/usr/bin/flock -n /var/lib/agent-memory-fabric/raw-extractor/tick.lock /usr/bin/node /opt/agent-memory-fabric/scripts/amf-raw-memory-extractor.mjs --config /etc/agent-memory-fabric/raw-extractor.json
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/agent-memory-fabric/raw-extractor
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+RestrictSUIDSGID=true
