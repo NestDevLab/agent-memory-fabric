@@ -6,7 +6,8 @@ var
 .env.*
 config
 docs
-scripts
+scripts/*
+!scripts/amf-reindex-semantic.mjs
 docker-compose*.yml
 compose*.yml
 README.md

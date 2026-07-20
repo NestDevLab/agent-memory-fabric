@@ -13,7 +13,8 @@
     "stacks": [
       "amf-fabric-core",
       "amf-route-key-version",
-      "amf-integration-framework"
+      "amf-integration-framework",
+      "semantic-reindex-timer"
     ]
   },
   "stacks": [
@@ -303,6 +304,18 @@
       "meta": {
         "purpose": "Run the RAW memory extractor through subscription-authenticated Codex"
       }
+    },
+    {
+      "id": "semantic-reindex-timer",
+      "branch": "amf/semantic-reindex-timer",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "21e1cd859c2c0907b6fdd7e1a3a634f1fde61fb5"
+      ],
+      "meta": {}
     }
   ],
   "syncwheel_tracking": "git-tracked",

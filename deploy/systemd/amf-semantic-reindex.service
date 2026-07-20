@@ -1,0 +1,25 @@
+[Unit]
+Description=Refresh Agent Memory Fabric semantic index
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/agent-memory-fabric
+StateDirectory=agent-memory-fabric/semantic-reindex
+ExecStart=/usr/bin/flock -n /var/lib/agent-memory-fabric/semantic-reindex/tick.lock /usr/bin/docker exec agent-memory-fabric-agent-memory-fabric-1 /usr/local/bin/node /app/scripts/amf-reindex-semantic.mjs
+TimeoutStartSec=4min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/agent-memory-fabric/semantic-reindex
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
