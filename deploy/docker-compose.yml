@@ -1,9 +1,8 @@
 name: amf-stack
 
-# Tier 2 v1 stack per docs/multi-agent-compose-stack.md:
-# amf-server + postgres (pgvector) + ollama. Only amf-server is published,
-# bound to AMF_BIND_ADDRESS (trusted LAN; no TLS proxy in v1, decision 8).
-
+# Legacy v2 local/shadow reference only. This file is not a production upgrade
+# or operations runbook; use docs/deployment-procedure.md for production work
+# and docs/agent-memory-fabric-roadmap.md for future migration work.
 services:
   amf-server:
     build:
@@ -13,14 +12,11 @@ services:
     restart: unless-stopped
     init: true
     read_only: true
-    # Must match the owner of the bind-mounted host dirs (PAM runtime/brain
-    # shared): AMF validates mount ownership against the process euid. macOS
-    # Docker Desktop/Rancher maps host dirs to 503:20; Linux hosts use 1000.
-    user: "${AMF_SERVICE_UID:-1000}:${AMF_SERVICE_GID:-1000}"
+    user: "${AMF_SERVICE_UID:?required}:${AMF_SERVICE_GID:?required}"
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
     ports:
-      - "${AMF_BIND_ADDRESS:-127.0.0.1}:${AMF_HOST_PORT:-8787}:8787"
+      - "127.0.0.1:${AMF_HOST_PORT:?required}:8787"
     environment:
       AMF_SERVER_ENABLED: "true"
       AMF_POLICY_PATH: /run/config/agent-memory-fabric-policy.json
@@ -28,7 +24,7 @@ services:
       AMF_RAW_KEY_RING_PATH: /run/secrets/agent-memory-fabric-key-ring.json
       AMF_INGEST_KEY_RING_PATH: /run/secrets/agent-memory-fabric-ingest-key-ring.json
       AMF_CONTEXT_KEY_RING_PATH: /run/secrets/agent-memory-fabric-context-key-ring.json
-      AMF_POLICY_REVISION: "${AMF_POLICY_REVISION:?set the reviewed policy revision}"
+      AMF_POLICY_REVISION: "${AMF_POLICY_REVISION:?required}"
       AMF_PAM_MCP_SERVER_PATH: /opt/portable-agent-memory/tools/pam-mcp-server.mjs
       AMF_PAM_WORKSPACE: /srv/brain-shared
       AMF_PAM_RECORD_INDEX_PATH: /srv/brain-shared/memory/amf/record-index.json
@@ -40,21 +36,16 @@ services:
       AMF_DATA_PATH: /var/lib/agent-memory-fabric
       AMF_CATALOG_KIND: postgres
       AMF_CATALOG_DATABASE_URL: "postgresql://agent_memory_fabric:${AMF_DB_PASSWORD:?required}@postgres:5432/agent_memory_fabric"
-      # Postgres stays on the compose network (never published), so TLS is off
-      # here. Set verify-full (+ AMF_CATALOG_SSL_CA_PATH) if it ever moves off-network.
-      AMF_CATALOG_SSL_MODE: "${AMF_CATALOG_SSL_MODE:-disable}"
+      # The database is confined to this disposable Compose network and does
+      # not expose TLS. Production transport policy belongs in the runbook.
+      AMF_CATALOG_SSL_MODE: disable
       AMF_DOCUMENT_BACKEND: postgresql
       AMF_SEMANTIC_SEARCH_ENABLED: "true"
       AMF_SEMANTIC_EMBEDDING_BASE_URL: http://ollama:11434
       AMF_SEMANTIC_EMBEDDING_MODEL: nomic-embed-text
       AMF_SEMANTIC_EMBEDDING_DIMS: "768"
-      # Raised from the 256KB default: large accumulated notes (boards, daily
-      # notes) exceed it once JSON-wrapped → amf_http_413 at ingest.
-      AMF_MAX_BODY_BYTES: "${AMF_MAX_BODY_BYTES:-1048576}"
+      AMF_MAX_BODY_BYTES: "1048576"
       MEM0_BACKEND_KIND: disabled
-    env_file:
-      - path: .env.runtime
-        required: false
     volumes:
       - amf-data:/var/lib/agent-memory-fabric
       - ${AMF_POLICY_FILE:?required}:/run/config/agent-memory-fabric-policy.json:ro
@@ -62,18 +53,16 @@ services:
       - ${AMF_KEY_RING_FILE:?required}:/run/secrets/agent-memory-fabric-key-ring.json:ro
       - ${AMF_INGEST_KEY_RING_FILE:?required}:/run/secrets/agent-memory-fabric-ingest-key-ring.json:ro
       - ${AMF_CONTEXT_KEY_RING_FILE:?required}:/run/secrets/agent-memory-fabric-context-key-ring.json:ro
-      - ${PAM_RUNTIME_DIR:?must be owned 1000:1000, mode 0700}:/run/amf-pam-private
-      - ${PAM_SOURCE_DIR:?reviewed portable-agent-memory checkout}:/opt/portable-agent-memory:ro
-      - ${BRAIN_SHARED_DIR:?must be writable by uid 1000}:/srv/brain-shared
+      - ${PAM_RUNTIME_DIR:?required}:/run/amf-pam-private
+      - ${PAM_SOURCE_DIR:?required}:/opt/portable-agent-memory:ro
+      - ${BRAIN_SHARED_DIR:?required}:/srv/brain-shared
       - ../scripts:/app/scripts:ro
     depends_on:
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_started
+      ollama-model-init:
+        condition: service_completed_successfully
     healthcheck:
-      # TCP liveness only. /v2/status requires a memory:status bearer; probe it
-      # manually with curl -H "Authorization: Bearer ..." for deep checks.
       test: ["CMD", "node", "-e", "require('net').connect(8787,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
@@ -81,7 +70,6 @@ services:
       start_period: 15s
 
   postgres:
-    # pgvector/pgvector:pg16 pinned 2026-07-18
     image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
     restart: unless-stopped
     environment:
@@ -90,6 +78,7 @@ services:
       POSTGRES_PASSWORD: "${AMF_DB_PASSWORD:?required}"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U agent_memory_fabric -d agent_memory_fabric"]
       interval: 5s
@@ -97,13 +86,32 @@ services:
       retries: 10
 
   ollama:
-    # ollama/ollama:latest pinned 2026-07-18
     image: ollama/ollama@sha256:a6149234667efc71d37766d61c1a16f24c33e4cd7a0bf4125c44a7e47e2419c4
     restart: unless-stopped
     volumes:
       - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  ollama-model-init:
+    image: ollama/ollama@sha256:a6149234667efc71d37766d61c1a16f24c33e4cd7a0bf4125c44a7e47e2419c4
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["pull", "nomic-embed-text@${NOMIC_EMBED_TEXT_DIGEST:?required}"]
+    volumes:
+      - ollama-models:/root/.ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
 
 volumes:
+  # New named volumes start empty. They are never substitutes for an existing
+  # data or catalog store.
   amf-data:
   pgdata:
   ollama-models:
