@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Agent Memory Fabric semantic reindex every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+AccuracySec=5s
+Persistent=true
+Unit=amf-semantic-reindex.service
+
+[Install]
+WantedBy=timers.target

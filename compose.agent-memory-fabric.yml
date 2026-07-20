@@ -17,7 +17,9 @@ services:
       AMF_CONTEXT_KEY_RING_PATH: /run/secrets/agent-memory-fabric-context-key-ring.json
       AMF_SESSION_ROUTE_MANIFEST_PATH: /run/amf-session-routes/session-route-manifest.json
       AMF_POLICY_REVISION: "${AMF_POLICY_REVISION:?set the reviewed policy revision}"
-      AMF_RAW_V2_CUTOVER: "${AMF_RAW_V2_CUTOVER:-false}"
+      # Deployment-specific AMF_* settings, including AMF_SEMANTIC_*, belong
+      # only in .env.runtime. Do not restate them here with defaults: an
+      # environment: value overrides env_file and can silently change runtime behavior.
       AMF_PAM_MCP_SERVER_PATH: /opt/portable-agent-memory/tools/pam-mcp-server.mjs
       AMF_PAM_WORKSPACE: /srv/brain-shared
       AMF_PAM_RECORD_INDEX_PATH: /srv/brain-shared/memory/amf/record-index.json

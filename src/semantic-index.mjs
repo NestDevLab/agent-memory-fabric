@@ -141,6 +141,11 @@ export class SemanticIndex {
     return result.rows.map(row => row.record_id);
   }
 
+  async listRecordClaims() {
+    const result = await this.pool.query(`SELECT record_id, claim_text FROM ${SCHEMA}.${TABLE}`);
+    return new Map(result.rows.map(row => [row.record_id, row.claim_text]));
+  }
+
   // Returns the record ids of the nearest records within the allowed scopes,
   // bounded by topK and the maximum cosine distance. Scope and privacy are
   // re-checked downstream; this is a recall stage, not an authorization gate.
@@ -178,6 +183,7 @@ export function createUnconfiguredSemanticIndex() {
     async upsert() { throw error('semantic_index_unconfigured', 503); },
     async remove() {},
     async listRecordIds() { return []; },
+    async listRecordClaims() { return new Map(); },
     async close() {}
   };
 }
@@ -211,13 +217,15 @@ export function embeddableClaimText(record) {
   return String(record.claim.text ?? '').trim();
 }
 
-export async function reindexSemanticIndex({ semanticIndex, bridge, log = () => {} }) {
+export async function reindexSemanticIndex({ semanticIndex, bridge, force = false, log = () => {} }) {
   if (!semanticIndex?.configured) return { ok: false, reason: 'semantic_index_unconfigured' };
   if (typeof semanticIndex.ensureSchema === 'function') await semanticIndex.ensureSchema();
+  const indexedClaims = await semanticIndex.listRecordClaims();
   const index = bridge.refreshIndex();
   const entries = Object.entries(index.records || {});
   const present = new Set();
   let upserted = 0;
+  let unchanged = 0;
   let skipped = 0;
   let failed = 0;
   for (const [id, entry] of entries) {
@@ -230,11 +238,15 @@ export async function reindexSemanticIndex({ semanticIndex, bridge, log = () => 
     }
     const text = embeddableClaimText(record);
     if (!text) { skipped += 1; continue; }
+    present.add(id);
+    if (!force && indexedClaims.get(id) === text) {
+      unchanged += 1;
+      continue;
+    }
     // One poison record (embed hiccup, malformed scope/id) must not abort the
     // whole batch; upsert is idempotent so a later run recovers it.
     try {
       await semanticIndex.upsert({ recordId: id, scope: entry.scope, claimText: text });
-      present.add(id);
       upserted += 1;
     } catch (error) {
       failed += 1;
@@ -242,9 +254,9 @@ export async function reindexSemanticIndex({ semanticIndex, bridge, log = () => 
     }
   }
   let removed = 0;
-  for (const id of await semanticIndex.listRecordIds()) {
+  for (const id of indexedClaims.keys()) {
     if (!present.has(id)) { await semanticIndex.remove(id); removed += 1; }
   }
-  log(`semantic reindex: upserted=${upserted} skipped=${skipped} failed=${failed} removed=${removed}`);
-  return { ok: true, upserted, skipped, failed, removed };
+  log(`semantic reindex: upserted=${upserted} unchanged=${unchanged} skipped=${skipped} failed=${failed} removed=${removed}`);
+  return { ok: true, upserted, unchanged, skipped, failed, removed };
 }

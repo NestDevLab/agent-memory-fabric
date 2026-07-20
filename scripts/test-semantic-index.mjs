@@ -45,6 +45,9 @@ class FakePgvector {
       this.rows.delete(values[0]);
       return { rows: [] };
     }
+    if (compact.startsWith('SELECT record_id, claim_text FROM agent_memory_fabric.canonical_embeddings_v1')) {
+      return { rows: [...this.rows.values()].map(row => ({ record_id: row.record_id, claim_text: row.claim_text })) };
+    }
     if (compact.startsWith('SELECT record_id FROM agent_memory_fabric.canonical_embeddings_v1')) {
       return { rows: [...this.rows.values()].map(row => ({ record_id: row.record_id })) };
     }
@@ -149,11 +152,47 @@ test('reindex upserts plain records, skips sealed, and prunes vanished ids', asy
   pool.rows.set('mem_staleaaaaaaaaaaa', { record_id: 'mem_staleaaaaaaaaaaa', scope: 'agent:vitae', claim_text: 'old', embedding: unitVector(8) });
 
   const result = await reindexSemanticIndex({ semanticIndex: index, bridge });
-  assert.deepEqual(result, { ok: true, upserted: 2, skipped: 1, failed: 0, removed: 1 });
+  assert.deepEqual(result, { ok: true, upserted: 2, unchanged: 0, skipped: 1, failed: 0, removed: 1 });
   assert.ok(pool.rows.has('mem_r1aaaaaaaaaaaaaa'));
   assert.ok(pool.rows.has('mem_r2aaaaaaaaaaaaaa'));
   assert.equal(pool.rows.has('mem_sealedaaaaaaaaaa'), false);
   assert.equal(pool.rows.has('mem_staleaaaaaaaaaaa'), false);
+});
+
+test('reindex skips unchanged claims, re-embeds changed claims, and force re-embeds all claims', async () => {
+  const records = {
+    mem_firstaaaaaaaaaaa: { path: 'memory/records/first.md', text: 'Utrecht' },
+    mem_secondaaaaaaaaaa: { path: 'memory/records/second.md', text: 'moka' }
+  };
+  const bridge = new CanonicalPamBridge({
+    index: { records: Object.fromEntries(Object.entries(records).map(([id, record]) => [id, { path: record.path, scope: 'agent:vitae' }])) },
+    async callTool() { return { matches: [] }; }
+  });
+  bridge.read = async ({ id }) => ({ id, revision: 1, lifecycle: { status: 'active' }, claim: { encoding: 'plain', text: records[id].text } });
+  const embedded = [];
+  const { index } = makeIndex({ embedder: async texts => {
+    embedded.push(...texts);
+    return texts.map(() => unitVector(12));
+  } });
+
+  assert.deepEqual(await reindexSemanticIndex({ semanticIndex: index, bridge }), {
+    ok: true, upserted: 2, unchanged: 0, skipped: 0, failed: 0, removed: 0
+  });
+  assert.deepEqual(await reindexSemanticIndex({ semanticIndex: index, bridge }), {
+    ok: true, upserted: 0, unchanged: 2, skipped: 0, failed: 0, removed: 0
+  });
+  assert.equal(embedded.length, 2);
+
+  records.mem_firstaaaaaaaaaaa.text = 'Utrecht da tre anni';
+  assert.deepEqual(await reindexSemanticIndex({ semanticIndex: index, bridge }), {
+    ok: true, upserted: 1, unchanged: 1, skipped: 0, failed: 0, removed: 0
+  });
+  assert.deepEqual(embedded, ['Utrecht', 'moka', 'Utrecht da tre anni']);
+
+  assert.deepEqual(await reindexSemanticIndex({ semanticIndex: index, bridge, force: true }), {
+    ok: true, upserted: 2, unchanged: 0, skipped: 0, failed: 0, removed: 0
+  });
+  assert.deepEqual(embedded, ['Utrecht', 'moka', 'Utrecht da tre anni', 'Utrecht da tre anni', 'moka']);
 });
 
 test('reindex counts a poison record as failed and continues the batch', async () => {

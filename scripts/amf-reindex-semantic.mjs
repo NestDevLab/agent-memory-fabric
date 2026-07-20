@@ -2,7 +2,14 @@
 import { createCanonicalPamBridgeFromEnv } from '../src/canonical-memory-bridge.mjs';
 import { reindexSemanticIndex } from '../src/semantic-index.mjs';
 
+function parseArguments(argv) {
+  if (argv.length === 0) return { force: false };
+  if (argv.length === 1 && argv[0] === '--force') return { force: true };
+  throw new Error('semantic_reindex_arguments_invalid');
+}
+
 async function main() {
+  const { force } = parseArguments(process.argv.slice(2));
   const bridge = createCanonicalPamBridgeFromEnv(process.env);
   if (!bridge.configured) {
     process.stderr.write(`${JSON.stringify({ ok: false, error: 'canonical_store_unconfigured' })}\n`);
@@ -19,7 +26,7 @@ async function main() {
     const result = await reindexSemanticIndex({
       semanticIndex: bridge.semanticIndex,
       bridge,
-      log: (message) => process.stderr.write(`${message}\n`)
+      force
     });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     process.exitCode = result.ok ? 0 : 1;

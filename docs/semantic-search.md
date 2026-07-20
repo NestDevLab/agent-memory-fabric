@@ -71,9 +71,51 @@ pooling (no session state, client-side `query_timeout` bounds it).
 ## Reindex
 
 ```sh
-node scripts/amf-reindex-semantic.mjs
+docker exec agent-memory-fabric-agent-memory-fabric-1 \
+  /usr/local/bin/node /app/scripts/amf-reindex-semantic.mjs
 ```
 
-Reads the record index, ensures the schema, embeds plain claims, upserts, and
-prunes ids no longer present. Run after enabling, and whenever the corpus
-changes (or on a schedule / after a curation tick).
+The image contains only this operator script from `scripts/`; it uses the
+running container's environment rather than a host-side copy of database, PAM,
+or embedding configuration. `--force` re-embeds every plain claim when an
+embedding model is intentionally changed:
+
+```sh
+docker exec agent-memory-fabric-agent-memory-fabric-1 \
+  /usr/local/bin/node /app/scripts/amf-reindex-semantic.mjs --force
+```
+
+The normal path reads the indexed `(record_id, claim_text)` pairs once and
+does not embed an unchanged claim. Its JSON result reports:
+
+| Counter | Meaning |
+|---|---|
+| `upserted` | New or changed plain claims embedded and written. |
+| `unchanged` | Plain claims already indexed with identical text; no embed call. |
+| `skipped` | Sealed or unreadable claims. |
+| `failed` | Per-record embed/upsert failures; the remaining batch continues. |
+| `removed` | Indexed records no longer present in the canonical index. |
+
+## Scheduled production lane
+
+`deploy/systemd/amf-semantic-reindex.service` and `.timer` run the same command
+inside the existing fabric container every five minutes. The service runs as
+`root` solely to use the Docker socket; `stt` is deliberately not added to the
+Docker group. `flock -n` prevents overlapping ticks, `TimeoutStartSec` bounds a
+stalled reindex, and timer jitter avoids synchronized load.
+
+Install the committed units on the fabric host, then enable the independent
+timer:
+
+```sh
+install -m 0644 deploy/systemd/amf-semantic-reindex.service /etc/systemd/system/
+install -m 0644 deploy/systemd/amf-semantic-reindex.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now amf-semantic-reindex.timer
+systemctl start amf-semantic-reindex.service
+```
+
+This lane is intentionally not chained to a curation tick: an Ollama outage
+can make semantic recall stale, but cannot fail curation. Read the latest JSON
+result with `journalctl -u amf-semantic-reindex.service`; a healthy no-change
+tick has `upserted: 0` and a positive `unchanged` count.
