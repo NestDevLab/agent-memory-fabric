@@ -10,7 +10,7 @@
       "schema": "amf.conversation-event/v3",
       "eventId": "cevt_message0001",
       "conversationId": "ccon_conversation0001",
-      "sourceInstanceId": "csrc_source0001",
+      "sourceInstanceId": "src_source0001",
       "threadId": "cthr_thread0001",
       "role": "user",
       "visibleText": "Please summarize the draft.",
@@ -24,13 +24,13 @@
       "state": "active",
       "revision": 1,
       "logicalDigest": "sha256:55e98551fd4be93f98848cf23494ade59d8d9cf16f5cf1f2f81012d186df08e6",
-      "integrity": { "algorithm": "hmac-sha256", "keyId": "delivery-v1", "sentAt": "2026-01-02T03:04:07Z", "nonce": "nonce_for_fixture_01", "payloadDigest": "sha256:92386babe6f777cf5984e978b1c907a3e6412370cf32d87bb7dafd8130989495", "signature": "Y49UePKJhQWD2LaZmuJUIcL8WFoHOoE4d0h4FcRc0vI" }
+      "integrity": { "algorithm": "hmac-sha256", "keyId": "delivery-v1", "sentAt": "2026-01-02T03:04:07Z", "nonce": "nonce_for_fixture_01", "payloadDigest": "sha256:6c5cf1103f82420775729c9cf0b3854532f2d2f16c06c4ded58a0a9e067f2fa8", "signature": "BwKAG_Bd__Yp7Aso_rD9-dJ331EBsa3H4Zg7LSCAg6o" }
     },
     {
       "schema": "amf.conversation-event/v3",
       "eventId": "cevt_edit00000001",
       "conversationId": "ccon_conversation0001",
-      "sourceInstanceId": "csrc_source0001",
+      "sourceInstanceId": "src_source0001",
       "role": "assistant",
       "visibleText": "Here is the corrected summary.",
       "sourceOccurredAt": "2026-01-02T03:05:05Z",
@@ -43,13 +43,13 @@
       "revision": 2,
       "replacesEventId": "cevt_message0001",
       "logicalDigest": "sha256:6ce6fe31aaee23053db2b358587ee9a95d478da96164fb923207ddbc0407b2c0",
-      "integrity": { "algorithm": "hmac-sha256", "keyId": "delivery-v1", "sentAt": "2026-01-02T03:05:07Z", "nonce": "nonce_for_fixture_02", "payloadDigest": "sha256:5b34e18e78424570afd4643fe8f14459e7a47b20b68cd5083491089871457872", "signature": "AsUhmT59hxs2cOlsKySVEFPQ_IHa-O5fvKcM74yDe-A" }
+      "integrity": { "algorithm": "hmac-sha256", "keyId": "delivery-v1", "sentAt": "2026-01-02T03:05:07Z", "nonce": "nonce_for_fixture_02", "payloadDigest": "sha256:d34bd1d434e984b3f29bfdd32e18f374a2a7e64bd769bffebb49e09b8400e7b2", "signature": "RpUhZIZKzo_QEkEY1rHk0tttlPFv6uqjWT5pDC7Zsyc" }
     },
     {
       "schema": "amf.conversation-event/v3",
       "eventId": "cevt_tombstone001",
       "conversationId": "ccon_conversation0001",
-      "sourceInstanceId": "csrc_source0001",
+      "sourceInstanceId": "src_source0001",
       "role": "user",
       "sourceOccurredAt": "2026-01-02T03:06:05Z",
       "occurredAt": "2026-01-02T03:06:06Z",
@@ -61,13 +61,13 @@
       "revision": 1,
       "tombstonesEventId": "cevt_message0001",
       "logicalDigest": "sha256:9cbc11065ddf67b82bc8a9cba1ec9c968a9e1604bf149e7092ca96bc0b846278",
-      "integrity": { "algorithm": "hmac-sha256", "keyId": "delivery-v1", "sentAt": "2026-01-02T03:06:07Z", "nonce": "nonce_for_fixture_03", "payloadDigest": "sha256:0ee2347273e8d4216b91c7af82cbb811e5ae1c2fc7e8fc273194b927d97ed8bc", "signature": "50HNR6UAs3kfUPPvJHsQlTZyRWouiV17j1Doj-mdFTw" }
+      "integrity": { "algorithm": "hmac-sha256", "keyId": "delivery-v1", "sentAt": "2026-01-02T03:06:07Z", "nonce": "nonce_for_fixture_03", "payloadDigest": "sha256:8f51910c791fb413bc15b475040282995a8f13b789bc83d3f2b71d5817459637", "signature": "82YtY2Bvkg8mCHkdswejkIdKDjN1K27RmmnAfTFXLMs" }
     },
     {
       "schema": "amf.conversation-event/v3",
       "eventId": "cevt_conflict0001",
       "conversationId": "ccon_conversation0001",
-      "sourceInstanceId": "csrc_source0001",
+      "sourceInstanceId": "src_source0001",
       "role": "assistant",
       "visibleText": "A competing visible response.",
       "sourceOccurredAt": "2026-01-02T03:07:05Z",
@@ -80,13 +80,13 @@
       "revision": 1,
       "conflictsWithEventIds": ["cevt_edit00000001"],
       "logicalDigest": "sha256:8c1d252d9a2d9983274b41d613243b53d461ed40991a1fcf6e1ad80e8a2aa736",
-      "integrity": { "algorithm": "hmac-sha256", "keyId": "delivery-v1", "sentAt": "2026-01-02T03:07:07Z", "nonce": "nonce_for_fixture_04", "payloadDigest": "sha256:dddb27cffbbc59d8a96da3d60733c6f97fe0a9d901baad43b9409334ffc6f60b", "signature": "1YGxdxwYRdUPABoZAMDnUAyXeqWjHkjmM0ob7SgCGmc" }
+      "integrity": { "algorithm": "hmac-sha256", "keyId": "delivery-v1", "sentAt": "2026-01-02T03:07:07Z", "nonce": "nonce_for_fixture_04", "payloadDigest": "sha256:858e2aa2da7cb17fc63e401a742449d400dae325c356eab7b78f27fecc88aa39", "signature": "piI0mCR1M6pwcrG-bnDF9HQ174wHR5582KtLPkUJ7uM" }
     },
     {
       "schema": "amf.conversation-event/v3",
       "eventId": "cevt_replace0001",
       "conversationId": "ccon_conversation0001",
-      "sourceInstanceId": "csrc_source0001",
+      "sourceInstanceId": "src_source0001",
       "role": "assistant",
       "visibleText": "A replacement visible response.",
       "sourceOccurredAt": "2026-01-02T03:08:05Z",
@@ -99,7 +99,7 @@
       "revision": 2,
       "replacesEventId": "cevt_conflict0001",
       "logicalDigest": "sha256:7bb8ad2bd763838276fec043d480f10c3534759eb39c9ff0cd2401a87329d160",
-      "integrity": { "algorithm": "hmac-sha256", "keyId": "delivery-v1", "sentAt": "2026-01-02T03:08:07Z", "nonce": "nonce_for_fixture_05", "payloadDigest": "sha256:ac7b7d7a3fe35e83df42218d6101bce1045ea4e89052dc86ec9e20707209fee2", "signature": "ExrdLUMY_XSBgr7-UfN8t5h9GfLT4z9u3hI-g6JBIj4" }
+      "integrity": { "algorithm": "hmac-sha256", "keyId": "delivery-v1", "sentAt": "2026-01-02T03:08:07Z", "nonce": "nonce_for_fixture_05", "payloadDigest": "sha256:b9dbe25e0e0af25d6e1cb9c733ef44a4cc2ebe0ea87e08e6665897de9d171689", "signature": "NuyqQOwMtdXxhe8AFISE4NtqIyVZSlCmNSa9T9qHlJ4" }
     }
   ],
   "invalid": [

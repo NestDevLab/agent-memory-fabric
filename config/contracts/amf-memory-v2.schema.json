@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-memory-fabric.local/contracts/amf-memory-v2.schema.json",
+  "title": "Agent Memory Fabric canonical memory v2 transport",
+  "description": "AMF transport revision. It does not replace Portable Agent Memory authority or make a claim codec depend on visibility.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "revision", "claimType", "scope", "visibility", "subjects", "claim", "confidence", "lifecycle", "provenance", "createdAt", "updatedAt"],
+  "properties": {
+    "schema": { "const": "amf-memory/v2" },
+    "id": { "$ref": "#/$defs/memoryId" },
+    "revision": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "claimType": { "$ref": "#/$defs/claimType" },
+    "scope": { "$ref": "#/$defs/scope" },
+    "visibility": { "enum": ["private", "restricted", "shared", "confidential"] },
+    "subjects": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/subject" } },
+    "claim": { "$ref": "#/$defs/claim" },
+    "confidence": { "$ref": "#/$defs/confidence" },
+    "lifecycle": { "$ref": "#/$defs/lifecycle" },
+    "provenance": { "type": "array", "minItems": 1, "maxItems": 128, "items": { "$ref": "#/$defs/provenance" } },
+    "createdAt": { "$ref": "#/$defs/utcTimestamp" },
+    "updatedAt": { "$ref": "#/$defs/utcTimestamp" }
+  },
+  "$defs": {
+    "memoryId": { "type": "string", "pattern": "^mem_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+    "opaqueId": { "type": "string", "pattern": "^(?:agent|person|relationship|room|domain):[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$" },
+    "subjectIdentityId": { "type": "string", "pattern": "^(?:agent|person|relationship):[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$" },
+    "utcTimestamp": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$", "format": "date-time" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "claimType": { "oneOf": [{ "enum": ["fact", "preference", "event", "decision", "instruction", "summary", "relationship"] }, { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}:[a-z][a-z0-9._-]{0,63}$" }] },
+    "scope": {
+      "type": "object", "additionalProperties": false, "required": ["type", "id"],
+      "properties": { "type": { "enum": ["agent", "person", "relationship", "room", "domain", "shared"] }, "id": { "type": "string", "minLength": 3, "maxLength": 128 } },
+      "allOf": [
+        { "if": { "properties": { "type": { "const": "shared" } }, "required": ["type"] }, "then": { "properties": { "id": { "const": "shared:global" } }, "required": ["id"] } },
+        { "if": { "properties": { "type": { "const": "agent" } }, "required": ["type"] }, "then": { "properties": { "id": { "type": "string", "pattern": "^agent:[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$" } } } },
+        { "if": { "properties": { "type": { "const": "person" } }, "required": ["type"] }, "then": { "properties": { "id": { "type": "string", "pattern": "^person:[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$" } } } },
+        { "if": { "properties": { "type": { "const": "relationship" } }, "required": ["type"] }, "then": { "properties": { "id": { "type": "string", "pattern": "^relationship:[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$" } } } },
+        { "if": { "properties": { "type": { "const": "room" } }, "required": ["type"] }, "then": { "properties": { "id": { "type": "string", "pattern": "^room:[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$" } } } },
+        { "if": { "properties": { "type": { "const": "domain" } }, "required": ["type"] }, "then": { "properties": { "id": { "type": "string", "pattern": "^domain:[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$" } } } }
+      ]
+    },
+    "subject": {
+      "type": "object", "additionalProperties": false, "required": ["identityId", "role"],
+      "properties": { "identityId": { "$ref": "#/$defs/subjectIdentityId" }, "role": { "enum": ["subject", "object", "participant", "owner"] } }
+    },
+    "plainClaim": {
+      "type": "object", "additionalProperties": false, "required": ["encoding", "text"],
+      "properties": { "encoding": { "const": "plain" }, "text": { "type": "string", "minLength": 1, "maxLength": 65536, "pattern": "\\S" } }
+    },
+    "sealedClaim": {
+      "type": "object", "additionalProperties": false, "required": ["encoding", "alg", "kekId", "keyRef", "iv", "ciphertext", "tag", "aadSha256"],
+      "properties": {
+        "encoding": { "const": "sealed" }, "alg": { "const": "AES-256-GCM" },
+        "kekId": { "type": "string", "pattern": "^kek:[A-Za-z0-9][A-Za-z0-9._-]{2,127}$" },
+        "keyRef": { "type": "string", "pattern": "^key:[A-Za-z0-9][A-Za-z0-9._-]{2,127}$" },
+        "iv": { "type": "string", "pattern": "^[A-Za-z0-9+/]{16}$" },
+        "ciphertext": { "type": "string", "minLength": 4, "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$" },
+        "tag": { "type": "string", "pattern": "^[A-Za-z0-9+/]{22}==$" },
+        "aadSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "claim": { "oneOf": [{ "$ref": "#/$defs/plainClaim" }, { "$ref": "#/$defs/sealedClaim" }] },
+    "confidence": {
+      "type": "object", "additionalProperties": false, "required": ["score", "basis", "assessedAt"],
+      "properties": { "score": { "type": "number", "minimum": 0, "maximum": 1 }, "basis": { "enum": ["observed", "asserted", "inferred", "reviewed"] }, "assessedAt": { "$ref": "#/$defs/utcTimestamp" } }
+    },
+    "lifecycle": {
+      "type": "object", "additionalProperties": false, "required": ["status", "validFrom", "validTo", "supersedes", "revokedAt", "revocationReason"],
+      "properties": {
+        "status": { "enum": ["active", "superseded", "revoked", "expired"] }, "validFrom": { "$ref": "#/$defs/utcTimestamp" }, "validTo": { "anyOf": [{ "$ref": "#/$defs/utcTimestamp" }, { "type": "null" }] },
+        "supersedes": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/memoryId" } }, "revokedAt": { "anyOf": [{ "$ref": "#/$defs/utcTimestamp" }, { "type": "null" }] }, "revocationReason": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 512 }, { "type": "null" }] }
+      },
+      "allOf": [
+        { "if": { "properties": { "status": { "const": "revoked" } }, "required": ["status"] }, "then": { "properties": { "revokedAt": { "$ref": "#/$defs/utcTimestamp" }, "revocationReason": { "type": "string", "minLength": 1, "maxLength": 512 } }, "required": ["revokedAt", "revocationReason"] } },
+        { "if": { "properties": { "status": { "enum": ["active", "superseded", "expired"] } }, "required": ["status"] }, "then": { "properties": { "revokedAt": { "const": null }, "revocationReason": { "const": null } } } },
+        { "if": { "properties": { "status": { "const": "expired" } }, "required": ["status"] }, "then": { "properties": { "validTo": { "$ref": "#/$defs/utcTimestamp" } }, "required": ["validTo"] } }
+      ]
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false, "required": ["sourceType", "sourceId", "eventId", "contentSha256", "capturedAt"],
+      "properties": { "sourceType": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,63}$" }, "sourceId": { "type": "string", "minLength": 1, "maxLength": 256 }, "eventId": { "type": "string", "minLength": 8, "maxLength": 256 }, "contentSha256": { "$ref": "#/$defs/sha256" }, "capturedAt": { "$ref": "#/$defs/utcTimestamp" } }
+    }
+  }
+}

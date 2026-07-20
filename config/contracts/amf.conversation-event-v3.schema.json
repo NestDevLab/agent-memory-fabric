@@ -58,7 +58,7 @@
   "$defs": {
     "eventId": { "type": "string", "pattern": "^cevt_[a-z0-9][a-z0-9_-]{7,127}$" },
     "conversationId": { "type": "string", "pattern": "^ccon_[a-z0-9][a-z0-9_-]{7,127}$" },
-    "sourceInstanceId": { "type": "string", "pattern": "^csrc_[a-z0-9][a-z0-9_-]{7,127}$" },
+    "sourceInstanceId": { "type": "string", "pattern": "^src_[a-z0-9][a-z0-9_-]{7,127}$" },
     "threadId": { "type": "string", "pattern": "^cthr_[a-z0-9][a-z0-9_-]{7,127}$" },
     "utcTimestamp": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$", "format": "date-time" },
     "opaqueTag": { "type": "string", "pattern": "^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$" },

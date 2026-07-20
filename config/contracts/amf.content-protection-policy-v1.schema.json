@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-memory-fabric.local/contracts/amf.content-protection-policy-v1.schema.json",
+  "title": "Agent Memory Fabric content protection policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "revision", "defaults", "rules"],
+  "properties": {
+    "schema": { "const": "amf.content-protection-policy/v1" },
+    "revision": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "defaults": { "$ref": "#/$defs/defaults" },
+    "rules": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/rule" } }
+  },
+  "$defs": {
+    "contentClass": { "enum": ["conversation", "proposal", "canonical-memory", "document"] },
+    "codec": { "enum": ["plaintext", "aes-256-gcm"] },
+    "sourceInstanceId": { "type": "string", "pattern": "^src_[a-z0-9][a-z0-9_-]{7,127}$" },
+    "keyRef": { "type": "string", "pattern": "^key:[A-Za-z0-9][A-Za-z0-9._-]{2,127}$" },
+    "defaults": {
+      "type": "object", "additionalProperties": false,
+      "required": ["conversation", "proposal", "canonical-memory", "document"],
+      "properties": {
+        "conversation": { "const": "plaintext" }, "proposal": { "const": "plaintext" },
+        "canonical-memory": { "const": "plaintext" }, "document": { "const": "plaintext" }
+      }
+    },
+    "rule": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sourceInstanceId", "contentClass", "enabled", "codec"],
+      "properties": {
+        "sourceInstanceId": { "$ref": "#/$defs/sourceInstanceId" },
+        "contentClass": { "$ref": "#/$defs/contentClass" },
+        "enabled": { "type": "boolean" },
+        "codec": { "$ref": "#/$defs/codec" },
+        "writeKeyRef": { "$ref": "#/$defs/keyRef" },
+        "readKeyRefs": { "type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": { "$ref": "#/$defs/keyRef" } }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "codec": { "const": "plaintext" } }, "required": ["codec"] },
+          "then": { "not": { "anyOf": [{ "required": ["writeKeyRef"] }, { "required": ["readKeyRefs"] }] } }
+        },
+        {
+          "if": { "properties": { "enabled": { "const": true }, "codec": { "const": "aes-256-gcm" } }, "required": ["enabled", "codec"] },
+          "then": { "required": ["writeKeyRef", "readKeyRefs"] }
+        },
+        {
+          "if": { "properties": { "enabled": { "const": false } }, "required": ["enabled"] },
+          "then": { "not": { "anyOf": [{ "required": ["writeKeyRef"] }, { "required": ["readKeyRefs"] }] } }
+        }
+      ]
+    }
+  }
+}
