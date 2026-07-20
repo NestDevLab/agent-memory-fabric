@@ -14,7 +14,8 @@
       "amf-fabric-core",
       "amf-route-key-version",
       "amf-integration-framework",
-      "semantic-reindex-timer"
+      "semantic-reindex-timer",
+      "amf-safe-deploy"
     ]
   },
   "stacks": [
@@ -316,6 +317,15 @@
         "21e1cd859c2c0907b6fdd7e1a3a634f1fde61fb5"
       ],
       "meta": {}
+    },
+    {
+      "id": "amf-safe-deploy",
+      "branch": "fix/amf-safe-deploy",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": []
     }
   ],
   "syncwheel_tracking": "git-tracked",
