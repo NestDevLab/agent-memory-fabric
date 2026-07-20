@@ -2054,7 +2054,8 @@ const requestHandler = async (req, res) => {
       await sessionReader.get({ actor, ownerActors, id: sessionId, purpose: 'memory_curation', context: null });
       const transcript = await sessionReader.transcript({ actor, ownerActors, id: sessionId, view: 'redacted', query: '',
         cursor: url.searchParams.get('cursor') || null, limit: normalizeSessionLimit(url.searchParams.get('limit') || '100'),
-        from: null, to: null, purpose: 'memory_curation', context: null });
+        from: null, to: null, purpose: 'memory_curation', context: null,
+        newest: url.searchParams.get('window') === 'newest' });
       await auditRequired(fabricStore, { actor, action: 'raw_extractor_transcript_read', outcome: 'allowed', requestId,
         targetId: sessionId, details: { resultCount: transcript.items?.length || 0, view: 'redacted' } });
       return jsonNoStore(res, 200, v2Envelope(requestId, transcript));
