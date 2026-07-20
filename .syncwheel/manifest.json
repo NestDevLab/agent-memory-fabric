@@ -15,7 +15,8 @@
       "amf-route-key-version",
       "amf-integration-framework",
       "semantic-reindex-timer",
-      "amf-safe-deploy"
+      "amf-safe-deploy",
+      "amf-roadmap-plan"
     ]
   },
   "stacks": [
@@ -328,6 +329,19 @@
       "commits": [
         "7021505a78322fd771daf644c7868270800cb4a3",
         "d9f0d6ce1fb12632cc4a0246885e3725c016252c"
+      ],
+      "meta": {}
+    },
+    {
+      "id": "amf-roadmap-plan",
+      "branch": "docs/amf-roadmap-plan",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "000f652a50420766a0f23d657851bd67ac81b4c1",
+        "0d86d942a06a0ed833233cb9b4a5c942080082bf"
       ],
       "meta": {}
     }
