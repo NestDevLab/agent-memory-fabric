@@ -17,8 +17,25 @@ export function normalizeClaimText(value) {
 
 export function transcriptText(items) {
   if (!Array.isArray(items)) return '';
-  return items.filter(item => item && ['user', 'assistant'].includes(item.role) && typeof item.text === 'string')
+  return items.filter(item => item && ['user', 'assistant'].includes(item.role))
+    .map(item => ({ role: item.role, text: typeof item.text === 'string' ? item.text : item.content?.text }))
+    .filter(item => typeof item.text === 'string')
     .map(item => `${item.role}: ${item.text.trim()}`).filter(Boolean).join('\n');
+}
+
+// GPT tokenizers are byte based: UTF-8 bytes are a conservative, model-independent
+// upper bound.  This is deliberately not a character-count approximation.
+export function utf8TokenUpperBound(value) {
+  return Buffer.byteLength(String(value || ''), 'utf8');
+}
+
+export function truncateUtf8ToTokenUpperBound(value, maximum) {
+  const bytes = Buffer.from(String(value || ''), 'utf8');
+  if (!Number.isSafeInteger(maximum) || maximum < 0) throw new Error('extractor_token_bound_invalid');
+  if (bytes.length <= maximum) return bytes.toString('utf8');
+  let end = maximum;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString('utf8');
 }
 
 export function triageConversation(items, { minChars = 80 } = {}) {
@@ -68,8 +85,9 @@ export function settleModelBudget(state, reservation, usage = {}) {
   if (!reservation?.reserved) return;
   const current = state.days[reservation.day];
   if (!current) throw new Error('extractor_budget_reservation_missing');
-  const input = Math.max(0, Math.min(reservation.inputTokens, Number(usage.inputTokens || 0)));
-  const output = Math.max(0, Math.min(reservation.outputTokens, Number(usage.outputTokens || 0)));
+  const input = Number(usage.inputTokens || 0);
+  const output = Number(usage.outputTokens || 0);
+  if (!Number.isSafeInteger(input) || !Number.isSafeInteger(output) || input < 0 || output < 0) throw new Error('extractor_model_usage_invalid');
   current.reservedInputTokens -= reservation.inputTokens; current.reservedOutputTokens -= reservation.outputTokens;
   current.usedInputTokens += input; current.usedOutputTokens += output;
 }

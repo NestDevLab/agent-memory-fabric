@@ -9,16 +9,17 @@ preferences, commitments, and reusable conclusions.  Operational events,
 failures, counters, deployment state, and metrics are rejected; they belong in
 the operational ledger.
 
-The extractor never reads RAW object files or keys.  It is a least-privilege
-service on the Fabric host and reads completed sessions through authenticated
-Fabric extraction/session endpoints.  The Fabric performs authorization,
+The extractor never reads RAW object files or keys.  It runs on CT107, where
+Joseph's subscription-authenticated Codex login exists, and reads completed
+sessions from the Fabric only through authenticated HTTPS extraction/session
+endpoints.  The Fabric performs authorization,
 decryption, redaction, auditing, and cursor binding.  Vitae scopes are not
 granted to this service.  Extracted records are always
 `{type:"shared",id:"shared:global"}` with `visibility:"shared"`.
 
 ## Continuous bounded execution
 
-Run one `oneshot` systemd service from a timer on the Fabric host.  The service
+Run one `oneshot` systemd service from a timer on CT107.  The service
 uses a non-blocking lock; a missed tick is harmless.  Defaults are deliberately
 small and deployment-owned:
 
@@ -26,23 +27,37 @@ small and deployment-owned:
 | --- | ---: | ---: | --- |
 | `intervalSeconds` | 300 | 60..3600 | One eligible conversation attempt every five minutes. |
 | `maxConversationsPerTick` | 1 | 1..3 | No batch catch-up. |
-| `dailyInputTokens` | 20,000 | 1,000..100,000 | Paid-model input ceiling. |
-| `dailyOutputTokens` | 4,000 | 256..20,000 | Paid-model output ceiling. |
-| `maxInputTokensPerConversation` | 2,500 | 512..8,000 | Transcript truncation bound. |
-| `maxOutputTokensPerConversation` | 350 | 64..1,000 | Extraction response bound. |
+| `dailyInputTokens` | 20,000 | 1,000..100,000 | Audited Codex input-token ceiling. |
+| `dailyOutputTokens` | 4,000 | 256..20,000 | Audited Codex output-token ceiling. |
+| `maxInputTokensPerConversation` | 2,500 | 512..8,000 | Strict upper bound for extractor-controlled model input. |
+| `maxOutputTokensPerConversation` | 350 | 64..1,000 | Schema-bounded claim output target. |
+| `planMinRemainingPercent` | 25 | 1..100 | Pause before stage 2 when less than this subscription-plan percentage remains. |
 | `maxClaimsPerConversation` | 2 | 1..3 | A conversation rarely creates more than one durable memory. |
 
-Before the paid request, the service reserves the configured maximum tokens for
-the current UTC day.  If the reservation would exceed either daily ceiling, it
-does not call the model or advance the cursor.  It records actual provider usage
-after a response and releases unused reservation.  A stopped process can only
-leave a conservative reservation, so budget safety wins over throughput.
+Before every stage-2 invocation, the service asks the local subscription-authenticated
+Codex app-server for `account/rateLimits/read`.  It examines every active primary
+and secondary rate-limit window: a reported limit, or fewer than 25% remaining,
+pauses the extractor without moving its cursor until a later probe reports enough
+capacity.  If the probe fails or has no usable windows, it fails closed and pauses.
+The result records the checked time, minimum remaining percentage and reset time,
+but never an account token or reset-credit identifier.
 
-The configured paid model is `gpt-5.6-luna`.  The model name, token ceilings and
-pricing metadata are runtime configuration, never hard-coded secrets.  Costs
-are reported from provider usage (`input_tokens`, `output_tokens`) and the
-configured price table; a missing price table yields `cost: null`, never an
-invented estimate.
+The model call is `codex exec --ephemeral --ignore-user-config --ignore-rules
+--json --skip-git-repo-check -m gpt-5.6-luna -c model_reasoning_effort="none"
+-s read-only --output-schema ... --output-last-message ... -`.  It is a one-shot
+headless execution, not an interactive TUI and does not persist a Codex session.
+The output schema permits only zero to two bounded claims.  A hard timeout kills
+the child process.
+
+The transcript bound is not character slicing.  The fixed instruction, JSON output
+schema, and a conservative 512-byte Codex transport envelope are counted in UTF-8
+bytes, then the remaining transcript is clipped only at a UTF-8 boundary. UTF-8
+bytes are a conservative upper bound on tokenizer tokens, so extractor-controlled
+input never exceeds `maxInputTokensPerConversation`. Codex's private product/system
+context is not estimable by the extractor; after the run, its JSONL
+`turn.completed.usage` values are recorded exactly. Settlement never clamps actual
+input or output usage to the reservation: if Codex reports more than reserved, the
+ledger records more than reserved and the next reservation is rejected.
 
 ## Newest-first resumable cursor
 
@@ -53,7 +68,7 @@ The state file is private, atomic JSON:
   "schema": "amf.raw-memory-extractor-state/v1",
   "stream": "shared:global",
   "phase": "newest-first",
-  "cursor": {"lastOccurredAt": "2026-07-20T12:00:00Z", "sessionId": "ses_..."},
+  "cursor": "signed-newest-first-cursor",
   "inFlight": null,
   "days": {"2026-07-20": {"reservedInputTokens": 0, "reservedOutputTokens": 0, "usedInputTokens": 0, "usedOutputTokens": 0}},
   "version": 1
@@ -77,7 +92,8 @@ to an unordered batch scan.
    preference, commitment, or reusable conclusion.  A configured local Ollama
    classifier may make this pass stricter, but is advisory and may not promote a
    heuristic rejection.
-2. Only survivors go to `gpt-5.6-luna`, with a JSON-only instruction to emit
+2. Only survivors go to subscription-authenticated `gpt-5.6-luna` through
+   headless Codex, with a JSON-only instruction to emit
    zero to two short claims or an empty list.  The prompt prohibits operational
    events, failures, metrics, secrets, personal/relationship claims, invented
    facts, and transcript summaries.  Empty output is success and is expected to

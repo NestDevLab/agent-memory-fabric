@@ -289,6 +289,20 @@
         "941eebe183f047c14a5440b14bc1641e214da3c9"
       ],
       "meta": {}
+    },
+    {
+      "id": "amf-raw-extractor-subscription",
+      "branch": "amf/raw-extractor-subscription",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [
+        "c539a6b04447f65138fc14a3273ef94e1b7228ed"
+      ],
+      "meta": {
+        "purpose": "Run the RAW memory extractor through subscription-authenticated Codex"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",

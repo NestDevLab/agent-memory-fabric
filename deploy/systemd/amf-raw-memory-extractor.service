@@ -1,12 +1,12 @@
 [Unit]
-Description=Agent Memory Fabric slow RAW-to-memory extractor
+Description=Agent Memory Fabric slow RAW-to-memory extractor (Codex subscription)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=amf
-Group=amf
+User=administrator
+Group=administrator
 WorkingDirectory=/opt/agent-memory-fabric
 ExecStart=/usr/bin/flock -n /var/lib/agent-memory-fabric/raw-extractor/tick.lock /usr/bin/node /opt/agent-memory-fabric/scripts/amf-raw-memory-extractor.mjs --config /etc/agent-memory-fabric/raw-extractor.json
 NoNewPrivileges=true
