@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-memory-fabric.local/contracts/amf.conversation-archive-v1.schema.json",
+  "title": "Agent Memory Fabric conversation archive v1 conformance manifest",
+  "description": "Schema for content-free conformance data. The executable write boundary is defined normatively in the interface document and accepts a complete validated conversation-event v3.",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema", "orderingVersion", "adapterLabels", "scenarios"],
+  "properties": {
+    "schema": { "const": "amf.conversation-archive-conformance/v1" },
+    "orderingVersion": { "const": "conversation-archive-order/v1" },
+    "adapterLabels": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "enum": ["postgresql", "sqlite"] } },
+    "scenarios": { "type": "array", "minItems": 9, "maxItems": 32, "uniqueItems": true, "items": { "$ref": "#/$defs/scenario" } }
+  },
+  "$defs": {
+    "eventId": { "type": "string", "pattern": "^cevt_[a-z0-9][a-z0-9_-]{7,127}$" },
+    "conversationId": { "type": "string", "pattern": "^ccon_[a-z0-9][a-z0-9_-]{7,127}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "timestamp": { "type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$" },
+    "idempotencyKey": { "type": "string", "pattern": "^cai_[a-z0-9][a-z0-9_-]{7,127}$" },
+    "cursor": { "type": "string", "pattern": "^car_[A-Za-z0-9_-]{16,256}$" },
+    "eventReference": { "type": "object", "additionalProperties": false, "required": ["eventId", "conversationId", "logicalDigest", "payloadDigest", "sourceOccurredAt", "sourceSequence", "state"], "properties": { "eventId": { "$ref": "#/$defs/eventId" }, "conversationId": { "$ref": "#/$defs/conversationId" }, "logicalDigest": { "$ref": "#/$defs/digest" }, "payloadDigest": { "$ref": "#/$defs/digest" }, "sourceOccurredAt": { "$ref": "#/$defs/timestamp" }, "sourceSequence": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "state": { "enum": ["active", "edited", "replacement", "tombstone", "conflict"] } } },
+    "writeProjection": { "type": "object", "additionalProperties": false, "required": ["operation", "idempotencyKey", "event"], "properties": { "operation": { "enum": ["append", "tombstone"] }, "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }, "event": { "$ref": "#/$defs/eventReference" } } },
+    "retentionRequest": { "type": "object", "additionalProperties": false, "required": ["operation", "idempotencyKey", "cutoff", "limit"], "properties": { "operation": { "const": "apply_retention" }, "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }, "cutoff": { "$ref": "#/$defs/timestamp" }, "limit": { "type": "integer", "minimum": 1, "maximum": 1000 } } },
+    "readRequest": { "type": "object", "additionalProperties": false, "required": ["operation", "conversationId", "limit", "includeTombstones"], "properties": { "operation": { "const": "list" }, "conversationId": { "$ref": "#/$defs/conversationId" }, "limit": { "type": "integer", "minimum": 1, "maximum": 100 }, "includeTombstones": { "type": "boolean" }, "cursor": { "$ref": "#/$defs/cursor" } } },
+    "conflictMetadata": { "type": "object", "additionalProperties": false, "required": ["eventId", "logicalDigest", "existingPayloadDigest", "receivedPayloadDigest"], "properties": { "eventId": { "$ref": "#/$defs/eventId" }, "logicalDigest": { "$ref": "#/$defs/digest" }, "existingPayloadDigest": { "$ref": "#/$defs/digest" }, "receivedPayloadDigest": { "$ref": "#/$defs/digest" } } },
+    "result": {
+      "type": "object", "additionalProperties": false, "required": ["outcome", "stateChanged", "items", "nextCursor"],
+      "properties": { "outcome": { "enum": ["stored", "duplicate", "conflict_visible", "listed", "not_found", "transaction_rolled_back", "cursor_binding_invalid", "retention_expired", "audit_unavailable", "request_invalid"] }, "stateChanged": { "type": "boolean" }, "items": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": { "$ref": "#/$defs/eventReference" } }, "nextCursor": { "type": ["string", "null"], "pattern": "^car_[A-Za-z0-9_-]{16,256}$" }, "conflict": { "$ref": "#/$defs/conflictMetadata" } },
+      "allOf": [
+        { "if": { "properties": { "outcome": { "const": "conflict_visible" } }, "required": ["outcome"] }, "then": { "required": ["conflict"] } },
+        { "if": { "properties": { "outcome": { "enum": ["stored", "duplicate", "listed", "not_found", "transaction_rolled_back", "cursor_binding_invalid", "retention_expired", "audit_unavailable", "request_invalid"] } }, "required": ["outcome"] }, "then": { "not": { "required": ["conflict"] } } },
+        { "if": { "properties": { "stateChanged": { "const": true } }, "required": ["stateChanged"] }, "then": { "properties": { "outcome": { "enum": ["stored", "retention_expired"] } }, "required": ["outcome"] } },
+        { "if": { "properties": { "outcome": { "enum": ["stored", "retention_expired"] } }, "required": ["outcome"] }, "then": { "properties": { "stateChanged": { "const": true } }, "required": ["stateChanged"] } }
+      ]
+    },
+    "audit": { "type": "object", "additionalProperties": false, "required": ["action", "outcome", "required"], "properties": { "action": { "enum": ["append", "tombstone", "apply_retention", "list"] }, "outcome": { "enum": ["recorded", "absent", "unavailable"] }, "required": { "type": "boolean" } } },
+    "expected": { "type": "object", "additionalProperties": false, "required": ["result", "audit"], "properties": { "result": { "$ref": "#/$defs/result" }, "audit": { "$ref": "#/$defs/audit" } }, "allOf": [
+      { "if": { "properties": { "result": { "properties": { "stateChanged": { "const": true } }, "required": ["stateChanged"] } }, "required": ["result"] }, "then": { "properties": { "audit": { "properties": { "outcome": { "const": "recorded" }, "required": { "const": true } }, "required": ["outcome", "required"] } }, "required": ["audit"] } },
+      { "if": { "properties": { "result": { "properties": { "outcome": { "const": "transaction_rolled_back" } }, "required": ["outcome"] } }, "required": ["result"] }, "then": { "properties": { "audit": { "properties": { "outcome": { "const": "absent" } }, "required": ["outcome"] } }, "required": ["audit"] } },
+      { "if": { "properties": { "result": { "properties": { "outcome": { "const": "audit_unavailable" } }, "required": ["outcome"] } }, "required": ["result"] }, "then": { "properties": { "audit": { "properties": { "outcome": { "const": "unavailable" }, "required": { "const": true } }, "required": ["outcome", "required"] } }, "required": ["audit"] } }
+    ] },
+    "cursorBinding": { "type": "object", "additionalProperties": false, "required": ["conversationId", "includeTombstones", "orderingVersion", "limit"], "properties": { "conversationId": { "$ref": "#/$defs/conversationId" }, "includeTombstones": { "type": "boolean" }, "orderingVersion": { "const": "conversation-archive-order/v1" }, "limit": { "type": "integer", "minimum": 1, "maximum": 100 } } },
+    "tombstoneVisibility": { "type": "object", "additionalProperties": false, "required": ["ordinaryItems", "includedTombstone"], "properties": { "ordinaryItems": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/eventReference" } }, "includedTombstone": { "$ref": "#/$defs/eventReference" } } },
+    "retentionBoundary": { "type": "object", "additionalProperties": false, "required": ["cutoff", "expiredAtCutoff", "retainedAfterCutoff"], "properties": { "cutoff": { "$ref": "#/$defs/timestamp" }, "expiredAtCutoff": { "type": "object", "additionalProperties": false, "required": ["event", "expiresAt"], "properties": { "event": { "$ref": "#/$defs/eventReference" }, "expiresAt": { "$ref": "#/$defs/timestamp" } } }, "retainedAfterCutoff": { "type": "object", "additionalProperties": false, "required": ["event", "expiresAt"], "properties": { "event": { "$ref": "#/$defs/eventReference" }, "expiresAt": { "$ref": "#/$defs/timestamp" } } } } },
+    "scenario": { "type": "object", "additionalProperties": false, "required": ["id", "request", "expected"], "properties": { "id": { "enum": ["commit", "rollback", "replay", "changed_payload_conflict", "ordering", "pagination_cursor_binding", "tombstone_visibility", "retention_boundary", "audit_outage"] }, "request": { "anyOf": [{ "$ref": "#/$defs/writeProjection" }, { "$ref": "#/$defs/retentionRequest" }, { "$ref": "#/$defs/readRequest" }] }, "expected": { "$ref": "#/$defs/expected" }, "cursorBinding": { "$ref": "#/$defs/cursorBinding" }, "tombstoneVisibility": { "$ref": "#/$defs/tombstoneVisibility" }, "retentionBoundary": { "$ref": "#/$defs/retentionBoundary" } } }
+  }
+}
