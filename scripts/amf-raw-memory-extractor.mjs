@@ -85,6 +85,7 @@ async function tick(config, { dryRun }) {
   if (!session) return { ok: true, dryRun, outcome: 'empty', scanned: 0, cost: 0 };
   const transcriptUrl = new URL(`/v2/internal/extractor/sessions/${encodeURIComponent(session.id)}/transcript`, config.baseUrl);
   transcriptUrl.searchParams.set('limit', String(config.transcriptItemLimit));
+  transcriptUrl.searchParams.set('window', 'newest');
   const transcript = await requestJson({ url: transcriptUrl, token }); const triage = triageConversation(transcript.items);
   const base = { ok: true, dryRun, sessionId: session.id, occurredAt: session.lastOccurredAt, triage: triage.reason, scanned: 1, cost: 0 };
   if (!triage.pass) {

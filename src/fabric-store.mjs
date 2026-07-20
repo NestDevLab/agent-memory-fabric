@@ -2612,7 +2612,7 @@ export class FabricStore {
         return publicSession(await participantSession(actor, owners, id), actor, owners);
       },
       async transcript({ actor, ownerActors = null, id, view, query = '', cursor = null, limit = 100,
-        from = null, to = null, context = null }) {
+        from = null, to = null, context = null, newest = false }) {
         validateTimeWindow(from, to);
         const owners = normalizedSessionOwners(actor, ownerActors);
         const session = await participantSession(actor, owners, id);
@@ -2628,10 +2628,10 @@ export class FabricStore {
         }
         const offset = cursorState.offset;
         const page = await store._catalogOperation(() => store.catalog.listSessionEventsPage({ id,
-          offset: textQuery ? 0 : offset, limit: textQuery ? SESSION_TEXT_SCAN_MAX_EVENTS : limit, from, to,
-          newest: Boolean(textQuery) }));
+          offset: textQuery || newest ? 0 : offset, limit: textQuery ? SESSION_TEXT_SCAN_MAX_EVENTS : limit, from, to,
+          newest: Boolean(textQuery || newest) }));
         const events = view === 'original' ? page.items : await canonicalEvents(page.items);
-        let nextCursor = !textQuery && page.hasMore ? encodePageCursor({ offset: offset + page.items.length },
+        let nextCursor = !textQuery && !newest && page.hasMore ? encodePageCursor({ offset: offset + page.items.length },
           binding, store.rawStore) : null;
         if (view !== 'original') {
           const candidates = events.filter(event => event.projection.schema === 'amf.raw-event-projection/v2'

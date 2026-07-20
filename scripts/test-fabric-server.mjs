@@ -250,7 +250,7 @@ test('raw extractor can read only service-authorized redacted sessions', async (
     const headers = { authorization: 'Bearer extractor-token' };
     const page = await api('/v2/internal/extractor/sessions?limit=1', { headers });
     assert.equal(page.response.status, 200); assert.equal(page.body.data.items[0].id, 'ses_extract'); assert.equal(page.body.data.nextCursor, 'signed-next');
-    const transcript = await api('/v2/internal/extractor/sessions/ses_extract/transcript?limit=100', { headers });
+    const transcript = await api('/v2/internal/extractor/sessions/ses_extract/transcript?limit=100&window=newest', { headers });
     assert.equal(transcript.response.status, 200); assert.equal(transcript.body.data.view, 'redacted'); assert.equal(transcript.body.data.items[0].text, 'We decided to keep it slow.');
     const denied = await api('/v2/internal/extractor/sessions?limit=1');
     assert.equal(denied.response.status, 403);
