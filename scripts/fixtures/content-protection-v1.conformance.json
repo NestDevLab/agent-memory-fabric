@@ -1,0 +1,64 @@
+{
+  "policy": {
+    "valid": {
+      "schema": "amf.content-protection-policy/v1",
+      "revision": "policy-v1",
+      "defaults": { "conversation": "plaintext", "proposal": "plaintext", "canonical-memory": "plaintext", "document": "plaintext" },
+      "rules": [
+        { "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": true, "codec": "plaintext" },
+        { "sourceInstanceId": "src_synthetic0001", "contentClass": "canonical-memory", "enabled": true, "codec": "aes-256-gcm", "writeKeyRef": "key:synthetic-current-v1", "readKeyRefs": ["key:synthetic-current-v1", "key:synthetic-retired-v1"] },
+        { "sourceInstanceId": "src_synthetic0002", "contentClass": "document", "enabled": false, "codec": "aes-256-gcm" }
+      ]
+    },
+    "invalid": [
+      { "name": "default-not-plaintext", "expectedKeyword": "const", "expectedPath": "/defaults/document", "payload": { "defaults": { "conversation": "plaintext", "proposal": "plaintext", "canonical-memory": "plaintext", "document": "aes-256-gcm" } } },
+      { "name": "wildcard-source-selector", "expectedKeyword": "pattern", "expectedPath": "/rules/0/sourceInstanceId", "payload": { "rules": [{ "sourceInstanceId": "*", "contentClass": "conversation", "enabled": true, "codec": "plaintext" }] } },
+      { "name": "plaintext-key-reference", "expectedKeyword": "not", "expectedPath": "/rules/0", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": true, "codec": "plaintext", "writeKeyRef": "key:synthetic-current-v1" }] } },
+      { "name": "enabled-aes-without-key-reference", "expectedKeyword": "required", "expectedPath": "/rules/0", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": true, "codec": "aes-256-gcm" }] } },
+      { "name": "disabled-rule-carries-key-reference", "expectedKeyword": "not", "expectedPath": "/rules/0", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": false, "codec": "aes-256-gcm", "writeKeyRef": "key:synthetic-current-v1" }] } },
+      { "name": "enabled-write-key-is-not-readable", "expectedSemantic": "write_key_not_readable", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": true, "codec": "aes-256-gcm", "writeKeyRef": "key:synthetic-current-v1", "readKeyRefs": ["key:synthetic-retired-v1"] }] } },
+      { "name": "duplicate-selector", "expectedSemantic": "duplicate_selector", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "proposal", "enabled": false, "codec": "plaintext" }, { "sourceInstanceId": "src_synthetic0001", "contentClass": "proposal", "enabled": true, "codec": "aes-256-gcm", "writeKeyRef": "key:synthetic-current-v1", "readKeyRefs": ["key:synthetic-current-v1"] }] } }
+    ]
+  },
+  "memory": {
+    "valid": [
+      {
+        "schema": "amf-memory/v2", "id": "mem_synthetic0001", "revision": 1, "claimType": "decision",
+        "scope": { "type": "shared", "id": "shared:global" }, "visibility": "restricted",
+        "subjects": [{ "identityId": "agent:synthetic-owner", "role": "owner" }],
+        "claim": { "encoding": "plain", "text": "A synthetic restricted plain claim." },
+        "confidence": { "score": 0.8, "basis": "reviewed", "assessedAt": "2026-01-02T03:04:05Z" },
+        "lifecycle": { "status": "active", "validFrom": "2026-01-02T03:04:05Z", "validTo": null, "supersedes": [], "revokedAt": null, "revocationReason": null },
+        "provenance": [{ "sourceType": "synthetic-source", "sourceId": "source-synthetic-0001", "eventId": "event-synthetic-0001", "contentSha256": "1111111111111111111111111111111111111111111111111111111111111111", "capturedAt": "2026-01-02T03:04:05Z" }],
+        "createdAt": "2026-01-02T03:04:05Z", "updatedAt": "2026-01-02T03:04:05Z"
+      },
+      {
+        "schema": "amf-memory/v2", "id": "mem_synthetic0002", "revision": 1, "claimType": "fact",
+        "scope": { "type": "shared", "id": "shared:global" }, "visibility": "shared",
+        "subjects": [{ "identityId": "agent:synthetic-owner", "role": "owner" }],
+        "claim": { "encoding": "sealed", "alg": "AES-256-GCM", "kekId": "kek:synthetic-v1", "keyRef": "key:synthetic-current-v1", "iv": "AQEBAQEBAQEBAQEB", "ciphertext": "c3ludGhldGljLWNpcGhlcnRleHQ=", "tag": "AgICAgICAgICAgICAgICAg==", "aadSha256": "6c7907b771b2b6e1949e16bdafe8f6705c794882b2d8a962759732393c9a9c83" },
+        "confidence": { "score": 0.7, "basis": "observed", "assessedAt": "2026-01-02T03:05:05Z" },
+        "lifecycle": { "status": "active", "validFrom": "2026-01-02T03:05:05Z", "validTo": null, "supersedes": [], "revokedAt": null, "revocationReason": null },
+        "provenance": [{ "sourceType": "synthetic-source", "sourceId": "source-synthetic-0001", "eventId": "event-synthetic-0002", "contentSha256": "2222222222222222222222222222222222222222222222222222222222222222", "capturedAt": "2026-01-02T03:05:05Z" }],
+        "createdAt": "2026-01-02T03:05:05Z", "updatedAt": "2026-01-02T03:05:05Z"
+      }
+    ],
+    "legacyV1": {
+      "schema": "amf-memory/v1", "id": "mem_synthetic0003", "revision": 1, "claimType": "summary",
+      "scope": { "type": "shared", "id": "shared:global" }, "visibility": "shared",
+      "subjects": [{ "identityId": "agent:synthetic-owner", "role": "owner" }],
+      "claim": { "encoding": "plain", "text": "A synthetic legacy claim." },
+      "confidence": { "score": 0.6, "basis": "asserted", "assessedAt": "2026-01-02T03:06:05Z" },
+      "lifecycle": { "status": "active", "validFrom": "2026-01-02T03:06:05Z", "validTo": null, "supersedes": [], "revokedAt": null, "revocationReason": null },
+      "provenance": [{ "sourceType": "synthetic-source", "sourceId": "source-synthetic-0001", "eventId": "event-synthetic-0003", "contentSha256": "3333333333333333333333333333333333333333333333333333333333333333", "capturedAt": "2026-01-02T03:06:05Z" }],
+      "createdAt": "2026-01-02T03:06:05Z", "updatedAt": "2026-01-02T03:06:05Z"
+    },
+    "invalid": [
+      { "name": "plain-claim-key-material", "expectedKeyword": "oneOf", "expectedPath": "/claim", "payload": { "claim": { "encoding": "plain", "text": "Synthetic text.", "keyRef": "key:synthetic-current-v1" } } },
+      { "name": "sealed-aad-shape", "expectedKeyword": "pattern", "expectedPath": "/claim/aadSha256", "base": 1, "payload": { "claim": { "aadSha256": "not-a-digest" } } },
+      { "name": "plain-claim-whitespace", "expectedKeyword": "pattern", "expectedPath": "/claim/text", "payload": { "claim": { "encoding": "plain", "text": "   " } } },
+      { "name": "noncanonical-ciphertext", "expectedKeyword": "pattern", "expectedPath": "/claim/ciphertext", "base": 1, "payload": { "claim": { "ciphertext": "c3ludGhldGljLWNpcGhlcnRleHQ===" } } },
+      { "name": "visibility-does-not-name-a-codec", "expectedKeyword": "enum", "expectedPath": "/visibility", "payload": { "visibility": "aes-256-gcm" } }
+    ]
+  }
+}

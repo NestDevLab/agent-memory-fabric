@@ -1,0 +1,258 @@
+{
+  "integrityTestKey": {
+    "purpose": "public synthetic conformance key only",
+    "algorithm": "hmac-sha256",
+    "keyId": "safety-v1",
+    "base64": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+  },
+  "valid": [
+    {
+      "schema": "amf.migration-manifest/v1",
+      "manifestId": "pause-manifest-001",
+      "phase": "pause",
+      "revision": 1,
+      "pause": {
+        "state": "paused",
+        "collectorCursor": {
+          "id": "collector-cursor-001",
+          "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "pendingOutbox": {
+          "id": "pending-outbox-001",
+          "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "acknowledgements": {
+          "id": "acknowledgements-001",
+          "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+        },
+        "deadLetters": {
+          "id": "dead-letters-001",
+          "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+        },
+        "sourceCheckpoint": {
+          "id": "source-checkpoint-001",
+          "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+        },
+        "nativeTranscriptAuthority": {
+          "id": "native-authority-001",
+          "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+        },
+        "evidence": {
+          "id": "pause-evidence-001",
+          "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+        }
+      },
+      "integrity": {
+        "algorithm": "hmac-sha256",
+        "keyId": "safety-v1",
+        "payloadDigest": "sha256:e290cabca9721d53372fc43a2fb00183cc7bf179a812eeac2dd6ed0f9fccc3d3",
+        "signature": "gKNUy5XYK_BXr0sp7T5xch304wUE7uAD6h6GOUiahTw"
+      }
+    },
+    {
+      "schema": "amf.migration-manifest/v1",
+      "manifestId": "rollback-manifest-001",
+      "phase": "rollback",
+      "revision": 1,
+      "rollback": {
+        "pauseEvidence": {
+          "manifestId": "pause-manifest-001",
+          "digest": "sha256:e290cabca9721d53372fc43a2fb00183cc7bf179a812eeac2dd6ed0f9fccc3d3",
+          "signature": "gKNUy5XYK_BXr0sp7T5xch304wUE7uAD6h6GOUiahTw"
+        },
+        "sourceCheckpoint": {
+          "id": "source-checkpoint-001",
+          "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+        },
+        "targetCheckpoint": {
+          "id": "target-checkpoint-001",
+          "digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+        },
+        "compatibilityRouteRevision": "route-revision-001",
+        "recoveryCopy": {
+          "id": "recovery-copy-001",
+          "digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+        },
+        "restoreTest": "passed"
+      },
+      "integrity": {
+        "algorithm": "hmac-sha256",
+        "keyId": "safety-v1",
+        "payloadDigest": "sha256:be14e6c0cf49962af65c55b97f489433d1447d2a2ca46a3e6336e6823baf4ce4",
+        "signature": "X9Z8GmJfAkk31Z8zZD8p0PIA1C4FHiZiK3Zoi_pVPDE"
+      }
+    },
+    {
+      "schema": "amf.migration-manifest/v1",
+      "manifestId": "reconciliation-manifest-001",
+      "phase": "reconciliation",
+      "revision": 1,
+      "reconciliation": {
+        "state": "complete",
+        "pauseEvidence": {
+          "manifestId": "pause-manifest-001",
+          "digest": "sha256:e290cabca9721d53372fc43a2fb00183cc7bf179a812eeac2dd6ed0f9fccc3d3",
+          "signature": "gKNUy5XYK_BXr0sp7T5xch304wUE7uAD6h6GOUiahTw"
+        },
+        "rollbackEvidence": {
+          "manifestId": "rollback-manifest-001",
+          "digest": "sha256:be14e6c0cf49962af65c55b97f489433d1447d2a2ca46a3e6336e6823baf4ce4",
+          "signature": "X9Z8GmJfAkk31Z8zZD8p0PIA1C4FHiZiK3Zoi_pVPDE"
+        },
+        "dimensions": [
+          "counts",
+          "stable-ids",
+          "payload-digests",
+          "logical-digests",
+          "time-ranges",
+          "edits",
+          "replacements",
+          "tombstones",
+          "conflicts",
+          "paused-interval",
+          "replay-queues",
+          "source-checkpoints"
+        ],
+        "dimensionsBinding": {
+          "id": "dimensions-binding-001",
+          "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "completeness": 1,
+        "tolerance": 0,
+        "unresolvedMismatchCount": 0
+      },
+      "integrity": {
+        "algorithm": "hmac-sha256",
+        "keyId": "safety-v1",
+        "payloadDigest": "sha256:1fed40e0b29e96ee71a7c65d36dba91073feec374984de2737a93e82059a5717",
+        "signature": "vvcGKY2mWy3oM0_8RfF4Tq6ShuRCdHzhW9GxkwVnFXE"
+      }
+    },
+    {
+      "schema": "amf.migration-manifest/v1",
+      "manifestId": "cleanup-manifest-001",
+      "phase": "cleanup",
+      "revision": 1,
+      "cleanup": {
+        "state": "ready",
+        "reconciliationEvidence": {
+          "manifestId": "reconciliation-manifest-001",
+          "digest": "sha256:1fed40e0b29e96ee71a7c65d36dba91073feec374984de2737a93e82059a5717",
+          "signature": "vvcGKY2mWy3oM0_8RfF4Tq6ShuRCdHzhW9GxkwVnFXE",
+          "state": "complete"
+        },
+        "cutoverCanary": {
+          "id": "cutover-canary-001",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "state": "passed"
+        },
+        "catalogUnreferencedProof": {
+          "manifestId": "catalog-proof-001",
+          "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        },
+        "recoveryCopy": {
+          "id": "recovery-copy-001",
+          "digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+        },
+        "restoreTest": "passed",
+        "targets": [
+          {
+            "id": "legacy-object-001",
+            "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          }
+        ]
+      },
+      "integrity": {
+        "algorithm": "hmac-sha256",
+        "keyId": "safety-v1",
+        "payloadDigest": "sha256:5fe5ea7bb10f927a009d11a380c8233ee605105da1c9b5f028750c1d123af1c6",
+        "signature": "MEPQaScY1gE94gEJfs6daxqCBQWJo1bsWQuBRd38EDE"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "wrong-phase-body",
+      "base": "pause-manifest-001",
+      "add": {
+        "rollback": {}
+      },
+      "expectedPath": ""
+    },
+    {
+      "name": "missing-queue-checkpoint",
+      "base": "pause-manifest-001",
+      "remove": "pause.pendingOutbox",
+      "expectedPath": "/pause"
+    },
+    {
+      "name": "missing-pause-reference",
+      "base": "rollback-manifest-001",
+      "remove": "rollback.pauseEvidence",
+      "expectedPath": "/rollback"
+    },
+    {
+      "name": "incomplete-reconciliation",
+      "base": "reconciliation-manifest-001",
+      "set": {
+        "reconciliation.completeness": 0.5
+      },
+      "expectedPath": "/reconciliation/completeness"
+    },
+    {
+      "name": "unresolved-mismatch",
+      "base": "reconciliation-manifest-001",
+      "set": {
+        "reconciliation.unresolvedMismatchCount": 1
+      },
+      "expectedPath": "/reconciliation/unresolvedMismatchCount"
+    },
+    {
+      "name": "wildcard-target",
+      "base": "cleanup-manifest-001",
+      "set": {
+        "cleanup.targets": [
+          {
+            "id": "legacy-*",
+            "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          }
+        ]
+      },
+      "expectedPath": "/cleanup/targets/0/id"
+    },
+    {
+      "name": "recovery-restore-not-passed",
+      "base": "cleanup-manifest-001",
+      "set": {
+        "cleanup.restoreTest": "failed"
+      },
+      "expectedPath": "/cleanup/restoreTest"
+    },
+    {
+      "name": "cleanup-before-canary",
+      "base": "cleanup-manifest-001",
+      "set": {
+        "cleanup.cutoverCanary.state": "not-run"
+      },
+      "expectedPath": "/cleanup/cutoverCanary/state"
+    },
+    {
+      "name": "unsigned",
+      "base": "pause-manifest-001",
+      "set": {
+        "integrity.signature": ""
+      },
+      "expectedPath": "/integrity/signature"
+    },
+    {
+      "name": "tampered",
+      "base": "pause-manifest-001",
+      "set": {
+        "revision": 2
+      },
+      "preserveIntegrity": true,
+      "expectedPath": "/integrity/payloadDigest"
+    }
+  ]
+}

@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-memory-fabric.local/contracts/amf.conversation-event-v3.schema.json",
+  "title": "Agent Memory Fabric conversation event v3",
+  "description": "Minimal user-visible conversation event transport. The integrity envelope authenticates the canonical JSON payload with the integrity member omitted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "eventId", "conversationId", "sourceInstanceId", "role", "sourceOccurredAt", "occurredAt", "ordering", "direction", "conversationKind", "authorizationContextTags", "state", "revision", "logicalDigest", "integrity"],
+  "properties": {
+    "schema": { "const": "amf.conversation-event/v3" },
+    "eventId": { "$ref": "#/$defs/eventId" },
+    "conversationId": { "$ref": "#/$defs/conversationId" },
+    "sourceInstanceId": { "$ref": "#/$defs/sourceInstanceId" },
+    "threadId": { "$ref": "#/$defs/threadId" },
+    "role": { "enum": ["user", "assistant"] },
+    "visibleText": { "type": "string", "minLength": 1, "maxLength": 65536, "pattern": "\\S" },
+    "sourceOccurredAt": { "$ref": "#/$defs/utcTimestamp" },
+    "occurredAt": { "$ref": "#/$defs/utcTimestamp" },
+    "ordering": { "$ref": "#/$defs/ordering" },
+    "direction": { "enum": ["inbound", "outbound"] },
+    "conversationKind": { "enum": ["dm", "group", "channel", "thread", "session"] },
+    "authorizationContextTags": { "$ref": "#/$defs/contextTags" },
+    "attachments": { "type": "array", "maxItems": 32, "uniqueItems": true, "items": { "$ref": "#/$defs/attachmentReference" } },
+    "state": { "enum": ["active", "edited", "replacement", "tombstone", "conflict"] },
+    "revision": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "replacesEventId": { "$ref": "#/$defs/eventId" },
+    "tombstonesEventId": { "$ref": "#/$defs/eventId" },
+    "conflictsWithEventIds": { "type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": { "$ref": "#/$defs/eventId" } },
+    "logicalDigest": { "$ref": "#/$defs/logicalDigest" },
+    "integrity": { "$ref": "#/$defs/integrityEnvelope" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "state": { "const": "active" } }, "required": ["state"] },
+      "then": { "required": ["visibleText"], "not": { "anyOf": [{ "required": ["replacesEventId"] }, { "required": ["tombstonesEventId"] }, { "required": ["conflictsWithEventIds"] }] } }
+    },
+    {
+      "if": { "properties": { "role": { "const": "user" } }, "required": ["role"] },
+      "then": { "properties": { "direction": { "const": "inbound" } }, "required": ["direction"] }
+    },
+    {
+      "if": { "properties": { "role": { "const": "assistant" } }, "required": ["role"] },
+      "then": { "properties": { "direction": { "const": "outbound" } }, "required": ["direction"] }
+    },
+    {
+      "if": { "properties": { "state": { "enum": ["edited", "replacement"] } }, "required": ["state"] },
+      "then": { "required": ["visibleText", "replacesEventId"], "properties": { "revision": { "minimum": 2 } }, "not": { "anyOf": [{ "required": ["tombstonesEventId"] }, { "required": ["conflictsWithEventIds"] }] } }
+    },
+    {
+      "if": { "properties": { "state": { "const": "tombstone" } }, "required": ["state"] },
+      "then": { "required": ["tombstonesEventId"], "not": { "anyOf": [{ "required": ["visibleText"] }, { "required": ["attachments"] }, { "required": ["replacesEventId"] }, { "required": ["conflictsWithEventIds"] }] } }
+    },
+    {
+      "if": { "properties": { "state": { "const": "conflict" } }, "required": ["state"] },
+      "then": { "required": ["visibleText", "conflictsWithEventIds"], "not": { "anyOf": [{ "required": ["replacesEventId"] }, { "required": ["tombstonesEventId"] }] } }
+    }
+  ],
+  "$defs": {
+    "eventId": { "type": "string", "pattern": "^cevt_[a-z0-9][a-z0-9_-]{7,127}$" },
+    "conversationId": { "type": "string", "pattern": "^ccon_[a-z0-9][a-z0-9_-]{7,127}$" },
+    "sourceInstanceId": { "type": "string", "pattern": "^src_[a-z0-9][a-z0-9_-]{7,127}$" },
+    "threadId": { "type": "string", "pattern": "^cthr_[a-z0-9][a-z0-9_-]{7,127}$" },
+    "utcTimestamp": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$", "format": "date-time" },
+    "opaqueTag": { "type": "string", "pattern": "^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$" },
+    "tagArray": { "type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": { "$ref": "#/$defs/opaqueTag" } },
+    "contextTags": {
+      "type": "object", "additionalProperties": false, "required": ["conversation"],
+      "properties": {
+        "actor": { "$ref": "#/$defs/tagArray" }, "sender": { "$ref": "#/$defs/tagArray" },
+        "conversation": { "$ref": "#/$defs/tagArray" }, "room": { "$ref": "#/$defs/tagArray" },
+        "person": { "$ref": "#/$defs/tagArray" }, "relationship": { "$ref": "#/$defs/tagArray" },
+        "thread": { "$ref": "#/$defs/tagArray" }
+      }
+    },
+    "ordering": {
+      "type": "object", "additionalProperties": false, "required": ["sourceSequence"],
+      "properties": { "sourceSequence": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 } }
+    },
+    "attachmentReference": {
+      "type": "object", "additionalProperties": false, "required": ["attachmentId", "mediaType", "byteLength"],
+      "properties": {
+        "attachmentId": { "type": "string", "pattern": "^catt_[a-z0-9][a-z0-9_-]{7,127}$" },
+        "mediaType": { "enum": ["application/pdf", "audio/mpeg", "image/jpeg", "image/png", "image/webp", "text/plain", "video/mp4"] },
+        "byteLength": { "type": "integer", "minimum": 0, "maximum": 1073741824 },
+        "caption": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "logicalDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "integrityEnvelope": {
+      "type": "object", "additionalProperties": false, "required": ["algorithm", "keyId", "sentAt", "nonce", "payloadDigest", "signature"],
+      "properties": {
+        "algorithm": { "const": "hmac-sha256" },
+        "keyId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+        "sentAt": { "$ref": "#/$defs/utcTimestamp" },
+        "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$" },
+        "payloadDigest": { "$ref": "#/$defs/logicalDigest" },
+        "signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43,86}$" }
+      }
+    }
+  }
+}

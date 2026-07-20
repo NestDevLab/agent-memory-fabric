@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/contracts/amf.migration-manifest-v1.schema.json",
+  "title": "Migration safety manifest v1",
+  "description": "One signed, declarative phase record. It contains identifiers and digests only, never transfer or destructive instructions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "manifestId", "phase", "revision", "integrity"],
+  "properties": {
+    "schema": { "const": "amf.migration-manifest/v1" },
+    "manifestId": { "$ref": "#/$defs/id" },
+    "phase": { "enum": ["pause", "rollback", "reconciliation", "cleanup"] },
+    "revision": { "type": "integer", "minimum": 1 },
+    "pause": { "$ref": "#/$defs/pause" },
+    "rollback": { "$ref": "#/$defs/rollback" },
+    "reconciliation": { "$ref": "#/$defs/reconciliation" },
+    "cleanup": { "$ref": "#/$defs/cleanup" },
+    "integrity": { "$ref": "#/$defs/integrity" }
+  },
+  "oneOf": [
+    { "properties": { "phase": { "const": "pause" } }, "required": ["phase", "pause"], "not": { "anyOf": [{ "required": ["rollback"] }, { "required": ["reconciliation"] }, { "required": ["cleanup"] }] } },
+    { "properties": { "phase": { "const": "rollback" } }, "required": ["phase", "rollback"], "not": { "anyOf": [{ "required": ["pause"] }, { "required": ["reconciliation"] }, { "required": ["cleanup"] }] } },
+    { "properties": { "phase": { "const": "reconciliation" } }, "required": ["phase", "reconciliation"], "not": { "anyOf": [{ "required": ["pause"] }, { "required": ["rollback"] }, { "required": ["cleanup"] }] } },
+    { "properties": { "phase": { "const": "cleanup" } }, "required": ["phase", "cleanup"], "not": { "anyOf": [{ "required": ["pause"] }, { "required": ["rollback"] }, { "required": ["reconciliation"] }] } }
+  ],
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,79}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "checkpoint": { "type": "object", "additionalProperties": false, "required": ["id", "digest"], "properties": { "id": { "$ref": "#/$defs/id" }, "digest": { "$ref": "#/$defs/digest" } } },
+    "signedEvidence": { "type": "object", "additionalProperties": false, "required": ["manifestId", "digest", "signature"], "properties": { "manifestId": { "$ref": "#/$defs/id" }, "digest": { "$ref": "#/$defs/digest" }, "signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43,86}$" } } },
+    "completeReconciliationEvidence": { "type": "object", "additionalProperties": false, "required": ["manifestId", "digest", "signature", "state"], "properties": { "manifestId": { "$ref": "#/$defs/id" }, "digest": { "$ref": "#/$defs/digest" }, "signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43,86}$" }, "state": { "const": "complete" } } },
+    "passedEvidence": { "type": "object", "additionalProperties": false, "required": ["id", "digest", "state"], "properties": { "id": { "$ref": "#/$defs/id" }, "digest": { "$ref": "#/$defs/digest" }, "state": { "const": "passed" } } },
+    "pause": { "type": "object", "additionalProperties": false, "required": ["state", "collectorCursor", "pendingOutbox", "acknowledgements", "deadLetters", "sourceCheckpoint", "nativeTranscriptAuthority", "evidence"], "properties": { "state": { "const": "paused" }, "collectorCursor": { "$ref": "#/$defs/checkpoint" }, "pendingOutbox": { "$ref": "#/$defs/checkpoint" }, "acknowledgements": { "$ref": "#/$defs/checkpoint" }, "deadLetters": { "$ref": "#/$defs/checkpoint" }, "sourceCheckpoint": { "$ref": "#/$defs/checkpoint" }, "nativeTranscriptAuthority": { "$ref": "#/$defs/checkpoint" }, "evidence": { "$ref": "#/$defs/checkpoint" } } },
+    "rollback": { "type": "object", "additionalProperties": false, "required": ["pauseEvidence", "sourceCheckpoint", "targetCheckpoint", "compatibilityRouteRevision", "recoveryCopy", "restoreTest"], "properties": { "pauseEvidence": { "$ref": "#/$defs/signedEvidence" }, "sourceCheckpoint": { "$ref": "#/$defs/checkpoint" }, "targetCheckpoint": { "$ref": "#/$defs/checkpoint" }, "compatibilityRouteRevision": { "$ref": "#/$defs/id" }, "recoveryCopy": { "$ref": "#/$defs/checkpoint" }, "restoreTest": { "enum": ["not-run", "passed", "failed"] } } },
+    "reconciliation": { "type": "object", "additionalProperties": false, "required": ["state", "pauseEvidence", "rollbackEvidence", "dimensions", "dimensionsBinding", "completeness", "tolerance", "unresolvedMismatchCount"], "properties": { "state": { "enum": ["pending", "complete"] }, "pauseEvidence": { "$ref": "#/$defs/signedEvidence" }, "rollbackEvidence": { "$ref": "#/$defs/signedEvidence" }, "dimensions": { "type": "array", "minItems": 12, "maxItems": 12, "uniqueItems": true, "items": { "enum": ["counts", "stable-ids", "payload-digests", "logical-digests", "time-ranges", "edits", "replacements", "tombstones", "conflicts", "paused-interval", "replay-queues", "source-checkpoints"] } }, "dimensionsBinding": { "$ref": "#/$defs/checkpoint" }, "completeness": { "type": "number", "minimum": 0, "maximum": 1 }, "tolerance": { "type": "integer", "minimum": 0, "description": "Reporting only; it never permits an unresolved mismatch." }, "unresolvedMismatchCount": { "type": "integer", "minimum": 0 } }, "allOf": [{ "if": { "properties": { "state": { "const": "complete" } }, "required": ["state"] }, "then": { "properties": { "completeness": { "const": 1 }, "unresolvedMismatchCount": { "const": 0 } }, "required": ["completeness", "unresolvedMismatchCount"] } }] },
+    "cleanup": { "type": "object", "additionalProperties": false, "required": ["state", "reconciliationEvidence", "cutoverCanary", "catalogUnreferencedProof", "recoveryCopy", "restoreTest", "targets"], "properties": { "state": { "enum": ["not-ready", "ready"] }, "reconciliationEvidence": { "$ref": "#/$defs/completeReconciliationEvidence" }, "cutoverCanary": { "$ref": "#/$defs/passedEvidence" }, "catalogUnreferencedProof": { "$ref": "#/$defs/signedEvidence" }, "recoveryCopy": { "$ref": "#/$defs/checkpoint" }, "restoreTest": { "enum": ["not-run", "passed", "failed"] }, "targets": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/checkpoint" } } }, "allOf": [{ "if": { "properties": { "state": { "const": "ready" } }, "required": ["state"] }, "then": { "properties": { "restoreTest": { "const": "passed" } }, "required": ["reconciliationEvidence", "cutoverCanary", "catalogUnreferencedProof", "recoveryCopy", "restoreTest", "targets"] } }] },
+    "integrity": { "type": "object", "additionalProperties": false, "required": ["algorithm", "keyId", "payloadDigest", "signature"], "properties": { "algorithm": { "const": "hmac-sha256" }, "keyId": { "$ref": "#/$defs/id" }, "payloadDigest": { "$ref": "#/$defs/digest" }, "signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43,86}$" } } }
+  }
+}
