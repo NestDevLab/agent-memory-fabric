@@ -374,7 +374,8 @@
         "8a2a6e83a0a2321616f7e277529fa68abb545adc",
         "af28134ef5d17b0e8b532ff5669fee883786315a",
         "b5bcecadaa4b3f4c52f2224131e282f89a614b68",
-        "b5ed312457519f23b44a7059f89cf58adfddc52a"
+        "b5ed312457519f23b44a7059f89cf58adfddc52a",
+        "329d1037b3760639ff369e54622779cd59923ba4"
       ],
       "meta": {
         "purpose": "Freeze AMF v3 contracts and safety gates"
