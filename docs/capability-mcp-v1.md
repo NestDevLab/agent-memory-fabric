@@ -14,6 +14,10 @@ scope returns `not_found`, indistinguishable from an absent target.
 Successful search items and reads return only an opaque resource identifier,
 kind, and authorized text. Search returns at most 50 items and an opaque
 cursor; read returns one resource.
+A search cursor is bound to the originating query, kinds, scopes, purpose, and
+limit. Every page is re-authorized against the current grant. A malformed or
+mismatched cursor returns `invalid_request`; a current authorization denial
+returns `forbidden` without widening or revealing results.
 
 `propose` only queues a proposal under `memory_curation`; it cannot apply or
 change canonical memory. A queued proposal returns an opaque identifier, while

@@ -7,6 +7,7 @@ import { canonicalJson } from '../src/ingest/transcripts/canonical.mjs';
 
 const schema = JSON.parse(fs.readFileSync(new URL('../config/contracts/amf.conversation-event-v3.schema.json', import.meta.url), 'utf8'));
 const fixtures = JSON.parse(fs.readFileSync(new URL('./fixtures/conversation-event-v3.conformance.json', import.meta.url), 'utf8'));
+const sourceRules = fs.readFileSync(new URL('../docs/conversation-event-v3-source-rules.md', import.meta.url), 'utf8');
 const SUPPORTED_SCHEMA_KEYWORDS = new Set(['$schema', '$id', '$defs', '$ref', 'title', 'description', 'type', 'additionalProperties', 'required', 'properties', 'const', 'enum', 'pattern', 'format', 'minLength', 'maxLength', 'minimum', 'maximum', 'minItems', 'maxItems', 'uniqueItems', 'items', 'allOf', 'if', 'then', 'not', 'anyOf']);
 
 function assertBoundedSchemaSupport(rule) {
@@ -28,6 +29,7 @@ function typeMatches(value, expected) {
   return types.some(type => (type === 'array' && Array.isArray(value)) || (type === 'object' && value && typeof value === 'object' && !Array.isArray(value)) || (type === 'null' && value === null) || (type === 'integer' && Number.isInteger(value)) || (type === 'number' && typeof value === 'number' && Number.isFinite(value)) || (type === 'string' && typeof value === 'string') || (type === 'boolean' && typeof value === 'boolean'));
 }
 function resolve(ref) { return ref.split('/').slice(1).reduce((value, key) => value[key], schema); }
+function utcDateTime(value) { if (typeof value !== 'string' || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$/.test(value)) return false; const millis = Date.parse(value); if (!Number.isFinite(millis)) return false; const [date, time] = value.split('T'); const iso = new Date(millis).toISOString(); return iso.slice(0, 10) === date && iso.slice(11, 19) === time.slice(0, 8); }
 function validate(value, rule = schema, path = '') {
   if (rule.$ref) return validate(value, resolve(rule.$ref), path);
   const errors = [];
@@ -40,6 +42,7 @@ function validate(value, rule = schema, path = '') {
     if (rule.minLength !== undefined && codePoints < rule.minLength) add('minLength');
     if (rule.maxLength !== undefined && codePoints > rule.maxLength) add('maxLength');
     if (rule.pattern && !(new RegExp(rule.pattern).test(value))) add('pattern');
+    if (rule.format === 'date-time' && !utcDateTime(value)) add('format');
   }
   if (typeof value === 'number') {
     if (rule.minimum !== undefined && value < rule.minimum) add('minimum');
@@ -108,6 +111,18 @@ test('v3 schema is strict, versioned, and defines only safe attachment and integ
 
 test('every synthetic valid v3 fixture satisfies the bounded published-schema evaluator', () => {
   for (const fixture of fixtures.valid) assert.deepEqual(validate(fixture), [], fixture.eventId);
+});
+
+test('calendar-invalid timestamps fail the published date-time contract', () => {
+  const invalid = structuredClone(fixtures.valid[0]);
+  invalid.sourceOccurredAt = '2026-02-30T03:04:05Z';
+  assert.ok(validate(invalid).some(error => error.keyword === 'format' && error.instancePath === '/sourceOccurredAt'));
+});
+
+test('event cross-references are source- and conversation-bound', () => {
+  const normalized = sourceRules.replace(/\s+/g, ' ');
+  assert.match(normalized, /same `conversationId` and `sourceInstanceId`/);
+  assert.match(normalized, /rejects a cross-conversation or cross-source reference/);
 });
 
 test('every valid fixture has deterministic logical, payload, and authenticated integrity digests', () => {

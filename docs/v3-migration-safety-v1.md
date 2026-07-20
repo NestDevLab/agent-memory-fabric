@@ -39,6 +39,15 @@ recovery copy with a passed restore test.
 Destructive execution is separately explicitly approved and is not implemented
 by this contract.
 
+## Manifest integrity
+
+The `payloadDigest` is `sha256:` plus the lowercase SHA-256 of canonical JSON
+for the complete manifest with `integrity` omitted. The signature is
+HMAC-SHA-256 over the domain-separated canonical JSON tuple
+`["amf.migration-manifest/v1/integrity", payloadDigest, keyId]`, encoded as
+unpadded base64url. Verifiers authenticate the referenced key ID and reject a
+digest or signature mismatch before accepting phase evidence.
+
 ## Verification
 
 Conformance fixtures cover ready evidence and blocked states. The contract test

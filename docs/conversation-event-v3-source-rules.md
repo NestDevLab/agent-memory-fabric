@@ -51,6 +51,10 @@ it can produce v3 events.
 - `conflict` carries a visible competing event and one or more
   `conflictsWithEventIds`. A consumer must expose the conflict instead of
   silently selecting a winner.
+- Every `replacesEventId`, `tombstonesEventId`, and `conflictsWithEventIds`
+  target must resolve to an event with the same `conversationId` and
+  `sourceInstanceId`. The archive rejects a cross-conversation or cross-source
+  reference before it can replace, hide, or quarantine any event.
 - `logicalDigest` is `sha256:` plus the lowercase SHA-256 of a domain-separated
   canonical JSON tuple: `["amf.conversation-event/v3/logical", conversationId,
   threadId-or-null, role, state, visibleText-or-null, attachment-reference

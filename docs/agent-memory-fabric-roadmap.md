@@ -1,6 +1,6 @@
 # Agent Memory Fabric Roadmap and Implementation Plan
 
-Status: active; M0 accepted, M1 next
+Status: active; M1 accepted, M2 next
 Audience: maintainers, contributors, and operators
 Maintenance rule: update this checklist in the same change that completes a roadmap item.
 
