@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-import { buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, normalizeState, proposalIdempotencyKey, reserveModelBudget, settleModelBudget, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
+import { buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, normalizeState, proposalIdempotencyKey, reserveModelBudget, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
 
 function fail(code) { throw new Error(code); }
 
@@ -158,7 +158,8 @@ async function extractWithCodex(text, config) {
     if (result.timedOut) fail('extractor_model_timeout');
     if (result.code !== 0) fail(`extractor_model_failed:${result.stderr.slice(0, 160) || result.stdout.slice(-160)}`);
     const parsed = readJson(outputFile);
-    return { claims: validateClaims(parsed?.claims || [], { maxClaims: config.maxClaimsPerConversation }), usage: usageFromJsonl(result.stdout), inputTokenUpperBound: bounded.inputTokenUpperBound };
+    const claims = validateClaims(parsed?.claims || [], { maxClaims: config.maxClaimsPerConversation }).filter(claim => sharedDurableClaim(claim.claim));
+    return { claims, usage: usageFromJsonl(result.stdout), inputTokenUpperBound: bounded.inputTokenUpperBound };
   } finally { try { fs.unlinkSync(outputFile); } catch (error) { if (error?.code !== 'ENOENT') throw error; } }
 }
 
