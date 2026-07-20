@@ -371,7 +371,8 @@
       "integration_branch": "main-integration",
       "commits": [
         "6a3d3b3025921f3c4545e72480a0a459008cca4d",
-        "8a2a6e83a0a2321616f7e277529fa68abb545adc"
+        "8a2a6e83a0a2321616f7e277529fa68abb545adc",
+        "af28134ef5d17b0e8b532ff5669fee883786315a"
       ],
       "meta": {
         "purpose": "Freeze AMF v3 contracts and safety gates"
