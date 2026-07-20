@@ -6,6 +6,7 @@ export const RAW_MEMORY_EXTRACTOR_VERSION = 'amf.raw-memory-extractor/v1';
 const ELIGIBLE_TYPES = new Set(['decision', 'preference', 'instruction', 'summary']);
 const OPERATIONAL = /\b(?:error|exception|failed?|failure|incident|outage|alert|metric|counter|latency|throughput|deploy(?:ment)?|restart(?:ed)?|health ?check|ticket|log|trace|cpu|memory usage)\b/i;
 const DURABLE = /\b(?:decid(?:e|ed|ing|iamo|iamo di)|prefer(?:s|red|enza)?|always|never|must|should|will|commit(?:ted|ment)?|agreed|conclusion|policy|standard|regola|preferisc|decidiamo|mai|sempre|dobbiamo|impegno)\b/i;
+const PROJECT_SCOPED = /\b(?:project-specific|this project|the project)\b/i;
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
@@ -109,6 +110,10 @@ export function validateClaims(value, { maxClaims = 2 } = {}) {
 export function duplicateCanonicalClaim(claim, records) {
   const candidate = normalizeClaimText(claim);
   return (Array.isArray(records) ? records : []).some(item => normalizeClaimText(item?.record?.claim?.text ?? item?.claim?.text) === candidate);
+}
+
+export function sharedDurableClaim(claim) {
+  return !PROJECT_SCOPED.test(String(claim || ''));
 }
 
 export function extractionFingerprint({ sessionId, claim }) {

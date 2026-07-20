@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, normalizeState, proposalIdempotencyKey, reserveModelBudget, settleModelBudget, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
+import { buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, normalizeState, proposalIdempotencyKey, reserveModelBudget, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
 import { buildBoundedModelInput, evaluatePlanUsage } from './amf-raw-memory-extractor.mjs';
 
 const durable = [{ role: 'user', text: 'We decided to keep the extractor slow and cost bounded.' }, { role: 'assistant', text: 'Agreed: one conversation per tick and a daily ceiling.' }];
@@ -62,6 +62,11 @@ test('claims exclude operational material and records use shared global plus det
   const record = buildMemoryRecord({ sessionId: 'ses_123', transcript: 'decrypted transcript', claim, now: '2026-07-20T12:00:00Z' });
   assert.equal(record.scope.id, 'shared:global'); assert.equal(record.visibility, 'shared');
   assert.equal(proposalIdempotencyKey({ sessionId: 'ses_123', claim: claim.claim }), proposalIdempotencyKey({ sessionId: 'ses_123', claim: claim.claim }));
+});
+
+test('shared global extraction drops explicitly project-scoped claims', () => {
+  assert.equal(sharedDurableClaim('Project-specific agent guidance should describe this project.'), false);
+  assert.equal(sharedDurableClaim('Prefer reusable policy over a one-off integration.'), true);
 });
 
 test('dedup compares normalized decrypted claim content, not encrypted storage bytes', () => {
