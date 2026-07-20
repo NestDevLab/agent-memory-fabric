@@ -9,7 +9,7 @@ The deployment root contains three classes of content:
 | Content | Recovery source | Installer behavior |
 |---|---|---|
 | Tracked code | Git revision and image rebuild | Replaced in place |
-| `.env`, `.env.runtime`, `runtime/` | Small deployment-owned config backup | Preserved in place and copied to the config backup |
+| `.env`, `.env.runtime`, `runtime/` | Small deployment-owned config backup | Validated, bounded, preserved in place, and copied to the config backup |
 | `var/` | Platform disaster-recovery backup | Preserved in place; rejected if present in a release archive |
 
 Never rename or recursively copy the deployment root. In particular, never
@@ -49,10 +49,13 @@ node /tmp/amf-install-release.mjs \
   --revision <merged-sha>
 ```
 
-The dry-run fails unless the archive excludes every persistent path, required
-release files are present, the deployment root is the expected root-owned
-directory, and there is enough space to stage code. It does not create a
-configuration backup or change the live release.
+The backup root must already exist as an ordinary, owner-private `0700`
+directory outside the release tree. The dry-run fails unless the archive
+excludes every persistent path, contains only ordinary single-link files and
+directories, provides every required release file, the deployment root has the
+expected owner, the configuration snapshot stays within 16 MiB and 4,096
+files, and enough space exists to stage code plus that snapshot. It does not
+create a configuration backup or change the live release.
 
 ## Install
 
@@ -60,17 +63,29 @@ Run the same command without `--dry-run`. The installer:
 
 1. takes an exclusive deploy lock and stages source in a unique directory
    outside the live release;
-2. backs up only `.env`, `.env.runtime`, and `runtime/`;
-3. overlays tracked source without replacing the deployment root;
-4. removes obsolete code only when it was listed in the previous release
+2. recursively validates `.env`, `.env.runtime`, and `runtime/`, rejecting
+   aliases, special files, or a snapshot above the documented limits;
+3. copies that bounded configuration snapshot without following links;
+4. publishes tracked source with atomic file replacement without replacing the
+   deployment root;
+5. removes obsolete code only when it was listed in the previous release
    manifest;
-5. verifies that every persistent root inode, including
+6. rolls every source and manifest change back if any later installation check
+   fails;
+7. verifies that every persistent root inode, including
    `var/agent-memory-fabric`, are unchanged;
-6. enforces exactly `0711 root:root` on `/opt/agent-memory-fabric`.
+8. enforces exactly `0711 root:root` on `/opt/agent-memory-fabric`.
 
 The JSON result records the config backup path, installed file count, removed
 stale-file count, preserved data identity, and final root mode. Stop before
 building or recreating the container if the installer exits non-zero.
+
+If rollback itself fails, the installer returns `release_rollback_failed`,
+preserves the deploy lock, and retains the owner-private same-filesystem staging
+directory reported as `recovery_required`. Do not remove the lock or retry.
+Inspect and restore the retained source and manifest evidence first, verify the
+persistent roots, then clear the lock only through the reviewed recovery
+procedure.
 
 After installation, follow the release-specific build/recreate steps, install
 the shipped tmpfiles policy, and run the deployment-mode guard described in
