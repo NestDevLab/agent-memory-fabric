@@ -218,9 +218,9 @@ indexing runs on schedule, and a failed deploy cannot truncate application data.
 
 ### M1 — Freeze v3 contracts and safety gates
 
-- [ ] Publish the conversation-event v3 schema and invalid-payload fixtures.
-- [ ] Publish deterministic inclusion and exclusion rules for every supported source.
-- [ ] Publish attachment-reference and tombstone semantics.
+- [x] Publish the conversation-event v3 schema and invalid-payload fixtures.
+- [x] Publish deterministic inclusion and exclusion rules for every supported source.
+- [x] Publish attachment-reference and tombstone semantics.
 - [ ] Publish the content protection policy and canonical-memory schema revision.
 - [ ] Publish the archive adapter interface and shared conformance fixtures.
 - [ ] Publish the provider-neutral MCP schema and authorization matrix.
