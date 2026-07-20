@@ -18,6 +18,9 @@
     "room:team": {
       "backendUserId": "openmemory"
     },
+    "shared:global": {
+      "backendUserId": "openmemory"
+    },
     "person:alice": {
       "backendUserId": "openmemory"
     },

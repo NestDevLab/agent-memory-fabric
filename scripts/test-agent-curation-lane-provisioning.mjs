@@ -101,6 +101,15 @@ test('plan validates inputs and reports intended artifacts', () => {
   assert.match(plan.files.serviceUnit, /amf-curation-agent-vitae\.service$/);
 });
 
+test('shared global lane permits the automatic shared curation policy only', () => {
+  const { options } = fixture();
+  const plan = planAgentCurationLane({ ...options, laneName: 'raw-extractor', scope: 'shared:global' });
+  assert.equal(plan.autoScopeType, 'shared');
+  assert.equal(plan.autoVisibility, 'shared');
+  assert.equal(plan.autoScopeAlreadyPresent, true);
+  assert.equal(plan.autoVisibilityAlreadyPresent, true);
+});
+
 test('dry run mutates nothing', () => {
   const { options } = fixture();
   const before = fs.readFileSync(options.authRegistryPath, 'utf8');

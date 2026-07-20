@@ -128,6 +128,9 @@ Success uses `{ "ok": true, "data": ..., "meta": ... }`; errors use
 - `POST /v2/context/search` (interleaved canonical-memory and editorial-document recall)
 - `POST /v2/memory/proposals` (requires `Idempotency-Key`)
 - `POST /v2/ingest/raw-events` (requires `raw:ingest`)
+- `GET /v2/internal/extractor/sessions?limit=1&cursor=...` and
+  `GET /v2/internal/extractor/sessions/:id/transcript` (service-only,
+  `raw:extract`; redacted text only)
 - `GET /v2/memory/:id` (canonical record, rationale and expected revision)
 - `GET /v2/memory/proposals/:id` (status only; no record decryption)
 - `GET /v2/internal/curation/proposals?status=queued&limit=50&cursor=...`

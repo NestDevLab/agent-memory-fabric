@@ -230,6 +230,34 @@ test('v2 REST queues idempotently while canonical read never exposes proposal pa
   });
 });
 
+test('raw extractor can read only service-authorized redacted sessions', async () => {
+  const sessionReader = {
+    configured: true, kind: 'extractor-test-reader',
+    async search({ actor, ownerActors, context }) {
+      assert.equal(actor, 'service:raw-extractor'); assert.ok(ownerActors.includes('test-actor')); assert.equal(context, null);
+      return { items: [{ id: 'ses_extract', title: 'hidden', scope: 'main-lab', ownerActor: 'test-actor', conversationKind: 'session' }], nextCursor: 'signed-next' };
+    },
+    async get({ id, context }) { assert.equal(id, 'ses_extract'); assert.equal(context, null); return { id, scope: 'main-lab', ownerActor: 'test-actor' }; },
+    async transcript({ id, view, context }) { assert.equal(id, 'ses_extract'); assert.equal(view, 'redacted'); assert.equal(context, null); return { id, view, items: [{ role: 'user', text: 'We decided to keep it slow.' }], nextCursor: null }; }
+  };
+  await withServer(async ({ api, fabricStore, registry, writeRegistry }) => {
+    registry.rows.push({
+      token: 'extractor-token', active: true, actor: 'service:raw-extractor', mode: 'scoped',
+      allowedScopes: ['shared:global'], sessionOwnerActors: ['test-actor'],
+      permissions: ['raw:extract', 'memory:search', 'memory:propose', 'memory:status', 'purpose:memory_curation']
+    });
+    writeRegistry();
+    const headers = { authorization: 'Bearer extractor-token' };
+    const page = await api('/v2/internal/extractor/sessions?limit=1', { headers });
+    assert.equal(page.response.status, 200); assert.equal(page.body.data.items[0].id, 'ses_extract'); assert.equal(page.body.data.nextCursor, 'signed-next');
+    const transcript = await api('/v2/internal/extractor/sessions/ses_extract/transcript?limit=100', { headers });
+    assert.equal(transcript.response.status, 200); assert.equal(transcript.body.data.view, 'redacted'); assert.equal(transcript.body.data.items[0].text, 'We decided to keep it slow.');
+    const denied = await api('/v2/internal/extractor/sessions?limit=1');
+    assert.equal(denied.response.status, 403);
+    assert.ok(fabricStore.catalog.auditEvents.some(event => event.action === 'raw_extractor_transcript_read'));
+  }, { sessionReader });
+});
+
 test('document REST and MCP enforce revision, vault ACL, context binding, and audit', async () => {
   const documentStore = new MemoryDocumentStore();
   await withServer(async ({ api, fabricStore }) => {

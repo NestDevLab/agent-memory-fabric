@@ -840,6 +840,24 @@ function requireSessionPermission(policy) {
   throw error;
 }
 
+// The extractor is a dedicated service, not an alternate interactive session
+// reader.  It can receive only redacted user/assistant text through these
+// routes; RAW objects and decryption keys remain inside Fabric.
+function requireRawExtractorAccess(policy, policies) {
+  requirePermission(policy, 'raw:extract');
+  requirePurposePermission(policy, 'memory_curation');
+  if (!canReadScope(policy, 'shared:global') || !getScopeConfig('shared:global', policies)) {
+    const error = new Error('scope_forbidden');
+    error.status = 403;
+    throw error;
+  }
+  if (!Array.isArray(policy.sessionOwnerActors) || policy.sessionOwnerActors.length === 0) {
+    const error = new Error('sessions_forbidden');
+    error.status = 403;
+    throw error;
+  }
+}
+
 function requirePermission(policy, permission) {
   if (hasPermission(policy, permission)) return;
   const error = new Error('forbidden');
@@ -2002,6 +2020,44 @@ const requestHandler = async (req, res) => {
         requireIdempotencyKey: true
       });
       return json(res, proposal.duplicate ? 200 : 202, v2Envelope(requestId, { status: proposal.status, proposalId: proposal.id, duplicate: proposal.duplicate, idempotencyKey }));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (url.pathname === '/v2/internal/extractor/sessions' && req.method === 'GET') {
+    try {
+      requireRawExtractorAccess(policy, policies);
+      const limit = normalizeSessionLimit(url.searchParams.get('limit') || '1');
+      const ownerActors = authorizedSessionOwners(actor, policy);
+      const result = await sessionReader.search({ actor, ownerActors, query: '', cursor: url.searchParams.get('cursor') || null,
+        limit, from: null, to: null, purpose: 'memory_curation', context: null });
+      await auditRequired(fabricStore, { actor, action: 'raw_extractor_sessions_read', outcome: 'allowed', requestId,
+        details: { resultCount: result.items?.length || 0 } });
+      return jsonNoStore(res, 200, v2Envelope(requestId, { items: result.items || [], nextCursor: result.nextCursor || null }));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (pathnameParts[0] === 'v2' && pathnameParts[1] === 'internal' && pathnameParts[2] === 'extractor'
+      && pathnameParts[3] === 'sessions' && pathnameParts[4] && pathnameParts[5] === 'transcript'
+      && pathnameParts.length === 6 && req.method === 'GET') {
+    try {
+      requireRawExtractorAccess(policy, policies);
+      const sessionId = pathnameParts[4];
+      const ownerActors = authorizedSessionOwners(actor, policy);
+      // `get` proves the actor participates before the redacted decrypt.  No
+      // context token is accepted or needed for the service-only global lane.
+      await sessionReader.get({ actor, ownerActors, id: sessionId, purpose: 'memory_curation', context: null });
+      const transcript = await sessionReader.transcript({ actor, ownerActors, id: sessionId, view: 'redacted', query: '',
+        cursor: url.searchParams.get('cursor') || null, limit: normalizeSessionLimit(url.searchParams.get('limit') || '100'),
+        from: null, to: null, purpose: 'memory_curation', context: null });
+      await auditRequired(fabricStore, { actor, action: 'raw_extractor_transcript_read', outcome: 'allowed', requestId,
+        targetId: sessionId, details: { resultCount: transcript.items?.length || 0, view: 'redacted' } });
+      return jsonNoStore(res, 200, v2Envelope(requestId, transcript));
     } catch (error) {
       const failure = v2Error(requestId, error, 500);
       return jsonNoStore(res, failure.status, failure.body);
