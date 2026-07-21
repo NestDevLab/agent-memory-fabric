@@ -1,6 +1,6 @@
 # Agent Memory Fabric Roadmap and Implementation Plan
 
-Status: active; M1 accepted, M2 next
+Status: active; M2 accepted, M3 next
 Audience: maintainers, contributors, and operators
 Maintenance rule: update this checklist in the same change that completes a roadmap item.
 
@@ -233,11 +233,11 @@ security review has no unresolved blocking finding.
 
 ### M2 — Pause legacy growth without losing recovery state
 
-- [ ] Stop all legacy v2 collectors before archive implementation begins.
-- [ ] Preserve collector cursors, outboxes, acknowledgements, and dead letters unchanged.
-- [ ] Record signed pause manifests and last-known checkpoints.
-- [ ] Report health as a migration pause or degraded state, never as healthy.
-- [ ] Verify that native source transcripts retain the paused interval.
+- [x] Stop all legacy v2 collectors before archive implementation begins.
+- [x] Preserve collector cursors, outboxes, acknowledgements, and dead letters unchanged.
+- [x] Record signed pause manifests and last-known checkpoints.
+- [x] Report health as a migration pause or degraded state, never as healthy.
+- [x] Verify that native source transcripts retain the paused interval.
 
 Acceptance: no new v2 rows are created, all replay state is recoverable, and no
 source transcript is altered or deleted.
