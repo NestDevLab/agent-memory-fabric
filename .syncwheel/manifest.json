@@ -389,7 +389,9 @@
       "target_remote": "origin",
       "target_branch": "main",
       "integration_branch": "main-integration",
-      "commits": [],
+      "commits": [
+        "48bf223d22a5ae6b93b9fa1a2022a172069423c2"
+      ],
       "meta": {
         "purpose": "Pause legacy v2 growth with signed recovery evidence"
       }
