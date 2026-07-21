@@ -1,6 +1,6 @@
 # Agent Memory Fabric Roadmap and Implementation Plan
 
-Status: active; M2 accepted, M3 next
+Status: active; M2 accepted, M3 in progress
 Audience: maintainers, contributors, and operators
 Maintenance rule: update this checklist in the same change that completes a roadmap item.
 
@@ -244,7 +244,7 @@ source transcript is altered or deleted.
 
 ### M3 — Implement the minimal conversation archive
 
-- [ ] Implement deterministic filters for each supported transcript format.
+- [x] Implement deterministic filters for each supported transcript format.
 - [ ] Implement owner-only plaintext outboxes with authenticated delivery.
 - [ ] Add `POST /v3/ingest/conversation-events` with bounded inputs.
 - [ ] Implement PostgreSQL and SQLite archive adapters.
