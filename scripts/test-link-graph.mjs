@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { LinkGraph } from '../src/link-graph.mjs';
+import { LinkGraph, createUnconfiguredLinkGraph, createLinkGraphFromEnv } from '../src/link-graph.mjs';
 import { resolveTargets } from './amf-reindex-graph.mjs';
 
 const URL = process.env.AMF_TEST_DATABASE_URL;
@@ -112,6 +112,27 @@ maybe('shortestPath returns [] when unreachable within depth', async () => {
   const p = await g.shortestPath({ fromId: 'doc_a', toId: 'doc_missing', vaults: ['work-wiki'], maxDepth: 4 });
   assert.deepEqual(p, []);
   await g.close();
+});
+
+maybe('expand returns graph-tagged neighbors of seeds, capped', async () => {
+  const g = await fresh(); await seedChain(g);
+  const e = await g.expand({ seedDocumentIds: ['doc_a'], vaults: ['work-wiki'], limit: 10 });
+  assert.deepEqual(e.map(r => r.documentId).sort(), ['doc_b']);
+  assert.equal(e[0].source, 'graph');
+  assert.equal(e[0].seed, 'doc_a');
+  await g.close();
+});
+
+test('createUnconfiguredLinkGraph is inert', async () => {
+  const g = createUnconfiguredLinkGraph();
+  assert.equal(g.configured, false);
+  assert.deepEqual(await g.expand({ seedDocumentIds: ['x'], vaults: ['v'], limit: 5 }), []);
+  assert.deepEqual(await g.neighbors({ documentId: 'x', vaults: ['v'] }), []);
+});
+
+test('createLinkGraphFromEnv unconfigured when disabled', () => {
+  assert.equal(createLinkGraphFromEnv({}).configured, false);
+  assert.equal(createLinkGraphFromEnv({ AMF_LINK_GRAPH_ENABLED: 'true', AMF_LINK_GRAPH_ENGINE: 'falkor' }).configured, false);
 });
 
 test('resolveTargets resolves exact and .md-suffixed paths, keeps danglers', () => {
