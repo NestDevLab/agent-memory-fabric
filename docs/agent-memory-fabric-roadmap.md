@@ -245,7 +245,7 @@ source transcript is altered or deleted.
 ### M3 — Implement the minimal conversation archive
 
 - [x] Implement deterministic filters for each supported transcript format.
-- [ ] Implement owner-only plaintext outboxes with authenticated delivery.
+- [x] Implement owner-only plaintext outboxes with authenticated delivery.
 - [ ] Add `POST /v3/ingest/conversation-events` with bounded inputs.
 - [ ] Implement PostgreSQL and SQLite archive adapters.
 - [ ] Run the complete adapter conformance suite against both implementations.
