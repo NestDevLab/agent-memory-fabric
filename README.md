@@ -125,7 +125,10 @@ Success uses `{ "ok": true, "data": ..., "meta": ... }`; errors use
 `{ "ok": false, "error": { "code", "message", "details" }, "meta": ... }`.
 
 - `POST /v2/memory/search`
-- `POST /v2/context/search` (interleaved canonical-memory and editorial-document recall)
+- `POST /v2/context/search` (interleaved canonical-memory and editorial-document recall;
+  when `AMF_LINK_GRAPH_ENABLED=true`, unions link-graph-expanded documents from the
+  returned document set as additional `source:'graph'` items, deduped against results
+  already present; adds a `graph` count to the response `sources`)
 - `POST /v2/memory/proposals` (requires `Idempotency-Key`)
 - `POST /v2/ingest/raw-events` (requires `raw:ingest`)
 - `GET /v2/internal/extractor/sessions?limit=1&cursor=...` and

@@ -10,6 +10,7 @@ import { validateAmfMemoryRecord } from './amf-memory-record-validator.mjs';
 import { createCanonicalPamBridgeFromEnv, createReceiptCoordinatorFromEnv, createUnconfiguredCanonicalStore } from './canonical-memory-bridge.mjs';
 import { createContextVerifierFromEnv, createUnconfiguredContextVerifier } from './context-token.mjs';
 import { createDocumentStoreFromEnv, createUnconfiguredDocumentStore } from './document-store.mjs';
+import { createLinkGraphFromEnv, createUnconfiguredLinkGraph } from './link-graph.mjs';
 import { PURPOSES, buildContextRequest, exactContextIntersection, normalizeScopeList, scopeRequiresContext } from './access-contract.mjs';
 import { RAW_EVENT_HTTP_MAX_BODY_BYTES } from './ingest/raw-event-contract.mjs';
 import { validatePamRuntimePrivateDirFromEnv } from './operator/pam-runtime-private-dir.mjs';
@@ -638,7 +639,7 @@ function buildToolsListResult() {
 }
 
 async function executeMcpMethod({ body, actor, policy, policies, backend, fabricStore, canonicalStore, documentStore,
-  contextVerifier, routeManifestPath, sessionReader, migrationPause, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
+  linkGraph, contextVerifier, routeManifestPath, sessionReader, migrationPause, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
   const method = body.method;
   const id = body.id ?? null;
 
@@ -760,7 +761,7 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
 
     if (name === 'context_search') {
       const result = await performContextSearch({ actor, policy, policies, fabricStore, canonicalStore, documentStore,
-        contextVerifier, request: args, requestId, transport: 'mcp' });
+        linkGraph, contextVerifier, request: args, requestId, transport: 'mcp' });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
     }
 
@@ -968,16 +969,39 @@ function interleaveContextResults(memories, documents, limit) {
   for (let index = 0; items.length < limit && (index < memories.length || index < documents.length); index += 1) {
     if (index < memories.length) items.push({ kind: 'memory', sourceRank: index + 1, id: memories[index].id,
       scope: memories[index].scope, provenance: memories[index].provenance, record: memories[index] });
-    if (items.length < limit && index < documents.length) items.push({ kind: 'document', sourceRank: index + 1,
-      id: documents[index].documentId, revision: documents[index].revision, vaultId: documents[index].vaultId,
-      path: documents[index].path, provenance: documents[index].provenance,
-      snippet: documentSnippet(documents[index].text, documents[index].query) });
+    if (items.length < limit && index < documents.length) {
+      const document = documents[index];
+      const item = { kind: 'document', sourceRank: index + 1,
+        id: document.documentId, revision: document.revision, vaultId: document.vaultId,
+        path: document.path, provenance: document.provenance,
+        snippet: documentSnippet(document.text, document.query) };
+      if (document.source === 'graph') {
+        item.source = 'graph'; item.documentId = document.documentId;
+        item.distance = document.distance; item.seed = document.seed;
+      }
+      items.push(item);
+    }
   }
   return items;
 }
 
+export async function buildContextSearchResult({ memoryResult, documents, linkGraph, vaults, limit }) {
+  const preparedDocuments = documents.map(d => ({ ...d }));
+  const present = new Set(preparedDocuments.map(d => d.documentId));
+  let graphItems = [];
+  if (linkGraph?.configured) {
+    const expanded = await linkGraph.expand({ seedDocumentIds: [...present], vaults, limit });
+    graphItems = expanded.filter(g => !present.has(g.documentId));
+  }
+  const items = interleaveContextResults(memoryResult.items, [...preparedDocuments, ...graphItems], limit);
+  return {
+    items, nextCursor: null, scopes: memoryResult.scopes, vaultIds: [...vaults].sort(),
+    sources: { memory: memoryResult.items.length, document: documents.length, graph: graphItems.length }
+  };
+}
+
 async function performContextSearch({ actor, policy, policies, fabricStore, canonicalStore, documentStore,
-  contextVerifier, request, contextToken = request.contextToken, requestId, transport }) {
+  contextVerifier, linkGraph = defaultLinkGraph, request, contextToken = request.contextToken, requestId, transport }) {
   try {
     requirePermission(policy, 'memory:search');
     requirePermission(policy, 'documents:search');
@@ -993,11 +1017,10 @@ async function performContextSearch({ actor, policy, policies, fabricStore, cano
       query: request.query, policy, policies, canonicalStore, context, limit });
     const documents = await documentStore.search({ query: request.query, vaultIds: request.vaultIds, limit });
     const preparedDocuments = documents.map(document => ({ ...document, query: request.query }));
-    const items = interleaveContextResults(memoryResult.items, preparedDocuments, limit);
-    const result = { items, nextCursor: null, scopes: memoryResult.scopes, vaultIds: [...request.vaultIds].sort(),
-      sources: { memory: memoryResult.items.length, document: documents.length } };
+    const result = await buildContextSearchResult({ memoryResult, documents: preparedDocuments, linkGraph,
+      vaults: request.vaultIds, limit });
     await auditRequired(fabricStore, { actor, action: 'context_search', outcome: 'allowed', requestId,
-      details: { scopes: result.scopes, vaultIds: result.vaultIds, resultCount: items.length, transport } });
+      details: { scopes: result.scopes, vaultIds: result.vaultIds, resultCount: result.items.length, transport } });
     return result;
   } catch (error) {
     if (error?.message !== 'audit_unavailable') await auditRequired(fabricStore, { actor, action: 'context_search',
@@ -1638,8 +1661,10 @@ const defaultSessionReader = createUnconfiguredSessionReader();
 const defaultCanonicalStore = createUnconfiguredCanonicalStore();
 const defaultContextVerifier = createUnconfiguredContextVerifier();
 const defaultDocumentStore = createUnconfiguredDocumentStore();
+const defaultLinkGraph = process.env.AMF_LINK_GRAPH_ENABLED === 'true'
+  ? createLinkGraphFromEnv(process.env) : createUnconfiguredLinkGraph();
 
-function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null } = {}) {
+function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, linkGraph = defaultLinkGraph, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null } = {}) {
   if (!Buffer.isBuffer(curationCursorKey) || curationCursorKey.length < 32) throw new Error('curation_cursor_key_invalid');
 if (!Number.isSafeInteger(rawIngestBodyBytes) || rawIngestBodyBytes < 1024 || rawIngestBodyBytes > 16 * 1024 * 1024) throw new Error('raw_ingest_body_limit_invalid');
 if (!isVerifiedMigrationPause(migrationPause)) {
@@ -1799,7 +1824,7 @@ const requestHandler = async (req, res) => {
       const allowed = new Set(['query', 'scopes', 'vaultIds', 'purpose', 'limit']);
       if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !allowed.has(key))) throw Object.assign(new Error('invalid_request'), { status: 400 });
       const result = await performContextSearch({ actor, policy, policies, fabricStore, canonicalStore, documentStore,
-        contextVerifier, request: body, contextToken: getAccessContextToken(req, url, policy), requestId, transport: 'rest' });
+        linkGraph, contextVerifier, request: body, contextToken: getAccessContextToken(req, url, policy), requestId, transport: 'rest' });
       return jsonNoStore(res, 200, v2Envelope(requestId, result));
     } catch (error) {
       const failure = v2Error(requestId, error, 500);
@@ -2400,6 +2425,7 @@ const requestHandler = async (req, res) => {
         fabricStore,
         canonicalStore,
         documentStore,
+        linkGraph,
         contextVerifier,
         routeManifestPath,
         sessionReader,
@@ -2468,6 +2494,7 @@ const requestHandler = async (req, res) => {
         fabricStore,
         canonicalStore,
         documentStore,
+        linkGraph,
         contextVerifier,
         routeManifestPath,
         sessionReader,
@@ -2580,7 +2607,7 @@ if (isMain) {
         ? createDocumentStoreFromEnv(process.env) : createUnconfiguredDocumentStore();
       const runtimeContextVerifier = createContextVerifierFromEnv(process.env);
       runtimeReceiptCoordinator = createReceiptCoordinatorFromEnv({ canonicalStore: runtimeCanonicalStore, proposalStore: runtimeFabricStore });
-      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore, canonicalStore: runtimeCanonicalStore, documentStore: runtimeDocumentStore, contextVerifier: runtimeContextVerifier, receiptCoordinator: runtimeReceiptCoordinator, migrationPause: runtimeMigrationPause });
+      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore, canonicalStore: runtimeCanonicalStore, documentStore: runtimeDocumentStore, linkGraph: defaultLinkGraph, contextVerifier: runtimeContextVerifier, receiptCoordinator: runtimeReceiptCoordinator, migrationPause: runtimeMigrationPause });
     } catch (error) {
       console.error(`agent-memory-fabric disabled: configuration failed: ${safeError(error)?.code || 'internal_error'}`);
       process.exitCode = 78;

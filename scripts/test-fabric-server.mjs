@@ -391,7 +391,7 @@ test('context search interleaves canonical memories and bounded document candida
     assert.equal(searched.body.data.items[1].path, documentFixture.create.document.path);
     assert.match(searched.body.data.items[1].snippet, /Memory Fabric/);
     assert.equal(searched.body.data.items[1].text, undefined);
-    assert.deepEqual(searched.body.data.sources, { memory: 1, document: 1 });
+    assert.deepEqual(searched.body.data.sources, { memory: 1, document: 1, graph: 0 });
 
     const listed = await api('/mcp/test-client/context-search', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) });
     assert.ok(listed.body.result.tools.some(tool => tool.name === 'context_search'));
