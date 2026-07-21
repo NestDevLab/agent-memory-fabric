@@ -91,3 +91,19 @@ hook is out of scope for this engine.
 DB-backed tests need a reachable Postgres and must run on the compose network
 (`127.0.0.1` will not connect to the container). See
 `docs/benchmark-link-graph.md` for the container-runner pattern.
+
+## Verified live (2026-07-21)
+
+Exercised end-to-end against the live corpus (~16k edges, `work-wiki`) with the
+engine enabled, driving `context_search` over the MCP transport. The graph
+source appears in the response `sources` count:
+
+| query | memory | document | graph |
+|---|---|---|---|
+| `agentBerry` | 0 | 10 | 10 |
+| `HolmesGPT` | 0 | 25 | 20 |
+
+A non-zero `graph` count confirms `expand()` ran: the returned documents were
+one-hop wikilink-expanded, deduped against results already present, and unioned
+in as `source:'graph'` items. With the engine disabled the `graph` count is
+absent and `context_search` is document-interleave only.
