@@ -4,7 +4,10 @@ node_modules
 var
 .env
 .env.*
-config
+config/*
+!config/contracts/
+config/contracts/*
+!config/contracts/amf.conversation-event-v3.schema.json
 docs
 scripts/*
 !scripts/amf-reindex-semantic.mjs

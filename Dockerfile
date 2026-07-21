@@ -8,6 +8,7 @@ RUN npm ci --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 
 COPY --chown=node:node src/ ./src/
+COPY --chown=node:node config/contracts/amf.conversation-event-v3.schema.json ./config/contracts/amf.conversation-event-v3.schema.json
 COPY --chown=node:node scripts/amf-reindex-semantic.mjs ./scripts/amf-reindex-semantic.mjs
 RUN mkdir -p /var/lib/agent-memory-fabric \
     && chown node:node /var/lib/agent-memory-fabric
