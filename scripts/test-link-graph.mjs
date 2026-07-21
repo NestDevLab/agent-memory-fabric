@@ -79,6 +79,41 @@ maybe('backlinks returns sources pointing at target', async () => {
   await g.close();
 });
 
+maybe('related ranks by shared targets', async () => {
+  const g = await fresh();
+  await g.pool.query('TRUNCATE agent_memory_fabric.document_links_v1');
+  await g.replaceDocumentEdges('doc_a', 'work-wiki', 'A.md', [
+    { targetRaw: 'X', targetPath: 'X.md', dstDocumentId: 'doc_x', alias: null },
+    { targetRaw: 'Y', targetPath: 'Y.md', dstDocumentId: 'doc_y', alias: null }
+  ]);
+  await g.replaceDocumentEdges('doc_b', 'work-wiki', 'B.md', [
+    { targetRaw: 'X', targetPath: 'X.md', dstDocumentId: 'doc_x', alias: null },
+    { targetRaw: 'Y', targetPath: 'Y.md', dstDocumentId: 'doc_y', alias: null }
+  ]);
+  await g.replaceDocumentEdges('doc_c', 'work-wiki', 'C.md', [
+    { targetRaw: 'X', targetPath: 'X.md', dstDocumentId: 'doc_x', alias: null }
+  ]);
+  const r = await g.related({ documentId: 'doc_a', vaults: ['work-wiki'], limit: 10 });
+  assert.deepEqual(r, [{ documentId: 'doc_b', shared: 2 }, { documentId: 'doc_c', shared: 1 }]);
+  await g.close();
+});
+
+maybe('shortestPath finds A..C over chain', async () => {
+  const g = await fresh();
+  await g.replaceDocumentEdges('doc_a', 'work-wiki', 'A.md', [{ targetRaw: 'B', targetPath: 'B.md', dstDocumentId: 'doc_b', alias: null }]);
+  await g.replaceDocumentEdges('doc_b', 'work-wiki', 'B.md', [{ targetRaw: 'C', targetPath: 'C.md', dstDocumentId: 'doc_c', alias: null }]);
+  const p = await g.shortestPath({ fromId: 'doc_a', toId: 'doc_c', vaults: ['work-wiki'], maxDepth: 4 });
+  assert.deepEqual(p, ['doc_a', 'doc_b', 'doc_c']);
+  await g.close();
+});
+
+maybe('shortestPath returns [] when unreachable within depth', async () => {
+  const g = await fresh(); await seedChain(g);
+  const p = await g.shortestPath({ fromId: 'doc_a', toId: 'doc_missing', vaults: ['work-wiki'], maxDepth: 4 });
+  assert.deepEqual(p, []);
+  await g.close();
+});
+
 test('resolveTargets resolves exact and .md-suffixed paths, keeps danglers', () => {
   const pathToDocId = new Map([['B.md', 'doc_b'], ['Projects/agentBerry.md', 'doc_ab']]);
   const edges = resolveTargets({
