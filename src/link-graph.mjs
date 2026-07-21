@@ -115,5 +115,48 @@ export class LinkGraph {
     return result.rows.map(r => ({ documentId: r.src_document_id }));
   }
 
+  async related({ documentId, vaults, limit = 10 }) {
+    const allowed = [...new Set((Array.isArray(vaults) ? vaults : []).map(String))];
+    if (!allowed.length) return [];
+    const bounded = Math.max(1, Math.min(100, Number(limit) || 10));
+    const result = await this.pool.query(
+      `WITH mine AS (
+         SELECT dst_document_id FROM ${SCHEMA}.${TABLE}
+          WHERE src_document_id=$1 AND src_vault_id=ANY($2::text[]) AND dst_document_id IS NOT NULL
+       )
+       SELECT e.src_document_id, COUNT(*)::int AS shared
+         FROM ${SCHEMA}.${TABLE} e JOIN mine ON e.dst_document_id=mine.dst_document_id
+        WHERE e.src_vault_id=ANY($2::text[]) AND e.src_document_id <> $1
+        GROUP BY e.src_document_id ORDER BY shared DESC, e.src_document_id LIMIT $3`,
+      [documentId, allowed, bounded]
+    );
+    return result.rows.map(r => ({ documentId: r.src_document_id, shared: r.shared }));
+  }
+
+  async shortestPath({ fromId, toId, vaults, maxDepth = 4 }) {
+    const allowed = [...new Set((Array.isArray(vaults) ? vaults : []).map(String))];
+    if (!allowed.length) return [];
+    const bounded = Math.max(1, Math.min(4, Number(maxDepth) || 4));
+    const result = await this.pool.query(
+      `WITH RECURSIVE undirected(a, b) AS (
+         SELECT src_document_id, dst_document_id FROM ${SCHEMA}.${TABLE}
+           WHERE src_vault_id=ANY($3::text[]) AND dst_document_id IS NOT NULL
+         UNION ALL
+         SELECT dst_document_id, src_document_id FROM ${SCHEMA}.${TABLE}
+           WHERE src_vault_id=ANY($3::text[]) AND dst_document_id IS NOT NULL
+       ),
+       bfs(node, path, depth) AS (
+         SELECT $1::text, ARRAY[$1::text], 0
+         UNION ALL
+         SELECT u.b, w.path || u.b, w.depth+1
+           FROM undirected u JOIN bfs w ON u.a=w.node
+          WHERE w.depth < $4 AND NOT (u.b = ANY(w.path))
+       )
+       SELECT path FROM bfs WHERE node=$2 ORDER BY depth LIMIT 1`,
+      [fromId, toId, allowed, bounded]
+    );
+    return result.rows[0] ? result.rows[0].path : [];
+  }
+
   async close() { if (this._closed) return; this._closed = true; await this.pool.end?.(); }
 }
