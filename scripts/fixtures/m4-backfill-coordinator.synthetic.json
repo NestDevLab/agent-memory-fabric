@@ -1,0 +1,18 @@
+{
+  "schema": "amf.m4-backfill-coordinator-fixture/v1",
+  "description": "Synthetic, content-free gate and valid event metadata for coordinator tests.",
+  "gate": {
+    "schema": "amf.m4-backfill-gate/v1",
+    "state": "approved",
+    "runId": "m4-run-001",
+    "phase": "v2-archive",
+    "pauseEvidence": { "manifestId": "pause-manifest-001", "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "signature": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "rollbackEvidence": { "manifestId": "rollback-manifest-001", "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "signature": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "sourceCheckpoint": { "id": "source-checkpoint-001", "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+    "targetCheckpoint": { "id": "target-checkpoint-001", "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }
+  },
+  "rows": [
+    { "sequence": 1, "checkpoint": { "id": "row-checkpoint-1", "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }, "event": { "eventId": "cevt_backfill0001", "integrity": { "payloadDigest": "sha256:7061796c6f61642d316161616161616161616161616161616161616161616161" } } },
+    { "sequence": 2, "checkpoint": { "id": "row-checkpoint-2", "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }, "event": { "eventId": "cevt_backfill0002", "integrity": { "payloadDigest": "sha256:7061796c6f61642d326161616161616161616161616161616161616161616161" } } }
+  ]
+}
