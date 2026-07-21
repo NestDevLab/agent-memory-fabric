@@ -56,9 +56,35 @@ an event is expired when `expiresAt <= cutoff`; it is retained only when
 `expiresAt > cutoff`. `sourceOccurredAt` is ordering metadata, never retention
 eligibility.
 
+Edited and replacement events are immutable. A replacement hides its referenced
+target from every archive list, including after the replacement itself expires;
+chains therefore expose only their current visible projection and never
+resurrect superseded content. An injected archive remains caller-owned by
+default: server shutdown does not close it unless the server explicitly created
+and owns that archive instance.
+
 PostgreSQL and SQLite are alternative adapters selected one at a time. They
 never dual-write or fall back. Adapter names never appear in agent-facing
 requests, results, item projections, cursors, conflicts, or audit records.
+
+The v3 HTTP route accepts `Idempotency-Key: cevt_...` and deterministically
+derives the archive-only `cai_...` key by replacing the prefix. Archive retries
+remain exact only for that same internal key, event ID, and payload digest; the
+derived key never appears in the HTTP acknowledgement.
+
+`POST /v3/ingest/conversation-events` is gated by bearer permission
+`conversation:ingest` before the server reads the request body. The injected
+endpoint then enforces an exact JSON content type, a bounded byte length and
+read timeout, an optional request HMAC when configured, event integrity and
+replay verification, source-instance authorization, and exact event-ID
+idempotency. The default endpoint bounds are 256 KiB and 10 seconds; callers
+may select only validated bounds when constructing the handler.
+
+Successful writes return a content-free acknowledgement with the event ID,
+payload digest, and `stored` or `duplicate` status. Authorization, validation,
+timeout, storage, audit, and conflict failures never return visible text,
+signatures, nonces, archive-only keys, adapter names, or stored evidence. A
+visible conflict is limited to the event ID and the three contract digests.
 
 ## Executable conformance
 

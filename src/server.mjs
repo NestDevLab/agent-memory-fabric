@@ -14,6 +14,7 @@ import { PURPOSES, buildContextRequest, exactContextIntersection, normalizeScope
 import { RAW_EVENT_HTTP_MAX_BODY_BYTES } from './ingest/raw-event-contract.mjs';
 import { validatePamRuntimePrivateDirFromEnv } from './operator/pam-runtime-private-dir.mjs';
 import { isVerifiedMigrationPause, loadVerifiedMigrationPauseFromEnv } from './migration-pause.mjs';
+import { CONVERSATION_EVENT_V3_PATH } from './ingest/http-conversation-event-v3-endpoint.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
@@ -1639,7 +1640,8 @@ const defaultCanonicalStore = createUnconfiguredCanonicalStore();
 const defaultContextVerifier = createUnconfiguredContextVerifier();
 const defaultDocumentStore = createUnconfiguredDocumentStore();
 
-function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null } = {}) {
+function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), conversationEventIngest = null, clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null } = {}) {
+  if (conversationEventIngest !== null && typeof conversationEventIngest !== 'function') throw new Error('conversation_event_ingest_invalid');
   if (!Buffer.isBuffer(curationCursorKey) || curationCursorKey.length < 32) throw new Error('curation_cursor_key_invalid');
 if (!Number.isSafeInteger(rawIngestBodyBytes) || rawIngestBodyBytes < 1024 || rawIngestBodyBytes > 16 * 1024 * 1024) throw new Error('raw_ingest_body_limit_invalid');
 if (!isVerifiedMigrationPause(migrationPause)) {
@@ -1734,6 +1736,11 @@ const requestHandler = async (req, res) => {
 
   const actor = authContext.actor;
   const policy = authContext.policy;
+  if (url.pathname === CONVERSATION_EVENT_V3_PATH) {
+    if (!hasPermission(policy, 'conversation:ingest')) return json(res, 403, { error: 'forbidden' });
+    if (!conversationEventIngest) return json(res, 503, { error: 'archive_unconfigured' });
+    return conversationEventIngest(req, res, url, { actor });
+  }
 
   if (url.pathname === '/v2/status' && req.method === 'GET') {
     try {
