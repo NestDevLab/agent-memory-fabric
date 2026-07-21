@@ -14,6 +14,7 @@
   "$defs": {
     "contentClass": { "enum": ["conversation", "proposal", "canonical-memory", "document"] },
     "codec": { "enum": ["plaintext", "aes-256-gcm"] },
+    "compression": { "enum": ["deflate-raw"] },
     "sourceInstanceId": { "type": "string", "pattern": "^src_[a-z0-9][a-z0-9_-]{7,127}$" },
     "keyRef": { "type": "string", "pattern": "^key:[A-Za-z0-9][A-Za-z0-9._-]{2,127}$" },
     "defaults": {
@@ -33,12 +34,14 @@
         "enabled": { "type": "boolean" },
         "codec": { "$ref": "#/$defs/codec" },
         "writeKeyRef": { "$ref": "#/$defs/keyRef" },
-        "readKeyRefs": { "type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": { "$ref": "#/$defs/keyRef" } }
+        "readKeyRefs": { "type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": { "$ref": "#/$defs/keyRef" } },
+        "compression": { "$ref": "#/$defs/compression" },
+        "readPlaintext": { "type": "boolean" }
       },
       "allOf": [
         {
           "if": { "properties": { "codec": { "const": "plaintext" } }, "required": ["codec"] },
-          "then": { "not": { "anyOf": [{ "required": ["writeKeyRef"] }, { "required": ["readKeyRefs"] }] } }
+          "then": { "not": { "anyOf": [{ "required": ["writeKeyRef"] }, { "required": ["readKeyRefs"] }, { "required": ["compression"] }, { "required": ["readPlaintext"] }] } }
         },
         {
           "if": { "properties": { "enabled": { "const": true }, "codec": { "const": "aes-256-gcm" } }, "required": ["enabled", "codec"] },
@@ -46,7 +49,7 @@
         },
         {
           "if": { "properties": { "enabled": { "const": false } }, "required": ["enabled"] },
-          "then": { "not": { "anyOf": [{ "required": ["writeKeyRef"] }, { "required": ["readKeyRefs"] }] } }
+          "then": { "not": { "anyOf": [{ "required": ["writeKeyRef"] }, { "required": ["readKeyRefs"] }, { "required": ["compression"] }, { "required": ["readPlaintext"] }] } }
         }
       ]
     }

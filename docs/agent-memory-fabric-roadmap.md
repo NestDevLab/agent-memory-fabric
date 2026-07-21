@@ -1,6 +1,6 @@
 # Agent Memory Fabric Roadmap and Implementation Plan
 
-Status: active; M2 accepted, M3 in progress
+Status: active; M3 accepted, M4 next
 Audience: maintainers, contributors, and operators
 Maintenance rule: update this checklist in the same change that completes a roadmap item.
 
@@ -258,9 +258,9 @@ source transcript is altered or deleted.
 - [x] Retry PostgreSQL schema initialization after a transient first-touch failure.
 - [x] Preserve the v2 session-read API as a compatibility view over v3 data.
 - [x] Add audit-outage injection tests and prove audited operations fail closed.
-- [ ] Add key-rotation drills for every policy class that enables encryption.
-- [ ] Measure representative storage, filesystem-block, and query costs.
-- [ ] Enable compression before encryption only where the measurement justifies it.
+- [x] Add key-rotation drills for every policy class that enables encryption.
+- [x] Measure representative storage, filesystem-block, and query costs.
+- [x] Enable compression before encryption only where the measurement justifies it.
 
 Acceptance: the same fixtures produce equivalent observable behavior on both
 adapters, excluded content never crosses the filter, and recovery tests pass.
@@ -275,6 +275,7 @@ adapters, excluded content never crosses the filter, and recovery tests pass.
 - [ ] Take and restore-test one recovery copy of the old archive and one of the new archive.
 - [ ] Switch session reads and extraction to the v3 archive.
 - [ ] Observe a bounded canary period with queue, latency, and error thresholds.
+- [ ] Close plaintext migration reads for encrypted selectors only after reconciliation succeeds.
 - [ ] Remove only legacy transcript rows and blobs proven unreferenced by the catalog.
 - [ ] Preserve proposal, canonical-memory, and document data that shares storage.
 
