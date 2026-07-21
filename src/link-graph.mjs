@@ -158,5 +158,48 @@ export class LinkGraph {
     return result.rows[0] ? result.rows[0].path : [];
   }
 
+  async expand({ seedDocumentIds, vaults, limit }) {
+    const seeds = [...new Set((Array.isArray(seedDocumentIds) ? seedDocumentIds : []).map(String))];
+    if (!seeds.length) return [];
+    const cap = Math.max(0, Math.min(Number(limit) || this.maxExpansion, this.maxExpansion));
+    if (!cap) return [];
+    const seen = new Set(seeds);
+    const out = [];
+    for (const seed of seeds) {
+      const hits = await this.neighbors({ documentId: seed, vaults, depth: this.maxDepth });
+      for (const hit of hits) {
+        if (seen.has(hit.documentId)) continue;
+        seen.add(hit.documentId);
+        out.push({ documentId: hit.documentId, source: 'graph', distance: hit.distance, seed });
+        if (out.length >= cap) return out;
+      }
+    }
+    return out;
+  }
+
   async close() { if (this._closed) return; this._closed = true; await this.pool.end?.(); }
+}
+
+export function createUnconfiguredLinkGraph() {
+  return {
+    configured: false,
+    async neighbors() { return []; },
+    async backlinks() { return []; },
+    async related() { return []; },
+    async shortestPath() { return []; },
+    async expand() { return []; },
+    async close() {}
+  };
+}
+
+export function createLinkGraphFromEnv(env = process.env) {
+  if (String(env.AMF_LINK_GRAPH_ENABLED || '').trim() !== 'true') return createUnconfiguredLinkGraph();
+  if (String(env.AMF_LINK_GRAPH_ENGINE || 'postgres').trim() === 'falkor') return createUnconfiguredLinkGraph();
+  const connectionString = String(env.AMF_CATALOG_DATABASE_URL || '').trim();
+  if (!connectionString) throw error('link_graph_database_url_required');
+  return new LinkGraph({
+    connectionString,
+    maxDepth: Math.max(1, Math.min(4, Number(env.AMF_LINK_GRAPH_MAX_DEPTH) || 1)),
+    maxExpansion: Math.max(1, Math.min(200, Number(env.AMF_LINK_GRAPH_MAX_EXPANSION) || 20))
+  });
 }
