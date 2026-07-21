@@ -1,0 +1,39 @@
+{
+  "schema": "amf.m4-v2-conversation-projector-fixture/v1",
+  "description": "Synthetic, content-free normalized v2 observation fixture.",
+  "observations": [
+    {
+      "eventId": "evt_1111111111111111111111111111111111111111111111111111111111111111",
+      "sessionId": "ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sourceTag": "synthetic-k1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "migrationSequence": 1,
+      "projection": {
+        "schema": "amf.raw-event-projection/v2",
+        "eventId": "evt_1111111111111111111111111111111111111111111111111111111111111111",
+        "sessionId": "ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "logicalMessageId": "lmsg_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "logicalMessageAliases": [],
+        "derivationVersion": "amf-logical-message/v1",
+        "keyVersion": "synthetic-k1",
+        "sourceKind": "codex",
+        "observationClass": "native",
+        "direction": "inbound",
+        "conversationKind": "dm",
+        "contextTags": { "sender": ["hmac-sha256:synthetic-k1:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"], "conversation": ["hmac-sha256:synthetic-k1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"] },
+        "subtype": "message",
+        "occurredAt": "2026-01-01T00:00:01Z",
+        "editedAt": null,
+        "nativeRevision": 1,
+        "sourceSequence": 1,
+        "authoritativeDeletion": false,
+        "role": "user",
+        "contentType": "text",
+        "contentParts": 1,
+        "hasContent": true,
+        "normalizationVersion": "amf-observation-normalization/v1",
+        "normalizedPayloadDigest": "hmac-sha256:normalized-k1:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "visibleText": "synthetic fixture text"
+    }
+  ]
+}
