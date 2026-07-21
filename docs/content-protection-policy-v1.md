@@ -15,6 +15,46 @@ key material. `writeKeyRef` selects new encrypted writes and must also appear in
 `readKeyRefs`. That list contains accepted current and retired identifiers, so
 previously encrypted objects remain readable during rotation and migration.
 
+The reusable runtime boundary selects one rule by the exact source and class;
+it is caller-composed and does not change existing stores or native transcript
+paths. It accepts generic content bytes, so storage adapters can compose it
+without coupling the policy to one record schema.
+Plaintext remains the default for every class and requires no key. AES rules
+require 32-byte key material, use AES-256-GCM with a random 12-byte IV and a
+16-byte tag, and bind canonical public metadata into AAD. A removed read key
+reference makes ciphertext using that reference unreadable by policy. During a
+plaintext-to-AES migration, valid plaintext envelopes remain readable while new
+writes follow the active AES rule. An AES rule may set `readPlaintext: false`
+only after migration reconciliation to close that downgrade window. Content is
+limited to 16 MiB, metadata to 16 KiB and 32,768 visited values, and
+authenticated decompression uses the same 16 MiB output bound.
+
+An enabled AES rule may declare `compression: "deflate-raw"`. Compression is
+performed at a fixed level before encryption and the selection is AAD-bound.
+The reviewed policy change is accepted only with class-bound evidence showing
+at least 64 bytes of complete-envelope savings. The runtime follows the
+operator-owned policy; it does not trust a per-write caller assertion about
+performance. The evidence generator verifies the candidate size against the
+real protected envelope, and ciphertext is never presented to compression.
+Readers accept both compressed and uncompressed AES envelopes while the active
+rule changes; new writes follow the current rule. Omitted compression retains
+the `none` write behavior. Compressed byte identity is not a cross-version
+compatibility contract; readers rely on the declared algorithm and bounded
+decompression.
+
+The measurement method and current synthetic results are recorded in
+[Content protection evidence v1](content-protection-evidence-v1.md).
+
+Deploy the updated schema and compatible runtime before, or in the same release
+as, a policy using `compression` or `readPlaintext`. Older strict validators
+reject these fields because policy rules disallow unknown properties.
+
+Compression leaks the compressed length of each protected object. Do not place
+attacker-controlled probes and unrelated secret material in the same compressed
+content unit. The exact-selector policy, one-record envelope boundary, and
+bounded output reduce exposure but do not remove this general compression side
+channel.
+
 `amf-memory/v2` is the next AMF transport revision. It accepts `plain` and
 `sealed` claims independently of visibility: a restricted plain claim and a
 shared sealed claim are both structurally valid. Policy selection determines

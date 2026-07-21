@@ -6,7 +6,7 @@
       "defaults": { "conversation": "plaintext", "proposal": "plaintext", "canonical-memory": "plaintext", "document": "plaintext" },
       "rules": [
         { "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": true, "codec": "plaintext" },
-        { "sourceInstanceId": "src_synthetic0001", "contentClass": "canonical-memory", "enabled": true, "codec": "aes-256-gcm", "writeKeyRef": "key:synthetic-current-v1", "readKeyRefs": ["key:synthetic-current-v1", "key:synthetic-retired-v1"] },
+        { "sourceInstanceId": "src_synthetic0001", "contentClass": "canonical-memory", "enabled": true, "codec": "aes-256-gcm", "writeKeyRef": "key:synthetic-current-v1", "readKeyRefs": ["key:synthetic-current-v1", "key:synthetic-retired-v1"], "compression": "deflate-raw", "readPlaintext": true },
         { "sourceInstanceId": "src_synthetic0002", "contentClass": "document", "enabled": false, "codec": "aes-256-gcm" }
       ]
     },
@@ -14,6 +14,10 @@
       { "name": "default-not-plaintext", "expectedKeyword": "const", "expectedPath": "/defaults/document", "payload": { "defaults": { "conversation": "plaintext", "proposal": "plaintext", "canonical-memory": "plaintext", "document": "aes-256-gcm" } } },
       { "name": "wildcard-source-selector", "expectedKeyword": "pattern", "expectedPath": "/rules/0/sourceInstanceId", "payload": { "rules": [{ "sourceInstanceId": "*", "contentClass": "conversation", "enabled": true, "codec": "plaintext" }] } },
       { "name": "plaintext-key-reference", "expectedKeyword": "not", "expectedPath": "/rules/0", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": true, "codec": "plaintext", "writeKeyRef": "key:synthetic-current-v1" }] } },
+      { "name": "plaintext-compression", "expectedKeyword": "not", "expectedPath": "/rules/0", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": true, "codec": "plaintext", "compression": "deflate-raw" }] } },
+      { "name": "plaintext-read-migration-flag", "expectedKeyword": "not", "expectedPath": "/rules/0", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": true, "codec": "plaintext", "readPlaintext": false }] } },
+      { "name": "invalid-read-migration-flag", "expectedKeyword": "type", "expectedPath": "/rules/0/readPlaintext", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": true, "codec": "aes-256-gcm", "writeKeyRef": "key:synthetic-current-v1", "readKeyRefs": ["key:synthetic-current-v1"], "readPlaintext": "false" }] } },
+      { "name": "unknown-compression", "expectedKeyword": "enum", "expectedPath": "/rules/0/compression", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": true, "codec": "aes-256-gcm", "writeKeyRef": "key:synthetic-current-v1", "readKeyRefs": ["key:synthetic-current-v1"], "compression": "gzip" }] } },
       { "name": "enabled-aes-without-key-reference", "expectedKeyword": "required", "expectedPath": "/rules/0", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": true, "codec": "aes-256-gcm" }] } },
       { "name": "disabled-rule-carries-key-reference", "expectedKeyword": "not", "expectedPath": "/rules/0", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": false, "codec": "aes-256-gcm", "writeKeyRef": "key:synthetic-current-v1" }] } },
       { "name": "enabled-write-key-is-not-readable", "expectedSemantic": "write_key_not_readable", "payload": { "rules": [{ "sourceInstanceId": "src_synthetic0001", "contentClass": "conversation", "enabled": true, "codec": "aes-256-gcm", "writeKeyRef": "key:synthetic-current-v1", "readKeyRefs": ["key:synthetic-retired-v1"] }] } },
