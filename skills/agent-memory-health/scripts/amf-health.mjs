@@ -48,6 +48,10 @@ export function evaluateFabricPayload(payload, { requireSemanticBackend = false,
   if (store.rawProjectionV2Ready !== true || store.rawProjectionV2ReadinessReason !== null || store.legacyV1WritesEnabled !== false) {
     return check("fabric", "critical", "RAW projection v2 readiness contract failed");
   }
+  if (verifiedMigrationPause(payload)) {
+    return check("fabric", "degraded", "RAW ingest is intentionally paused by verified migration evidence",
+      { rawIngestState: "paused", migrationEvidenceVerified: true });
+  }
   if (canonical?.configured !== true) return check("fabric", "degraded", "Canonical memory store is not configured");
   if (requireSemanticBackend && backend?.configured !== true) return check("fabric", "degraded", "Semantic backend is required but disabled");
   if (requireDocumentStore && documents?.configured !== true) {
@@ -63,11 +67,15 @@ export function evaluateFabricPayload(payload, { requireSemanticBackend = false,
 
 export function evaluateCollectorSnapshot(snapshot, { maxPending = 0, maxAgeMs = 15 * 60_000 } = {}) {
   const id = `collector:${snapshot.id}`;
-  if (snapshot.timerActive !== true) return check(id, "critical", "Collector timer is not active", publicCollectorEvidence(snapshot));
+  const intentionallyPaused = snapshot.migrationPause?.state === "paused" && snapshot.migrationPause?.verified === true;
+  if (!intentionallyPaused && snapshot.timerActive !== true) return check(id, "critical", "Collector timer is not active", publicCollectorEvidence(snapshot));
   if (snapshot.result && snapshot.result !== "success") return check(id, "critical", `Collector result is ${snapshot.result}`, publicCollectorEvidence(snapshot));
   if (Number(snapshot.execMainStatus ?? 0) !== 0) return check(id, "critical", `Collector exit status is ${snapshot.execMainStatus}`, publicCollectorEvidence(snapshot));
   if (Number(snapshot.dead ?? 0) > 0) return check(id, "degraded", `Collector has ${snapshot.dead} dead event(s)`, publicCollectorEvidence(snapshot));
   if (Number(snapshot.pending ?? 0) > maxPending) return check(id, "degraded", `Collector has ${snapshot.pending} pending event(s)`, publicCollectorEvidence(snapshot));
+  if (intentionallyPaused) {
+    return check(id, "degraded", "Collector is intentionally paused for migration", publicCollectorEvidence(snapshot));
+  }
   if (snapshot.lastTriggerMs && Date.now() - snapshot.lastTriggerMs > maxAgeMs) {
     return check(id, "degraded", "Collector has not triggered recently", publicCollectorEvidence(snapshot));
   }
@@ -144,6 +152,7 @@ export async function runHealth(options = {}) {
   const tokenEnv = settings.tokenEnv || "AMF_RAW_INGEST_TOKEN";
   const fileEnv = settings.envFile ? parseEnvText(readFileSync(settings.envFile, "utf8")) : {};
   const token = process.env[tokenEnv] || fileEnv[tokenEnv] || process.env.AMF_STATUS_TOKEN || fileEnv.AMF_STATUS_TOKEN;
+  let migrationPause = null;
 
   if (settings.offline) {
     checks.push(check("fabric", "skipped", "Fabric HTTP status skipped by --offline"));
@@ -152,13 +161,15 @@ export async function runHealth(options = {}) {
   } else if (!token) {
     checks.push(check("fabric", "degraded", `Status token is unavailable (${tokenEnv})`));
   } else {
-    checks.push(await fetchFabricStatus(endpoint, token, settings));
+    const fabric = await fetchFabricStatus(endpoint, token, settings);
+    checks.push(fabric.check);
+    migrationPause = fabric.migrationPause;
   }
 
   const collectors = Array.isArray(settings.collectors) ? settings.collectors : discoverCollectors(settings.configRoot);
   if (!collectors.length) checks.push(check("collectors", "skipped", "No local RAW collectors discovered"));
   for (const collector of collectors) {
-    const snapshot = collectorSnapshot(collector, settings.stateRoot);
+    const snapshot = { ...collectorSnapshot(collector, settings.stateRoot), migrationPause };
     checks.push(evaluateCollectorSnapshot(snapshot, {
       maxPending: finiteOr(collector.maxPending, finiteOr(settings.maxPending, 0)),
       maxAgeMs: finiteOr(collector.maxAgeMs, finiteOr(settings.maxAgeMs, 15 * 60_000))
@@ -256,11 +267,18 @@ async function fetchFabricStatus(endpoint, token, settings) {
       signal: AbortSignal.timeout(finiteOr(settings.timeoutMs, 10_000))
     });
     const body = await response.json().catch(() => null);
-    if (!response.ok) return check("fabric", response.status >= 500 ? "critical" : "degraded", `Fabric status returned HTTP ${response.status}`);
-    return evaluateFabricPayload(body, settings);
+    if (!response.ok) return { check: check("fabric", response.status >= 500 ? "critical" : "degraded", `Fabric status returned HTTP ${response.status}`), migrationPause: null };
+    return { check: evaluateFabricPayload(body, settings), migrationPause: verifiedMigrationPause(body) };
   } catch (error) {
-    return check("fabric", "critical", `Fabric status failed: ${oneLine(error?.message ?? error)}`);
+    return { check: check("fabric", "critical", `Fabric status failed: ${oneLine(error?.message ?? error)}`), migrationPause: null };
   }
+}
+
+function verifiedMigrationPause(payload) {
+  const state = payload?.data?.migration?.rawIngest;
+  if (state?.state !== "paused" || state?.health !== "degraded" || state?.verified !== true
+      || typeof state.manifestId !== "string" || !Number.isSafeInteger(state.revision) || state.revision < 1) return null;
+  return { state: "paused", verified: true };
 }
 
 function collectorSnapshot(collector, stateRoot = "/var/lib/agent-memory-fabric/runtime-raw") {
@@ -311,7 +329,9 @@ function publicCollectorEvidence(snapshot) {
     execMainStatus: snapshot.execMainStatus,
     pending: snapshot.pending,
     dead: snapshot.dead,
-    lastTriggerAt: snapshot.lastTriggerMs ? new Date(snapshot.lastTriggerMs).toISOString() : null
+    lastTriggerAt: snapshot.lastTriggerMs ? new Date(snapshot.lastTriggerMs).toISOString() : null,
+    ...(snapshot.migrationPause?.state === "paused" && snapshot.migrationPause?.verified === true
+      ? { rawIngestState: "paused", migrationEvidenceVerified: true } : {})
   };
 }
 

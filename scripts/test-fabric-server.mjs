@@ -12,6 +12,7 @@ import { ContextTokenVerifier, issueContextToken, issueSessionRouteBinding, requ
 import { buildContextRequest } from '../src/access-contract.mjs';
 import { CanonicalPamBridge, CuratorReceiptCoordinator, MemoryReceiptLedger } from '../src/canonical-memory-bridge.mjs';
 import { MemoryDocumentStore } from '../src/document-store.mjs';
+import { createPauseManifest, verifyPauseManifest } from '../src/migration-pause.mjs';
 
 const testPolicyPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'config', 'policies.example.json');
 const CONTEXT_RING = { currentKeyVersion: 'ctx-v1', keys: { 'ctx-v1': Buffer.alloc(32, 7).toString('base64') } };
@@ -19,6 +20,18 @@ const CONTEXT_NOW = Date.parse('2026-07-12T12:00:00Z');
 const ROOM_A = `hmac-sha256:routing-v1:${'a'.repeat(64)}`;
 const ROOM_B = `hmac-sha256:routing-v1:${'b'.repeat(64)}`;
 const documentFixture = JSON.parse(fs.readFileSync(new URL('./fixtures/contracts/obsidian-document-lifecycle.json', import.meta.url), 'utf8'));
+const migrationKey = { schema: 'amf.migration-signing-key/v1', keyId: 'migration-key-test', key: Buffer.alloc(32, 9).toString('base64') };
+function verifiedMigrationPause() {
+  const checkpoint = (id, byte) => ({ id, digest: `sha256:${byte.repeat(64)}` });
+  return verifyPauseManifest(createPauseManifest({
+    schema: 'amf.migration-pause-checkpoints/v1', manifestId: 'pause-manifest-test', revision: 1,
+    keyId: 'migration-key-test', pause: { state: 'paused',
+      collectorCursor: checkpoint('collector-cursor-test', '1'), pendingOutbox: checkpoint('pending-outbox-test', '2'),
+      acknowledgements: checkpoint('acknowledgements-test', '3'), deadLetters: checkpoint('dead-letters-test', '4'),
+      sourceCheckpoint: checkpoint('source-checkpoint-test', '5'), nativeTranscriptAuthority: checkpoint('native-authority-test', '6'),
+      evidence: checkpoint('pause-evidence-test', '7') }
+  }, migrationKey), migrationKey);
+}
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
@@ -63,7 +76,7 @@ function canonicalProposal(text, scope = 'main-lab', revision = 1) {
 
 async function withServer(run, { sessionOptions, clock, configuredSessionReader = true,
   sessionReader: sessionReaderOverride, fabricStore: fabricStoreOverride, backend: backendOverride,
-  canonicalStore, documentStore, contextVerifier, receiptCoordinator, routeManifestSetup } = {}) {
+  canonicalStore, documentStore, contextVerifier, receiptCoordinator, routeManifestSetup, migrationPause } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-server-'));
   const registryPath = path.join(dir, 'auth.json');
   const registry = {
@@ -173,7 +186,7 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
     documentStore,
     contextVerifier: effectiveContextVerifier, routeManifestPath: effectiveRouteManifestPath, receiptCoordinator,
     sessionReader: configuredSessionReader ? sessionReader : undefined, sessionOptions, clock,
-    policyPath: testPolicyPath });
+    policyPath: testPolicyPath, migrationPause });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const api = async (pathname, options = {}) => {
@@ -228,6 +241,60 @@ test('v2 REST queues idempotently while canonical read never exposes proposal pa
     assert.equal(read.body.error.code, 'canonical_store_unconfigured');
     assert.equal(JSON.stringify(read.body).includes('Remember the appointment'), false);
   });
+});
+
+test('verified migration pause keeps status readable and fences RAW ingest before body, storage, or audit', async () => {
+  const fabricStore = makeStore();
+  let ingestCalls = 0;
+  let auditCalls = 0;
+  const originalIngest = fabricStore.ingestRawEvent.bind(fabricStore);
+  const originalAudit = fabricStore.audit.bind(fabricStore);
+  fabricStore.ingestRawEvent = async (...args) => { ingestCalls += 1; return originalIngest(...args); };
+  fabricStore.audit = async (...args) => { auditCalls += 1; return originalAudit(...args); };
+  const migrationPause = verifiedMigrationPause();
+
+  await withServer(async ({ api }) => {
+    const status = await api('/v2/status');
+    assert.equal(status.response.status, 200);
+    assert.deepEqual(status.body.data.migration, { rawIngest: {
+      state: 'paused', health: 'degraded', verified: true,
+      manifestId: 'pause-manifest-test', revision: 1
+    } });
+    assert.doesNotMatch(JSON.stringify(status.body.data.migration), /key|digest|checkpoint/i);
+    const unauthenticated = await api('/v2/ingest/raw-events', {
+      method: 'POST', headers: { authorization: '' }, body: '{'
+    });
+    assert.equal(unauthenticated.response.status, 401);
+    const forbidden = await api('/v2/ingest/raw-events', {
+      method: 'POST', headers: { authorization: 'Bearer limited-token' }, body: '{'
+    });
+    assert.equal(forbidden.response.status, 403);
+    const auditBeforeIngest = auditCalls;
+    const result = await api('/v2/ingest/raw-events', { method: 'POST', body: '{' });
+    assert.equal(result.response.status, 503);
+    assert.equal(result.body.error.code, 'migration_paused');
+    assert.equal(ingestCalls, 0);
+    assert.equal(auditCalls, auditBeforeIngest);
+  }, { fabricStore, migrationPause });
+});
+
+test('RAW ingest behavior is unchanged when no migration pause is configured', async () => {
+  await withServer(async ({ api, fabricStore }) => {
+    const auditBefore = fabricStore.catalog.auditEvents.length;
+    const result = await api('/v2/ingest/raw-events', { method: 'POST', body: '{' });
+    assert.equal(result.response.status, 400);
+    assert.equal(result.body.error.code, 'invalid_json');
+    assert.equal(fabricStore.catalog.auditEvents.length, auditBefore + 1);
+    const status = await api('/v2/status');
+    assert.equal(status.body.data.migration, undefined);
+  });
+});
+
+test('server construction rejects unverified pause-shaped state', () => {
+  assert.throws(() => createAgentMemoryFabricServer({ migrationPause: {
+    state: 'paused', health: 'degraded', verified: true,
+    manifestId: 'pause-manifest-test', revision: 1
+  } }), /migration_pause_state_invalid/);
 });
 
 test('raw extractor can read only service-authorized redacted sessions', async () => {

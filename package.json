@@ -17,6 +17,7 @@
     "operator:provision-document-client": "node scripts/amf-provision-document-client.mjs",
     "operator:provision-session-routes": "node scripts/amf-provision-session-routes.mjs",
     "operator:preflight-pam-runtime": "node src/operator/pam-runtime-private-dir.mjs",
+    "operator:migration-pause": "node scripts/amf-migration-pause.mjs",
     "integrations": "node scripts/amf-integrations.mjs",
     "mcp:interactive-recall": "node scripts/amf-interactive-recall-mcp.mjs",
     "test": "node --test scripts/test-*.mjs",
