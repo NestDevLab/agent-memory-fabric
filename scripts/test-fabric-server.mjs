@@ -12,7 +12,7 @@ import { ContextTokenVerifier, issueContextToken, issueSessionRouteBinding, requ
 import { buildContextRequest } from '../src/access-contract.mjs';
 import { CanonicalPamBridge, CuratorReceiptCoordinator, MemoryReceiptLedger } from '../src/canonical-memory-bridge.mjs';
 import { MemoryDocumentStore } from '../src/document-store.mjs';
-import { createPauseManifest, verifyPauseManifest } from '../src/migration-pause.mjs';
+import { aggregatePauseCheckpointInputs, createPauseManifest, verifyPauseManifest } from '../src/migration-pause.mjs';
 
 const testPolicyPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'config', 'policies.example.json');
 const CONTEXT_RING = { currentKeyVersion: 'ctx-v1', keys: { 'ctx-v1': Buffer.alloc(32, 7).toString('base64') } };
@@ -23,14 +23,18 @@ const documentFixture = JSON.parse(fs.readFileSync(new URL('./fixtures/contracts
 const migrationKey = { schema: 'amf.migration-signing-key/v1', keyId: 'migration-key-test', key: Buffer.alloc(32, 9).toString('base64') };
 function verifiedMigrationPause() {
   const checkpoint = (id, byte) => ({ id, digest: `sha256:${byte.repeat(64)}` });
-  return verifyPauseManifest(createPauseManifest({
+  const collectorId = `pause-collector-${'7'.repeat(64)}`;
+  const child = {
     schema: 'amf.migration-pause-checkpoints/v1', manifestId: 'pause-manifest-test', revision: 1,
     keyId: 'migration-key-test', pause: { state: 'paused',
       collectorCursor: checkpoint('collector-cursor-test', '1'), pendingOutbox: checkpoint('pending-outbox-test', '2'),
       acknowledgements: checkpoint('acknowledgements-test', '3'), deadLetters: checkpoint('dead-letters-test', '4'),
       sourceCheckpoint: checkpoint('source-checkpoint-test', '5'), nativeTranscriptAuthority: checkpoint('native-authority-test', '6'),
-      evidence: checkpoint('pause-evidence-test', '7') }
-  }, migrationKey), migrationKey);
+      evidence: checkpoint(collectorId, '7') }
+  };
+  const aggregate = aggregatePauseCheckpointInputs([child], { schema: 'amf.migration-pause-collector-roster/v1',
+    manifestId: 'pause-manifest-test', revision: 1, keyId: 'migration-key-test', collectors: [collectorId] });
+  return verifyPauseManifest(createPauseManifest(aggregate, migrationKey), migrationKey);
 }
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;

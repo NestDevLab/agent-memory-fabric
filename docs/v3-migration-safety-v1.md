@@ -47,17 +47,56 @@ regular file with this shape:
 }
 ```
 
-Generate and verify with absolute paths. Verification is read-only. Generation
-creates an owner-only manifest atomically and refuses to replace an existing
-target:
+Before the pause, deployment configuration records an owner-only roster with the
+stable opaque collector IDs reported by every enabled collector. The roster is
+authoritative; it is not inferred from the checkpoint files supplied during the
+pause. It uses schema `amf.migration-pause-collector-roster/v1` and binds the
+manifest identifier, revision, signing-key identifier, and a sorted unique list
+of `pause-collector-<64 lowercase hex characters>` identifiers.
+
+Combine every per-collector checkpoint into one deterministic checkpoint set.
+The command requires exact equality with the roster, rejects mixed metadata and
+duplicate collector IDs even when their state digests differ, and binds each
+collector ID, child evidence digest, and checkpoint category into
+domain-separated aggregate digests. The aggregate uses a `pause-set-` evidence
+identifier so a raw per-collector checkpoint cannot enter the signing path. The
+output contains no collector name or input path.
 
 ```sh
-npm run operator:migration-pause -- generate --input /absolute/checkpoints.json --key-file /absolute/key.json --output /absolute/pause-manifest.json
+npm run operator:migration-pause -- aggregate \
+  --roster /absolute/collector-roster.json \
+  --input /absolute/collector-a.json \
+  --input /absolute/collector-b.json \
+  --output /absolute/checkpoints.json
+```
+
+Generation recomputes the aggregate from the retained roster and child
+checkpoints before signing. It creates an owner-only manifest atomically and
+refuses to replace an existing target. The ordinary `verify` operation checks
+the manifest signature for the runtime fence. The `verify-set` operation also
+recomputes exact collector membership and checkpoint state for M2 acceptance.
+All paths must be absolute and verification is read-only:
+
+```sh
+npm run operator:migration-pause -- generate \
+  --input /absolute/checkpoints.json \
+  --roster /absolute/collector-roster.json \
+  --checkpoint /absolute/collector-a.json \
+  --checkpoint /absolute/collector-b.json \
+  --key-file /absolute/key.json \
+  --output /absolute/pause-manifest.json
 npm run operator:migration-pause -- verify --manifest /absolute/pause-manifest.json --key-file /absolute/key.json
+npm run operator:migration-pause -- verify-set \
+  --manifest /absolute/pause-manifest.json \
+  --roster /absolute/collector-roster.json \
+  --input /absolute/collector-a.json \
+  --input /absolute/collector-b.json \
+  --key-file /absolute/key.json
 ```
 
 The tool emits only bounded identifiers and state; it never prints key material
-or checkpoint digests.
+or checkpoint digests. Retain the private roster and every child checkpoint with
+the signed manifest so exact set verification remains reproducible.
 
 Rollback references signed pause evidence and names immutable source and target
 checkpoints, a compatibility-route revision, and a recovery-copy identifier and
