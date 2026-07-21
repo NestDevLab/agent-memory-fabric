@@ -75,6 +75,7 @@ const PUBLIC_ERRORS = new Map([
   ['sessions_forbidden', [403, 'sessions_forbidden']], ['raw_decrypt_forbidden', [403, 'raw_decrypt_forbidden']],
   ['not_found', [404, 'not_found']], ['memory_not_found', [404, 'memory_not_found']], ['session_not_found', [404, 'session_not_found']], ['unknown_session', [404, 'unknown_session']],
   ['document_not_found', [404, 'document_not_found']],
+  ['session_original_unavailable', [410, 'session_original_unavailable']],
   ['idempotency_key_conflict', [409, 'idempotency_key_conflict']], ['body_too_large', [413, 'body_too_large']], ['query_too_large', [413, 'query_too_large']],
   ['document_idempotency_conflict', [409, 'document_idempotency_conflict']], ['document_path_conflict', [409, 'document_path_conflict']],
   ['body_read_timeout', [408, 'body_read_timeout']],
@@ -639,12 +640,12 @@ function buildToolsListResult() {
 }
 
 async function executeMcpMethod({ body, actor, policy, policies, backend, fabricStore, canonicalStore, documentStore,
-  contextVerifier, routeManifestPath, sessionReader, migrationPause, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
+  contextVerifier, routeManifestPath, sessionReader, conversationSessionReader, migrationPause, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
   const method = body.method;
   const id = body.id ?? null;
 
   if (method === 'initialize') {
-    return createRpcResult(id, buildInitializeResult(body.params?.protocolVersion, sessionReader));
+    return createRpcResult(id, buildInitializeResult(body.params?.protocolVersion, conversationSessionReader));
   }
 
   if (method === 'notifications/initialized') {
@@ -677,7 +678,7 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
     if (name === 'memory_status') {
       requirePermission(policy, 'memory:status');
       await healthRequired(fabricStore);
-      const status = buildStatus({ backend, fabricStore, canonicalStore, documentStore, contextVerifier, sessionReader, migrationPause });
+      const status = buildStatus({ backend, fabricStore, canonicalStore, documentStore, contextVerifier, conversationSessionReader, migrationPause });
       await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] });
     }
@@ -774,7 +775,7 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
         routeManifestPath);
       validateSearchInput(query);
       const ownerActors = authorizedSessionOwners(actor, policy);
-      const raw = await sessionReader.search({ actor, ownerActors, query, cursor: args.cursor || null,
+      const raw = await conversationSessionReader.search({ actor, ownerActors, query, cursor: args.cursor || null,
         limit: normalizeSessionLimit(args.limit), from: args.from || null, to: args.to || null, purpose, context });
       const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy,
         policies, context, routeScopes, ownerActors)).map(item => exposeSession(item, routeScopes)),
@@ -788,7 +789,7 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       const purpose = requirePurpose(args.purpose);
       const sessionTargetId = String(args.sessionId || args.id || '');
       const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: args.contextToken, request: buildContextRequest('session_get', { sessionId: sessionTargetId }), required: true });
-      const result = await getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+      const result = await getAuthorizedSession(conversationSessionReader, { actor, policy, policies, contextVerifier,
         routeManifestPath, id: sessionTargetId, purpose, context });
       await auditRequired(fabricStore, { actor, action: 'session_get', outcome: 'allowed', requestId, targetId: sessionTargetId, details: { purpose } });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
@@ -800,18 +801,11 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       const sessionTargetId = String(args.sessionId || args.id || '');
       const view = args.view === 'original' ? 'original' : 'redacted';
       const query = String(args.query || ''); validateSearchInput(query);
-      if (view === 'original' && query) throw Object.assign(new Error('invalid_request'), { status: 400 });
       const context = requireAccessContext(contextVerifier, { actor, policy, purpose, token: args.contextToken, request: buildContextRequest('session_transcript', { ...args, sessionId: sessionTargetId, view }), required: true });
-      await getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+      if (view === 'original') throw Object.assign(new Error('session_original_unavailable'), { status: 410 });
+      await getAuthorizedSession(conversationSessionReader, { actor, policy, policies, contextVerifier,
         routeManifestPath, id: sessionTargetId, purpose, context });
-      if (view === 'original' && !hasPermission(policy, 'raw:decrypt')) {
-        await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'denied', requestId, targetId: sessionTargetId, details: { view, purpose } });
-        const error = new Error('raw_decrypt_forbidden');
-        error.status = 403;
-        throw error;
-      }
-      if (view === 'original') await auditRequired(fabricStore, { actor, action: 'raw_decrypt_intent', outcome: 'authorized', requestId, targetId: sessionTargetId, details: { view, purpose, transport: 'mcp' } });
-      const transcript = await sessionReader.transcript({ actor, ownerActors: authorizedSessionOwners(actor, policy),
+      const transcript = await conversationSessionReader.transcript({ actor, ownerActors: authorizedSessionOwners(actor, policy),
         id: sessionTargetId, view, cursor: args.cursor || null, limit: normalizeSessionLimit(args.limit || 100),
         query, from: args.from || null, to: args.to || null, purpose, context });
       const result = { ...transcript, nextCursor: transcript?.nextCursor || null };
@@ -1129,7 +1123,7 @@ function createUnconfiguredSessionReader() {
   return { configured: false, kind: 'unconfigured', search: fail, get: fail, transcript: fail };
 }
 
-function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, sessionReader, migrationPause = null }) {
+function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, conversationSessionReader = defaultSessionReader, migrationPause = null }) {
   return {
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
@@ -1139,7 +1133,7 @@ function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalSt
     canonicalStore: { kind: canonicalStore.kind || 'unconfigured', configured: Boolean(canonicalStore.configured) },
     documentStore: { kind: documentStore.kind || 'custom', configured: Boolean(documentStore.configured) },
     contextTokens: { configured: Boolean(contextVerifier.configured), conversationRecallRequired: true },
-    sessionReader: { kind: sessionReader.kind || 'custom', configured: Boolean(sessionReader.configured) },
+    sessionReader: { kind: conversationSessionReader.kind || 'custom', configured: Boolean(conversationSessionReader.configured) },
     compatibility: { restV1: true, mcpSse: true, mcpStreamableHttp: true },
     limits: LIMITS,
     ...(migrationPause ? { migration: { rawIngest: {
@@ -1640,7 +1634,7 @@ const defaultCanonicalStore = createUnconfiguredCanonicalStore();
 const defaultContextVerifier = createUnconfiguredContextVerifier();
 const defaultDocumentStore = createUnconfiguredDocumentStore();
 
-function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), conversationEventIngest = null, clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null } = {}) {
+function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, conversationSessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), conversationEventIngest = null, clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null } = {}) {
   if (conversationEventIngest !== null && typeof conversationEventIngest !== 'function') throw new Error('conversation_event_ingest_invalid');
   if (!Buffer.isBuffer(curationCursorKey) || curationCursorKey.length < 32) throw new Error('curation_cursor_key_invalid');
 if (!Number.isSafeInteger(rawIngestBodyBytes) || rawIngestBodyBytes < 1024 || rawIngestBodyBytes > 16 * 1024 * 1024) throw new Error('raw_ingest_body_limit_invalid');
@@ -1648,6 +1642,7 @@ if (!isVerifiedMigrationPause(migrationPause)) {
   throw new Error('migration_pause_state_invalid');
 }
 sessionReader = sessionReader || fabricStore.createSessionReader?.() || defaultSessionReader;
+conversationSessionReader = conversationSessionReader || defaultSessionReader;
 const sessions = new Map();
 const sessionPolicy = { ...MCP_SESSION_DEFAULTS, ...sessionOptions };
 function pruneSessions(now = clock()) {
@@ -1746,7 +1741,7 @@ const requestHandler = async (req, res) => {
     try {
       requirePermission(policy, 'memory:status');
       await healthRequired(fabricStore);
-      const response = buildStatus({ backend, fabricStore, canonicalStore, documentStore, contextVerifier, sessionReader, migrationPause });
+      const response = buildStatus({ backend, fabricStore, canonicalStore, documentStore, contextVerifier, conversationSessionReader, migrationPause });
       await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
       return json(res, 200, v2Envelope(requestId, response));
     } catch (error) {
@@ -2137,7 +2132,7 @@ const requestHandler = async (req, res) => {
         routeManifestPath);
       validateSearchInput(query);
       const ownerActors = authorizedSessionOwners(actor, policy);
-      const raw = await sessionReader.search({ actor, ownerActors, query, cursor: body.cursor || null, limit,
+      const raw = await conversationSessionReader.search({ actor, ownerActors, query, cursor: body.cursor || null, limit,
         from: body.from || null, to: body.to || null, purpose, context });
       const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy,
         policies, context, routeScopes, ownerActors)).map(item => exposeSession(item, routeScopes)),
@@ -2163,19 +2158,12 @@ const requestHandler = async (req, res) => {
           cursor: url.searchParams.get('cursor'), limit: url.searchParams.get('limit'),
           from: url.searchParams.get('from'), to: url.searchParams.get('to') };
         validateSearchInput(transcriptInput.query);
-        if (view === 'original' && transcriptInput.query) throw Object.assign(new Error('invalid_request'), { status: 400 });
         const context = requireAccessContext(contextVerifier, { actor, policy, purpose,
           token: getAccessContextToken(req, url, policy), request: buildContextRequest('session_transcript', transcriptInput), required: true });
-        await getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+        if (view === 'original') throw Object.assign(new Error('session_original_unavailable'), { status: 410 });
+        await getAuthorizedSession(conversationSessionReader, { actor, policy, policies, contextVerifier,
           routeManifestPath, id: sessionId, purpose, context });
-        if (view === 'original' && !hasPermission(policy, 'raw:decrypt')) {
-          await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'denied', requestId, targetId: sessionId, details: { view, purpose } });
-          const error = new Error('raw_decrypt_forbidden');
-          error.status = 403;
-          throw error;
-        }
-        if (view === 'original') await auditRequired(fabricStore, { actor, action: 'raw_decrypt_intent', outcome: 'authorized', requestId, targetId: sessionId, details: { view, purpose, transport: 'rest' } });
-        const transcript = await sessionReader.transcript({ actor, ownerActors: authorizedSessionOwners(actor, policy),
+        const transcript = await conversationSessionReader.transcript({ actor, ownerActors: authorizedSessionOwners(actor, policy),
           id: sessionId, view, cursor: transcriptInput.cursor, limit: normalizeSessionLimit(transcriptInput.limit || 100),
           query: transcriptInput.query, from: transcriptInput.from, to: transcriptInput.to, purpose, context });
         result = { ...transcript, nextCursor: transcript?.nextCursor || null };
@@ -2183,7 +2171,7 @@ const requestHandler = async (req, res) => {
       } else if (pathnameParts.length === 3) {
         const context = requireAccessContext(contextVerifier, { actor, policy, purpose,
           token: getAccessContextToken(req, url, policy), request: buildContextRequest('session_get', { sessionId }), required: true });
-        result = await getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+        result = await getAuthorizedSession(conversationSessionReader, { actor, policy, policies, contextVerifier,
           routeManifestPath, id: sessionId, purpose, context });
         await auditRequired(fabricStore, { actor, action: 'session_get', outcome: 'allowed', requestId, targetId: sessionId, details: { purpose } });
       } else {
@@ -2220,7 +2208,7 @@ const requestHandler = async (req, res) => {
         routeManifestPath);
       validateSearchInput(query);
       const ownerActors = authorizedSessionOwners(actor, policy);
-      const raw = await sessionReader.search({ actor, ownerActors, query, cursor: body.cursor || null, limit,
+      const raw = await conversationSessionReader.search({ actor, ownerActors, query, cursor: body.cursor || null, limit,
         from: body.from || null, to: body.to || null, purpose, context });
       const result = { ...raw, items: (raw?.items || []).filter(item => sessionVisible(item, actor, policy,
         policies, context, routeScopes, ownerActors)).map(item => exposeSession(item, routeScopes)),
@@ -2239,14 +2227,12 @@ const requestHandler = async (req, res) => {
           cursor: url.searchParams.get('cursor'), limit: url.searchParams.get('limit'),
           from: url.searchParams.get('from'), to: url.searchParams.get('to') };
         validateSearchInput(input.query);
-        if (view === 'original' && input.query) throw Object.assign(new Error('invalid_request'), { status: 400 });
         const context = requireAccessContext(contextVerifier, { actor, policy, purpose,
           token: getAccessContextToken(req, url, policy), request: buildContextRequest('session_transcript', input), required: true });
-        await getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+        if (view === 'original') throw Object.assign(new Error('session_original_unavailable'), { status: 410 });
+        await getAuthorizedSession(conversationSessionReader, { actor, policy, policies, contextVerifier,
           routeManifestPath, id, purpose, context });
-        if (view === 'original' && !hasPermission(policy, 'raw:decrypt')) throw Object.assign(new Error('raw_decrypt_forbidden'), { status: 403 });
-        if (view === 'original') await auditRequired(fabricStore, { actor, action: 'raw_decrypt_intent', outcome: 'authorized', requestId, targetId: id, details: { view, purpose, transport: 'v1' } });
-        const result = await sessionReader.transcript({ actor, ownerActors: authorizedSessionOwners(actor, policy),
+        const result = await conversationSessionReader.transcript({ actor, ownerActors: authorizedSessionOwners(actor, policy),
           id, view, cursor: input.cursor, limit: normalizeSessionLimit(input.limit || 100), from: input.from,
           to: input.to, query: input.query, purpose, context });
         await auditRequired(fabricStore, { actor, action: 'session_transcript', outcome: 'allowed', requestId, targetId: id, details: { view, purpose, transport: 'v1' } });
@@ -2255,7 +2241,7 @@ const requestHandler = async (req, res) => {
       if (pathnameParts.length !== 3) throw Object.assign(new Error('not_found'), { status: 404 });
       const context = requireAccessContext(contextVerifier, { actor, policy, purpose,
         token: getAccessContextToken(req, url, policy), request: buildContextRequest('session_get', { sessionId: id }), required: true });
-      const result = await getAuthorizedSession(sessionReader, { actor, policy, policies, contextVerifier,
+      const result = await getAuthorizedSession(conversationSessionReader, { actor, policy, policies, contextVerifier,
         routeManifestPath, id, purpose, context });
       await auditRequired(fabricStore, { actor, action: 'session_get', outcome: 'allowed', requestId, targetId: id, details: { purpose, transport: 'v1' } });
       return jsonV1(res, 200, result);
@@ -2410,6 +2396,7 @@ const requestHandler = async (req, res) => {
         contextVerifier,
         routeManifestPath,
         sessionReader,
+        conversationSessionReader,
         migrationPause,
         requestId,
         requestStartedAt,
@@ -2478,6 +2465,7 @@ const requestHandler = async (req, res) => {
         contextVerifier,
         routeManifestPath,
         sessionReader,
+        conversationSessionReader,
         migrationPause,
         requestId,
         requestStartedAt,

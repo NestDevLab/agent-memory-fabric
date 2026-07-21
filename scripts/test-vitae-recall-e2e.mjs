@@ -132,8 +132,9 @@ test('collector-owned Hermes RAW is recalled by Vitae through exact delegation a
       async search({ scopes }) { return { items: [], nextCursor: null, scopes }; },
       async read() { throw Object.assign(new Error('memory_not_found'), { status: 404 }); },
       routingContext() { return null; } };
+    const reader = store.createSessionReader();
     server = createAgentMemoryFabricServer({ fabricStore: store, canonicalStore, contextVerifier: verifier,
-      policyPath, routeManifestPath });
+      policyPath, routeManifestPath, conversationSessionReader: reader });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
     const call = async (pathname, token, options = {}) => {
@@ -184,7 +185,6 @@ test('collector-owned Hermes RAW is recalled by Vitae through exact delegation a
     }
     assert.equal((await catalog.getSession(observations[0].projection.sessionId)).eventCount, 276);
     const sessionId = observations[0].projection.sessionId;
-    const reader = store.createSessionReader();
     assert.equal((await reader.search({ actor: RECALL_CONSUMER_ACTOR,
       ownerActors: [RECALL_CONSUMER_ACTOR], query: '', limit: 20,
       context: { contextTags: CONTEXT_TAGS } })).items.length, 0);
@@ -344,10 +344,10 @@ test('collector-owned Hermes RAW is recalled by Vitae through exact delegation a
     assert.equal(rejectedQueryTransport.body.error.code, 'context_transport_invalid');
     const originalInput = { sessionId, view: 'original', query: '', cursor: null, limit: null, from: null, to: null };
     const original = await getWithContext(`/v2/sessions/${sessionId}/transcript?view=original&purpose=conversation_recall`, 'session_transcript', originalInput);
-    assert.equal(original.response.status, 403); assert.equal(original.body.error.code, 'raw_decrypt_forbidden');
+    assert.equal(original.response.status, 410); assert.equal(original.body.error.code, 'session_original_unavailable');
     const originalQueryInput = { ...originalInput, query: 'appuntamento' };
     const originalQuery = await getWithContext(`/v2/sessions/${sessionId}/transcript?view=original&query=appuntamento&purpose=conversation_recall`, 'session_transcript', originalQueryInput);
-    assert.equal(originalQuery.response.status, 400); assert.equal(originalQuery.body.error.code, 'invalid_request');
+    assert.equal(originalQuery.response.status, 410); assert.equal(originalQuery.body.error.code, 'session_original_unavailable');
     assert.equal(serverRing.keys[RECALL_CONSUMER_CONTEXT_KEY_VERSION],
       consumerRing.keys[RECALL_CONSUMER_CONTEXT_KEY_VERSION]);
   } finally {
