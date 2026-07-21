@@ -8,9 +8,8 @@
 Head-to-head comparison of the two link-graph traversal engines — Path A
 (Postgres recursive CTE, `src/link-graph.mjs`) and Path B (FalkorDB,
 `src/link-graph-falkor.mjs`) — on the live corpus. This benchmark exists to
-decide the FalkorDB-vs-Postgres question with measured data rather than the
-assumed edge-count trigger recorded in `docs/multi-agent-compose-stack.md`
-decision 10.
+decide the FalkorDB-vs-Postgres question with measured data rather than an
+assumed edge-count trigger.
 
 **Bottom line:** at the current corpus size neither engine wins. Correctness is
 identical (5/5 parity); latency is a wash (Postgres faster on 3 of 5 seeds,
@@ -106,13 +105,13 @@ one-shot timings head-to-head.
 
 ## Conclusion
 
-Building both engines and measuring confirmed the deferral recorded in
-`docs/multi-agent-compose-stack.md` decision 10: **Postgres-first is correct at
-this scale.** FalkorDB adds a second stateful container, a sync step, and a
-per-edge ACL-provenance surface, in exchange for no measurable speedup. It stays
-available (`AMF_LINK_GRAPH_ENGINE=falkor`) but is not the default.
+Building both engines and measuring confirmed the deferral decision:
+**Postgres-first is correct at this scale.** FalkorDB adds a second stateful
+container, a sync step, and a per-edge ACL-provenance surface, in exchange for no
+measurable speedup. It stays available (`AMF_LINK_GRAPH_ENGINE=falkor`) but is
+not the default.
 
-Re-run this benchmark when a decision-10 reversal trigger approaches — corpus
+Re-run this benchmark when a reversal trigger approaches — corpus
 past ~100k edges, hot 4+-hop queries as a real workload, or an automatic
 entity-extraction layer — to see whether the crossover has arrived.
 
