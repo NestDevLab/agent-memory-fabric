@@ -62,6 +62,45 @@ test("Fabric fails closed on RAW readiness or store health", () => {
   assert.equal(evaluateFabricPayload(closed).status, "critical");
 });
 
+test("verified migration pause is degraded for fabric and collectors, never healthy or critical inactivity", () => {
+  const paused = structuredClone(healthyFabric);
+  paused.data.migration = { rawIngest: {
+    state: "paused", health: "degraded", verified: true,
+    manifestId: "pause-manifest-test", revision: 1
+  } };
+  const fabric = evaluateFabricPayload(paused);
+  assert.equal(fabric.status, "degraded");
+  assert.deepEqual(fabric.evidence, { rawIngestState: "paused", migrationEvidenceVerified: true });
+  const collector = evaluateCollectorSnapshot({
+    id: "runtime", timerActive: false, timerState: "inactive", serviceState: "inactive",
+    result: "", execMainStatus: 0, pending: 0, dead: 0, lastTriggerMs: null,
+    migrationPause: { state: "paused", verified: true }
+  });
+  assert.equal(collector.status, "degraded");
+  assert.match(collector.summary, /intentionally paused/);
+  assert.equal(JSON.stringify(collector).includes("pause-manifest-test"), false);
+  const failedCollector = evaluateCollectorSnapshot({
+    id: "runtime", timerActive: false, result: "failure", execMainStatus: 1,
+    pending: 0, dead: 0, migrationPause: { state: "paused", verified: true }
+  });
+  assert.equal(failedCollector.status, "critical");
+  assert.match(failedCollector.summary, /failure/);
+  const deadCollector = evaluateCollectorSnapshot({
+    id: "runtime", timerActive: false, result: "success", execMainStatus: 0,
+    pending: 0, dead: 2, migrationPause: { state: "paused", verified: true }
+  });
+  assert.equal(deadCollector.status, "degraded");
+  assert.match(deadCollector.summary, /2 dead/);
+});
+
+test("unverified pause-shaped status cannot suppress collector failures", () => {
+  const paused = structuredClone(healthyFabric);
+  paused.data.migration = { rawIngest: { state: "paused", health: "degraded", verified: false } };
+  assert.equal(evaluateFabricPayload(paused).status, "healthy");
+  assert.equal(evaluateCollectorSnapshot({ id: "runtime", timerActive: false,
+    migrationPause: { state: "paused", verified: false } }).status, "critical");
+});
+
 test("proposal thresholds degrade without exposing payloads", () => {
   const result = evaluateFabricPayload(healthyFabric, { maxQueuedProposals: 1 });
   assert.equal(result.status, "degraded");

@@ -13,6 +13,7 @@ import { createDocumentStoreFromEnv, createUnconfiguredDocumentStore } from './d
 import { PURPOSES, buildContextRequest, exactContextIntersection, normalizeScopeList, scopeRequiresContext } from './access-contract.mjs';
 import { RAW_EVENT_HTTP_MAX_BODY_BYTES } from './ingest/raw-event-contract.mjs';
 import { validatePamRuntimePrivateDirFromEnv } from './operator/pam-runtime-private-dir.mjs';
+import { isVerifiedMigrationPause, loadVerifiedMigrationPauseFromEnv } from './migration-pause.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
@@ -88,6 +89,7 @@ const PUBLIC_ERRORS = new Map([
   ['retention_plan_in_future', [409, 'retention_plan_in_future']],
   ['receipt_invalid', [400, 'invalid_request']], ['receipt_transition_invalid', [409, 'conflict']], ['receipt_conflict', [409, 'conflict']], ['receipt_proposal_unverified', [409, 'conflict']], ['canonical_apply_unverified', [409, 'conflict']],
   ['raw_reconcile_required', [409, 'raw_reconcile_required']],
+  ['migration_paused', [503, 'migration_paused']],
   ['session_capacity_exceeded', [429, 'session_capacity_exceeded']], ['fabric_store_unconfigured', [503, 'fabric_store_unconfigured']],
   ['document_store_unconfigured', [503, 'document_store_unconfigured']],
   ['raw_projection_invalid', [400, 'raw_projection_invalid']], ['raw_envelope_invalid', [400, 'raw_envelope_invalid']], ['raw_envelope_binding_invalid', [400, 'raw_envelope_binding_invalid']],
@@ -636,7 +638,7 @@ function buildToolsListResult() {
 }
 
 async function executeMcpMethod({ body, actor, policy, policies, backend, fabricStore, canonicalStore, documentStore,
-  contextVerifier, routeManifestPath, sessionReader, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
+  contextVerifier, routeManifestPath, sessionReader, migrationPause, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
   const method = body.method;
   const id = body.id ?? null;
 
@@ -674,7 +676,7 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
     if (name === 'memory_status') {
       requirePermission(policy, 'memory:status');
       await healthRequired(fabricStore);
-      const status = buildStatus({ backend, fabricStore, canonicalStore, documentStore, contextVerifier, sessionReader });
+      const status = buildStatus({ backend, fabricStore, canonicalStore, documentStore, contextVerifier, sessionReader, migrationPause });
       await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] });
     }
@@ -1126,7 +1128,7 @@ function createUnconfiguredSessionReader() {
   return { configured: false, kind: 'unconfigured', search: fail, get: fail, transcript: fail };
 }
 
-function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, sessionReader }) {
+function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, sessionReader, migrationPause = null }) {
   return {
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
@@ -1138,7 +1140,11 @@ function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalSt
     contextTokens: { configured: Boolean(contextVerifier.configured), conversationRecallRequired: true },
     sessionReader: { kind: sessionReader.kind || 'custom', configured: Boolean(sessionReader.configured) },
     compatibility: { restV1: true, mcpSse: true, mcpStreamableHttp: true },
-    limits: LIMITS
+    limits: LIMITS,
+    ...(migrationPause ? { migration: { rawIngest: {
+      state: 'paused', health: 'degraded', verified: true,
+      manifestId: migrationPause.manifestId, revision: migrationPause.revision
+    } } } : {})
   };
 }
 
@@ -1633,9 +1639,12 @@ const defaultCanonicalStore = createUnconfiguredCanonicalStore();
 const defaultContextVerifier = createUnconfiguredContextVerifier();
 const defaultDocumentStore = createUnconfiguredDocumentStore();
 
-function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH } = {}) {
+function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null } = {}) {
   if (!Buffer.isBuffer(curationCursorKey) || curationCursorKey.length < 32) throw new Error('curation_cursor_key_invalid');
 if (!Number.isSafeInteger(rawIngestBodyBytes) || rawIngestBodyBytes < 1024 || rawIngestBodyBytes > 16 * 1024 * 1024) throw new Error('raw_ingest_body_limit_invalid');
+if (!isVerifiedMigrationPause(migrationPause)) {
+  throw new Error('migration_pause_state_invalid');
+}
 sessionReader = sessionReader || fabricStore.createSessionReader?.() || defaultSessionReader;
 const sessions = new Map();
 const sessionPolicy = { ...MCP_SESSION_DEFAULTS, ...sessionOptions };
@@ -1730,7 +1739,7 @@ const requestHandler = async (req, res) => {
     try {
       requirePermission(policy, 'memory:status');
       await healthRequired(fabricStore);
-      const response = buildStatus({ backend, fabricStore, canonicalStore, documentStore, contextVerifier, sessionReader });
+      const response = buildStatus({ backend, fabricStore, canonicalStore, documentStore, contextVerifier, sessionReader, migrationPause });
       await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
       return json(res, 200, v2Envelope(requestId, response));
     } catch (error) {
@@ -2068,6 +2077,10 @@ const requestHandler = async (req, res) => {
   if (url.pathname === '/v2/ingest/raw-events' && req.method === 'POST') {
     try {
       requirePermission(policy, 'raw:ingest');
+      if (migrationPause) {
+        const failure = v2Error(requestId, Object.assign(new Error('migration_paused'), { status: 503 }), 503);
+        return jsonNoStore(res, failure.status, failure.body);
+      }
       const body = await parseBody(req, { maxBytes: rawIngestBodyBytes, timeoutMs: bodyReadTimeoutMs });
       if (!body || Object.keys(body).sort().join('\0') !== 'envelope\0projection\0sourceInstanceId') throw Object.assign(new Error('invalid_request'), { status: 400 });
       const result = await fabricStore.ingestRawEvent({ actor, sourceInstanceId: body.sourceInstanceId, projection: body.projection, envelope: body.envelope }, { requestId });
@@ -2390,6 +2403,7 @@ const requestHandler = async (req, res) => {
         contextVerifier,
         routeManifestPath,
         sessionReader,
+        migrationPause,
         requestId,
         requestStartedAt,
         sourceIp,
@@ -2457,6 +2471,7 @@ const requestHandler = async (req, res) => {
         contextVerifier,
         routeManifestPath,
         sessionReader,
+        migrationPause,
         requestId,
         requestStartedAt,
         sourceIp,
@@ -2529,9 +2544,16 @@ return applicationServer;
 }
 
 if (process.argv.includes('--check')) {
-  const checkStore = createUnconfiguredFabricStore('check_only');
-  console.log(JSON.stringify({ ok: true, service: SERVICE_NAME, aliases: LEGACY_SERVICE_ALIASES, policyPath: POLICY_PATH, port: PORT, backend: defaultBackend.kind, configured: defaultBackend.configured, fabricStore: checkStore.status(), authRegistry: getAuthRegistrySource().kind }, null, 2));
-  process.exit(0);
+  try {
+    const migrationPause = loadVerifiedMigrationPauseFromEnv(process.env);
+    const checkStore = createUnconfiguredFabricStore('check_only');
+    console.log(JSON.stringify({ ok: true, service: SERVICE_NAME, aliases: LEGACY_SERVICE_ALIASES, policyPath: POLICY_PATH, port: PORT, backend: defaultBackend.kind, configured: defaultBackend.configured, fabricStore: checkStore.status(), authRegistry: getAuthRegistrySource().kind,
+      ...(migrationPause ? { migration: { rawIngest: { state: 'paused', health: 'degraded', verified: true } } } : {}) }, null, 2));
+    process.exit(0);
+  } catch (error) {
+    console.error(`agent-memory-fabric check failed: ${safeError(error)?.code || 'internal_error'}`);
+    process.exit(78);
+  }
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
@@ -2550,6 +2572,7 @@ if (isMain) {
     let runtimeReceiptCoordinator;
     let runtimeServer;
     try {
+      const runtimeMigrationPause = loadVerifiedMigrationPauseFromEnv(process.env);
       validatePamRuntimePrivateDirFromEnv(process.env);
       runtimeFabricStore = createFabricStoreFromEnv({ rootPath: ROOT });
       runtimeCanonicalStore = createCanonicalPamBridgeFromEnv(process.env);
@@ -2557,7 +2580,7 @@ if (isMain) {
         ? createDocumentStoreFromEnv(process.env) : createUnconfiguredDocumentStore();
       const runtimeContextVerifier = createContextVerifierFromEnv(process.env);
       runtimeReceiptCoordinator = createReceiptCoordinatorFromEnv({ canonicalStore: runtimeCanonicalStore, proposalStore: runtimeFabricStore });
-      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore, canonicalStore: runtimeCanonicalStore, documentStore: runtimeDocumentStore, contextVerifier: runtimeContextVerifier, receiptCoordinator: runtimeReceiptCoordinator });
+      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore, canonicalStore: runtimeCanonicalStore, documentStore: runtimeDocumentStore, contextVerifier: runtimeContextVerifier, receiptCoordinator: runtimeReceiptCoordinator, migrationPause: runtimeMigrationPause });
     } catch (error) {
       console.error(`agent-memory-fabric disabled: configuration failed: ${safeError(error)?.code || 'internal_error'}`);
       process.exitCode = 78;

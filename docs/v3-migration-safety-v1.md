@@ -14,6 +14,51 @@ Pause evidence preserves collector cursors, pending outboxes,
 acknowledgements, dead letters, source checkpoints, and native transcript
 authority. Each is identified and digested; pause evidence is signed.
 
+The pause generator accepts one strict, content-free aggregate checkpoint file:
+
+```json
+{
+  "schema": "amf.migration-pause-checkpoints/v1",
+  "manifestId": "pause-manifest-example",
+  "revision": 1,
+  "keyId": "migration-key-example",
+  "pause": {
+    "state": "paused",
+    "collectorCursor": { "id": "collector-cursor-example", "digest": "sha256:<64 lowercase hex characters>" },
+    "pendingOutbox": { "id": "pending-outbox-example", "digest": "sha256:<64 lowercase hex characters>" },
+    "acknowledgements": { "id": "acknowledgements-example", "digest": "sha256:<64 lowercase hex characters>" },
+    "deadLetters": { "id": "dead-letters-example", "digest": "sha256:<64 lowercase hex characters>" },
+    "sourceCheckpoint": { "id": "source-checkpoint-example", "digest": "sha256:<64 lowercase hex characters>" },
+    "nativeTranscriptAuthority": { "id": "native-authority-example", "digest": "sha256:<64 lowercase hex characters>" },
+    "evidence": { "id": "pause-evidence-example", "digest": "sha256:<64 lowercase hex characters>" }
+  }
+}
+```
+
+Unknown fields, non-pause phase bodies, and path-like or command-like fields are
+not accepted. The HMAC key is supplied only through an explicit owner-only
+regular file with this shape:
+
+```json
+{
+  "schema": "amf.migration-signing-key/v1",
+  "keyId": "migration-key-example",
+  "key": "<canonical base64 encoding of 32 to 64 random bytes>"
+}
+```
+
+Generate and verify with absolute paths. Verification is read-only. Generation
+creates an owner-only manifest atomically and refuses to replace an existing
+target:
+
+```sh
+npm run operator:migration-pause -- generate --input /absolute/checkpoints.json --key-file /absolute/key.json --output /absolute/pause-manifest.json
+npm run operator:migration-pause -- verify --manifest /absolute/pause-manifest.json --key-file /absolute/key.json
+```
+
+The tool emits only bounded identifiers and state; it never prints key material
+or checkpoint digests.
+
 Rollback references signed pause evidence and names immutable source and target
 checkpoints, a compatibility-route revision, and a recovery-copy identifier and
 digest with restore-test state.
@@ -53,3 +98,20 @@ digest or signature mismatch before accepting phase evidence.
 Conformance fixtures cover ready evidence and blocked states. The contract test
 checks signatures, digests, phase coverage, semantic gate ordering, exact
 cleanup targets, and the no-path/no-command manifest boundary.
+
+## Runtime pause fence
+
+RAW ingest remains active by default. To activate the central fence, configure
+both `AMF_MIGRATION_PAUSE_MANIFEST_PATH` and
+`AMF_MIGRATION_PAUSE_KEY_PATH` with absolute paths to owner-only files. A
+missing pair, unsafe file, malformed key, invalid manifest, digest mismatch, or
+signature mismatch prevents server startup.
+
+After successful verification, `POST /v2/ingest/raw-events` returns the bounded
+`migration_paused` error before request-body parsing, decryption, storage, or
+audit mutation. Read and status routes remain available. Status reports RAW
+ingest as verified, `paused`, and `degraded`, with only the manifest identifier
+and revision. Health monitoring propagates that verified state to collector
+checks, so an intentionally inactive collector is degraded rather than healthy
+or critically inactive. Unverified pause-shaped data never suppresses a
+collector failure.
