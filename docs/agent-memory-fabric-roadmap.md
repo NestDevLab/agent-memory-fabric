@@ -246,11 +246,15 @@ source transcript is altered or deleted.
 
 - [x] Implement deterministic filters for each supported transcript format.
 - [x] Implement owner-only plaintext outboxes with authenticated delivery.
-- [ ] Add `POST /v3/ingest/conversation-events` with bounded inputs.
+- [x] Add `POST /v3/ingest/conversation-events` with bounded inputs.
 - [x] Implement PostgreSQL and SQLite archive adapters.
 - [x] Run the complete adapter conformance suite against both implementations.
 - [x] Implement stable deduplication and changed-payload conflict detection.
-- [ ] Implement edits, replacements, tombstones, and deterministic ordering.
+- [x] Implement edits, replacements, tombstones, and deterministic ordering.
+- [ ] Add real-socket client-abort, end-to-end HTTP conflict, and PostgreSQL endpoint composition coverage.
+- [ ] Normalize PostgreSQL startup and connection failures into typed archive outcomes.
+- [ ] Bound SQLite replacement and tombstone visibility work for long edit chains.
+- [ ] Align duplicate replay audit semantics across append and retention operations.
 - [ ] Preserve the v2 session-read API as a compatibility view over v3 data.
 - [x] Add audit-outage injection tests and prove audited operations fail closed.
 - [ ] Add key-rotation drills for every policy class that enables encryption.

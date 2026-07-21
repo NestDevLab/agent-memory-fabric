@@ -31,6 +31,7 @@ function timestampKey(value) {
 }
 function strictTimestamp(value) { return isConversationEventUtcTimestamp(value) ? timestampKey(value) : null; }
 function requestDigest(value) { return crypto.createHash('sha256').update(canonicalJson(value)).digest('hex'); }
+function archiveRequestDigest(operation, idempotencyKey, event) { return requestDigest({ operation, idempotencyKey, eventId: event.eventId, payloadDigest: event.integrity.payloadDigest }); }
 function requireCursorKey(cursorKey) {
   if (!Buffer.isBuffer(cursorKey) || cursorKey.length < 32) throw new TypeError('conversation_archive_cursor_key_invalid');
   return cursorKey;
@@ -119,7 +120,7 @@ export class SqliteConversationArchive {
   }
   _write(operation, event, idempotencyKey) {
     const verified = validateWrite(event, idempotencyKey, operation, this.resolveIntegrityKey); if (!verified) return invalid();
-    const digest = requestDigest({ operation, event: verified, idempotencyKey });
+    const digest = archiveRequestDigest(operation, idempotencyKey, verified);
     const replay = this.db.prepare('SELECT * FROM conversation_archive_requests_v1 WHERE idempotency_key=?').get(idempotencyKey);
     if (replay) {
       if (replay.request_digest === digest) { this._audit(operation, 'recorded', verified.eventId); return result('duplicate'); }
@@ -149,7 +150,7 @@ export class SqliteConversationArchive {
   tombstone(event, idempotencyKey) { try { return this.writeTransaction('tombstone', event, idempotencyKey); } catch (error) { return result(error instanceof AuditUnavailableError ? 'audit_unavailable' : 'transaction_rolled_back'); } }
   list(conversationId, limit, includeTombstones, cursor) {
     const request = listRequest(conversationId, limit, includeTombstones, cursor, this.cursorKey); if (!request) return invalid(); if (cursor !== undefined && !request.state) return result('cursor_binding_invalid');
-    const hidden = this.db.prepare(`SELECT tombstones_event_id FROM (SELECT json_extract(event_json,'$.tombstonesEventId') AS tombstones_event_id FROM conversation_archive_events_v1 WHERE conversation_id=? AND state='tombstone')`).all(conversationId).map(x => x.tombstones_event_id);
+    const hidden = this.db.prepare(`SELECT target FROM (SELECT json_extract(event_json,'$.tombstonesEventId') AS target FROM conversation_archive_events_v1 WHERE conversation_id=? AND state='tombstone' UNION ALL SELECT json_extract(event_json,'$.replacesEventId') AS target FROM conversation_archive_events_v1 WHERE conversation_id=? AND state IN ('edited','replacement'))`).all(conversationId, conversationId).map(x => x.target).filter(Boolean);
     const clauses = ['conversation_id=?', 'expired=0', "state <> 'conflict'"]; const values = [conversationId];
     if (!includeTombstones) clauses.push("state <> 'tombstone'"); if (hidden.length) { clauses.push(`event_id NOT IN (${hidden.map(() => '?').join(',')})`); values.push(...hidden); }
     if (request.state) { clauses.push('(source_time_key > ? OR (source_time_key = ? AND (source_sequence > ? OR (source_sequence = ? AND event_id > ?))))'); values.push(request.state.t,request.state.t,request.state.s,request.state.s,request.state.e); }
@@ -215,7 +216,7 @@ export class PostgresConversationArchive {
   async _write(operation, event, idempotencyKey) {
     const verified = validateWrite(event, idempotencyKey, operation, this.resolveIntegrityKey);
     if (!verified) return invalid(); await this.ready();
-    const digest = requestDigest({ operation, event: verified, idempotencyKey }); let client = await this.pool.connect();
+    const digest = archiveRequestDigest(operation, idempotencyKey, verified); let client = await this.pool.connect();
     try {
       await client.query('BEGIN'); await this._lock(client, [`archive:event:${verified.eventId}`, `archive:idempotency:${idempotencyKey}`]);
       const replay = (await client.query('SELECT * FROM agent_memory_fabric.conversation_archive_requests_v1 WHERE idempotency_key=$1', [idempotencyKey])).rows[0];
@@ -247,7 +248,7 @@ export class PostgresConversationArchive {
     if (!request) return invalid(); if (cursor !== undefined && !request.state) return result('cursor_binding_invalid');
     await this.ready();
     const filters = ['e.conversation_id=$1', 'e.expired=false', "e.state <> 'conflict'",
-      "NOT EXISTS (SELECT 1 FROM agent_memory_fabric.conversation_archive_events_v1 t WHERE t.conversation_id=e.conversation_id AND t.state='tombstone' AND t.event_json->>'tombstonesEventId'=e.event_id)"];
+      "NOT EXISTS (SELECT 1 FROM agent_memory_fabric.conversation_archive_events_v1 t WHERE t.conversation_id=e.conversation_id AND ((t.state='tombstone' AND t.event_json->>'tombstonesEventId'=e.event_id) OR (t.state IN ('edited','replacement') AND t.event_json->>'replacesEventId'=e.event_id)))"];
     const values = [conversationId];
     if (!includeTombstones) filters.push("e.state <> 'tombstone'");
     if (request.state) {
