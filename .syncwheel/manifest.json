@@ -18,7 +18,8 @@
       "amf-safe-deploy",
       "amf-roadmap-plan",
       "amf-compose-v2-reconciliation",
-      "amf-v3-contracts"
+      "amf-v3-contracts",
+      "amf-v3-m2-pause"
     ]
   },
   "stacks": [
@@ -379,6 +380,18 @@
       ],
       "meta": {
         "purpose": "Freeze AMF v3 contracts and safety gates"
+      }
+    },
+    {
+      "id": "amf-v3-m2-pause",
+      "branch": "feat/amf-v3-m2-pause",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [],
+      "meta": {
+        "purpose": "Pause legacy v2 growth with signed recovery evidence"
       }
     }
   ],
