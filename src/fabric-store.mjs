@@ -8,6 +8,10 @@ import { ciphertextContentId, ciphertextPayloadDigest, decryptClientCiphertext, 
 import { normalizeSessionContextBinding, selectLogicalMessage, sessionBindingMatches, sessionContextBinding, validateProjectionV2 } from './ingest/raw-projection-v2.mjs';
 import { strictIsoTimestamp } from './ingest/transcripts/canonical.mjs';
 import {
+  buildM4V2LogicalGroup,
+  validateM4V2LogicalGroupRequest,
+} from './migration/m4-v2-catalog-groups.mjs';
+import {
   retentionDeadline,
   retentionTombstone,
   validateIdentityCreate,
@@ -26,6 +30,12 @@ function createError(message, status, data) {
   error.status = status;
   error.data = data;
   return error;
+}
+
+function m4V2CatalogFailure(error) {
+  if (error?.code === 'm4_v2_catalog_request_invalid') return createError(error.code, 400);
+  if (error?.code === 'm4_v2_catalog_group_invalid') return createError(error.code, 500);
+  return createError('m4_v2_catalog_enumeration_failed', 500);
 }
 
 function canonicalJson(value) {
@@ -566,6 +576,40 @@ export class MemoryCatalog {
     this.auditEvents.push({ ...auditEvent, outcome: 'stored' });
     return { record: stored, duplicate: false, logical: structuredClone(logical) };
   }
+  listM4V2LogicalGroups(input = {}) {
+    let request;
+    try { request = validateM4V2LogicalGroupRequest(input); }
+    catch (error) { throw m4V2CatalogFailure(error); }
+    try {
+      const logicalRows = [...this.logicalMessages.values()].map(row => structuredClone(row));
+      const eventRows = new Map([...this.rawEventsV2.entries()].map(([id, row]) => [id, structuredClone(row)]));
+      const observationsByLogicalMessageId = new Map();
+      for (const event of eventRows.values()) {
+        const observations = observationsByLogicalMessageId.get(event.logicalMessageId) || [];
+        observations.push(event);
+        observationsByLogicalMessageId.set(event.logicalMessageId, observations);
+      }
+      const page = logicalRows
+        .filter(row => request.after === null || row.logicalMessageId > request.after)
+        .sort((left, right) => left.logicalMessageId.localeCompare(right.logicalMessageId))
+        .slice(0, request.limit + 1);
+      const selected = page.slice(0, request.limit);
+      const items = selected.map(logical => buildM4V2LogicalGroup({
+        logicalMessageId: logical.logicalMessageId,
+        preferredObservationId: logical.preferredObservationId,
+        payloadConflict: logical.payloadConflict,
+        tombstoned: logical.tombstoned,
+        selectionVersion: logical.selectionVersion,
+        eventIds: logical.eventIds,
+      }, observationsByLogicalMessageId.get(logical.logicalMessageId) || []));
+      return structuredClone({
+        items,
+        next: page.length > request.limit ? selected.at(-1).logicalMessageId : null,
+      });
+    } catch (error) {
+      throw m4V2CatalogFailure(error);
+    }
+  }
   getRawEvent(id) { return this.rawEventsV2.get(id) || this.rawEvents.get(id) || null; }
   searchSessions({ ownerTags = [], query = '', limit = 20, after = null, from = null, to = null,
     contextTags = null }) {
@@ -848,6 +892,7 @@ export class SqliteCatalog {
       CREATE TABLE IF NOT EXISTS raw_events_v2 (event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES raw_sessions_v1(session_id), logical_message_id TEXT NOT NULL, content_id TEXT NOT NULL REFERENCES raw_objects_v2(content_id), payload_digest TEXT NOT NULL, projection_json TEXT NOT NULL, owner_tag TEXT NOT NULL, source_tag TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS raw_events_v2_session_created_idx ON raw_events_v2(session_id,created_at,event_id);
       CREATE INDEX IF NOT EXISTS raw_events_v2_owner_session_idx ON raw_events_v2(owner_tag,session_id);
+      CREATE INDEX IF NOT EXISTS raw_events_v2_logical_message_idx ON raw_events_v2(logical_message_id);
       CREATE TABLE IF NOT EXISTS logical_messages_v2 (logical_message_id TEXT PRIMARY KEY, preferred_observation_id TEXT NOT NULL, payload_conflict INTEGER NOT NULL, tombstoned INTEGER NOT NULL, selection_version TEXT NOT NULL, event_ids_json TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS logical_message_aliases_v2 (alias_id TEXT PRIMARY KEY, logical_message_id TEXT NOT NULL REFERENCES logical_messages_v2(logical_message_id));
       CREATE INDEX IF NOT EXISTS raw_sessions_v1_owner_tag_idx ON raw_sessions_v1(owner_tag,last_occurred_at);
@@ -1093,6 +1138,58 @@ export class SqliteCatalog {
     }
     return null;
   }
+  listM4V2LogicalGroups(input = {}) {
+    let request;
+    try { request = validateM4V2LogicalGroupRequest(input); }
+    catch (error) { throw m4V2CatalogFailure(error); }
+    try {
+      return this.db.transaction(() => {
+        const logicalRows = this.db.prepare(`
+          SELECT logical_message_id,preferred_observation_id,payload_conflict,tombstoned,selection_version,event_ids_json
+          FROM logical_messages_v2
+          WHERE (? IS NULL OR logical_message_id>?)
+          ORDER BY logical_message_id ASC
+          LIMIT ?
+        `).all(request.after, request.after, request.limit + 1);
+        const selected = logicalRows.slice(0, request.limit);
+        const items = selected.map(row => {
+          if (![0, 1].includes(row.payload_conflict) || ![0, 1].includes(row.tombstoned)) {
+            const malformed = createError('m4_v2_catalog_group_invalid', 500);
+            malformed.code = 'm4_v2_catalog_group_invalid';
+            throw malformed;
+          }
+          let eventIds;
+          try { eventIds = JSON.parse(row.event_ids_json); }
+          catch {
+            const malformed = createError('m4_v2_catalog_group_invalid', 500);
+            malformed.code = 'm4_v2_catalog_group_invalid';
+            throw malformed;
+          }
+          const logical = {
+            logicalMessageId: row.logical_message_id,
+            preferredObservationId: row.preferred_observation_id,
+            payloadConflict: Boolean(row.payload_conflict),
+            tombstoned: Boolean(row.tombstoned),
+            selectionVersion: row.selection_version,
+            eventIds,
+          };
+          const observations = this.db.prepare(`
+            SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at
+            FROM raw_events_v2
+            WHERE logical_message_id=?
+            ORDER BY event_id ASC
+          `).all(row.logical_message_id).map(value => this.mapRawEvent(value));
+          return buildM4V2LogicalGroup(logical, observations);
+        });
+        return structuredClone({
+          items,
+          next: logicalRows.length > request.limit ? selected.at(-1).logical_message_id : null,
+        });
+      })();
+    } catch (error) {
+      throw m4V2CatalogFailure(error);
+    }
+  }
   getRawEvent(id) { return this.mapRawEvent(this.db.prepare('SELECT * FROM raw_events_v2 WHERE event_id=?').get(id) || this.db.prepare('SELECT * FROM raw_events_v1 WHERE event_id=?').get(id)); }
   mapSession(row) { return row ? { id: row.session_id, runtime: row.runtime, ownerTag: row.owner_tag, sourceTag: row.source_tag, conversationKind: row.conversation_kind || null, contextTags: row.session_binding_json ? JSON.parse(row.session_binding_json) : null, firstOccurredAt: row.first_occurred_at, lastOccurredAt: row.last_occurred_at, eventCount: row.event_count, createdAt: row.created_at } : null; }
   searchSessions({ ownerTags = [], query = '', limit = 20, after = null, from = null, to = null,
@@ -1256,6 +1353,7 @@ const POSTGRES_SCHEMA_SQL = [
   )`,
   `CREATE INDEX IF NOT EXISTS raw_events_v2_session_created_idx ON ${POSTGRES_SCHEMA}.raw_events_v2(session_id,created_at,event_id)`,
   `CREATE INDEX IF NOT EXISTS raw_events_v2_owner_session_idx ON ${POSTGRES_SCHEMA}.raw_events_v2(owner_tag,session_id)`,
+  `CREATE INDEX IF NOT EXISTS raw_events_v2_logical_message_idx ON ${POSTGRES_SCHEMA}.raw_events_v2(logical_message_id)`,
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.logical_messages_v2 (
     logical_message_id TEXT PRIMARY KEY, preferred_observation_id TEXT NOT NULL, payload_conflict BOOLEAN NOT NULL,
     tombstoned BOOLEAN NOT NULL, selection_version TEXT NOT NULL, event_ids JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL
@@ -1747,6 +1845,74 @@ export class PostgresCatalog {
     const result = await this._query(queryable, `SELECT * FROM ${POSTGRES_SCHEMA}.logical_messages_v2 WHERE logical_message_id=$1`, [canonical]);
     const row = result.rows[0];
     return row ? { logicalMessageId: row.logical_message_id, preferredObservationId: row.preferred_observation_id, payloadConflict: row.payload_conflict, tombstoned: row.tombstoned, selectionVersion: row.selection_version, eventIds: typeof row.event_ids === 'string' ? JSON.parse(row.event_ids) : row.event_ids, updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at) } : null;
+  }
+  async listM4V2LogicalGroups(input = {}) {
+    let request;
+    try { request = validateM4V2LogicalGroupRequest(input); }
+    catch (error) { throw m4V2CatalogFailure(error); }
+
+    let client = null;
+    let primaryError = null;
+    let discardClient = false;
+    let result = null;
+    try {
+      await this.ready();
+      client = await this._connect();
+      await this._query(client, 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      await this._query(client, `SELECT set_config('statement_timeout', $1, true)`, [String(this.statementTimeoutMs)]);
+      const logicalRows = await this._query(client, `
+        SELECT logical_message_id,preferred_observation_id,payload_conflict,tombstoned,selection_version,event_ids
+        FROM ${POSTGRES_SCHEMA}.logical_messages_v2
+        WHERE ($1::text IS NULL OR logical_message_id>$1)
+        ORDER BY logical_message_id ASC
+        LIMIT $2
+      `, [request.after, request.limit + 1]);
+      const selected = logicalRows.rows.slice(0, request.limit);
+      const items = [];
+      for (const row of selected) {
+        const logical = {
+          logicalMessageId: row.logical_message_id,
+          preferredObservationId: row.preferred_observation_id,
+          payloadConflict: row.payload_conflict,
+          tombstoned: row.tombstoned,
+          selectionVersion: row.selection_version,
+          eventIds: (() => {
+            try { return typeof row.event_ids === 'string' ? JSON.parse(row.event_ids) : row.event_ids; }
+            catch {
+              const malformed = new Error('m4_v2_catalog_group_invalid');
+              malformed.code = 'm4_v2_catalog_group_invalid';
+              throw malformed;
+            }
+          })(),
+        };
+        const observations = await this._query(client, `
+          SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at
+          FROM ${POSTGRES_SCHEMA}.raw_events_v2
+          WHERE logical_message_id=$1
+          ORDER BY event_id ASC
+        `, [row.logical_message_id]);
+        items.push(buildM4V2LogicalGroup(logical, observations.rows.map(mapPostgresRawEvent)));
+      }
+      result = structuredClone({
+        items,
+        next: logicalRows.rows.length > request.limit ? selected.at(-1).logical_message_id : null,
+      });
+      await this._query(client, 'COMMIT');
+    } catch (error) {
+      primaryError = error;
+      discardClient = error?.code === 'catalog_postgres_query_timeout';
+      if (client) {
+        try { await this._query(client, 'ROLLBACK'); }
+        catch { discardClient = true; }
+      }
+    } finally {
+      if (client) {
+        try { client.release(discardClient ? new Error('catalog_client_discarded') : undefined); }
+        catch (error) { if (!primaryError) primaryError = error; }
+      }
+    }
+    if (primaryError) throw m4V2CatalogFailure(primaryError);
+    return result;
   }
   async ingestRawEventV2(record, rawRecord, auditEvent) {
     await this.ready();
