@@ -25,6 +25,8 @@
     "test:conversation-archive": "node --test scripts/test-conversation-archive-v1-adapters.mjs",
     "test:m4-reconciliation": "node --test scripts/test-m4-reconciliation-reader.mjs",
     "test:m4-backfill-coordinator": "node --test scripts/test-m4-backfill-coordinator.mjs",
+    "test:m4-progress-store": "node --test scripts/test-m4-progress-store.mjs",
+    "test:m4-backfill-gate": "node --test scripts/test-m4-backfill-gate.mjs",
     "test:m4-v2-projector": "node --test scripts/test-m4-v2-conversation-projector.mjs",
     "test:m4-v2-catalog-enumerator": "node --test scripts/test-m4-v2-catalog-enumerator.mjs",
     "test:m4-v2-archive-source": "node --test scripts/test-m4-v2-archive-source.mjs",
