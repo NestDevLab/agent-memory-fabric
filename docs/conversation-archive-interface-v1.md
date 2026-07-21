@@ -59,3 +59,21 @@ eligibility.
 PostgreSQL and SQLite are alternative adapters selected one at a time. They
 never dual-write or fall back. Adapter names never appear in agent-facing
 requests, results, item projections, cursors, conflicts, or audit records.
+
+## Executable conformance
+
+`npm run test:conversation-archive` always executes the shared scenarios against
+SQLite. It reports PostgreSQL as skipped unless a real disposable PostgreSQL
+database is supplied explicitly:
+
+```sh
+AMF_ARCHIVE_POSTGRES_TEST_URL=postgresql://user:password@127.0.0.1:5432/archive_test npm run test:conversation-archive
+```
+
+The test uses fixed archive-only schema tables and truncates those tables before
+the PostgreSQL scenario run. Use an isolated test database only.
+
+PostgreSQL writes serialize stable event and idempotency keys with transaction
+advisory locks. If a commit acknowledgement is ambiguous, the adapter re-reads
+the idempotency record and returns `duplicate` only when the exact request was
+durably recorded; it never retries a changed payload as a new write.

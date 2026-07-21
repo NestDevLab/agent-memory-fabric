@@ -247,12 +247,12 @@ source transcript is altered or deleted.
 - [x] Implement deterministic filters for each supported transcript format.
 - [x] Implement owner-only plaintext outboxes with authenticated delivery.
 - [ ] Add `POST /v3/ingest/conversation-events` with bounded inputs.
-- [ ] Implement PostgreSQL and SQLite archive adapters.
-- [ ] Run the complete adapter conformance suite against both implementations.
-- [ ] Implement stable deduplication and changed-payload conflict detection.
+- [x] Implement PostgreSQL and SQLite archive adapters.
+- [x] Run the complete adapter conformance suite against both implementations.
+- [x] Implement stable deduplication and changed-payload conflict detection.
 - [ ] Implement edits, replacements, tombstones, and deterministic ordering.
 - [ ] Preserve the v2 session-read API as a compatibility view over v3 data.
-- [ ] Add audit-outage injection tests and prove audited operations fail closed.
+- [x] Add audit-outage injection tests and prove audited operations fail closed.
 - [ ] Add key-rotation drills for every policy class that enables encryption.
 - [ ] Measure representative storage, filesystem-block, and query costs.
 - [ ] Enable compression before encryption only where the measurement justifies it.
