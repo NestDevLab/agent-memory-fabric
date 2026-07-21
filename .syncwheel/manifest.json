@@ -390,7 +390,8 @@
       "target_branch": "main",
       "integration_branch": "main-integration",
       "commits": [
-        "48bf223d22a5ae6b93b9fa1a2022a172069423c2"
+        "48bf223d22a5ae6b93b9fa1a2022a172069423c2",
+        "5aa0f281565f219fdbab7bcc2994c01876e1008f"
       ],
       "meta": {
         "purpose": "Pause legacy v2 growth with signed recovery evidence"
