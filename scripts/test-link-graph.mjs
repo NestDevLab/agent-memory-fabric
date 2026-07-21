@@ -44,6 +44,41 @@ maybe('pruneDocuments removes edges for vanished sources', async () => {
   await g.close();
 });
 
+async function seedChain(g) {
+  await g.pool.query('TRUNCATE agent_memory_fabric.document_links_v1');
+  await g.replaceDocumentEdges('doc_a', 'work-wiki', 'A.md', [{ targetRaw: 'B', targetPath: 'B.md', dstDocumentId: 'doc_b', alias: null }]);
+  await g.replaceDocumentEdges('doc_b', 'work-wiki', 'B.md', [{ targetRaw: 'C', targetPath: 'C.md', dstDocumentId: 'doc_c', alias: null }]);
+  await g.replaceDocumentEdges('doc_c', 'work-wiki', 'C.md', [{ targetRaw: 'A', targetPath: 'A.md', dstDocumentId: 'doc_a', alias: null }]);
+}
+
+maybe('neighbors depth 1 returns direct targets only', async () => {
+  const g = await fresh(); await seedChain(g);
+  const n = await g.neighbors({ documentId: 'doc_a', vaults: ['work-wiki'], depth: 1 });
+  assert.deepEqual(n, [{ documentId: 'doc_b', distance: 1 }]);
+  await g.close();
+});
+
+maybe('neighbors depth 2 expands, cycle-safe', async () => {
+  const g = await fresh(); await seedChain(g);
+  const n = await g.neighbors({ documentId: 'doc_a', vaults: ['work-wiki'], depth: 2 });
+  assert.deepEqual(n.map(r => r.documentId).sort(), ['doc_b', 'doc_c']);
+  await g.close();
+});
+
+maybe('neighbors excludes other vaults (ACL)', async () => {
+  const g = await fresh(); await seedChain(g);
+  const n = await g.neighbors({ documentId: 'doc_a', vaults: ['other-vault'], depth: 2 });
+  assert.deepEqual(n, []);
+  await g.close();
+});
+
+maybe('backlinks returns sources pointing at target', async () => {
+  const g = await fresh(); await seedChain(g);
+  const b = await g.backlinks({ documentId: 'doc_b', vaults: ['work-wiki'] });
+  assert.deepEqual(b, [{ documentId: 'doc_a' }]);
+  await g.close();
+});
+
 test('resolveTargets resolves exact and .md-suffixed paths, keeps danglers', () => {
   const pathToDocId = new Map([['B.md', 'doc_b'], ['Projects/agentBerry.md', 'doc_ab']]);
   const edges = resolveTargets({
