@@ -23,6 +23,7 @@
     "test:conversation-event-outbox": "node --test scripts/test-conversation-event-v3-outbox.mjs",
     "test:conversation-event-ingest": "node --test scripts/test-conversation-event-v3-ingest-endpoint.mjs",
     "test:conversation-archive": "node --test scripts/test-conversation-archive-v1-adapters.mjs",
+    "test:m4-reconciliation": "node --test scripts/test-m4-reconciliation-reader.mjs",
     "test:content-protection": "node --test scripts/test-content-protection-v1-contract.mjs scripts/test-content-protection-v1-runtime.mjs scripts/test-content-protection-v1-measurements.mjs",
     "measure:content-protection": "node scripts/measure-content-protection-v1.mjs",
     "test:conversation-session-view": "node --test scripts/test-conversation-session-view-v2.mjs",

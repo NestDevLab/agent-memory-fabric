@@ -1,0 +1,48 @@
+{
+  "schema": "amf.m4-reconciliation-fixture/v1",
+  "description": "Synthetic, content-free metadata for reconciliation-reader tests.",
+  "events": [
+    {
+      "eventId": "cevt_fixture0001",
+      "payloadDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "logicalDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceOccurredAt": "2026-01-01T00:00:01Z",
+      "occurredAt": "2026-01-01T00:01:01Z",
+      "state": "active"
+    },
+    {
+      "eventId": "cevt_fixture0002",
+      "payloadDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "logicalDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sourceOccurredAt": "2026-01-01T00:00:02Z",
+      "occurredAt": "2026-01-01T00:01:02Z",
+      "state": "replacement",
+      "replacesEventId": "cevt_fixture0001"
+    },
+    {
+      "eventId": "cevt_fixture0003",
+      "payloadDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "logicalDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "sourceOccurredAt": "2026-01-01T00:00:03Z",
+      "occurredAt": "2026-01-01T00:01:03Z",
+      "state": "tombstone",
+      "tombstonesEventId": "cevt_fixture0002"
+    }
+  ],
+  "staticEvidence": {
+    "pausedInterval": {
+      "start": { "id": "pause-start", "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
+      "end": { "id": "pause-end", "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }
+    },
+    "replayQueues": {
+      "pendingOutbox": { "id": "queue-pending", "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" },
+      "acknowledgements": { "id": "queue-acks", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111" },
+      "deadLetters": { "id": "queue-dead", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222" }
+    },
+    "sourceCheckpoints": {
+      "collectorCursor": { "id": "source-cursor", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333" },
+      "sourceCheckpoint": { "id": "source-checkpoint", "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444" },
+      "nativeTranscriptAuthority": { "id": "native-authority", "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555" }
+    }
+  }
+}
