@@ -79,5 +79,41 @@ export class LinkGraph {
     return result.rows.map(r => r.src_document_id);
   }
 
+  async neighbors({ documentId, vaults, depth = this.maxDepth }) {
+    const bounded = Math.max(1, Math.min(4, Number(depth) || 1));
+    const allowed = [...new Set((Array.isArray(vaults) ? vaults : []).map(String))];
+    if (!allowed.length) return [];
+    const result = await this.pool.query(
+      `WITH RECURSIVE walk(document_id, distance, path) AS (
+         SELECT dst_document_id, 1, ARRAY[$1::text, dst_document_id]
+           FROM ${SCHEMA}.${TABLE}
+          WHERE src_document_id=$1 AND src_vault_id=ANY($2::text[]) AND dst_document_id IS NOT NULL
+         UNION ALL
+         SELECT e.dst_document_id, w.distance+1, w.path || e.dst_document_id
+           FROM ${SCHEMA}.${TABLE} e
+           JOIN walk w ON e.src_document_id=w.document_id
+          WHERE e.src_vault_id=ANY($2::text[]) AND e.dst_document_id IS NOT NULL
+            AND w.distance < $3 AND NOT (e.dst_document_id = ANY(w.path))
+       )
+       SELECT document_id, MIN(distance) AS distance
+         FROM walk WHERE document_id <> $1
+        GROUP BY document_id ORDER BY distance, document_id`,
+      [documentId, allowed, bounded]
+    );
+    return result.rows.map(r => ({ documentId: r.document_id, distance: Number(r.distance) }));
+  }
+
+  async backlinks({ documentId, vaults }) {
+    const allowed = [...new Set((Array.isArray(vaults) ? vaults : []).map(String))];
+    if (!allowed.length) return [];
+    const result = await this.pool.query(
+      `SELECT DISTINCT src_document_id FROM ${SCHEMA}.${TABLE}
+        WHERE dst_document_id=$1 AND src_vault_id=ANY($2::text[])
+        ORDER BY src_document_id`,
+      [documentId, allowed]
+    );
+    return result.rows.map(r => ({ documentId: r.src_document_id }));
+  }
+
   async close() { if (this._closed) return; this._closed = true; await this.pool.end?.(); }
 }
