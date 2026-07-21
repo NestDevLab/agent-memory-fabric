@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { LinkGraph } from '../src/link-graph.mjs';
+import { resolveTargets } from './amf-reindex-graph.mjs';
 
 const URL = process.env.AMF_TEST_DATABASE_URL;
 const maybe = URL ? test : test.skip;
@@ -41,4 +42,21 @@ maybe('pruneDocuments removes edges for vanished sources', async () => {
   await g.pruneDocuments(['doc_a']);
   assert.deepEqual(await g.listSrcDocumentIds(), ['doc_a']);
   await g.close();
+});
+
+test('resolveTargets resolves exact and .md-suffixed paths, keeps danglers', () => {
+  const pathToDocId = new Map([['B.md', 'doc_b'], ['Projects/agentBerry.md', 'doc_ab']]);
+  const edges = resolveTargets({
+    links: [
+      { target: 'B', alias: null },
+      { target: 'Projects/agentBerry', alias: 'bot' },
+      { target: 'Ghost Note', alias: null }
+    ],
+    pathToDocId
+  });
+  assert.deepEqual(edges, [
+    { targetRaw: 'B', alias: null, targetPath: 'B.md', dstDocumentId: 'doc_b' },
+    { targetRaw: 'Projects/agentBerry', alias: 'bot', targetPath: 'Projects/agentBerry.md', dstDocumentId: 'doc_ab' },
+    { targetRaw: 'Ghost Note', alias: null, targetPath: null, dstDocumentId: null }
+  ]);
 });
