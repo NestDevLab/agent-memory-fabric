@@ -6,7 +6,7 @@ import path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
 import test from 'node:test';
 
-import { SqliteConversationArchive } from '../src/conversation-archive-v1.mjs';
+import { PostgresConversationArchive, SqliteConversationArchive } from '../src/conversation-archive-v1.mjs';
 import { createConversationEvent } from '../src/conversation-event-v3.mjs';
 import { createConversationEventV3IngestHandler } from '../src/ingest/http-conversation-event-v3-endpoint.mjs';
 import { ConversationEventV3HttpRequestVerifier, ConversationEventV3ReplayVerifier, HttpConversationEventV3Sink } from '../src/ingest/http-conversation-event-v3-sink.mjs';
@@ -20,6 +20,10 @@ const openRequests = new Set();
 
 function active({ nonce = 'endpoint_nonce_01', sentAt = '2026-01-02T03:04:06Z' } = {}) {
   return createConversationEvent({ eventId: 'cevt_endpoint0001', conversationId: 'ccon_endpoint0001', sourceInstanceId: 'src_endpoint0001', role: 'user', visibleText: 'synthetic visible text', sourceOccurredAt: '2026-01-02T03:04:05Z', occurredAt: '2026-01-02T03:04:05Z', ordering: { sourceSequence: 1 }, direction: 'inbound', conversationKind: 'session', authorizationContextTags: { conversation: [TAG] }, state: 'active', revision: 1 }, { keyId: 'test', key: KEY, sentAt, nonce });
+}
+
+function changedActive() {
+  return createConversationEvent({ eventId: 'cevt_endpoint0001', conversationId: 'ccon_endpoint0001', sourceInstanceId: 'src_endpoint0001', role: 'user', visibleText: 'synthetic changed visible text', sourceOccurredAt: '2026-01-02T03:04:05Z', occurredAt: '2026-01-02T03:04:06Z', ordering: { sourceSequence: 1 }, direction: 'inbound', conversationKind: 'session', authorizationContextTags: { conversation: [TAG] }, state: 'active', revision: 1 }, { keyId: 'test', key: KEY, sentAt: '2026-01-02T03:04:08Z', nonce: 'endpoint_nonce_03' });
 }
 
 function tombstone() {
@@ -121,6 +125,13 @@ function within(promise, timeoutMs, code) {
     promise,
     new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(code)), timeoutMs); })
   ]).finally(() => clearTimeout(timer));
+}
+
+function waitFor(predicate, timeoutMs, code) {
+  let interval;
+  return within(new Promise(resolve => {
+    interval = setInterval(() => { if (predicate()) resolve(); }, 5);
+  }), timeoutMs, code).finally(() => clearInterval(interval));
 }
 
 function responseForOpenRequest(url, headers = {}) {
@@ -296,6 +307,57 @@ test('real SQLite archive accepts a freshly signed retry as an exact duplicate',
   }
 });
 
+test('real SQLite endpoint preserves the authoritative event and durable conflict evidence', async () => {
+  const archive = new SqliteConversationArchive({ resolveIntegrityKey: id => id === 'test' ? KEY : null, resolveExpiresAt: () => '2026-02-01T00:00:00Z', cursorKey: Buffer.alloc(32, 9) });
+  const ingest = handler({ archive, replayVerifier: eventVerifier(nonceStore()), authorizeSource: async () => true });
+  const first = active();
+  const changed = changedActive();
+  try {
+    assert.deepEqual(await call(ingest, JSON.stringify(first), { 'idempotency-key': first.eventId }), { status: 201, body: { acknowledged: true, eventId: first.eventId, payloadDigest: first.integrity.payloadDigest, status: 'stored' } });
+    const conflict = await call(ingest, JSON.stringify(changed), { 'idempotency-key': changed.eventId });
+    assert.deepEqual(conflict, { status: 409, body: { error: 'conflict_visible', conflict: { eventId: changed.eventId, logicalDigest: changed.logicalDigest, existingPayloadDigest: first.integrity.payloadDigest, receivedPayloadDigest: changed.integrity.payloadDigest } } });
+    noLeaks(conflict, changed);
+    assert.equal(archive.conflictEvidenceCount(), 1);
+    assert.deepEqual(archive.list(first.conversationId, 10, false).items.map(item => item.payloadDigest), [first.integrity.payloadDigest]);
+  } finally { archive.close(); }
+});
+
+test('node HTTP client abort settles the endpoint without mutation or orphaned server sockets', async () => {
+  let mutations = 0;
+  let settled = 0;
+  let started;
+  const sockets = new Set();
+  const handlerStarted = new Promise(resolve => { started = resolve; });
+  const ingest = handler({ archive: { async append() { mutations += 1; return { outcome: 'stored' }; }, async tombstone() { mutations += 1; return { outcome: 'stored' }; } } });
+  const server = http.createServer(async (req, res) => {
+    started();
+    await ingest(req, res, new URL(req.url, 'http://127.0.0.1'), { actor: 'synthetic-actor' });
+    settled += 1;
+  });
+  server.on('connection', socket => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const request = http.request(`http://127.0.0.1:${server.address().port}/v3/ingest/conversation-events`, { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': active().eventId } });
+  request.on('error', () => {});
+  request.on('response', response => response.resume());
+  request.write('{');
+  try {
+    await within(handlerStarted, 500, 'client_abort_handler_start_timeout');
+    request.destroy();
+    await waitFor(() => settled === 1, 500, 'client_abort_handler_timeout');
+    assert.equal(mutations, 0);
+  } finally {
+    request.destroy();
+    for (const socket of sockets) socket.destroy();
+    server.closeAllConnections?.();
+    server.closeIdleConnections?.();
+    await within(new Promise(resolve => server.close(resolve)), 500, 'client_abort_server_close_timeout');
+    assert.equal(sockets.size, 0);
+  }
+});
+
 test('idempotency mismatch rejects before archive mutation without leakage', async () => {
   const value = active();
   const writes = { count: 0 };
@@ -427,3 +489,25 @@ test('real server hides handler configuration until permission succeeds', async 
     assert.equal(writes.count, 1);
   });
 });
+
+if (process.env.AMF_ARCHIVE_POSTGRES_TEST_URL) {
+  test('real PostgreSQL endpoint composition stores, retries, and reports content-free conflicts', async () => {
+    const archive = new PostgresConversationArchive({ connectionString: process.env.AMF_ARCHIVE_POSTGRES_TEST_URL, resolveIntegrityKey: id => id === 'test' ? KEY : null, resolveExpiresAt: () => '2026-02-01T00:00:00Z', cursorKey: Buffer.alloc(32, 9) });
+    const ingest = handler({ archive, replayVerifier: eventVerifier(nonceStore()), authorizeSource: async () => true });
+    const first = active();
+    const refreshed = active({ nonce: 'endpoint_nonce_02', sentAt: '2026-01-02T03:04:07Z' });
+    const changed = changedActive();
+    try {
+      await archive.ready();
+      await archive.pool.query('TRUNCATE agent_memory_fabric.conversation_archive_audit_v1, agent_memory_fabric.conversation_archive_conflicts_v1, agent_memory_fabric.conversation_archive_requests_v1, agent_memory_fabric.conversation_archive_events_v1');
+      assert.equal((await call(ingest, JSON.stringify(first), { 'idempotency-key': first.eventId })).status, 201);
+      assert.equal((await call(ingest, JSON.stringify(refreshed), { 'idempotency-key': refreshed.eventId })).status, 200);
+      const conflict = await call(ingest, JSON.stringify(changed), { 'idempotency-key': changed.eventId });
+      assert.equal(conflict.status, 409);
+      assert.deepEqual(conflict.body.conflict, { eventId: changed.eventId, logicalDigest: changed.logicalDigest, existingPayloadDigest: first.integrity.payloadDigest, receivedPayloadDigest: changed.integrity.payloadDigest });
+      noLeaks(conflict, changed);
+    } finally { await archive.close(); }
+  });
+} else {
+  test('real PostgreSQL endpoint composition', { skip: 'set AMF_ARCHIVE_POSTGRES_TEST_URL to run against real PostgreSQL' }, () => {});
+}

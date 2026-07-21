@@ -251,10 +251,11 @@ source transcript is altered or deleted.
 - [x] Run the complete adapter conformance suite against both implementations.
 - [x] Implement stable deduplication and changed-payload conflict detection.
 - [x] Implement edits, replacements, tombstones, and deterministic ordering.
-- [ ] Add real-socket client-abort, end-to-end HTTP conflict, and PostgreSQL endpoint composition coverage.
-- [ ] Normalize PostgreSQL startup and connection failures into typed archive outcomes.
-- [ ] Bound SQLite replacement and tombstone visibility work for long edit chains.
-- [ ] Align duplicate replay audit semantics across append and retention operations.
+- [x] Add real-socket client-abort, end-to-end HTTP conflict, and PostgreSQL endpoint composition coverage.
+- [x] Normalize PostgreSQL startup and connection failures into typed archive outcomes.
+- [x] Bound SQLite replacement and tombstone visibility work for long edit chains.
+- [x] Align duplicate replay audit semantics across append and retention operations.
+- [ ] Retry PostgreSQL schema initialization after a transient first-touch failure.
 - [ ] Preserve the v2 session-read API as a compatibility view over v3 data.
 - [x] Add audit-outage injection tests and prove audited operations fail closed.
 - [ ] Add key-rotation drills for every policy class that enables encryption.

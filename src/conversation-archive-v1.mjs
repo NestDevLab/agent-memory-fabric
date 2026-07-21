@@ -150,18 +150,28 @@ export class SqliteConversationArchive {
   tombstone(event, idempotencyKey) { try { return this.writeTransaction('tombstone', event, idempotencyKey); } catch (error) { return result(error instanceof AuditUnavailableError ? 'audit_unavailable' : 'transaction_rolled_back'); } }
   list(conversationId, limit, includeTombstones, cursor) {
     const request = listRequest(conversationId, limit, includeTombstones, cursor, this.cursorKey); if (!request) return invalid(); if (cursor !== undefined && !request.state) return result('cursor_binding_invalid');
-    const hidden = this.db.prepare(`SELECT target FROM (SELECT json_extract(event_json,'$.tombstonesEventId') AS target FROM conversation_archive_events_v1 WHERE conversation_id=? AND state='tombstone' UNION ALL SELECT json_extract(event_json,'$.replacesEventId') AS target FROM conversation_archive_events_v1 WHERE conversation_id=? AND state IN ('edited','replacement'))`).all(conversationId, conversationId).map(x => x.target).filter(Boolean);
-    const clauses = ['conversation_id=?', 'expired=0', "state <> 'conflict'"]; const values = [conversationId];
-    if (!includeTombstones) clauses.push("state <> 'tombstone'"); if (hidden.length) { clauses.push(`event_id NOT IN (${hidden.map(() => '?').join(',')})`); values.push(...hidden); }
-    if (request.state) { clauses.push('(source_time_key > ? OR (source_time_key = ? AND (source_sequence > ? OR (source_sequence = ? AND event_id > ?))))'); values.push(request.state.t,request.state.t,request.state.s,request.state.s,request.state.e); }
-    const rows = this.db.prepare(`SELECT * FROM conversation_archive_events_v1 WHERE ${clauses.join(' AND ')} ORDER BY source_time_key,source_sequence,event_id LIMIT ?`).all(...values,limit + 1);
+    const clauses = ['e.conversation_id=?', 'e.expired=0', "e.state <> 'conflict'", `NOT EXISTS (
+      SELECT 1 FROM conversation_archive_events_v1 t
+      WHERE t.conversation_id=e.conversation_id AND (
+        (t.state='tombstone' AND json_extract(t.event_json,'$.tombstonesEventId')=e.event_id) OR
+        (t.state IN ('edited','replacement') AND json_extract(t.event_json,'$.replacesEventId')=e.event_id)
+      )
+    )`]; const values = [conversationId];
+    if (!includeTombstones) clauses.push("e.state <> 'tombstone'");
+    if (request.state) { clauses.push('(e.source_time_key > ? OR (e.source_time_key = ? AND (e.source_sequence > ? OR (e.source_sequence = ? AND e.event_id > ?))))'); values.push(request.state.t,request.state.t,request.state.s,request.state.s,request.state.e); }
+    const rows = this.db.prepare(`SELECT e.* FROM conversation_archive_events_v1 e WHERE ${clauses.join(' AND ')} ORDER BY e.source_time_key,e.source_sequence,e.event_id LIMIT ?`).all(...values,limit + 1);
     const page = rows.slice(0, limit); return result('listed', { items: page.map(projection), nextCursor: rows.length > limit ? encodeCursor(request.binding, page.at(-1), this.cursorKey) : null });
   }
   applyRetention(cutoff, limit, idempotencyKey) {
     if (!strictTimestamp(cutoff) || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000 || !IDEMPOTENCY_KEY.test(idempotencyKey)) return invalid();
     try { return this.db.transaction(() => {
       const digest = requestDigest({ operation: 'apply_retention', cutoff, limit, idempotencyKey }); const replay = this.db.prepare('SELECT * FROM conversation_archive_requests_v1 WHERE idempotency_key=?').get(idempotencyKey);
-      if (replay) return replay.request_digest === digest ? result('duplicate') : invalid(); if (this.fault?.transaction) throw new Error('transaction');
+      if (replay) {
+        if (replay.request_digest !== digest) return invalid();
+        this._audit('apply_retention', 'recorded');
+        return result('duplicate');
+      }
+      if (this.fault?.transaction) throw new Error('transaction');
       const rows = this.db.prepare(`SELECT e.event_id FROM conversation_archive_events_v1 e WHERE e.expired=0 AND e.expires_time_key<=? AND e.state<>'conflict' AND NOT EXISTS (SELECT 1 FROM conversation_archive_conflicts_v1 c WHERE c.event_id=e.event_id) ORDER BY e.expires_time_key,e.source_time_key,e.source_sequence,e.event_id LIMIT ?`).all(timestampKey(cutoff),limit);
       if (rows.length) this.db.prepare(`UPDATE conversation_archive_events_v1 SET expired=1 WHERE event_id IN (${rows.map(() => '?').join(',')})`).run(...rows.map(row => row.event_id));
       this.db.prepare('INSERT INTO conversation_archive_requests_v1(idempotency_key,request_digest,outcome,operation) VALUES (?,?,?,?)').run(idempotencyKey,digest,'retention_expired','apply_retention'); this._audit('apply_retention','recorded');
@@ -189,18 +199,30 @@ export class PostgresConversationArchive {
     const checkedExpiresAt = requireFunction(resolveExpiresAt, 'conversation_archive_expiry_resolver_invalid');
     this.pool = pool || poolFactory({ connectionString }); this.resolveIntegrityKey = checkedIntegrityKey;
     this.resolveExpiresAt = checkedExpiresAt; this.cursorKey = checkedCursorKey; this.fault = fault;
-    this.initialized = this.pool.query(POSTGRES_DDL);
+    this.initialized = null;
   }
-  async ready() { await this.initialized; return this; }
+  async ready() {
+    if (!this.initialized) this.initialized = Promise.resolve().then(() => this.pool.query(POSTGRES_DDL));
+    await this.initialized;
+    return this;
+  }
   async _audit(client, action, eventId = null) {
     if (this.fault?.audit) throw new AuditUnavailableError('audit_unavailable');
     try { await client.query('INSERT INTO agent_memory_fabric.conversation_archive_audit_v1(action,outcome,event_id,created_at) VALUES ($1,$2,$3,now())', [action, 'recorded', eventId]); }
     catch (error) { throw new AuditUnavailableError('audit_unavailable', { cause: error }); }
   }
   async _lock(client, keys) { for (const key of keys.sort()) await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [key]); }
-  async _committedOrDuplicate(idempotencyKey, digest) {
-    const row = (await this.pool.query('SELECT request_digest FROM agent_memory_fabric.conversation_archive_requests_v1 WHERE idempotency_key=$1', [idempotencyKey])).rows[0];
-    return row?.request_digest === digest ? result('duplicate') : null;
+  async _committedWriteOutcome(idempotencyKey, digest, event) {
+    const row = (await this.pool.query('SELECT request_digest,outcome FROM agent_memory_fabric.conversation_archive_requests_v1 WHERE idempotency_key=$1', [idempotencyKey])).rows[0];
+    if (!row || row.request_digest !== digest) return null;
+    if (row.outcome !== 'conflict_visible') return result('duplicate');
+    const existing = (await this.pool.query('SELECT * FROM agent_memory_fabric.conversation_archive_events_v1 WHERE event_id=$1', [event.eventId])).rows[0];
+    return existing ? conflict(existing, event) : null;
+  }
+  async _committedRetentionOutcome(idempotencyKey, digest) {
+    const row = (await this.pool.query('SELECT request_digest,outcome,operation FROM agent_memory_fabric.conversation_archive_requests_v1 WHERE idempotency_key=$1', [idempotencyKey])).rows[0];
+    if (row?.request_digest !== digest || row.outcome !== 'retention_expired' || row.operation !== 'apply_retention') return null;
+    return result('duplicate');
   }
   async _referencesAreLocal(client, event) {
     const targets = references(event); if (!targets.length) return true;
@@ -238,16 +260,17 @@ export class PostgresConversationArchive {
       try { await client.query('ROLLBACK'); } catch {}
       if (error instanceof AuditUnavailableError) return result('audit_unavailable');
       client.release(); client = null;
-      return (await this._committedOrDuplicate(idempotencyKey, digest).catch(() => null)) ?? result('transaction_rolled_back');
+      return (await this._committedWriteOutcome(idempotencyKey, digest, verified).catch(() => null)) ?? result('transaction_rolled_back');
     } finally { client?.release(); }
   }
-  append(event, key) { return this._write('append', event, key); }
-  tombstone(event, key) { return this._write('tombstone', event, key); }
+  async append(event, key) { try { return await this._write('append', event, key); } catch { return result('transaction_rolled_back'); } }
+  async tombstone(event, key) { try { return await this._write('tombstone', event, key); } catch { return result('transaction_rolled_back'); } }
   async list(conversationId, limit, includeTombstones, cursor) {
     const request = listRequest(conversationId, limit, includeTombstones, cursor, this.cursorKey);
     if (!request) return invalid(); if (cursor !== undefined && !request.state) return result('cursor_binding_invalid');
-    await this.ready();
-    const filters = ['e.conversation_id=$1', 'e.expired=false', "e.state <> 'conflict'",
+    try {
+      await this.ready();
+      const filters = ['e.conversation_id=$1', 'e.expired=false', "e.state <> 'conflict'",
       "NOT EXISTS (SELECT 1 FROM agent_memory_fabric.conversation_archive_events_v1 t WHERE t.conversation_id=e.conversation_id AND ((t.state='tombstone' AND t.event_json->>'tombstonesEventId'=e.event_id) OR (t.state IN ('edited','replacement') AND t.event_json->>'replacesEventId'=e.event_id)))"];
     const values = [conversationId];
     if (!includeTombstones) filters.push("e.state <> 'tombstone'");
@@ -257,25 +280,33 @@ export class PostgresConversationArchive {
     }
     values.push(limit + 1);
     const sql = `SELECT e.* FROM agent_memory_fabric.conversation_archive_events_v1 e WHERE ${filters.join(' AND ')} ORDER BY e.source_time_key,e.source_sequence,e.event_id LIMIT $${values.length}`;
-    const rows = (await this.pool.query(sql, values)).rows; const page = rows.slice(0, limit);
-    return result('listed', { items: page.map(projection), nextCursor: rows.length > limit ? encodeCursor(request.binding, page.at(-1), this.cursorKey) : null });
+      const rows = (await this.pool.query(sql, values)).rows; const page = rows.slice(0, limit);
+      return result('listed', { items: page.map(projection), nextCursor: rows.length > limit ? encodeCursor(request.binding, page.at(-1), this.cursorKey) : null });
+    } catch { return result('transaction_rolled_back'); }
   }
   async applyRetention(cutoff, limit, idempotencyKey) {
     if (!strictTimestamp(cutoff) || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000 || !IDEMPOTENCY_KEY.test(idempotencyKey)) return invalid();
-    await this.ready(); const digest = requestDigest({ operation: 'apply_retention', cutoff, limit, idempotencyKey }); let client = await this.pool.connect();
+    const digest = requestDigest({ operation: 'apply_retention', cutoff, limit, idempotencyKey }); let client = null;
     try {
+      await this.ready();
+      client = await this.pool.connect();
       await client.query('BEGIN'); await this._lock(client, [`archive:retention:${idempotencyKey}`]);
       const replay = (await client.query('SELECT * FROM agent_memory_fabric.conversation_archive_requests_v1 WHERE idempotency_key=$1', [idempotencyKey])).rows[0];
-      if (replay) { await client.query(replay.request_digest === digest ? 'COMMIT' : 'ROLLBACK'); return replay.request_digest === digest ? result('duplicate') : invalid(); }
+      if (replay) {
+        if (replay.request_digest !== digest) { await client.query('ROLLBACK'); return invalid(); }
+        await this._audit(client, 'apply_retention');
+        await client.query('COMMIT');
+        return result('duplicate');
+      }
       if (this.fault?.transaction) throw new Error('transaction');
       await client.query(`WITH eligible AS (SELECT e.event_id FROM agent_memory_fabric.conversation_archive_events_v1 e WHERE e.expired=false AND e.expires_time_key<=$1 AND e.state<>'conflict' AND NOT EXISTS (SELECT 1 FROM agent_memory_fabric.conversation_archive_conflicts_v1 c WHERE c.event_id=e.event_id) ORDER BY e.expires_time_key,e.source_time_key,e.source_sequence,e.event_id LIMIT $2 FOR UPDATE) UPDATE agent_memory_fabric.conversation_archive_events_v1 e SET expired=true FROM eligible WHERE e.event_id=eligible.event_id`, [timestampKey(cutoff), limit]);
       await client.query('INSERT INTO agent_memory_fabric.conversation_archive_requests_v1(idempotency_key,request_digest,outcome,operation) VALUES ($1,$2,$3,$4)', [idempotencyKey, digest, 'retention_expired', 'apply_retention']);
       await this._audit(client, 'apply_retention'); await client.query('COMMIT'); return result('retention_expired', { stateChanged: true });
     } catch (error) {
-      try { await client.query('ROLLBACK'); } catch {}
+      try { await client?.query('ROLLBACK'); } catch {}
       if (error instanceof AuditUnavailableError) return result('audit_unavailable');
-      client.release(); client = null;
-      return (await this._committedOrDuplicate(idempotencyKey, digest).catch(() => null)) ?? result('transaction_rolled_back');
+      client?.release(); client = null;
+      return (await this._committedRetentionOutcome(idempotencyKey, digest).catch(() => null)) ?? result('transaction_rolled_back');
     } finally { client?.release(); }
   }
   async auditRows() { await this.ready(); return (await this.pool.query('SELECT action,outcome,event_id FROM agent_memory_fabric.conversation_archive_audit_v1 ORDER BY id')).rows; }

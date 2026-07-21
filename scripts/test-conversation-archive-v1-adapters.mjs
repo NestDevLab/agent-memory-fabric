@@ -25,6 +25,15 @@ function event(reference, overrides = {}) {
   return createConversationEvent(payload, { keyId: 'synthetic-key', key: KEY, sentAt: '2026-01-02T03:04:06Z', nonce: `nonce_${reference.eventId.slice(-32)}`.padEnd(16, 'x') });
 }
 function options(extra = {}) { return { cursorKey: Buffer.alloc(32, 9), resolveIntegrityKey: id => id === 'synthetic-key' ? KEY : null, resolveExpiresAt: item => expires.get(item.eventId) ?? '2026-02-01T00:00:00Z', ...extra }; }
+async function bounded(promise, timeoutMs, code) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(code)), timeoutMs); })
+    ]);
+  } finally { clearTimeout(timer); }
+}
 function clean(result) { return JSON.parse(JSON.stringify(result)); }
 const scenario = id => FIXTURE.scenarios.find(item => item.id === id);
 function projectionOf(value) { return { eventId: value.eventId, conversationId: value.conversationId, logicalDigest: value.logicalDigest, payloadDigest: value.integrity.payloadDigest, sourceOccurredAt: value.sourceOccurredAt, sourceSequence: value.ordering.sourceSequence, state: value.state }; }
@@ -69,6 +78,23 @@ async function scenarios(name, create) {
     await t.test('audit_outage', async () => { await reset(); const entry = scenario('audit_outage'); const attempted = sign(entry.request.event); const before = (await archive.auditRows()).length; archive.fault = { audit: true }; const response = await archive.append(attempted, entry.request.idempotencyKey); archive.fault = null; assertFixtureResult('audit_outage', response, entry.expected.result, before, await archive.auditRows()); assert.equal((await archive.list(entry.request.event.conversationId, 20, false)).items.some(x => x.eventId === attempted.eventId), false); });
     await t.test('cross-reference rejection and content-free invalid errors', async () => { const foreign = event({ eventId: 'cevt_foreign0001', conversationId: 'ccon_archive0002', sourceOccurredAt: '2026-01-02T03:04:05Z', sourceSequence: 1, state: 'active' }); await archive.append(foreign, 'cai_foreign0001'); const cross = event({ eventId: 'cevt_crossref0001', conversationId: 'ccon_archive0001', sourceOccurredAt: '2026-01-02T03:04:06Z', sourceSequence: 2, state: 'replacement' }, { replacesEventId: foreign.eventId }); assert.deepEqual(clean(await archive.append(cross, 'cai_crossref0001')), { outcome: 'request_invalid', stateChanged: false, items: [], nextCursor: null }); });
     await t.test('refreshed envelope retries require the same cai key', async () => { await reset(); const first = event({ eventId: 'cevt_refreshretry01', conversationId: 'ccon_archive0001', sourceOccurredAt: '2026-01-02T03:04:05Z', sourceSequence: 1, state: 'active' }); const { schema, logicalDigest, integrity, ...payload } = first; const refreshed = createConversationEvent(payload, { keyId: 'synthetic-key', key: KEY, sentAt: '2026-01-02T03:04:07Z', nonce: 'refreshed_nonce_01' }); assert.equal((await archive.append(first, 'cai_refreshretry01')).outcome, 'stored'); assert.equal((await archive.append(refreshed, 'cai_refreshretry01')).outcome, 'duplicate'); assert.equal((await archive.append(refreshed, 'cai_refreshretry02')).outcome, 'conflict_visible'); });
+    await t.test('duplicate replays append audits and fail closed when the audit is unavailable', async () => {
+      await reset();
+      const first = event({ eventId: 'cevt_duplicateaudit1', conversationId: 'ccon_archive0001', sourceOccurredAt: '2026-01-02T03:04:05Z', sourceSequence: 1, state: 'active' });
+      expires.set(first.eventId, '2026-01-02T03:05:00Z');
+      assert.equal((await archive.append(first, 'cai_duplicateaudit1')).outcome, 'stored');
+      const beforeAppendReplay = (await archive.auditRows()).length;
+      assert.equal((await archive.append(first, 'cai_duplicateaudit1')).outcome, 'duplicate');
+      assert.equal((await archive.auditRows()).length, beforeAppendReplay + 1);
+      assert.equal((await archive.applyRetention('2026-01-02T03:05:00Z', 1, 'cai_duplicateaudit2')).outcome, 'retention_expired');
+      const beforeRetentionReplay = (await archive.auditRows()).length;
+      assert.equal((await archive.applyRetention('2026-01-02T03:05:00Z', 1, 'cai_duplicateaudit2')).outcome, 'duplicate');
+      assert.equal((await archive.auditRows()).length, beforeRetentionReplay + 1);
+      archive.fault = { audit: true };
+      assert.equal((await archive.applyRetention('2026-01-02T03:05:00Z', 1, 'cai_duplicateaudit2')).outcome, 'audit_unavailable');
+      archive.fault = null;
+      assert.equal((await archive.auditRows()).length, beforeRetentionReplay + 1);
+    });
     await t.test('replacement chains hide immutable targets permanently', async () => { await reset(); const base = event({ eventId: 'cevt_replacebase01', conversationId: 'ccon_archive0001', sourceOccurredAt: '2026-01-02T03:04:05Z', sourceSequence: 1, state: 'active' }); const edited = event({ eventId: 'cevt_replaceedit01', conversationId: 'ccon_archive0001', sourceOccurredAt: '2026-01-02T03:04:06Z', sourceSequence: 2, state: 'edited' }, { replacesEventId: base.eventId }); const current = event({ eventId: 'cevt_replacefinal1', conversationId: 'ccon_archive0001', sourceOccurredAt: '2026-01-02T03:04:07Z', sourceSequence: 3, state: 'replacement' }, { replacesEventId: edited.eventId }); expires.set(edited.eventId, '2026-01-02T03:08:00Z'); expires.set(current.eventId, '2026-01-02T03:08:00Z'); assert.equal((await archive.append(base, 'cai_replacebase01')).outcome, 'stored'); assert.equal((await archive.append(edited, 'cai_replaceedit01')).outcome, 'stored'); assert.equal((await archive.append(current, 'cai_replacefinal1')).outcome, 'stored'); assert.deepEqual((await archive.list(base.conversationId, 10, false)).items, [projectionOf(current)]); assert.deepEqual((await archive.list(base.conversationId, 10, true)).items, [projectionOf(current)]); await archive.applyRetention('2026-01-02T03:08:00Z', 10, 'cai_replaceexpire1'); assert.deepEqual((await archive.list(base.conversationId, 10, false)).items, []); });
   });
 }
@@ -82,6 +108,53 @@ test('cursor key and dependencies are checked before PostgreSQL pool creation', 
 test('cursor key is mandatory and cursors page before rejecting tampering', () => { assert.throws(() => new SqliteConversationArchive({}), /cursor_key_invalid/); const archive = new SqliteConversationArchive(options()); const firstEvent = event(syntheticReference('cevt_cursor0001')); const secondEvent = event({ ...syntheticReference('cevt_cursor0002'), sourceSequence: 2 }); archive.append(firstEvent, 'cai_cursor0001'); archive.append(secondEvent, 'cai_cursor0002'); const cursor = archive.list('ccon_archive0001', 1, false).nextCursor; assert.deepEqual(archive.list('ccon_archive0001', 1, false, cursor).items, [projectionOf(secondEvent)]); const changed = `${cursor.slice(0, -1)}${cursor.endsWith('A') ? 'B' : 'A'}`; assert.deepEqual(archive.list('ccon_archive0001', 1, false, changed), { outcome: 'cursor_binding_invalid', stateChanged: false, items: [], nextCursor: null }); archive.close(); });
 test('maximum-length opaque identifiers fit a real protected cursor', () => { const archive = new SqliteConversationArchive(options()); const conversationId = `ccon_${'a'.repeat(128)}`; const first = event({ eventId: `cevt_${'b'.repeat(128)}`, conversationId, sourceOccurredAt: '2026-01-02T03:04:05Z', sourceSequence: 1, state: 'active' }); const second = event({ eventId: `cevt_${'c'.repeat(128)}`, conversationId, sourceOccurredAt: '2026-01-02T03:04:05Z', sourceSequence: 2, state: 'active' }); archive.append(first, `cai_${'d'.repeat(128)}`); archive.append(second, `cai_${'e'.repeat(128)}`); const firstPage = archive.list(conversationId, 1, false); assert.ok(firstPage.nextCursor.length > 256); assert.deepEqual(archive.list(conversationId, 1, false, firstPage.nextCursor).items, [projectionOf(second)]); archive.close(); });
 test('actual SQLite audit insert failure rolls back as audit_unavailable', () => { const archive = new SqliteConversationArchive(options()); archive.db.exec('DROP TABLE conversation_archive_audit_v1'); const response = archive.append(event(syntheticReference('cevt_auditinsert01')), 'cai_auditinsert01'); assert.deepEqual(response, { outcome: 'audit_unavailable', stateChanged: false, items: [], nextCursor: null }); assert.equal(archive.list('ccon_archive0001', 20, false).items.some(item => item.eventId === 'cevt_auditinsert01'), false); archive.close(); });
+test('SQLite visibility query handles a chain beyond the parameter ceiling without resurrection', () => {
+  const archive = new SqliteConversationArchive(options());
+  const conversationId = 'ccon_longchain0001';
+  let previous = event({ eventId: 'cevt_chain0000000', conversationId, sourceOccurredAt: '2026-01-02T03:04:05Z', sourceSequence: 1, state: 'active' });
+  assert.equal(archive.append(previous, 'cai_chain0000000').outcome, 'stored');
+  for (let index = 1; index <= 1_050; index += 1) {
+    const suffix = String(index).padStart(7, '0');
+    const current = event({ eventId: `cevt_chain${suffix}`, conversationId, sourceOccurredAt: '2026-01-02T03:04:06Z', sourceSequence: index + 1, state: 'replacement' }, { replacesEventId: previous.eventId });
+    assert.equal(archive.append(current, `cai_chain${suffix}`).outcome, 'stored');
+    previous = current;
+  }
+  const removal = event({ eventId: 'cevt_chainremove1', conversationId, sourceOccurredAt: '2026-01-02T03:24:00Z', sourceSequence: 2_000, state: 'tombstone' }, { tombstonesEventId: previous.eventId });
+  assert.equal(archive.tombstone(removal, 'cai_chainremove1').outcome, 'stored');
+  assert.deepEqual(archive.list(conversationId, 100, false).items, []);
+  assert.deepEqual(archive.list(conversationId, 100, true).items.map(item => item.eventId), [removal.eventId]);
+  archive.close();
+});
+test('PostgreSQL initialization, connection, and query failures normalize to archive results', async () => {
+  const initialFailure = new PostgresConversationArchive({
+    pool: { async query() { throw new Error('initialization'); }, async connect() { throw new Error('unexpected'); }, async end() {} },
+    ...options()
+  });
+  const input = event(syntheticReference('cevt_pgfailure0001'));
+  assert.equal((await initialFailure.append(input, 'cai_pgfailure0001')).outcome, 'transaction_rolled_back');
+  assert.equal((await initialFailure.tombstone(input, 'cai_pgfailure0001')).outcome, 'request_invalid');
+  assert.equal((await initialFailure.list(input.conversationId, 1, false)).outcome, 'transaction_rolled_back');
+  assert.equal((await initialFailure.applyRetention('2026-01-02T03:05:00Z', 1, 'cai_pgfailure0002')).outcome, 'transaction_rolled_back');
+  await initialFailure.close();
+  const connectionFailure = new PostgresConversationArchive({
+    pool: { async query() { return { rows: [] }; }, async connect() { throw new Error('connection'); }, async end() {} },
+    ...options()
+  });
+  assert.equal((await connectionFailure.append(input, 'cai_pgfailure0003')).outcome, 'transaction_rolled_back');
+  await connectionFailure.close();
+  let poolQueries = 0;
+  const queryFailure = new PostgresConversationArchive({
+    pool: {
+      async query() { poolQueries += 1; if (poolQueries === 1) return { rows: [] }; throw new Error('query'); },
+      async connect() { return { async query() { throw new Error('query'); }, release() {} }; },
+      async end() {}
+    },
+    ...options()
+  });
+  assert.equal((await queryFailure.append(input, 'cai_pgfailure0004')).outcome, 'transaction_rolled_back');
+  assert.equal((await queryFailure.list(input.conversationId, 1, false)).outcome, 'transaction_rolled_back');
+  await queryFailure.close();
+});
 
 if (process.env.AMF_ARCHIVE_POSTGRES_TEST_URL) {
   await scenarios('PostgreSQL archive adapter shared conformance', async () => {
@@ -120,6 +193,76 @@ if (process.env.AMF_ARCHIVE_POSTGRES_TEST_URL) {
         (SELECT count(*) FROM agent_memory_fabric.conversation_archive_requests_v1) AS requests,
         (SELECT count(*) FROM agent_memory_fabric.conversation_archive_audit_v1) AS audits`)).rows[0];
       assert.deepEqual(counts, { events: '1', requests: '1', audits: '1' });
+    } finally { await archive.close(); }
+  });
+  test('PostgreSQL ambiguous committed conflict returns conflict_visible', async () => {
+    const realPool = new pg.Pool({ connectionString: process.env.AMF_ARCHIVE_POSTGRES_TEST_URL, max: 1 });
+    let failAfterCommit = false;
+    const pool = {
+      query: (...args) => realPool.query(...args),
+      end: () => realPool.end(),
+      connect: async () => {
+        const client = await realPool.connect();
+        return new Proxy(client, { get(target, property) {
+          if (property === 'query') return async (...args) => {
+            const response = await target.query(...args);
+            if (failAfterCommit && args[0] === 'COMMIT') { failAfterCommit = false; throw new Error('synthetic_conflict_ack_lost'); }
+            return response;
+          };
+          const value = target[property];
+          return typeof value === 'function' ? value.bind(target) : value;
+        } });
+      }
+    };
+    const archive = new PostgresConversationArchive({ pool, ...options() });
+    try {
+      await archive.ready();
+      await pool.query('TRUNCATE agent_memory_fabric.conversation_archive_audit_v1, agent_memory_fabric.conversation_archive_conflicts_v1, agent_memory_fabric.conversation_archive_requests_v1, agent_memory_fabric.conversation_archive_events_v1');
+      const original = event(syntheticReference('cevt_ambiguousconflict1'));
+      const changed = event(syntheticReference('cevt_ambiguousconflict1'), { occurredAt: '2026-01-02T03:04:06Z' });
+      assert.equal((await archive.append(original, 'cai_ambiguousconflict1')).outcome, 'stored');
+      failAfterCommit = true;
+      const response = await Promise.race([
+        archive.append(changed, 'cai_ambiguousconflict2'),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('ambiguous_conflict_timeout')), 2_000))
+      ]);
+      assert.deepEqual(response, { outcome: 'conflict_visible', stateChanged: false, items: [], nextCursor: null, conflict: { eventId: changed.eventId, logicalDigest: changed.logicalDigest, existingPayloadDigest: original.integrity.payloadDigest, receivedPayloadDigest: changed.integrity.payloadDigest } });
+      assert.equal(await archive.conflictEvidenceCount(), 1);
+    } finally { await archive.close(); }
+  });
+  test('PostgreSQL max-1 pool recovers an ambiguous committed retention acknowledgement', async () => {
+    const realPool = new pg.Pool({ connectionString: process.env.AMF_ARCHIVE_POSTGRES_TEST_URL, max: 1 });
+    let failAfterCommit = false;
+    const pool = {
+      query: (...args) => realPool.query(...args),
+      end: () => realPool.end(),
+      connect: async () => {
+        const client = await realPool.connect();
+        return new Proxy(client, { get(target, property) {
+          if (property === 'query') return async (...args) => {
+            const response = await target.query(...args);
+            if (failAfterCommit && args[0] === 'COMMIT') { failAfterCommit = false; throw new Error('synthetic_retention_ack_lost'); }
+            return response;
+          };
+          const value = target[property];
+          return typeof value === 'function' ? value.bind(target) : value;
+        } });
+      }
+    };
+    const archive = new PostgresConversationArchive({ pool, ...options() });
+    try {
+      await archive.ready();
+      await pool.query('TRUNCATE agent_memory_fabric.conversation_archive_audit_v1, agent_memory_fabric.conversation_archive_conflicts_v1, agent_memory_fabric.conversation_archive_requests_v1, agent_memory_fabric.conversation_archive_events_v1');
+      const input = event(syntheticReference('cevt_ambiguousretain1'));
+      expires.set(input.eventId, '2026-01-02T03:05:00Z');
+      assert.equal((await archive.append(input, 'cai_ambiguousretain1')).outcome, 'stored');
+      failAfterCommit = true;
+      assert.deepEqual(await bounded(archive.applyRetention('2026-01-02T03:05:00Z', 1, 'cai_ambiguousretain2'), 2_000, 'ambiguous_retention_timeout'), { outcome: 'duplicate', stateChanged: false, items: [], nextCursor: null });
+      const counts = (await pool.query(`SELECT
+        (SELECT count(*) FROM agent_memory_fabric.conversation_archive_requests_v1 WHERE idempotency_key='cai_ambiguousretain2' AND outcome='retention_expired' AND operation='apply_retention') AS requests,
+        (SELECT count(*) FROM agent_memory_fabric.conversation_archive_audit_v1 WHERE action='apply_retention' AND outcome='recorded') AS audits,
+        (SELECT count(*) FROM agent_memory_fabric.conversation_archive_events_v1 WHERE event_id='cevt_ambiguousretain1' AND expired=true) AS expired`)).rows[0];
+      assert.deepEqual(counts, { requests: '1', audits: '1', expired: '1' });
     } finally { await archive.close(); }
   });
 } else {

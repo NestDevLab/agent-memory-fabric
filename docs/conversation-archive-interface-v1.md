@@ -35,6 +35,10 @@ digests; it never exposes hidden content.
 `append`, `tombstone`, and `applyRetention` are state-changing operations.
 Their state change and append-only committed audit row are one transaction.
 `stored` and `retention_expired` change state and require `audit.recorded`.
+Exact `duplicate` replays for both write and retention operations also append a
+new `audit.recorded` row in their replay transaction. If that audit insert is
+unavailable, the replay fails closed as `audit_unavailable` and does not commit
+a replay audit row.
 `transaction_rolled_back` changes neither state nor committed audit row and
 therefore has `audit.absent`. If audit is unavailable, the mutation fails
 closed as `audit_unavailable`, with no state change and no committed audit row.
@@ -101,5 +105,7 @@ the PostgreSQL scenario run. Use an isolated test database only.
 
 PostgreSQL writes serialize stable event and idempotency keys with transaction
 advisory locks. If a commit acknowledgement is ambiguous, the adapter re-reads
-the idempotency record and returns `duplicate` only when the exact request was
-durably recorded; it never retries a changed payload as a new write.
+the idempotency record: a durably recorded exact write returns `duplicate`, and
+a durably recorded changed-payload write returns its content-free
+`conflict_visible` projection. It never retries a changed payload as a new
+write.
