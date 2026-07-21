@@ -256,7 +256,7 @@ source transcript is altered or deleted.
 - [x] Bound SQLite replacement and tombstone visibility work for long edit chains.
 - [x] Align duplicate replay audit semantics across append and retention operations.
 - [ ] Retry PostgreSQL schema initialization after a transient first-touch failure.
-- [ ] Preserve the v2 session-read API as a compatibility view over v3 data.
+- [x] Preserve the v2 session-read API as a compatibility view over v3 data.
 - [x] Add audit-outage injection tests and prove audited operations fail closed.
 - [ ] Add key-rotation drills for every policy class that enables encryption.
 - [ ] Measure representative storage, filesystem-block, and query costs.

@@ -23,6 +23,7 @@
     "test:conversation-event-outbox": "node --test scripts/test-conversation-event-v3-outbox.mjs",
     "test:conversation-event-ingest": "node --test scripts/test-conversation-event-v3-ingest-endpoint.mjs",
     "test:conversation-archive": "node --test scripts/test-conversation-archive-v1-adapters.mjs",
+    "test:conversation-session-view": "node --test scripts/test-conversation-session-view-v2.mjs",
     "test": "node --test scripts/test-*.mjs",
     "test:auth": "node --test scripts/test-auth-registry.mjs"
   },

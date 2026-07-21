@@ -78,8 +78,9 @@ function canonicalProposal(text, scope = 'main-lab', revision = 1) {
   return { record: canonicalRecord(text, scope, revision), rationale: 'test_evidence', expectedRevision: revision - 1 };
 }
 
-async function withServer(run, { sessionOptions, clock, configuredSessionReader = true,
-  sessionReader: sessionReaderOverride, fabricStore: fabricStoreOverride, backend: backendOverride,
+async function withServer(run, { sessionOptions, clock, configuredSessionReader = true, conversationSessionReaderConfigured = configuredSessionReader,
+  sessionReader: sessionReaderOverride, conversationSessionReader: conversationSessionReaderOverride,
+  fabricStore: fabricStoreOverride, backend: backendOverride,
   canonicalStore, documentStore, contextVerifier, receiptCoordinator, routeManifestSetup, migrationPause } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-server-'));
   const registryPath = path.join(dir, 'auth.json');
@@ -189,7 +190,9 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
   const server = createAgentMemoryFabricServer({ backend, fabricStore, canonicalStore,
     documentStore,
     contextVerifier: effectiveContextVerifier, routeManifestPath: effectiveRouteManifestPath, receiptCoordinator,
-    sessionReader: configuredSessionReader ? sessionReader : undefined, sessionOptions, clock,
+    sessionReader: configuredSessionReader ? sessionReader : undefined,
+    conversationSessionReader: conversationSessionReaderConfigured ? (conversationSessionReaderOverride || sessionReader) : undefined,
+    sessionOptions, clock,
     policyPath: testPolicyPath, migrationPause });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
@@ -1109,7 +1112,63 @@ test('session reader capability is explicit and unconfigured access returns 503'
   }, { configuredSessionReader: false });
 });
 
-test('session transcript defaults redacted and requires raw decrypt permission for original', async () => {
+test('public v2 and MCP session reads use only the conversation reader while the extractor stays legacy', async () => {
+  let legacySearches = 0;
+  let conversationSearches = 0;
+  const legacyReader = {
+    configured: true, kind: 'legacy-spy',
+    async search() { legacySearches += 1; return { items: [{ id: 'legacy-session' }] }; },
+    async get() { return { id: 'legacy-session' }; },
+    async transcript() { return { id: 'legacy-session', view: 'redacted', items: [] }; }
+  };
+  const conversationReader = {
+    configured: true, kind: 'conversation-spy',
+    async search() { conversationSearches += 1; return { items: [{ id: 'ccon_servercompat01', title: '', scope: '', ownerSelf: true, conversationKind: 'group', contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }], nextCursor: null }; },
+    async get({ id }) { return { id, title: '', scope: '', ownerSelf: true, conversationKind: 'group', contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }; },
+    async transcript({ id }) { return { id, view: 'redacted', items: [], nextCursor: null }; }
+  };
+  await withServer(async ({ api, registry, writeRegistry }) => {
+    registry.rows.push({ token: 'compat-extractor-token', active: true, actor: 'service:compat-extractor', mode: 'scoped', allowedScopes: ['shared:global'], sessionOwnerActors: ['test-actor'], permissions: ['raw:extract', 'purpose:memory_curation'] });
+    writeRegistry();
+    const input = { query: 'synthetic', purpose: 'continuity_resume' };
+    const contextToken = contextTokenFor({ purpose: input.purpose, operation: 'sessions_search', input });
+    const rest = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ ...input, contextToken }) });
+    assert.equal(rest.response.status, 200);
+    assert.equal(conversationSearches, 1);
+    assert.equal(legacySearches, 0);
+
+    const v1 = await api('/v1/sessions/search', { method: 'POST', body: JSON.stringify({ ...input, contextToken }) });
+    assert.equal(v1.response.status, 200);
+    assert.equal(conversationSearches, 2);
+    assert.equal(legacySearches, 0);
+
+    const initialized = await api('/mcp/test-client/compat', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) });
+    const mcp = await api('/mcp/test-client/compat', { method: 'POST', headers: { 'mcp-session-id': initialized.response.headers.get('mcp-session-id') }, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sessions_search', arguments: { ...input, contextToken } } }) });
+    assert.equal(mcp.response.status, 200);
+    assert.equal(conversationSearches, 3);
+    assert.equal(legacySearches, 0);
+
+    const status = await api('/v2/status');
+    assert.equal(status.body.data.sessionReader.kind, 'conversation-spy');
+    const mcpStatus = await api('/mcp/test-client/compat', { method: 'POST', headers: { 'mcp-session-id': initialized.response.headers.get('mcp-session-id') }, body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'memory_status', arguments: {} } }) });
+    assert.equal(JSON.parse(mcpStatus.body.result.content[0].text).sessionReader.kind, 'conversation-spy');
+
+    const extractor = await api('/v2/internal/extractor/sessions?limit=1', { headers: { authorization: 'Bearer compat-extractor-token' } });
+    assert.equal(extractor.response.status, 200);
+    assert.equal(legacySearches, 1);
+  }, { sessionReader: legacyReader, conversationSessionReader: conversationReader });
+
+  await withServer(async ({ api }) => {
+    const input = { query: 'synthetic', purpose: 'continuity_resume' };
+    const contextToken = contextTokenFor({ purpose: input.purpose, operation: 'sessions_search', input });
+    const unavailable = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ ...input, contextToken }) });
+    assert.equal(unavailable.response.status, 503);
+    assert.equal(unavailable.body.error.code, 'session_reader_unconfigured');
+    assert.equal(legacySearches, 1);
+  }, { sessionReader: legacyReader, conversationSessionReaderConfigured: false });
+});
+
+test('v3 compatibility transcript defaults redacted and rejects original before RAW access', async () => {
   await withServer(async ({ api }) => {
     const redactedToken = contextTokenFor({ purpose: 'continuity_resume', operation: 'session_transcript', input: { sessionId: 'session-1', view: 'redacted' } });
     const transcript = await api(`/v2/sessions/session-1/transcript?purpose=continuity_resume&contextToken=${encodeURIComponent(redactedToken)}`);
@@ -1121,8 +1180,8 @@ test('session transcript defaults redacted and requires raw decrypt permission f
     const forbidden = await api(`/v2/sessions/session-1/transcript?view=original&purpose=incident_debug&contextToken=${encodeURIComponent(limitedToken)}`, {
       headers: { authorization: 'Bearer limited-token' }
     });
-    assert.equal(forbidden.response.status, 403);
-    assert.equal(forbidden.body.error.code, 'raw_decrypt_forbidden');
+    assert.equal(forbidden.response.status, 410);
+    assert.equal(forbidden.body.error.code, 'session_original_unavailable');
 
     const tirreniaContext = contextTokenFor({ actor: 'tirrenia-actor', purpose: 'operator_review', operation: 'session_get',
       input: { sessionId: 'session-1' }, conversationKind: 'session', canonicalScopes: ['tirrenia'] });
@@ -1138,21 +1197,30 @@ test('session transcript defaults redacted and requires raw decrypt permission f
   });
 });
 
-test('durable decrypt-intent audit failure prevents the session reader from decrypting RAW', async () => {
+test('original view is 410 before every reader or RAW decrypt-intent call', async () => {
   const fabricStore = makeStore();
   const originalAudit = fabricStore.audit.bind(fabricStore);
-  fabricStore.audit = async event => { if (event.action === 'raw_decrypt_intent') throw new Error('audit offline'); return originalAudit(event); };
+  let decryptIntentCalls = 0;
+  fabricStore.audit = async event => { if (event.action === 'raw_decrypt_intent') { decryptIntentCalls += 1; throw new Error('audit offline'); } return originalAudit(event); };
+  let getCalls = 0;
   let transcriptCalls = 0;
   const sessionReader = {
     configured: true, kind: 'decrypt-spy',
     async search() { return { items: [] }; },
-    async get({ id }) { return { id, scope: 'main-lab', ownerActor: 'test-actor', conversationKind: 'group', contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }; },
+    async get({ id }) { getCalls += 1; return { id, scope: 'main-lab', ownerActor: 'test-actor', conversationKind: 'group', contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }; },
     async transcript() { transcriptCalls += 1; return { id: 'session-1', view: 'original', items: [], nextCursor: null }; }
   };
   await withServer(async ({ api }) => {
-    const contextToken = contextTokenFor({ purpose: 'incident_debug', operation: 'session_transcript', input: { sessionId: 'session-1', view: 'original' } });
-    const result = await api(`/v2/sessions/session-1/transcript?view=original&purpose=incident_debug&contextToken=${encodeURIComponent(contextToken)}`);
-    assert.equal(result.response.status, 503); assert.equal(result.body.error.code, 'audit_unavailable'); assert.equal(transcriptCalls, 0);
+    const input = { sessionId: 'session-1', view: 'original', query: 'still unavailable' };
+    const contextToken = contextTokenFor({ purpose: 'incident_debug', operation: 'session_transcript', input });
+    const v2 = await api(`/v2/sessions/session-1/transcript?view=original&query=${encodeURIComponent(input.query)}&purpose=incident_debug&contextToken=${encodeURIComponent(contextToken)}`);
+    assert.equal(v2.response.status, 410); assert.equal(v2.body.error.code, 'session_original_unavailable');
+    const v1 = await api('/v1/sessions/session-1/transcript?view=original&query=still%20unavailable&purpose=incident_debug&contextToken=' + encodeURIComponent(contextToken));
+    assert.equal(v1.response.status, 410); assert.equal(v1.body.error, 'session_original_unavailable');
+    const initialized = await api('/mcp/test-client/original', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) });
+    const mcp = await api('/mcp/test-client/original', { method: 'POST', headers: { 'mcp-session-id': initialized.response.headers.get('mcp-session-id') }, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'session_transcript', arguments: { ...input, purpose: 'incident_debug', contextToken } } }) });
+    assert.equal(mcp.response.status, 200); assert.equal(mcp.body.error.message, 'session_original_unavailable');
+    assert.equal(getCalls, 0); assert.equal(transcriptCalls, 0); assert.equal(decryptIntentCalls, 0);
   }, { fabricStore, sessionReader });
 });
 
