@@ -217,8 +217,9 @@ test('successful batches heartbeat, enqueue, acknowledge, durable-commit, and re
     'heartbeat', 'enqueue', 'deliver', 'commit', 'release',
   ]);
   assert.deepEqual(Object.keys(deps.calls.find(call => call[0] === 'open')[1]).sort(), [
-    'after', 'maxEvents', 'phase', 'runId',
+    'after', 'afterSequence', 'maxEvents', 'phase', 'runId',
   ]);
+  assert.equal(deps.calls.find(call => call[0] === 'open')[1].afterSequence, 0);
   assert.equal(deps.committed.length, 2);
   assert.equal(deps.committed[0].planDigest, plan.planDigest);
 });
@@ -241,6 +242,21 @@ test('checkpoint progress is plan-bound and checkpoints must advance', async () 
   await assert.rejects(() => planM4BackfillBatch({
     gateVerifier: async () => gate(), maxEvents: M4_BACKFILL_MAX_EVENTS + 1,
   }), { code: 'm4_backfill_request_invalid' });
+});
+
+test('resume forwards the loaded sequence to a mutation-isolated source open request', async () => {
+  const probe = [];
+  const { plan } = await confirmedRun([row(2)], {
+    loaded: currentPlan => ({
+      schema: 'amf.m4-backfill-progress/v1', runId: currentPlan.runId, phase: currentPlan.phase,
+      planDigest: currentPlan.planDigest, sequence: 1,
+      checkpoint: { id: 'row-checkpoint-1', digest: digest('row-1') },
+      eventId: event(1).eventId, payloadDigest: event(1).integrity.payloadDigest,
+    }),
+    mutateOpen: input => { probe.push(structuredClone(input)); input.afterSequence = 999; },
+  });
+  assert.equal(plan.phase, 'v2-archive');
+  assert.equal(probe[0].afterSequence, 1);
 });
 
 test('durable acknowledgement and event-to-outbox identity mismatches stop before progress success', async () => {

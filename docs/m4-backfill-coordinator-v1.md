@@ -13,7 +13,8 @@ content, paths, commands, keys, hostnames, or credentials.
 `runM4BackfillBatch` recomputes the plan and requires the exact confirmed
 digest before acquiring a lease, reading a checkpoint, opening a source, or
 touching an outbox. It opens a source only with `{runId, phase, after,
-maxEvents}`. For each strictly ascending source row it heartbeats the lease,
+afterSequence, maxEvents}`. `afterSequence` is zero initially and the loaded
+progress sequence on resume. For each strictly ascending source row it heartbeats the lease,
 enqueues the opaque event, delivers its returned event ID, requires a compact
 acknowledgement, and only then commits compact progress. The store must return
 an exact durable progress acknowledgement before the row is counted. Progress

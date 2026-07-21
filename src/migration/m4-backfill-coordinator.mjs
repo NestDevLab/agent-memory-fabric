@@ -352,6 +352,7 @@ export async function runM4BackfillBatch({
         runId: plan.runId,
         phase: plan.phase,
         after: copyCheckpoint(after, 'm4_backfill_progress_invalid'),
+        afterSequence: loaded?.sequence ?? 0,
         maxEvents: plan.maxEvents,
       }),
       'm4_backfill_source_open_failed',
