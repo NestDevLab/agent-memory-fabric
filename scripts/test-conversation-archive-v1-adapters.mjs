@@ -155,10 +155,107 @@ test('PostgreSQL initialization, connection, and query failures normalize to arc
   assert.equal((await queryFailure.list(input.conversationId, 1, false)).outcome, 'transaction_rolled_back');
   await queryFailure.close();
 });
+test('PostgreSQL lazy initialization resets after one shared transient failure and caches success', async () => {
+  let ddlAttempts = 0;
+  const archive = new PostgresConversationArchive({
+    pool: {
+      async query() {
+        ddlAttempts += 1;
+        if (ddlAttempts === 1) throw new Error('transient initialization failure');
+        return { rows: [] };
+      },
+      async connect() { throw new Error('not reached'); },
+      async end() {}
+    },
+    ...options()
+  });
+
+  const first = await Promise.allSettled([archive.ready(), archive.ready(), archive.ready()]);
+  assert.deepEqual(first.map(item => item.status), ['rejected', 'rejected', 'rejected']);
+  assert.equal(ddlAttempts, 1);
+
+  const second = await Promise.all([archive.ready(), archive.ready(), archive.ready()]);
+  assert.equal(second.every(item => item === archive), true);
+  assert.equal(ddlAttempts, 2);
+
+  await archive.ready();
+  assert.equal(ddlAttempts, 2);
+  await archive.close();
+});
+test('PostgreSQL append retries only after a later initialization attempt recovers', async () => {
+  let ddlAttempts = 0;
+  let stored = null;
+  const client = {
+    async query(sql, values = []) {
+      if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK' || sql.startsWith('SELECT pg_advisory')) return { rows: [] };
+      if (sql.startsWith('SELECT * FROM agent_memory_fabric.conversation_archive_requests_v1')) return { rows: [] };
+      if (sql.startsWith('SELECT * FROM agent_memory_fabric.conversation_archive_events_v1')) return { rows: [] };
+      if (sql.startsWith('INSERT INTO agent_memory_fabric.conversation_archive_events_v1')) {
+        stored = {
+          event_id: values[0], conversation_id: values[1], source_instance_id: values[2], state: values[3],
+          logical_digest: values[4], payload_digest: values[5], source_occurred_at: values[6],
+          source_time_key: values[7], source_sequence: values[8]
+        };
+      }
+      return { rows: [] };
+    },
+    release() {}
+  };
+  const archive = new PostgresConversationArchive({
+    pool: {
+      async query(sql) {
+        if (sql.includes('CREATE SCHEMA IF NOT EXISTS')) {
+          ddlAttempts += 1;
+          if (ddlAttempts === 1) throw new Error('transient initialization failure');
+          return { rows: [] };
+        }
+        if (sql.startsWith('SELECT e.*')) return { rows: stored ? [stored] : [] };
+        throw new Error('unexpected pool query');
+      },
+      async connect() { return client; },
+      async end() {}
+    },
+    ...options()
+  });
+  const input = event(syntheticReference('cevt_pgretryappend1'));
+
+  assert.deepEqual(await archive.append(input, 'cai_pgretryappend1'), { outcome: 'transaction_rolled_back', stateChanged: false, items: [], nextCursor: null });
+  assert.equal(ddlAttempts, 1);
+  assert.deepEqual(await archive.append(input, 'cai_pgretryappend1'), { outcome: 'stored', stateChanged: true, items: [], nextCursor: null });
+  assert.equal(ddlAttempts, 2);
+  assert.deepEqual((await archive.list(input.conversationId, 1, false)).items, [projectionOf(input)]);
+  await archive.ready();
+  assert.equal(ddlAttempts, 2);
+  await archive.close();
+});
 
 if (process.env.AMF_ARCHIVE_POSTGRES_TEST_URL) {
   await scenarios('PostgreSQL archive adapter shared conformance', async () => {
     const archive = new PostgresConversationArchive({ connectionString: process.env.AMF_ARCHIVE_POSTGRES_TEST_URL, ...options() }); await archive.ready(); await archive.pool.query('TRUNCATE agent_memory_fabric.conversation_archive_audit_v1, agent_memory_fabric.conversation_archive_conflicts_v1, agent_memory_fabric.conversation_archive_requests_v1, agent_memory_fabric.conversation_archive_events_v1'); return archive;
+  });
+  test('PostgreSQL ready retries one pre-DDL transient failure and then remains cached', async () => {
+    const realPool = new pg.Pool({ connectionString: process.env.AMF_ARCHIVE_POSTGRES_TEST_URL, max: 1 });
+    let ddlAttempts = 0;
+    const pool = {
+      query: async (...args) => {
+        if (typeof args[0] === 'string' && args[0].includes('CREATE SCHEMA IF NOT EXISTS')) {
+          ddlAttempts += 1;
+          if (ddlAttempts === 1) throw new Error('synthetic_pre_ddl_failure');
+        }
+        return realPool.query(...args);
+      },
+      connect: (...args) => realPool.connect(...args),
+      end: () => realPool.end()
+    };
+    const archive = new PostgresConversationArchive({ pool, ...options() });
+    try {
+      await assert.rejects(archive.ready(), /synthetic_pre_ddl_failure/);
+      await archive.ready();
+      await archive.ready();
+      assert.equal(ddlAttempts, 2);
+    } finally {
+      await archive.close();
+    }
   });
   test('PostgreSQL max-1 pool recovers an ambiguous committed append acknowledgement', async () => {
     const realPool = new pg.Pool({ connectionString: process.env.AMF_ARCHIVE_POSTGRES_TEST_URL, max: 1 });

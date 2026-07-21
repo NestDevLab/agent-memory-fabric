@@ -202,7 +202,14 @@ export class PostgresConversationArchive {
     this.initialized = null;
   }
   async ready() {
-    if (!this.initialized) this.initialized = Promise.resolve().then(() => this.pool.query(POSTGRES_DDL));
+    if (!this.initialized) {
+      const attempt = Promise.resolve().then(() => this.pool.query(POSTGRES_DDL));
+      const shared = attempt.catch(error => {
+        if (this.initialized === shared) this.initialized = null;
+        throw error;
+      });
+      this.initialized = shared;
+    }
     await this.initialized;
     return this;
   }
