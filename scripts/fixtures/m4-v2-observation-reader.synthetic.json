@@ -1,0 +1,5 @@
+{
+  "schema": "amf.m4-v2-observation-reader-fixture/v1",
+  "description": "Synthetic metadata identifiers for the M4 v2 observation-reader tests.",
+  "catalogTagKeyId": "catalog-k1"
+}
