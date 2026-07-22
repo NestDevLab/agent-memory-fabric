@@ -6,11 +6,15 @@ import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 
+import { MemoryCatalog } from '../src/fabric-store.mjs';
+import { ciphertextContentId } from '../src/ingest/raw-event-contract.mjs';
+import { EncryptedOutbox } from '../src/ingest/outbox.mjs';
 import { canonicalJson } from '../src/ingest/transcripts/canonical.mjs';
 import { ConversationEventPlaintextOutbox } from '../src/ingest/conversation-event-v3-outbox.mjs';
 import { runM4PreservedGroupReplay } from '../src/migration/m4-preserved-group-replay.mjs';
 import { prepareM4PreservedUnifiedIndex } from '../src/migration/m4-preserved-unified-index.mjs';
 import { prepareM4UnifiedLogicalGroupSource } from '../src/migration/m4-unified-logical-group-source.mjs';
+import { prepareM4V2UnifiedIndex } from '../src/migration/m4-v2-unified-index.mjs';
 
 const sha = value => `sha256:${crypto.createHash('sha256').update(value).digest('hex')}`;
 const eventId = value => `evt_${String(value).repeat(64).slice(0, 64)}`;
@@ -163,7 +167,7 @@ test('optionally crosses preserved reader/decoder through unified source and Fab
         timestamp: `2026-07-22T00:00:0${revision}Z`, authoritativeDeletion: deleted,
         message: { role: 'user', content: deleted ? 'discarded tombstone source' : 'cross-repo visible edit' } },
       defaults: { sessionId: 'synthetic-session', canonicalSenderIdentity: 'person:synthetic', actorIdentity: 'synthetic-actor' } });
-    const edit = build(1, false); const tombstone = build(2, true); rawOutbox.enqueue(edit); rawOutbox.enqueue(tombstone);
+    const edit = build(1, false); const tombstone = build(2, true); rawOutbox.enqueue(tombstone);
     rawOutbox.defer(rawOutbox.readRecord(tombstone.event.eventId), Object.assign(new Error('dead'), { permanent: true, code: 'synthetic_dead' }));
     const pausePath = path.join(root, 'pause.json'); createPauseCheckpoint({ config: { sourceInstanceId: 'synthetic-runtime', actorId: 'synthetic-actor', outboxPath: outboxRoot, cursorPath: cursorRoot },
       sources: [{ runtime: 'claude', filePath: nativePath }], manifestId: 'pause-manifest-synthetic', revision: 1, keyId: 'migration-key-synthetic',
@@ -173,13 +177,33 @@ test('optionally crosses preserved reader/decoder through unified source and Fab
     const decoder = createM4PreservedObservationDecoder({ envelopeDecoder: createRawEnvelopeDecoder({ encryptionKey, digestKey, keyId: 'client-v1', sourceInstanceId: 'synthetic-runtime', actorId: 'synthetic-actor' }) });
     const bridge = await prepareM4PreservedUnifiedIndex({ authority: { schema: 'amf.m4-group-replay-authority/v1', authorityDigest }, reader, decoder,
       sourceTag: `migration:${'b'.repeat(64)}` });
-    const canonicalAlias = bridge.indexes['preserved-outbox'].entries[0].projectionDigests.find(item => item.logicalMessageId !== edit.projection.logicalMessageId);
-    assert.ok(canonicalAlias); assert.equal(bridge.indexes['preserved-deadletter'].entries[0].projectionDigests.some(item => item.logicalMessageId === canonicalAlias.logicalMessageId), true);
+    const archiveRoot = path.join(root, 'v2-archive'); const archiveOutbox = new EncryptedOutbox({ rootPath: archiveRoot,
+      encryptionKey, digestKey, keyId: 'client-v1', sourceInstanceId: 'synthetic-runtime', actorId: 'synthetic-actor' });
+    const archiveEnvelope = archiveOutbox.encrypt(edit); const archiveCatalog = new MemoryCatalog();
+    const archivedLogicalId = edit.projection.logicalMessageAliases[0].logicalMessageId;
+    const archiveRow = { eventId: edit.event.eventId, sessionId: edit.event.sessionId, logicalMessageId: archivedLogicalId,
+      contentId: ciphertextContentId(archiveEnvelope), payloadDigest: archiveEnvelope.payloadDigest, projection: structuredClone(edit.projection),
+      ownerTag: `catalog-k1:${'c'.repeat(64)}`, sourceTag: `migration:${'b'.repeat(64)}`, createdAt: '2026-07-22T00:00:10Z' };
+    await archiveCatalog.ingestRawEventV2(archiveRow, { contentId: archiveRow.contentId, mediaType: 'application/json', byteLength: 1,
+      storageRef: `test/${archiveRow.contentId}`, createdAt: archiveRow.createdAt },
+    { id: `audit-${archiveRow.eventId.slice(4, 36)}`, ts: archiveRow.createdAt, actorTag: archiveRow.ownerTag,
+      action: 'synthetic', targetId: archiveRow.eventId, details: {} });
+    const archiveBridge = await prepareM4V2UnifiedIndex({ authority: { schema: 'amf.m4-group-replay-authority/v1', authorityDigest },
+      catalog: archiveCatalog, rawStore: { async getClientCiphertext() { return structuredClone(archiveEnvelope); } },
+      ingestKeys: { keys: { 'client-v1': encryptionKey }, digestKey,
+        authorizations: { 'client-v1': { actors: ['synthetic-actor'], sourceInstances: ['synthetic-runtime'] } },
+        logicalMessageKeys: { currentKeyVersion: 'logical-v2', keys: { 'logical-v1': logicalKey, 'logical-v2': rotatedLogicalKey } } },
+      verifyCatalogBinding: async () => ({ owner: true, source: true }),
+      auditDecrypt: async request => ({ recorded: true, eventId: request.eventId, contentId: request.contentId }) });
+    const canonicalAlias = { logicalMessageId: edit.projection.logicalMessageId };
+    assert.equal(bridge.indexes['preserved-outbox'].entries.length, 0);
+    assert.equal(archiveBridge.index.entries[0].projectionDigests.some(item => item.logicalMessageId === canonicalAlias.logicalMessageId), true);
+    assert.equal(bridge.indexes['preserved-deadletter'].entries[0].projectionDigests.some(item => item.logicalMessageId === canonicalAlias.logicalMessageId), true);
     const source = await prepareM4UnifiedLogicalGroupSource({ authority: { schema: 'amf.m4-group-replay-authority/v1', authorityDigest },
-      indexes: { 'v2-archive': { schema: 'amf.m4-unified-logical-index/v1', authorityDigest, origin: 'v2-archive', complete: true, entries: [] },
+      indexes: { 'v2-archive': archiveBridge.index,
         'preserved-outbox': bridge.indexes['preserved-outbox'], 'preserved-deadletter': bridge.indexes['preserved-deadletter'] },
       resolveCanonicalLogicalId: async () => canonicalAlias.logicalMessageId,
-      materializers: { 'v2-archive': async () => { throw new Error('unexpected archive materialization'); },
+      materializers: { 'v2-archive': archiveBridge.materializer,
         'preserved-outbox': bridge.materializers['preserved-outbox'], 'preserved-deadletter': bridge.materializers['preserved-deadletter'] } });
     const opened = await source.open({ schema: 'amf.m4-preserved-group-replay-request/v1', authorityDigest, after: null,
       maxGroups: 100, maxObservations: 1000, maxOutputEvents: 1000 }); const privateGroups = await groups(opened); assert.equal(privateGroups.length, 1);
