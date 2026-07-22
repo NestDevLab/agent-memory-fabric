@@ -9,6 +9,7 @@ import {
   deriveM4V3EventIdFromLegacyEventId,
   projectM4V2LogicalGroup,
 } from '../src/migration/m4-v2-conversation-projector.mjs';
+import { createM4CrossPhaseIdentityInMemoryAccumulator } from '../src/migration/m4-cross-phase-identity-in-memory-accumulator.mjs';
 
 const fixture = JSON.parse(fs.readFileSync(
   new URL('./fixtures/m4-v2-conversation-projector.synthetic.json', import.meta.url),
@@ -97,6 +98,7 @@ async function project(observations, options = {}) {
     logical: options.logical ?? logical(observations),
     observations,
     integrityFor: options.integrityFor ?? recorder.integrityFor,
+    identityCollector: options.identityCollector ?? null,
   });
   return { result, recorder };
 }
@@ -445,4 +447,64 @@ test('exports the stable legacy event mapping used by preserved replay', () => {
     () => deriveM4V3EventIdFromLegacyEventId('not-a-legacy-event'),
     { code: 'm4_v2_projector_legacy_event_id_invalid' },
   );
+});
+
+test('emits a content-free identity block only for accepted projector output', async () => {
+  const first = observation('c', { sequence: 1, migrationSequence: 1, nativeRevision: 1, sourceTag: sourceTag('a') });
+  const edited = observation('d', { sequence: 2, migrationSequence: 2, nativeRevision: 2, sourceTag: sourceTag('a') });
+  const deleted = observation('e', { sequence: 3, migrationSequence: 3, nativeRevision: 3,
+    sourceTag: sourceTag('a'), authoritativeDeletion: true, role: 'unknown', direction: 'internal',
+    conversationKind: 'unknown', contentType: 'none', contentParts: 0, hasContent: false, visibleText: null });
+  const blocks = [];
+  const { result } = await project([first, edited, deleted], { recorder: integrityRecorder(),
+    identityCollector: { async accept(block) { blocks.push(block); } } });
+  assert.equal(blocks.length, 1);
+  const block = blocks[0];
+  assert.equal(block.schema, 'amf.m4-cross-phase-projector-identity-block/v1');
+  assert.deepEqual(block.events.map(item => item.eventId).sort(), result.events.map(item => item.eventId).sort());
+  assert.deepEqual(block.events.map(item => item.state).sort(), result.events.map(item => item.state).sort());
+  for (const item of block.events) {
+    const v3 = result.events.find(event => event.eventId === item.eventId);
+    assert.equal(item.conversationId, v3.conversationId);
+    assert.equal(item.sourceInstanceId, v3.sourceInstanceId);
+    assert.deepEqual(item.authorizationContextTags, v3.authorizationContextTags);
+  }
+  assert.doesNotMatch(JSON.stringify(block), /visibleText|normalizedPayloadDigest|logicalMessageId|nativeEventId|nativeSessionId|integrity|attachment/i);
+
+  const accumulator = createM4CrossPhaseIdentityInMemoryAccumulator({ registrySecret: Buffer.alloc(32, 3) });
+  await project([first, edited, deleted], { identityCollector: { accept: accumulator.accept } });
+  const sealed = accumulator.seal({ coveredThrough: '2026-07-22T00:00:00Z',
+    backfillBinding: { completionDigest: `sha256:${'a'.repeat(64)}`, catalogRevisionDigest: `sha256:${'b'.repeat(64)}` },
+    scanCompletion: { complete: true, acceptedGroupCount: 1, excludedGroupCount: 0, traversalDigest: `sha256:${'c'.repeat(64)}` } });
+  assert.deepEqual(sealed.registry.authority.coverage, { sessionCount: 1, eventCount: 3,
+    pageDigest: sealed.registry.authority.coverage.pageDigest });
+
+  const mutationInput = observation('a');
+  const mutationResult = await project([mutationInput], { identityCollector: { async accept(value) {
+    value.session.sessionContextTags.conversation[0] = opaque('mutated-session');
+    value.events[0].authorizationContextTags.conversation[0] = opaque('mutated-event');
+    value.events[0].sourceTags[0] = sourceTag('z');
+  } } });
+  assert.notEqual(mutationResult.result.events[0].authorizationContextTags.conversation[0], opaque('mutated-event'));
+  assert.notEqual(mutationInput.projection.contextTags.conversation[0], opaque('mutated-event'));
+  assert.ok(mutationResult.result.events[0].sourceInstanceId);
+
+  const multiA = observation('7', { migrationSequence: 4, sequence: 4, sourceTag: sourceTag('a') });
+  const multiB = observation('8', { migrationSequence: 5, sequence: 5, sourceTag: sourceTag('b'), sourceKind: 'claude' });
+  const multi = [];
+  const multiResult = await project([multiA, multiB], { identityCollector: { async accept(value) { multi.push(value); } } });
+  assert.deepEqual(multi[0].events[0].sourceTags, [sourceTag('a'), sourceTag('b')].sort());
+  assert.deepEqual(multi[0].events.map(item => [item.eventId, item.state]).sort(),
+    multiResult.result.events.map(item => [item.eventId, item.state]).sort());
+  assert.ok(multi[0].events.some(item => item.state === 'conflict'));
+
+  let calls = 0;
+  const ineligible = observation('f', { role: 'tool', direction: 'internal', visibleText: 'synthetic ineligible' });
+  const excludedResult = await projectM4V2LogicalGroup({ logical: logical([ineligible]), observations: [ineligible],
+    integrityFor: integrityRecorder().integrityFor, identityCollector: { async accept() { calls += 1; } } });
+  assert.equal(excludedResult.outcome, 'excluded');
+  assert.equal(calls, 0);
+  await assert.rejects(() => projectM4V2LogicalGroup({ logical: logical([first]), observations: [first],
+    integrityFor: integrityRecorder().integrityFor, identityCollector: { async accept() { throw new Error('fail'); } } }),
+  { code: 'm4_v2_projector_identity_collector_failed' });
 });

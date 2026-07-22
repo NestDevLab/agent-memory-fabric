@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { compareConversationEvents, createConversationEvent } from '../conversation-event-v3.mjs';
 import {
   compareObservations,
+  sessionContextBinding,
   selectLogicalMessage,
   validateProjectionV2,
 } from '../ingest/raw-projection-v2.mjs';
@@ -328,11 +329,79 @@ async function createProjectedEvent({
   }
 }
 
-export async function projectM4V2LogicalGroup({ logical, observations, integrityFor } = {}) {
+function identityCollector(value) {
+  if (value === undefined || value === null) return null;
+  if (!hasExactKeys(value, ['accept']) || typeof value.accept !== 'function') {
+    fail('m4_v2_projector_identity_collector_invalid');
+  }
+  return value;
+}
+
+function exactEventReferenceLegacyId(eventId, byV3EventId) {
+  if (eventId === null) return null;
+  const legacyEventId = byV3EventId.get(eventId);
+  if (legacyEventId === undefined) fail('m4_v2_projector_identity_binding_invalid');
+  return legacyEventId;
+}
+
+// This is a content-free observation of the exact projector result. It is
+// deliberately not an attestation: only a later trusted traversal can prove
+// that every callback originated from this projector invocation.
+function projectorIdentityBlock({ sessionId, conversationId, sourceTags, selected, events }) {
+  if (!Array.isArray(selected) || !Array.isArray(events) || selected.length !== events.length) {
+    fail('m4_v2_projector_identity_binding_invalid');
+  }
+  const byV3EventId = new Map();
+  for (const observation of selected) {
+    const eventId = deriveM4V3EventIdFromLegacyEventId(observation.eventId);
+    if (byV3EventId.has(eventId)) fail('m4_v2_projector_identity_binding_invalid');
+    byV3EventId.set(eventId, observation.eventId);
+  }
+  const entries = events.map(event => {
+    const legacyEventId = byV3EventId.get(event.eventId);
+    if (legacyEventId === undefined || event.conversationId !== conversationId
+      || event.sourceInstanceId !== deriveSourceInstanceId(sessionId, sourceTags)) {
+      fail('m4_v2_projector_identity_binding_invalid');
+    }
+    return {
+      legacyEventId,
+      legacySessionId: sessionId,
+      eventId: event.eventId,
+      conversationId,
+      sourceInstanceId: event.sourceInstanceId,
+      sourceTags: [...sourceTags],
+      conversationKind: event.conversationKind,
+      authorizationContextTags: structuredClone(event.authorizationContextTags),
+      role: event.role,
+      direction: event.direction,
+      state: event.state,
+      revision: event.revision,
+      replacesLegacyEventId: exactEventReferenceLegacyId(event.replacesEventId ?? null, byV3EventId),
+      tombstonesLegacyEventId: exactEventReferenceLegacyId(event.tombstonesEventId ?? null, byV3EventId),
+      conflictsWithLegacyEventIds: (event.conflictsWithEventIds ?? []).map(item => exactEventReferenceLegacyId(item, byV3EventId)).sort(),
+    };
+  });
+  const first = entries[0];
+  let sessionContextTags;
+  try { sessionContextTags = sessionContextBinding(first.authorizationContextTags); }
+  catch { fail('m4_v2_projector_identity_binding_invalid'); }
+  if (entries.some(entry => entry.conversationKind !== first.conversationKind
+    || canonicalJson(sessionContextBinding(entry.authorizationContextTags)) !== canonicalJson(sessionContextTags))) {
+    fail('m4_v2_projector_identity_binding_invalid');
+  }
+  return {
+    schema: 'amf.m4-cross-phase-projector-identity-block/v1',
+    session: { legacySessionId: sessionId, conversationId, conversationKind: first.conversationKind, sessionContextTags },
+    events: entries,
+  };
+}
+
+export async function projectM4V2LogicalGroup({ logical, observations, integrityFor, identityCollector: collectorInput = null } = {}) {
   if (typeof integrityFor !== 'function' || !Array.isArray(observations) || observations.length < 1 || observations.length > 1_000) {
     fail('m4_v2_projector_request_invalid');
   }
   const safeLogical = copyLogical(logical);
+  const identitySink = identityCollector(collectorInput);
   const safeObservations = observations.map(copyObservation);
   if (new Set(safeObservations.map(item => item.eventId)).size !== safeObservations.length
     || new Set(safeObservations.map(item => item.migrationSequence)).size !== safeObservations.length
@@ -424,6 +493,12 @@ export async function projectM4V2LogicalGroup({ logical, observations, integrity
   }
 
   events.sort(compareConversationEvents);
+  if (identitySink !== null) {
+    const selected = [...representatives, ...(deletion === null ? [] : [deletion])];
+    const block = projectorIdentityBlock({ sessionId, conversationId, sourceTags, selected, events });
+    try { await identitySink.accept(structuredClone(block)); }
+    catch { fail('m4_v2_projector_identity_collector_failed'); }
+  }
   return {
     schema: SCHEMA,
     outcome: 'projected',

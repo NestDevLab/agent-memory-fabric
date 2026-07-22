@@ -8,6 +8,7 @@ import { FileRawStore, MemoryCatalog, SqliteCatalog } from '../src/fabric-store.
 import { ciphertextContentId, normalizeIngestKeyRing, normalizedObservationDigest } from '../src/ingest/raw-event-contract.mjs';
 import { EncryptedOutbox } from '../src/ingest/outbox.mjs';
 import { deriveEventIdV2, deriveLogicalMessageIds, deriveSessionIdV2, opaqueContextTag } from '../src/ingest/raw-projection-v2.mjs';
+import { createM4CrossPhaseIdentityInMemoryAccumulator } from '../src/migration/m4-cross-phase-identity-in-memory-accumulator.mjs';
 import { createM4V2ArchiveSource } from '../src/migration/m4-v2-archive-source.mjs';
 
 const INGEST_KEY = Buffer.alloc(32, 7).toString('base64');
@@ -85,7 +86,7 @@ function catalogRow(value, envelope) {
     ownerTag: OWNER, sourceTag: SOURCE, createdAt: '2026-07-21T12:00:10Z' };
 }
 
-async function fixture({ ingestKeys = ROTATING_KEYS } = {}) {
+async function fixture({ ingestKeys = ROTATING_KEYS, identityCollector = null } = {}) {
   const catalog = new MemoryCatalog();
   const envelopes = new Map();
   const values = fixtureValues();
@@ -104,7 +105,7 @@ async function fixture({ ingestKeys = ROTATING_KEYS } = {}) {
   const source = createM4V2ArchiveSource({ catalog, rawStore: new TestRawStore(), ingestKeys,
   verifyCatalogBinding: async input => { calls.binding.push(structuredClone(input)); return { owner: true, source: true }; },
   auditDecrypt: async input => { calls.audit.push(structuredClone(input)); return { recorded: true, eventId: input.eventId, contentId: input.contentId }; },
-  integrityFor: integrityFor(), startCheckpoint: START, pageLimit: 2 });
+  integrityFor: integrityFor(), identityCollector, startCheckpoint: START, pageLimit: 2 });
   return { catalog, envelopes, values, source, calls };
 }
 
@@ -164,6 +165,38 @@ test('real v2 catalog, client ciphertext, reader and projector produce only conv
   for (const input of [...env.calls.binding, ...env.calls.audit]) assert.equal(JSON.stringify(input).includes('visible '), false);
   output[0].event.visibleText = 'mutated output';
   assert.equal((await rows(env.source)).some(row => row.event.visibleText === 'mutated output'), false);
+});
+
+test('forwards the projector-only identity collector without placing identity data in rows', async () => {
+  const blocks = [];
+  const env = await fixture({ identityCollector: { async accept(block) { blocks.push(block); } } });
+  const output = await rows(env.source);
+  assert.ok(blocks.length > 0);
+  assert.equal(output.some(row => Object.hasOwn(row, 'identity')), false);
+  assert.doesNotMatch(JSON.stringify(blocks), /visibleText|normalizedPayloadDigest|logicalMessageId|nativeEventId|nativeSessionId|integrity|attachment/i);
+  const failed = await fixture({ identityCollector: { async accept() { throw new Error('collector unavailable'); } } });
+  await exactError(async () => { await rows(failed.source); }, 'm4_v2_source_project_failed');
+});
+
+test('replay and resume feed one identity accumulator idempotently without changing rows', async () => {
+  const accumulator = createM4CrossPhaseIdentityInMemoryAccumulator({ registrySecret: Buffer.alloc(32, 6) });
+  const blocks = [];
+  const env = await fixture({ identityCollector: { async accept(block) {
+    blocks.push(structuredClone(block));
+    return accumulator.accept(block);
+  } } });
+  const first = await rows(env.source);
+  const replay = await rows(env.source);
+  const resumed = await rows(env.source, { after: first[2].checkpoint, afterSequence: first[2].sequence });
+  const uniqueBlocks = new Set(blocks.map(block => JSON.stringify(block)));
+  const sealed = accumulator.seal({ coveredThrough: '2026-07-22T00:00:00Z',
+    backfillBinding: { completionDigest: `sha256:${'a'.repeat(64)}`, catalogRevisionDigest: `sha256:${'b'.repeat(64)}` },
+    scanCompletion: { complete: true, acceptedGroupCount: uniqueBlocks.size, excludedGroupCount: 1, traversalDigest: `sha256:${'c'.repeat(64)}` } });
+  assert.equal(sealed.registry.authority.coverage.eventCount, first.length);
+  assert.ok(blocks.length > uniqueBlocks.size);
+  assert.deepEqual(replay.map(row => row.checkpoint), first.map(row => row.checkpoint));
+  assert.deepEqual(resumed.map(row => row.checkpoint), first.slice(3).map(row => row.checkpoint));
+  assert.ok([...first, ...replay, ...resumed].every(row => Object.keys(row).sort().join(',') === 'checkpoint,event,sequence'));
 });
 
 test('persistent SQLite catalog and filesystem ciphertext reopen, page and resume without duplicates', async () => {
