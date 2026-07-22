@@ -48,6 +48,16 @@ test('constructs its own registry resolver and resolves a signed content-free pa
     sourceTagAuthority: value.authority, ...keys }), { code: 'm4_paused_projection_identity_resolver_invalid' });
 });
 
+test('destroys owned key copies on idempotent close and rejects warmed-cache reuse', () => {
+  const resolver = fixture().resolver;
+  const input = { identity: identity(), attestation: binding };
+  assert.equal(resolver.resolve(input).covered, true);
+  resolver.close(); resolver.close();
+  assert.throws(() => resolver.resolve(input), {
+    code: 'm4_paused_projection_identity_resolver_closed',
+  });
+});
+
 test('rejects unknown fields at every identity layer plus attestation binding drift', () => {
   const resolver = fixture().resolver;
   for (const mutate of [
