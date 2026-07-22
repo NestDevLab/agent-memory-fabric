@@ -19,8 +19,11 @@ An empty preserved queue is represented by an interval whose
 
 The reader attests its source kind, pause checkpoint, interval, chain, and
 natural completion. Positions must be strictly increasing inside the selected
-interval. A batch emits at most `maxEvents + 1` acknowledgements and visits at
-most 10,000 records. Ciphertext must be a non-empty buffer no larger than 16
+interval. A batch durably enqueues, delivers, and acknowledges at most
+`maxEvents` records. After that bound, the coordinator may read one unprocessed
+record solely to distinguish a full batch from natural completion; it never
+authorizes, decrypts, enqueues, delivers, or acknowledges that probe. It visits
+at most 10,000 processed records. Ciphertext must be a non-empty buffer no larger than 16
 MiB. On resume, `afterSequence` is passed to the reader so it can begin with
 the previously acknowledged row; the coordinator re-derives and verifies that
 row checkpoint before processing its successor. Unknown resume checkpoints,

@@ -497,23 +497,32 @@ test('accepts an empty attested interval and rejects an out-of-range resume befo
   assert.equal(deniedReader.openCalls, 0);
 });
 
-test('uses maxEvents plus one as a probe and accepts completion only at natural exhaustion', async () => {
+test('keeps maxEvents as a hard durable bound while probing natural completion', async () => {
   const fixtures = [1, 2, 3].map(position => replayFixture({ position }));
   const boundedReader = new FixtureReader({ outbox: fixtures.map(item => item.record), deadletter: [] });
-  const bounded = await rows(coordinator({ fixtures, reader: boundedReader }).value, { maxEvents: 1 });
-  assert.equal(bounded.length, 2);
+  const boundedOutbox = new MemoryOutbox();
+  const bounded = await rows(coordinator({ fixtures, reader: boundedReader, outbox: boundedOutbox }).value, { maxEvents: 1 });
+  assert.equal(bounded.length, 1);
+  assert.equal(boundedOutbox.enqueueCalls, 1);
+  assert.equal(boundedOutbox.deliverCalls, 1);
   assert.equal(boundedReader.completionCalls, 0);
 
-  const completeReader = new FixtureReader({ outbox: [fixtures[0].record], deadletter: [] });
-  await rows(coordinator({ fixtures: [fixtures[0]], reader: completeReader }).value);
-  assert.equal(completeReader.completionCalls, 1);
+  const exactBoundReader = new FixtureReader({ outbox: [fixtures[0].record], deadletter: [] });
+  const exactBoundOutbox = new MemoryOutbox();
+  const exactBound = await rows(coordinator({ fixtures: [fixtures[0]], reader: exactBoundReader, outbox: exactBoundOutbox }).value, {
+    maxEvents: 1,
+  });
+  assert.equal(exactBound.length, 1);
+  assert.equal(exactBoundOutbox.enqueueCalls, 1);
+  assert.equal(exactBoundOutbox.deliverCalls, 1);
+  assert.equal(exactBoundReader.completionCalls, 1);
 
   const invalidCompletion = new FixtureReader(
     { outbox: [fixtures[0].record], deadletter: [] },
     { completion: { ...completionFor('outbox'), endInclusive: 20_049 } },
   );
   await rejects(
-    () => rows(coordinator({ fixtures: [fixtures[0]], reader: invalidCompletion }).value),
+    () => rows(coordinator({ fixtures: [fixtures[0]], reader: invalidCompletion }).value, { maxEvents: 1 }),
     'm4_preserved_replay_completion_mismatch',
   );
 });
