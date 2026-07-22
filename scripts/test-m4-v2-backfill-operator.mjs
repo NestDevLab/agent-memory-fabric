@@ -15,6 +15,8 @@ import { deriveEventIdV2, deriveLogicalMessageIds, deriveSessionIdV2, opaqueCont
 import { normalizeIngestKeyRing, normalizedObservationDigest } from '../src/ingest/raw-event-contract.mjs';
 import { canonicalJson } from '../src/ingest/transcripts/canonical.mjs';
 import { SqliteConversationArchive } from '../src/conversation-archive-v1.mjs';
+import { deriveM4V2ArchiveRegistryBinding } from '../src/migration/m4-v2-backfill-completion.mjs';
+import { attestM4V2CatalogRevision } from '../src/migration/m4-v2-catalog-revision-attestation.mjs';
 import { planM4V2BackfillOperator, runM4V2BackfillOperator } from '../src/operator/m4-v2-backfill-operator.mjs';
 
 const digest = value => `sha256:${value.repeat(64)}`;
@@ -33,6 +35,19 @@ function setup() {
   write(files.archive, { schema: 'amf.m4-v2-backfill-archive/v1', kind: 'sqlite', filename: path.join(root, 'archive.sqlite') });
   write(files.config, { schema: 'amf.m4-v2-backfill-operator/v1', gate: { pauseManifestPath: files.pause, pauseKeyPath: files.pauseKey, rollbackManifestPath: files.rollback, rollbackKeyPath: files.rollbackKey }, fabricConfigPath: files.fabric, deliveryKeyRingPath: files.delivery, archiveConfigPath: files.archive, leasePath: path.join(root, 'lease.json'), outboxRoot: path.join(root, 'outbox'), progressRoot: path.join(root, 'progress') });
   return { root, files };
+}
+
+function enableV2Completion(item) {
+  const artifactRoot = path.join(item.root, 'artifacts'); fs.mkdirSync(artifactRoot, { mode: 0o700 }); fs.chmodSync(artifactRoot, 0o700);
+  item.files.catalogAttestationKey = path.join(item.root, 'catalog-attestation-key.json');
+  item.files.completionKey = path.join(item.root, 'completion-key.json');
+  write(item.files.catalogAttestationKey, key('catalog-attestation-k1', 21));
+  write(item.files.completionKey, key('archive-completion-k1', 22));
+  const config = JSON.parse(fs.readFileSync(item.files.config));
+  write(item.files.config, { ...config, schema: 'amf.m4-v2-backfill-operator/v2', artifactRoot,
+    manifestId: 'v2-backfill-completion', revision: 1,
+    catalogAttestationKeyPath: item.files.catalogAttestationKey, completionKeyPath: item.files.completionKey });
+  return { artifactRoot, target: path.join(artifactRoot, 'm4', 'v2-backfill', 'v2-backfill-completion-r1.json') };
 }
 
 function rawItem(suffix, role = 'user', direction = role === 'assistant' ? 'outbound' : 'inbound') {
@@ -55,6 +70,41 @@ async function seedFabric(item) {
     }
   } finally { await store.close(); }
 }
+
+test('catalog revision attestation traverses a non-empty catalog deterministically across pages and rejects order or chain changes', async () => {
+  const item = setup();
+  try {
+    await seedFabric(item);
+    const fabric = JSON.parse(fs.readFileSync(item.files.fabric));
+    const store = createFabricStoreFromEnv({ rootPath: fabric.rootPath, env: fabric.env });
+    try {
+      const catalogKey = key('catalog-attestation-k1', 21);
+      const baseline = await attestM4V2CatalogRevision({ catalog: store.catalog, keyDocument: catalogKey, pageLimit: 1 });
+      assert.deepEqual(baseline.traversal.groupCount, 3);
+      assert.deepEqual(baseline.traversal.observationCount, 3);
+
+      const reordered = {
+        async listM4V2LogicalGroups(request) {
+          const page = store.catalog.listM4V2LogicalGroups(request);
+          return request.after === null ? { ...page, items: [...page.items].reverse() } : page;
+        },
+      };
+      await assert.rejects(() => attestM4V2CatalogRevision({ catalog: reordered, keyDocument: catalogKey, pageLimit: 2 }), { code: 'm4_v2_catalog_attestation_catalog_invalid' });
+
+      const changed = {
+        async listM4V2LogicalGroups(request) {
+          const page = store.catalog.listM4V2LogicalGroups(request);
+          const copy = structuredClone(page);
+          if (copy.items.length > 0) copy.items[0].observations[0].createdAt = '2026-07-23T12:00:00Z';
+          return copy;
+        },
+      };
+      const changedAttestation = await attestM4V2CatalogRevision({ catalog: changed, keyDocument: catalogKey, pageLimit: 1 });
+      assert.notEqual(changedAttestation.traversal.finalChain, baseline.traversal.finalChain);
+      assert.notEqual(changedAttestation.traversal.catalogRevisionDigest, baseline.traversal.catalogRevisionDigest);
+    } finally { await store.close(); }
+  } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
+});
 
 test('plan is resource-free and returns only redacted confirmation material', async () => {
   const item = setup(); try { const plan = await planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1 }); assert.deepEqual(Object.keys(plan).sort(), ['confirmationDigest', 'operation', 'phase', 'runId', 'schema']); assert.match(plan.confirmationDigest, /^sha256:/); assert.equal(fs.existsSync(path.join(item.root, 'fabric')), false); assert.equal(fs.existsSync(path.join(item.root, 'archive.sqlite')), false); } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
@@ -93,6 +143,65 @@ test('real persisted Fabric v2 input resumes through the operator into SQLite an
     assert.equal(rows.some(row => row.event_id === eventId(rawItem('system', 'system', 'internal'))), false);
     const events = rows.map(row => JSON.parse(row.event_json)); assert.deepEqual(events.map(event => event.integrity.keyId), ['delivery-k1', 'delivery-k1']); assert.equal(events.every(event => /^2026-07-22T[0-9:.]+Z$/.test(event.integrity.sentAt)), true); assert.equal(new Set(events.map(event => event.integrity.nonce)).size, 2); assert.deepEqual(archive.db.prepare('SELECT expires_at FROM conversation_archive_events_v1 ORDER BY event_id').all().map(row => row.expires_at), ['2026-08-21T12:00:00.000Z', '2026-08-21T12:00:00.000Z']); archive.close();
     const catalog = new Database(path.join(item.root, 'fabric', 'catalog.sqlite')); assert.equal(catalog.prepare("SELECT count(*) AS count FROM audit_events_v2 WHERE action='raw_redacted_decrypt_intent'").get().count >= 2, true); catalog.close();
+  } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
+});
+
+test('v2 completion publishes only after a complete run with matching signed catalog attestations', async () => {
+  const item = setup(); const completion = enableV2Completion(item);
+  try {
+    await seedFabric(item);
+    let nonce = 0; const options = { clock: () => new Date('2026-07-22T12:00:00.000Z'), nonceFactory: () => `nonce${String(++nonce).padStart(11, '0')}` };
+    const plan = await planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1 });
+    const incomplete = await runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: plan.confirmationDigest }, options);
+    assert.deepEqual(incomplete.completion, { state: 'pending', digest: null }); assert.equal(fs.existsSync(completion.target), false);
+    const completePlan = await planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1 });
+    const complete = await runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: completePlan.confirmationDigest }, options);
+    assert.equal(complete.completion.state, 'published'); assert.match(complete.completion.digest, /^sha256:/); assert.equal(fs.statSync(completion.target).mode & 0o777, 0o600);
+    const artifact = JSON.parse(fs.readFileSync(completion.target, 'utf8'));
+    assert.deepEqual(Object.keys(artifact).sort(), ['catalogAttestationDigest', 'catalogAttestationKeyId', 'completionKeyId', 'finalCheckpoint', 'gateDigest', 'integrity', 'manifestId', 'resultDigest', 'revision', 'runnerPlanDigest', 'schema', 'state']);
+    assert.doesNotMatch(JSON.stringify(artifact), /visible|synthetic-|catalog-k1|sourceTag|rootPath/i);
+    const stage = path.dirname(completion.target); const baseline = JSON.parse(fs.readFileSync(path.join(stage,
+      fs.readdirSync(stage).find(name => name.startsWith('v2catalog-'))), 'utf8'));
+    const binding = deriveM4V2ArchiveRegistryBinding(artifact, key('archive-completion-k1', 22), baseline, key('catalog-attestation-k1', 21));
+    assert.match(binding.completionDigest, /^sha256:/); assert.equal(binding.catalogRevisionDigest, baseline.traversal.catalogRevisionDigest);
+    await assert.rejects(() => runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: completePlan.confirmationDigest }), { code: 'm4_operator_completion_artifact_exists' });
+  } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
+});
+
+test('v2 completion rejects a catalog change after runner completion without writing an artifact', async () => {
+  const item = setup(); const completion = enableV2Completion(item);
+  try {
+    await seedFabric(item); const plan = await planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 2 }); let opens = 0;
+    const dependencies = { createFabricStoreFromEnv(input) { const store = createFabricStoreFromEnv(input); opens += 1; if (opens === 4) store.catalog.listM4V2LogicalGroups = async () => ({ items: [], next: null }); return store; }, BackfillLease: (await import('../src/ingest/transcripts/backfill.mjs')).BackfillLease, ConversationEventPlaintextOutbox: (await import('../src/ingest/conversation-event-v3-outbox.mjs')).ConversationEventPlaintextOutbox, SqliteConversationArchive, PostgresConversationArchive: class {}, M4ProgressStore: (await import('../src/migration/m4-progress-store.mjs')).M4ProgressStore };
+    await assert.rejects(() => runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 2, confirmedPlanDigest: plan.confirmationDigest }, { dependencies, clock: () => new Date('2026-07-22T12:00:00.000Z'), nonceFactory: () => 'nonce00000000003' }), { code: 'm4_operator_catalog_baseline_mismatch' });
+    assert.equal(fs.existsSync(completion.target), false);
+  } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
+});
+
+test('v2 baseline rejects catalog drift during pending work and on the next invocation', async () => {
+  const item = setup(); const completion = enableV2Completion(item);
+  try {
+    await seedFabric(item); const plan = await planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1 });
+    let opens = 0;
+    const during = { createFabricStoreFromEnv(input) { const store = createFabricStoreFromEnv(input); opens += 1; if (opens === 4) store.catalog.listM4V2LogicalGroups = async () => ({ items: [], next: null }); return store; }, BackfillLease: (await import('../src/ingest/transcripts/backfill.mjs')).BackfillLease, ConversationEventPlaintextOutbox: (await import('../src/ingest/conversation-event-v3-outbox.mjs')).ConversationEventPlaintextOutbox, SqliteConversationArchive, PostgresConversationArchive: class {}, M4ProgressStore: (await import('../src/migration/m4-progress-store.mjs')).M4ProgressStore };
+    await assert.rejects(() => runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: plan.confirmationDigest }, { dependencies: during, clock: () => new Date('2026-07-22T12:00:00.000Z'), nonceFactory: () => 'nonce00000000004' }), { code: 'm4_operator_catalog_baseline_mismatch' });
+    assert.equal(fs.existsSync(completion.target), false);
+    const next = { createFabricStoreFromEnv(input) { const store = createFabricStoreFromEnv(input); store.catalog.listM4V2LogicalGroups = async () => ({ items: [], next: null }); return store; }, BackfillLease: during.BackfillLease, ConversationEventPlaintextOutbox: during.ConversationEventPlaintextOutbox, SqliteConversationArchive, PostgresConversationArchive: class {}, M4ProgressStore: during.M4ProgressStore };
+    await assert.rejects(() => runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: plan.confirmationDigest }, { dependencies: next }), { code: 'm4_operator_catalog_baseline_mismatch' });
+    assert.equal(fs.existsSync(completion.target), false);
+  } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
+});
+
+test('v2 retry verifies the persisted catalog baseline before constructing any catalog resource', async () => {
+  const item = setup(); const completion = enableV2Completion(item);
+  try {
+    await seedFabric(item); const plan = await planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1 });
+    await runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: plan.confirmationDigest }, { clock: () => new Date('2026-07-22T12:00:00.000Z'), nonceFactory: () => 'nonce00000000005' });
+    const stage = path.dirname(completion.target); const baselinePath = path.join(stage, fs.readdirSync(stage).find(name => name.startsWith('v2catalog-')));
+    const baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf8')); baseline.integrity.signature = 'a'.repeat(43); write(baselinePath, baseline);
+    let calls = 0; const dependencies = { createFabricStoreFromEnv() { calls += 1; throw new Error('must not open'); }, BackfillLease: class {}, ConversationEventPlaintextOutbox: class {}, SqliteConversationArchive: class {}, PostgresConversationArchive: class {}, M4ProgressStore: class {} };
+    await assert.rejects(() => runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: plan.confirmationDigest }, { dependencies }), { code: 'm4_operator_catalog_baseline_invalid' });
+    assert.equal(calls, 0);
   } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
 });
 

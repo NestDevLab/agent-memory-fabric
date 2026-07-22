@@ -9,8 +9,11 @@ import { BackfillLease } from '../ingest/transcripts/backfill.mjs';
 import { normalizeIngestKeyRing } from '../ingest/raw-event-contract.mjs';
 import { M4ProgressStore } from '../migration/m4-progress-store.mjs';
 import { createM4V2ArchiveSource } from '../migration/m4-v2-archive-source.mjs';
+import { attestM4V2CatalogRevision, verifyM4V2CatalogRevisionAttestation } from '../migration/m4-v2-catalog-revision-attestation.mjs';
+import { createM4V2ArchiveBackfillCompletion } from '../migration/m4-v2-backfill-completion.mjs';
 import { planM4V2Backfill, runM4V2Backfill } from '../migration/m4-v2-backfill-runner.mjs';
 import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
+import { artifactPath, readPrivateJson, validateArtifactRoot, writePrivateArtifact } from './private-artifacts.mjs';
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const B64 = /^[A-Za-z0-9+/]{43}=$/;
@@ -45,11 +48,22 @@ function privateJson(filePath, code) {
   } catch { fail(code); } finally { if (descriptor !== undefined) try { fs.closeSync(descriptor); } catch {} }
 }
 function configShape(value) {
-  const keys = ['schema', 'gate', 'fabricConfigPath', 'deliveryKeyRingPath', 'archiveConfigPath', 'leasePath', 'outboxRoot', 'progressRoot'];
-  if (!exact(value, keys) || value.schema !== 'amf.m4-v2-backfill-operator/v1' || !exact(value.gate, ['pauseManifestPath', 'pauseKeyPath', 'rollbackManifestPath', 'rollbackKeyPath'])) fail('m4_operator_config_invalid');
+  const v1 = ['schema', 'gate', 'fabricConfigPath', 'deliveryKeyRingPath', 'archiveConfigPath', 'leasePath', 'outboxRoot', 'progressRoot'];
+  const v2 = [...v1, 'artifactRoot', 'manifestId', 'revision', 'catalogAttestationKeyPath', 'completionKeyPath'];
+  if (!((value.schema === 'amf.m4-v2-backfill-operator/v1' && exact(value, v1))
+    || (value.schema === 'amf.m4-v2-backfill-operator/v2' && exact(value, v2)))
+    || !exact(value.gate, ['pauseManifestPath', 'pauseKeyPath', 'rollbackManifestPath', 'rollbackKeyPath'])) fail('m4_operator_config_invalid');
   for (const key of ['fabricConfigPath', 'deliveryKeyRingPath', 'archiveConfigPath', 'leasePath', 'outboxRoot', 'progressRoot']) absolute(value[key], 'm4_operator_config_invalid');
   for (const key of Object.keys(value.gate)) absolute(value.gate[key], 'm4_operator_config_invalid');
-  return structuredClone(value);
+  if (value.schema === 'amf.m4-v2-backfill-operator/v1') return { ...structuredClone(value), completion: null };
+  for (const key of ['catalogAttestationKeyPath', 'completionKeyPath']) absolute(value[key], 'm4_operator_config_invalid');
+  if (typeof value.manifestId !== 'string' || !/^[a-z][a-z0-9-]{2,79}$/.test(value.manifestId)
+    || !Number.isSafeInteger(value.revision) || value.revision < 1) fail('m4_operator_config_invalid');
+  validateArtifactRoot(value.artifactRoot, 'm4_operator_config_invalid');
+  const result = structuredClone(value);
+  result.completion = { artifactRoot: result.artifactRoot, manifestId: result.manifestId, revision: result.revision,
+    catalogAttestationKeyPath: result.catalogAttestationKeyPath, completionKeyPath: result.completionKeyPath };
+  return result;
 }
 function fabricShape(value) {
   if (!exact(value, ['schema', 'rootPath', 'env']) || value.schema !== 'amf.m4-v2-backfill-fabric/v1' || !plain(value.env)) fail('m4_operator_reference_invalid');
@@ -115,6 +129,21 @@ function revalidate(prepared) {
   if (prepared.archive.kind === 'sqlite') noSymlinks(prepared.archive.filename, 'm4_operator_resource_unsafe');
 }
 
+function independentCompletionKeys(catalogDocument, completionDocument) {
+  let left; let right; let leftBlock; let rightBlock;
+  try {
+    if (!plain(catalogDocument) || !plain(completionDocument) || typeof catalogDocument.keyId !== 'string'
+      || typeof completionDocument.keyId !== 'string' || typeof catalogDocument.key !== 'string' || typeof completionDocument.key !== 'string') fail('m4_operator_reference_invalid');
+    left = Buffer.from(catalogDocument.key, 'base64'); right = Buffer.from(completionDocument.key, 'base64');
+    if (left.length < 32 || left.length > 64 || right.length < 32 || right.length > 64
+      || left.toString('base64') !== catalogDocument.key || right.toString('base64') !== completionDocument.key
+      || catalogDocument.keyId === completionDocument.keyId) fail('m4_operator_reference_invalid');
+    leftBlock = Buffer.alloc(64); rightBlock = Buffer.alloc(64); left.copy(leftBlock); right.copy(rightBlock);
+    if (crypto.timingSafeEqual(leftBlock, rightBlock)) fail('m4_operator_reference_invalid');
+  } catch (error) { if (error?.code === 'm4_operator_reference_invalid') throw error; fail('m4_operator_reference_invalid'); }
+  finally { left?.fill(0); right?.fill(0); leftBlock?.fill(0); rightBlock?.fill(0); }
+}
+
 async function preparedInput({ configPath, maxEvents }) {
   if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 1000) fail('m4_operator_plan_input_invalid');
   const configLoaded = privateJson(configPath, 'm4_operator_config_invalid'); const config = configShape(configLoaded.value); const references = [['config', configLoaded.fileDigest]];
@@ -123,11 +152,62 @@ async function preparedInput({ configPath, maxEvents }) {
   const archiveLoaded = privateJson(config.archiveConfigPath, 'm4_operator_reference_invalid'); const archive = archiveShape(archiveLoaded.value); references.push(['archive', archiveLoaded.fileDigest]);
   const gateFiles = { pauseManifest: privateJson(config.gate.pauseManifestPath, 'm4_operator_reference_invalid'), pauseKeyDocument: privateJson(config.gate.pauseKeyPath, 'm4_operator_reference_invalid'), rollbackManifest: privateJson(config.gate.rollbackManifestPath, 'm4_operator_reference_invalid'), rollbackKeyDocument: privateJson(config.gate.rollbackKeyPath, 'm4_operator_reference_invalid') };
   for (const [role, loaded] of Object.entries(gateFiles)) references.push([role, loaded.fileDigest]);
+  let completion = null;
+  if (config.completion !== null) {
+    const catalogKey = privateJson(config.completion.catalogAttestationKeyPath, 'm4_operator_reference_invalid');
+    const completionKey = privateJson(config.completion.completionKeyPath, 'm4_operator_reference_invalid');
+    independentCompletionKeys(catalogKey.value, completionKey.value);
+    completion = { ...config.completion, catalogAttestationKeyDocument: catalogKey.value, completionKeyDocument: completionKey.value };
+    references.push(['catalog-attestation-key', catalogKey.fileDigest], ['completion-key', completionKey.fileDigest]);
+  }
   references.sort((left, right) => left[0].localeCompare(right[0]) || left[1].localeCompare(right[1]));
   const gate = gateInput(Object.fromEntries(Object.entries(gateFiles).map(([role, loaded]) => [role, loaded.value]))); const runnerPlan = await planM4V2Backfill({ gateInput: gate, maxEvents });
   const selection = { archive: archive.kind === 'sqlite' ? { kind: archive.kind, filename: archive.filename } : { kind: archive.kind, connectionString: archive.connectionString }, fabric: { rootPath: fabric.rootPath, dataPath: fabric.env.AMF_DATA_PATH, kind: fabric.env.AMF_CATALOG_KIND, catalogTarget: fabric.env.AMF_CATALOG_KIND === 'sqlite' ? fabric.env.AMF_CATALOG_PATH : fabric.env.AMF_CATALOG_DATABASE_URL }, leasePath: config.leasePath, outboxRoot: config.outboxRoot, progressRoot: config.progressRoot };
   const confirmationDigest = digest({ schema: 'amf.m4-v2-backfill-operator-confirmation/v1', runnerPlan, configDigest: configLoaded.fileDigest, referenceDigests: references, resourceSelectionDigest: digest(selection), runIdDerivation: { schema: 'amf.m4-v2-backfill-operator/run-id/v1', manifestId: digest({ manifestId: gate.pauseManifest.manifestId }), revision: gate.pauseManifest.revision } });
-  return { config, fabric, delivery, archive, gate, runnerPlan, confirmationDigest, files: [configPath, config.fabricConfigPath, config.deliveryKeyRingPath, config.archiveConfigPath, ...Object.values(config.gate), ...fabric.files] };
+  return { config, fabric, delivery, archive, gate, runnerPlan, completion, confirmationDigest, files: [configPath, config.fabricConfigPath, config.deliveryKeyRingPath, config.archiveConfigPath, ...Object.values(config.gate), ...fabric.files, ...(completion === null ? [] : [completion.catalogAttestationKeyPath, completion.completionKeyPath])] };
+}
+
+async function catalogAttestation(prepared, deps) {
+  let store;
+  try {
+    store = deps.createFabricStoreFromEnv({ rootPath: prepared.fabric.rootPath, env: prepared.fabric.env });
+    return await attestM4V2CatalogRevision({ catalog: store.catalog,
+      keyDocument: prepared.completion.catalogAttestationKeyDocument, pageLimit: 50 });
+  } catch (error) { if (error?.code?.startsWith?.('m4_v2_catalog_attestation_')) throw error; fail('m4_operator_catalog_attestation_failed'); }
+  finally { try { await store?.close?.(); } catch { fail('m4_operator_catalog_attestation_failed'); } }
+}
+
+function baselineArtifactId(manifestId) {
+  return `v2catalog-${crypto.createHash('sha256').update(canonicalJson(['amf.m4-v2-backfill/catalog-baseline/v1', manifestId]), 'utf8').digest('hex')}`;
+}
+
+function catalogDigest(value) { return digest(value); }
+
+async function catalogBaseline(prepared, deps) {
+  const { artifactRoot, manifestId, revision, catalogAttestationKeyDocument } = prepared.completion;
+  const target = artifactPath(artifactRoot, 'v2-backfill', baselineArtifactId(manifestId), revision);
+  let existing = null;
+  try { existing = readPrivateJson(target, 'm4_operator_catalog_baseline_missing'); }
+  catch (error) { if (error?.code !== 'm4_operator_catalog_baseline_missing') fail('m4_operator_catalog_baseline_invalid'); }
+  if (existing === null) {
+    const candidate = await catalogAttestation(prepared, deps);
+    try { writePrivateArtifact(artifactRoot, 'v2-backfill', baselineArtifactId(manifestId), revision, candidate); }
+    catch (error) { if (error?.code !== 'private_artifact_target_exists') throw error; }
+    try { existing = readPrivateJson(target, 'm4_operator_catalog_baseline_invalid'); }
+    catch { fail('m4_operator_catalog_baseline_invalid'); }
+  }
+  try { return verifyM4V2CatalogRevisionAttestation(existing, catalogAttestationKeyDocument); }
+  catch { fail('m4_operator_catalog_baseline_invalid'); }
+}
+
+function requireCatalogBaseline(baseline, current) {
+  if (catalogDigest(baseline) !== catalogDigest(current)) fail('m4_operator_catalog_baseline_mismatch');
+}
+
+function operatorResult(result, completion = null) {
+  if (completion === null) return { schema: 'amf.m4-v2-backfill-operator-result/v1', operation: 'run', runId: result.runId, phase: result.phase, processed: result.processed, duplicates: result.duplicates, complete: result.complete };
+  return { schema: 'amf.m4-v2-backfill-operator-result/v2', operation: 'run', runId: result.runId, phase: result.phase, processed: result.processed, duplicates: result.duplicates, complete: result.complete,
+    completion: result.complete ? { state: 'published', digest: `sha256:${crypto.createHash('sha256').update(canonicalJson(completion), 'utf8').digest('hex')}` } : { state: 'pending', digest: null } };
 }
 
 export async function planM4V2BackfillOperator(input = {}) {
@@ -142,6 +222,9 @@ export async function runM4V2BackfillOperator(input = {}, options = {}) {
   if (prepared.confirmationDigest !== request.confirmedPlanDigest) fail('m4_operator_confirmation_invalid');
   revalidate(prepared);
   const deps = options.dependencies || { createFabricStoreFromEnv, BackfillLease, ConversationEventPlaintextOutbox, SqliteConversationArchive, PostgresConversationArchive, M4ProgressStore };
+  const baseline = prepared.completion === null ? null : await catalogBaseline(prepared, deps);
+  const beforeCatalog = prepared.completion === null ? null : await catalogAttestation(prepared, deps);
+  if (baseline !== null) requireCatalogBaseline(baseline, beforeCatalog);
   const delivery = deliveryAdapter(prepared.delivery, options);
   const deliveryClock = options.deliveryClock || (() => new Date());
   const factories = {
@@ -155,5 +238,17 @@ export async function runM4V2BackfillOperator(input = {}, options = {}) {
     checkpointStore: async ({ runId, phase, planDigest }) => { revalidate(prepared); return new deps.M4ProgressStore({ rootPath: prepared.config.progressRoot, runId, phase, planDigest }); },
   };
   const result = await runM4V2Backfill({ gateInput: prepared.gate, maxEvents: request.maxEvents, confirmedPlanDigest: prepared.runnerPlan.planDigest, factories });
-  return { schema: 'amf.m4-v2-backfill-operator-result/v1', operation: 'run', runId: result.runId, phase: result.phase, processed: result.processed, duplicates: result.duplicates, complete: result.complete };
+  if (prepared.completion === null) return operatorResult(result, null);
+  const afterCatalog = await catalogAttestation(prepared, deps);
+  requireCatalogBaseline(baseline, afterCatalog);
+  if (!result.complete) return operatorResult(result, prepared.completion);
+  let completion;
+  try {
+    completion = await createM4V2ArchiveBackfillCompletion({ manifestId: prepared.completion.manifestId, revision: prepared.completion.revision,
+      gateInput: prepared.gate, runnerPlan: prepared.runnerPlan, result, preCatalogAttestation: baseline,
+      postCatalogAttestation: afterCatalog, catalogAttestationKeyDocument: prepared.completion.catalogAttestationKeyDocument,
+      completionKeyDocument: prepared.completion.completionKeyDocument });
+    writePrivateArtifact(prepared.completion.artifactRoot, 'v2-backfill', prepared.completion.manifestId, prepared.completion.revision, completion);
+  } catch (error) { if (error?.code === 'private_artifact_target_exists') fail('m4_operator_completion_artifact_exists'); if (error?.code?.startsWith?.('m4_')) throw error; fail('m4_operator_completion_failed'); }
+  return operatorResult(result, completion);
 }
