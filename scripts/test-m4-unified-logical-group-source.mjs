@@ -9,6 +9,7 @@ import { pathToFileURL } from 'node:url';
 import { canonicalJson } from '../src/ingest/transcripts/canonical.mjs';
 import { ConversationEventPlaintextOutbox } from '../src/ingest/conversation-event-v3-outbox.mjs';
 import { runM4PreservedGroupReplay } from '../src/migration/m4-preserved-group-replay.mjs';
+import { prepareM4PreservedUnifiedIndex } from '../src/migration/m4-preserved-unified-index.mjs';
 import { prepareM4UnifiedLogicalGroupSource } from '../src/migration/m4-unified-logical-group-source.mjs';
 
 const sha = value => `sha256:${crypto.createHash('sha256').update(value).digest('hex')}`;
@@ -147,7 +148,7 @@ test('optionally crosses preserved reader/decoder through unified source and Fab
   const encryptionKey = Buffer.alloc(32, 1).toString('base64'); const digestKey = Buffer.alloc(32, 2).toString('base64');
   const logicalKey = Buffer.alloc(32, 4).toString('base64'); const rotatedLogicalKey = Buffer.alloc(32, 6).toString('base64');
   const routingKey = Buffer.alloc(32, 5).toString('base64');
-  const eventKey = Buffer.alloc(32, 9); const ciphertextBuffers = []; const delivered = []; let checkpoint = null;
+  const eventKey = Buffer.alloc(32, 9); const delivered = []; let checkpoint = null;
   try {
     const outboxRoot = path.join(root, 'raw-outbox'); const cursorRoot = path.join(root, 'cursors'); fs.mkdirSync(cursorRoot, { mode: 0o700 });
     fs.writeFileSync(path.join(cursorRoot, 'cursor.enc.json'), 'cursor', { mode: 0o600 });
@@ -170,35 +171,16 @@ test('optionally crosses preserved reader/decoder through unified source and Fab
     const reader = new M4PreservedQueueReader({ outboxPath: outboxRoot, checkpointDocument: JSON.parse(fs.readFileSync(pausePath, 'utf8')) });
     const queueAuthority = reader.authority(); const authorityDigest = sha(canonicalJson(queueAuthority));
     const decoder = createM4PreservedObservationDecoder({ envelopeDecoder: createRawEnvelopeDecoder({ encryptionKey, digestKey, keyId: 'client-v1', sourceInstanceId: 'synthetic-runtime', actorId: 'synthetic-actor' }) });
-    const requestFor = (sourceKind, positions) => ({ schema: 'amf.m4-preserved-position-read/v1', sourceKind,
-      pauseCheckpoint: queueAuthority.sources[sourceKind].pauseCheckpoint, interval: queueAuthority.sources[sourceKind].interval, positions });
-    const one = async (sourceKind, position) => {
-      const opened = await reader.openPositions(requestFor(sourceKind, [position])); const iterator = opened.records[Symbol.asyncIterator]();
-      const record = (await iterator.next()).value; await iterator.return(); return record;
-    };
-    const rawRecords = { outbox: await one('outbox', 1), deadletter: await one('deadletter', 1) };
-    const indexed = Object.fromEntries(Object.entries(rawRecords).map(([sourceKind, record]) => {
-      const value = decoder.index({ authorityDigest, ...record }); ciphertextBuffers.push(record.ciphertext); return [sourceKind, value];
-    }));
-    const canonicalAlias = indexed.outbox.projectionDigests.find(item => item.logicalMessageId !== indexed.outbox.logicalMessageId);
-    assert.ok(canonicalAlias); assert.equal(indexed.deadletter.projectionDigests.some(item => item.logicalMessageId === canonicalAlias.logicalMessageId), true);
-    const toEntry = (origin, sourceKind) => ({ origin, position: indexed[sourceKind].position, legacyEventId: indexed[sourceKind].legacyEventId,
-      recordDigest: indexed[sourceKind].envelopeDigest,
-      projectionDigests: indexed[sourceKind].projectionDigests.map(item => ({ ...item })) });
+    const bridge = await prepareM4PreservedUnifiedIndex({ authority: { schema: 'amf.m4-group-replay-authority/v1', authorityDigest }, reader, decoder,
+      sourceTag: `migration:${'b'.repeat(64)}` });
+    const canonicalAlias = bridge.indexes['preserved-outbox'].entries[0].projectionDigests.find(item => item.logicalMessageId !== edit.projection.logicalMessageId);
+    assert.ok(canonicalAlias); assert.equal(bridge.indexes['preserved-deadletter'].entries[0].projectionDigests.some(item => item.logicalMessageId === canonicalAlias.logicalMessageId), true);
     const source = await prepareM4UnifiedLogicalGroupSource({ authority: { schema: 'amf.m4-group-replay-authority/v1', authorityDigest },
       indexes: { 'v2-archive': { schema: 'amf.m4-unified-logical-index/v1', authorityDigest, origin: 'v2-archive', complete: true, entries: [] },
-        'preserved-outbox': { schema: 'amf.m4-unified-logical-index/v1', authorityDigest, origin: 'preserved-outbox', complete: true, entries: [toEntry('preserved-outbox', 'outbox')] },
-        'preserved-deadletter': { schema: 'amf.m4-unified-logical-index/v1', authorityDigest, origin: 'preserved-deadletter', complete: true, entries: [toEntry('preserved-deadletter', 'deadletter')] } },
+        'preserved-outbox': bridge.indexes['preserved-outbox'], 'preserved-deadletter': bridge.indexes['preserved-deadletter'] },
       resolveCanonicalLogicalId: async () => canonicalAlias.logicalMessageId,
-      materializers: Object.fromEntries([['v2-archive', null], ['preserved-outbox', 'outbox'], ['preserved-deadletter', 'deadletter']].map(([origin, sourceKind]) => [origin, async locator => {
-        if (sourceKind === null) throw new Error('unexpected archive materialization'); const record = await one(sourceKind, locator.position);
-        ciphertextBuffers.push(record.ciphertext);
-        try {
-          if (record.envelopeDigest !== locator.recordDigest || record.legacyEventId !== locator.legacyEventId) throw new Error('locator binding mismatch');
-          return decoder.materialize({ authorityDigest, ...record }, { logicalMessageId: locator.canonicalLogicalMessageId,
-            sourceTag: `migration:${'b'.repeat(64)}`, migrationSequence: locator.migrationSequence });
-        } finally { record.ciphertext.fill(0); }
-      }])) });
+      materializers: { 'v2-archive': async () => { throw new Error('unexpected archive materialization'); },
+        'preserved-outbox': bridge.materializers['preserved-outbox'], 'preserved-deadletter': bridge.materializers['preserved-deadletter'] } });
     const opened = await source.open({ schema: 'amf.m4-preserved-group-replay-request/v1', authorityDigest, after: null,
       maxGroups: 100, maxObservations: 1000, maxOutputEvents: 1000 }); const privateGroups = await groups(opened); assert.equal(privateGroups.length, 1);
     assert.equal(privateGroups[0].descriptor.members.length, 2); assert.equal(privateGroups[0].logical.tombstoned, true);
@@ -212,6 +194,5 @@ test('optionally crosses preserved reader/decoder through unified source and Fab
     integrityFor: async ({ eventId, state, revision }) => ({ keyId: 'delivery-k1', key: eventKey, sentAt: '2026-07-22T01:00:00Z', nonce: `${state}${revision}${eventId.slice(5, 16)}`.padEnd(16, '0').slice(0, 16) }) });
     assert.equal(result.groups, 1); assert.equal(result.outputEvents, 2); assert.deepEqual(delivered.map(item => item.event.state), ['active', 'tombstone']);
     assert.equal(JSON.stringify(result).includes('cross-repo visible edit'), false); assert.equal(JSON.stringify(checkpoint).includes('cross-repo visible edit'), false);
-    assert.equal(ciphertextBuffers.every(buffer => buffer.every(byte => byte === 0)), true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
