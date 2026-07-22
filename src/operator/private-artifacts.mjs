@@ -148,7 +148,7 @@ function ensurePrivateDirectory(root, relative, code) {
 
 export function artifactPath(rootPath, stage, manifestId, revision) {
   const root = validateArtifactRoot(rootPath);
-  if (!['reconciliation', 'recovery', 'canary', 'authorization'].includes(stage)
+  if (!['reconciliation', 'recovery', 'canary', 'authorization', 'v2-backfill'].includes(stage)
     || typeof manifestId !== 'string' || !/^[a-z][a-z0-9-]{2,79}$/.test(manifestId)
     || !Number.isSafeInteger(revision) || revision < 1) fail('private_artifact_target_invalid');
   return path.join(root, 'm4', stage, `${manifestId}-r${revision}.json`);
