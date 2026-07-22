@@ -34,6 +34,7 @@
     "test:m4-v2-projector": "node --test scripts/test-m4-v2-conversation-projector.mjs",
     "test:m4-v2-catalog-enumerator": "node --test scripts/test-m4-v2-catalog-enumerator.mjs",
     "test:m4-v2-archive-source": "node --test scripts/test-m4-v2-archive-source.mjs",
+    "test:m4-native-paused-source": "node --test scripts/test-m4-native-paused-interval-source.mjs",
     "test:m4-v2-observation-reader": "node --test scripts/test-m4-v2-observation-reader.mjs",
     "test:content-protection": "node --test scripts/test-content-protection-v1-contract.mjs scripts/test-content-protection-v1-runtime.mjs scripts/test-content-protection-v1-measurements.mjs",
     "measure:content-protection": "node scripts/measure-content-protection-v1.mjs",
