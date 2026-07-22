@@ -79,7 +79,7 @@ A reader catalogue may split one logical source into multiple intervals. Each in
 
 Within one interval, retries resume from the last acknowledged opaque native checkpoint. Re-running a completed interval produces no additional archive row and completes from its existing progress.
 
-The runner refuses to begin an interval without accepted and currently verified legacy grouped replay completion. It does not decide cross-interval order or declare the full paused-native phase complete. A later orchestration layer must:
+The runner refuses to begin an interval without accepted and currently verified legacy grouped replay completion. It does not decide cross-interval order or declare the full paused-native phase complete. The catalog-wide `m4-native-paused-phase-orchestrator` composes this runner and must:
 
 - preserve catalogue order;
 - require every expected interval exactly once;
