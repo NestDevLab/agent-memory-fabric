@@ -11,7 +11,8 @@ import {
 } from '../src/conversation-event-v3.mjs';
 import {
   filterClaudeConversationRecord,
-  filterCodexConversationRecord
+  filterCodexConversationRecord,
+  filterOpenClawConversationRecord
 } from '../src/ingest/transcripts/conversation-v3.mjs';
 
 const fixtures = JSON.parse(fs.readFileSync(new URL('./fixtures/conversation-event-v3.conformance.json', import.meta.url), 'utf8'));
@@ -158,6 +159,22 @@ test('Claude filter handles strings and all-text arrays while preserving determi
   assert.deepEqual(ordered.map(event => event.eventId), ['cevt_claudeevent0001', 'cevt_claudeevent0002']);
 });
 
+test('OpenClaw filter emits only visible message text and uses the attested session hint', () => {
+  const value = { type: 'message', id: 'native-openclaw-message', timestamp: '2026-01-02T03:04:05Z',
+    path: '/synthetic/private/path', message: { role: 'assistant', content: [
+      { type: 'text', text: 'Visible\r\nanswer', metadata: { token: 'SECRET_BLOCK_MARKER' } },
+      { type: 'text', text: 'Second line' }
+    ], tool: 'TOOL_MARKER' }, telemetry: 'TELEMETRY_MARKER' };
+  const event = filterOpenClawConversationRecord({ value, sessionHint: 'agent:synthetic:session',
+    ...filterContext({ identity: { ...filterContext().identity, eventId: 'cevt_openclawevent0001' } }) });
+  assert.equal(event.visibleText, 'Visible\nanswer\nSecond line');
+  assert.equal(event.role, 'assistant'); assert.equal(event.direction, 'outbound');
+  const serialized = JSON.stringify(event);
+  for (const marker of ['native-openclaw-message', '/synthetic/private/path', 'SECRET_BLOCK_MARKER',
+    'TOOL_MARKER', 'TELEMETRY_MARKER']) assert.equal(serialized.includes(marker), false, marker);
+  assert.deepEqual(validateConversationEvent(event, { resolveIntegrityKey: resolveKey }), event);
+});
+
 test('ordering compares UTC instants before sequence and opaque event-id tie-breaks', () => {
   const event = fixtures.valid[0];
   const atExactSecond = { ...event, sourceOccurredAt: '2026-01-02T03:04:05Z' };
@@ -228,7 +245,27 @@ test('Claude filter excludes system, operational, mismatched, tool, structured, 
   for (const value of excluded) assert.equal(filterClaudeConversationRecord({ value, ...filterContext() }), null);
 });
 
-test('excluded source records and extra construction metadata never serialize across either filter', () => {
+test('OpenClaw filter excludes headers, operational rows, tools, mixed content, and malformed messages', () => {
+  const message = { type: 'message', id: 'native-message', timestamp: '2026-01-02T03:04:05Z',
+    message: { role: 'user', content: 'Visible' } };
+  const excluded = [
+    { ...message, type: 'session' }, { ...message, type: 'tool' }, { ...message, type: 'summary' },
+    { ...message, message: { ...message.message, role: 'system' } },
+    { ...message, message: { ...message.message, content: [{ type: 'tool_call', text: 'Tool' }] } },
+    { ...message, message: { ...message.message, content: [{ type: 'text', text: 'Visible' },
+      { type: 'tool_result', text: 'Tool' }] } },
+    { ...message, message: { ...message.message, content: { text: 'Structured' } } },
+    { ...message, message: { ...message.message, content: ' \n\t' } },
+    { ...message, id: null }, { ...message, id: ' \n\t' }, { ...message, id: 'x'.repeat(1025) },
+    { ...message, timestamp: 'not-a-timestamp' }
+  ];
+  for (const value of excluded) assert.equal(filterOpenClawConversationRecord({ value,
+    sessionHint: 'agent:synthetic:session', ...filterContext() }), null);
+  assert.equal(filterOpenClawConversationRecord({ value: message, sessionHint: null,
+    ...filterContext() }), null);
+});
+
+test('excluded source records and extra construction metadata never serialize across any filter', () => {
   const markers = ['SYSTEM_MARKER', 'DEVELOPER_MARKER', 'TOOL_PAYLOAD_MARKER', 'REASONING_PAYLOAD_MARKER',
     'USAGE_PAYLOAD_MARKER', 'TELEMETRY_PAYLOAD_MARKER', 'RAW_ROW_MARKER', '/synthetic/local/path',
     'SECRET_METADATA_MARKER'];
@@ -244,7 +281,14 @@ test('excluded source records and extra construction metadata never serialize ac
     system: markers[0], developer: markers[1], tool: markers[2], reasoning: markers[3], usage: markers[4],
     telemetry: markers[5], raw: markers[6], path: markers[7]
   }, ...filterContext({ identity: { ...filterContext().identity, eventId: 'cevt_filterevent0002' } }) });
-  const serialized = JSON.stringify([codex, claude]);
+  const openclaw = filterOpenClawConversationRecord({ value: {
+    type: 'message', id: 'native-id', timestamp: '2026-01-02T03:04:05Z',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Safe answer', secret: markers.at(-1) }] },
+    system: markers[0], developer: markers[1], tool: markers[2], reasoning: markers[3], usage: markers[4],
+    telemetry: markers[5], raw: markers[6], path: markers[7]
+  }, sessionHint: 'agent:synthetic:session',
+  ...filterContext({ identity: { ...filterContext().identity, eventId: 'cevt_filterevent0003' } }) });
+  const serialized = JSON.stringify([codex, claude, openclaw]);
   for (const marker of markers) assert.equal(serialized.includes(marker), false, marker);
 });
 

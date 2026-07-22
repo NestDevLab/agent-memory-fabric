@@ -60,6 +60,25 @@ test('binds native metadata, filters non-conversation records, and fails closed 
   const claudeSource = createM4NativePausedIntervalSource({ authority: claudeAuthority, derivationKey: key, derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification, reader: { async open() { return wrapper((async function* () { yield claude; })(), { runtime: 'claude' }); } }, integrityFor: input => integrity(input) }); assert.equal((await rows(claudeSource)).length, 1);
   const system = { native: { runtime: 'claude', sourceId: 'source-one', conversationId: 'not-used', threadId: null, messageId: 'not-used', position: 14, sourceOccurredAt: claudeTimestamp }, sessionHint: null, value: { type: 'system', payload: {} } };
   const systemSource = createM4NativePausedIntervalSource({ authority: claudeAuthority, derivationKey: key, derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification, reader: { async open() { return wrapper((async function* () { yield system; })(), { runtime: 'claude' }); } }, integrityFor: async () => { throw new Error('should not run'); } }); assert.equal((await rows(systemSource)).length, 0);
+  const openclawTimestamp = '2026-07-22T00:00:15Z';
+  const openclaw = { native: { runtime: 'openclaw', sourceId: 'source-one', conversationId: 'agent:synthetic:session',
+    threadId: null, messageId: 'openclaw-one', position: 15, sourceOccurredAt: openclawTimestamp },
+  sessionHint: 'agent:synthetic:session', value: { type: 'message', id: 'openclaw-one', timestamp: openclawTimestamp,
+    message: { role: 'user', content: [{ type: 'text', text: 'question' }] } } };
+  const openclawAuthority = { ...authority, sourceBinding: `hmac-sha256:source-v1:${hmac('amf.m4-native-paused/tag/source-v1/v1', ['openclaw', 'source-one'])}` };
+  const openclawSource = createM4NativePausedIntervalSource({ authority: openclawAuthority, derivationKey: key,
+    derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification,
+    reader: { async open() { return wrapper((async function* () { yield openclaw; })(), { runtime: 'openclaw' }); } },
+    integrityFor: input => integrity(input) });
+  const openclawRows = await rows(openclawSource); assert.equal(openclawRows.length, 1);
+  assert.equal(openclawRows[0].event.visibleText, 'question'); assert.equal(openclawRows[0].event.direction, 'inbound');
+  const openclawHeader = structuredClone(openclaw); openclawHeader.native.position = 16;
+  openclawHeader.value = { type: 'session', id: 'openclaw-one', timestamp: openclawTimestamp };
+  const openclawHeaderSource = createM4NativePausedIntervalSource({ authority: openclawAuthority, derivationKey: key,
+    derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification,
+    reader: { async open() { return wrapper((async function* () { yield openclawHeader; })(), { runtime: 'openclaw' }); } },
+    integrityFor: async () => { throw new Error('should not run'); } });
+  assert.equal((await rows(openclawHeaderSource)).length, 0);
   const repeated = [codex(14, 'same', 'same text', '2026-07-22T00:00:14Z'), codex(15, 'same', 'same text', '2026-07-22T00:00:14Z')]; assert.equal((await rows(build({ records: repeated }))).length, 1);
   await rejects(async () => rows(build({ records: [codex(16, 'same', 'one', '2026-07-22T00:00:16Z'), codex(17, 'same', 'two', '2026-07-22T00:00:16Z')] })), 'm4_native_paused_duplicate_conflict');
   await rejects(async () => rows(build({ records: [codex(18, 'same', 'one', '2026-07-22T00:00:18Z'), codex(19, 'same', 'one', '2026-07-22T00:00:19Z')] })), 'm4_native_paused_duplicate_conflict');

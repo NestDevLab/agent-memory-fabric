@@ -2,7 +2,8 @@ import crypto from 'node:crypto';
 
 import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
 import { createConversationEvent, isConversationEventUtcTimestamp } from '../conversation-event-v3.mjs';
-import { eligibleClaudeConversationPayload, eligibleCodexConversationPayload } from '../ingest/transcripts/conversation-v3.mjs';
+import { eligibleClaudeConversationPayload, eligibleCodexConversationPayload,
+  eligibleOpenClawConversationPayload } from '../ingest/transcripts/conversation-v3.mjs';
 
 const AUTHORITY_SCHEMA = 'amf.m4-native-paused-interval-authority/v1';
 const READER_SCHEMA = 'amf.m4-native-paused-reader/v1';
@@ -84,7 +85,7 @@ function request(value, initialCheckpoint) {
 
 function native(value) {
   const item = snapshot(value, ['runtime', 'sourceId', 'conversationId', 'threadId', 'messageId', 'position', 'sourceOccurredAt'], 'm4_native_paused_reader_invalid');
-  if (!['codex', 'claude'].includes(item.runtime) || ![item.sourceId, item.conversationId, item.messageId].every(nativeId)
+  if (!['codex', 'claude', 'openclaw'].includes(item.runtime) || ![item.sourceId, item.conversationId, item.messageId].every(nativeId)
     || !(item.threadId === null || nativeId(item.threadId)) || !Number.isSafeInteger(item.position) || item.position < 0
     || !isConversationEventUtcTimestamp(item.sourceOccurredAt)) fail('m4_native_paused_reader_invalid');
   return item;
@@ -125,7 +126,7 @@ function readerAttestation(value, authorityValue, key) {
   const item = snapshot(value, ['schema', 'source', 'interval', 'runtime', 'sourceId', 'records', 'completion'], 'm4_native_paused_reader_invalid');
   if (item.schema !== READER_SCHEMA || !same(checkpoint(item.source, 'm4_native_paused_reader_invalid'), authorityValue.source)
     || !same(interval(item.interval, 'm4_native_paused_reader_invalid'), authorityValue.interval)
-    || !['codex', 'claude'].includes(item.runtime) || !nativeId(item.sourceId)
+    || !['codex', 'claude', 'openclaw'].includes(item.runtime) || !nativeId(item.sourceId)
     || tag(key, 'source-v1', [item.runtime, item.sourceId]) !== authorityValue.sourceBinding
     || typeof item.completion !== 'function') fail('m4_native_paused_reader_attestation_mismatch');
   let records; let next; let close;
@@ -152,6 +153,12 @@ function boundNativeMetadata(value, runtime, sessionHint) {
   if (runtime === 'codex') {
     if (value.type !== 'response_item' || !plain(value.payload)) return null;
     return { conversationId: firstNativeId(value.session_id, value.sessionId, sessionHint), messageId: firstNativeId(value.id, value.payload.id, value.uuid) };
+  }
+  if (runtime === 'openclaw') {
+    if (value.type !== 'message' || !plain(value.message)) return null;
+    return { conversationId: firstNativeId(value.sessionKey, value.session_key, value.sessionId,
+      value.session_id, sessionHint), messageId: firstNativeId(value.id, value.uuid,
+      value.messageId, value.message_id, value.message.id) };
   }
   if (!['user', 'assistant'].includes(value.type) || !plain(value.message)) return null;
   return { conversationId: firstNativeId(value.sessionId, value.session_id, value.conversationId, sessionHint), messageId: firstNativeId(value.uuid, value.id, value.message.id) };
@@ -194,7 +201,9 @@ export function createM4NativePausedIntervalSource(input = {}) {
           try {
             const options = { value: candidate.value, identity: eventIdentity, sourceSequence: candidate.native.position,
               occurredAt: candidate.native.sourceOccurredAt, sessionHint: candidate.sessionHint };
-            payload = candidate.native.runtime === 'codex' ? eligibleCodexConversationPayload(options) : eligibleClaudeConversationPayload(options);
+            payload = candidate.native.runtime === 'codex' ? eligibleCodexConversationPayload(options)
+              : candidate.native.runtime === 'openclaw' ? eligibleOpenClawConversationPayload(options)
+                : eligibleClaudeConversationPayload(options);
           } catch { fail('m4_native_paused_projection_failed'); }
           if (payload === null) continue;
           const metadata = boundNativeMetadata(candidate.value, candidate.native.runtime, candidate.sessionHint);
