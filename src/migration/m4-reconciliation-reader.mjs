@@ -439,3 +439,139 @@ export async function reconcileM4({
     },
   };
 }
+
+function validateReportRange(value, count) {
+  if (!isPlainObject(value) || Object.keys(value).length !== 2
+    || !Object.hasOwn(value, 'min') || !Object.hasOwn(value, 'max')) {
+    fail('m4_reconciliation_report_invalid');
+  }
+  const valid = item => item === null || (typeof item === 'string' && isStrictUtcTimestamp(item));
+  if (!valid(value.min) || !valid(value.max)
+    || (count === 0) !== (value.min === null && value.max === null)
+    || (count > 0 && (value.min === null || value.max === null || value.min > value.max))) {
+    fail('m4_reconciliation_report_invalid');
+  }
+  return { min: value.min, max: value.max };
+}
+
+function validateReportCompactEvidence(value, includeRanges) {
+  const keys = includeRanges
+    ? ['count', 'digest', 'sourceOccurredAt', 'occurredAt']
+    : ['count', 'digest'];
+  if (!isPlainObject(value) || Object.keys(value).length !== keys.length
+    || keys.some(key => !Object.hasOwn(value, key))
+    || !Number.isSafeInteger(value.count) || value.count < 0
+    || typeof value.digest !== 'string' || !DIGEST_PATTERN.test(value.digest)) {
+    fail('m4_reconciliation_report_invalid');
+  }
+  return {
+    count: value.count,
+    digest: value.digest,
+    ...(includeRanges ? {
+      sourceOccurredAt: validateReportRange(value.sourceOccurredAt, value.count),
+      occurredAt: validateReportRange(value.occurredAt, value.count),
+    } : {}),
+  };
+}
+
+function validateReportDimensionEvidence(value, index) {
+  const keys = ['name', 'source', 'target', 'mismatchCount', 'match'];
+  if (!isPlainObject(value) || Object.keys(value).length !== keys.length
+    || keys.some(key => !Object.hasOwn(value, key))
+    || value.name !== M4_DIMENSIONS[index]
+    || !Number.isSafeInteger(value.mismatchCount) || value.mismatchCount < 0
+    || typeof value.match !== 'boolean' || value.match !== (value.mismatchCount === 0)) {
+    fail('m4_reconciliation_report_invalid');
+  }
+  let source;
+  let target;
+  if (EVENT_DIMENSIONS.includes(value.name)) {
+    const includeRanges = value.name === 'time-ranges';
+    source = validateReportCompactEvidence(value.source, includeRanges);
+    target = validateReportCompactEvidence(value.target, includeRanges);
+  } else {
+    const keysByDimension = {
+      'paused-interval': ['start', 'end'],
+      'replay-queues': ['pendingOutbox', 'acknowledgements', 'deadLetters'],
+      'source-checkpoints': ['collectorCursor', 'sourceCheckpoint', 'nativeTranscriptAuthority'],
+    };
+    source = validateEvidenceMap(value.source, keysByDimension[value.name]);
+    target = validateEvidenceMap(value.target, keysByDimension[value.name]);
+  }
+  return {
+    name: value.name,
+    source,
+    target,
+    mismatchCount: value.mismatchCount,
+    match: value.match,
+  };
+}
+
+function validateReportSamples(value, dimensionEvidence) {
+  if (!Array.isArray(value) || value.length > M4_MAX_MISMATCH_SAMPLES) {
+    fail('m4_reconciliation_report_invalid');
+  }
+  const mismatchByDimension = new Map(dimensionEvidence.map(item => [item.name, item.mismatchCount]));
+  const sampledDimensions = new Set(EVENT_DIMENSIONS.filter(name => name !== 'counts'));
+  return value.map(sample => {
+    const keys = ['eventId', 'dimension', 'kind'];
+    if (!isPlainObject(sample) || Object.keys(sample).length !== keys.length
+      || keys.some(key => !Object.hasOwn(sample, key))
+      || typeof sample.eventId !== 'string' || !EVENT_ID_PATTERN.test(sample.eventId)
+      || typeof sample.dimension !== 'string' || !sampledDimensions.has(sample.dimension)
+      || !['missing-target', 'extra-target', 'different'].includes(sample.kind)
+      || mismatchByDimension.get(sample.dimension) < 1) {
+      fail('m4_reconciliation_report_invalid');
+    }
+    return { eventId: sample.eventId, dimension: sample.dimension, kind: sample.kind };
+  });
+}
+
+export function validateM4ReconciliationReport(value) {
+  try {
+    const report = structuredClone(value);
+    const keys = [
+      'schema', 'dimensions', 'dimensionEvidence', 'unresolvedMismatchCount',
+      'completeness', 'tolerance', 'state', 'mismatchSamples', 'dimensionsBinding',
+    ];
+    if (!isPlainObject(report) || Object.keys(report).length !== keys.length
+      || keys.some(key => !Object.hasOwn(report, key))
+      || report.schema !== 'amf.m4-reconciliation-report/v1'
+      || canonicalJson(report.dimensions) !== canonicalJson(M4_DIMENSIONS)
+      || !Array.isArray(report.dimensionEvidence)
+      || report.dimensionEvidence.length !== M4_DIMENSIONS.length
+      || !Number.isSafeInteger(report.unresolvedMismatchCount) || report.unresolvedMismatchCount < 0
+      || report.completeness !== 1 || report.tolerance !== 0
+      || !['pending', 'complete'].includes(report.state)) {
+      fail('m4_reconciliation_report_invalid');
+    }
+    const dimensionEvidence = report.dimensionEvidence
+      .map((item, index) => validateReportDimensionEvidence(item, index));
+    assertReportInvariant(dimensionEvidence);
+    const mismatchSamples = validateReportSamples(report.mismatchSamples, dimensionEvidence);
+    const unresolvedMismatchCount = dimensionEvidence
+      .reduce((sum, item) => sum + item.mismatchCount, 0);
+    if (unresolvedMismatchCount !== report.unresolvedMismatchCount
+      || (report.state === 'complete') !== (unresolvedMismatchCount === 0)) {
+      fail('m4_reconciliation_report_invalid');
+    }
+    const bindingPayload = {
+      schema: report.schema,
+      dimensions: [...M4_DIMENSIONS],
+      dimensionEvidence,
+      unresolvedMismatchCount,
+      completeness: 1,
+      tolerance: 0,
+      state: report.state,
+      mismatchSamples,
+    };
+    const bindingDigest = digest(bindingPayload);
+    const dimensionsBinding = validateCheckpoint(report.dimensionsBinding);
+    if (dimensionsBinding.id !== `m4-binding-${bindingDigest.slice('sha256:'.length)}`
+      || dimensionsBinding.digest !== bindingDigest) fail('m4_reconciliation_report_invalid');
+    return { ...bindingPayload, dimensionsBinding };
+  } catch (error) {
+    if (error?.code === 'm4_reconciliation_report_invalid') throw error;
+    fail('m4_reconciliation_report_invalid');
+  }
+}
