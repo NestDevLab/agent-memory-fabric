@@ -37,6 +37,8 @@
     "test:m4-v2-archive-source": "node --test scripts/test-m4-v2-archive-source.mjs",
     "test:m4-native-paused-source": "node --test scripts/test-m4-native-paused-interval-source.mjs",
     "test:m4-native-paused-batch": "node --test scripts/test-m4-native-paused-batch-runner.mjs",
+    "test:m4-native-paused-phase-store": "node --test scripts/test-m4-native-paused-phase-store.mjs",
+    "test:m4-native-paused-phase": "node --test scripts/test-m4-native-paused-phase-orchestrator.mjs",
     "test:m4-legacy-group-replay-batch": "node --test scripts/test-m4-legacy-group-replay-batch-runner.mjs",
     "test:m4-preserved-replay": "node --test scripts/test-m4-preserved-replay-coordinator.mjs",
     "test:m4-v2-observation-reader": "node --test scripts/test-m4-v2-observation-reader.mjs",
