@@ -24,11 +24,14 @@ function predecessor(hex) {
   return value === 0n ? null : `lmsg_${(value - 1n).toString(16).padStart(64, '0')}`;
 }
 function validateFactory(value) {
-  if (!plain(value) || Object.keys(value).some(key => !['catalog','rawStore','ingestKeys','verifyCatalogBinding','auditDecrypt','integrityFor','startCheckpoint','pageLimit','maxCiphertextBytes'].includes(key))
+  if (!plain(value) || Object.keys(value).some(key => !['catalog','rawStore','ingestKeys','verifyCatalogBinding','auditDecrypt','integrityFor','identityCollector','startCheckpoint','pageLimit','maxCiphertextBytes'].includes(key))
     || !objectLike(value.catalog) || typeof value.catalog.listM4V2LogicalGroups !== 'function'
     || !objectLike(value.rawStore) || typeof value.rawStore.getClientCiphertext !== 'function'
     || typeof value.verifyCatalogBinding !== 'function' || typeof value.auditDecrypt !== 'function'
     || typeof value.integrityFor !== 'function') fail('m4_v2_source_dependency_invalid');
+  if (!(value.identityCollector === undefined || value.identityCollector === null
+    || (plain(value.identityCollector) && Object.keys(value.identityCollector).length === 1
+      && typeof value.identityCollector.accept === 'function'))) fail('m4_v2_source_dependency_invalid');
   const startCheckpoint = checkpoint(value.startCheckpoint, 'm4_v2_source_dependency_invalid');
   if (CHECKPOINT_ID.test(startCheckpoint.id)) fail('m4_v2_source_dependency_invalid');
   const pageLimit = value.pageLimit ?? 50;
@@ -118,7 +121,8 @@ export function createM4V2ArchiveSource(input = {}) {
               } catch { fail('m4_v2_source_read_failed'); }
             }
             let projected;
-            try { projected = await projectM4V2LogicalGroup({ logical: group.logical, observations, integrityFor: dependencies.integrityFor }); }
+            try { projected = await projectM4V2LogicalGroup({ logical: group.logical, observations,
+              integrityFor: dependencies.integrityFor, identityCollector: dependencies.identityCollector ?? null }); }
             catch { fail('m4_v2_source_project_failed'); }
             if (!exact(projected, ['schema', 'outcome', 'reason', 'evidence', 'events']) || !Array.isArray(projected.events)) fail('m4_v2_source_project_failed');
             let start = 0;
