@@ -21,3 +21,8 @@ The result is the standard six-field unified observation only.
 The adapter bounds entries, total decoded ciphertext bytes, per-record decoded
 ciphertext bytes, and signed logical variants. Returned attestation entries and
 projection digests are deeply frozen.
+
+The returned content-free index attestation contains the authority digest,
+archive chain digest, entry count, and ciphertext byte count. A phase runner can
+bind that exact catalog snapshot to independently verified pause evidence
+without hashing or exposing the complete index again.
