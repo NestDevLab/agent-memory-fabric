@@ -46,8 +46,8 @@ function eventPayload(identity, role, text, sourceOccurredAt, sourceSequence, oc
   return payload;
 }
 
-export function filterCodexConversationRecord({
-  value, identity, sourceSequence, occurredAt, integrity, sessionHint
+export function eligibleCodexConversationPayload({
+  value, identity, sourceSequence, occurredAt, sessionHint
 } = {}) {
   if (!isObject(value) || value.type !== 'response_item' || !isObject(value.payload)) return null;
   const message = value.payload;
@@ -65,14 +65,16 @@ export function filterCodexConversationRecord({
   }
   const text = visibleText(message.content.map(part => part.text));
   if (text === null) return null;
-  return createConversationEvent(
-    eventPayload(identity, message.role, text, sourceOccurredAt, sourceSequence, occurredAt),
-    integrity
-  );
+  return eventPayload(identity, message.role, text, sourceOccurredAt, sourceSequence, occurredAt);
 }
 
-export function filterClaudeConversationRecord({
-  value, identity, sourceSequence, occurredAt, integrity, sessionHint
+export function filterCodexConversationRecord(input = {}) {
+  const payload = eligibleCodexConversationPayload(input);
+  return payload === null ? null : createConversationEvent(payload, input.integrity);
+}
+
+export function eligibleClaudeConversationPayload({
+  value, identity, sourceSequence, occurredAt, sessionHint
 } = {}) {
   if (!isObject(value) || !['user', 'assistant'].includes(value.type) || !isObject(value.message)) return null;
   const message = value.message;
@@ -93,8 +95,10 @@ export function filterClaudeConversationRecord({
   }
   const text = visibleText(parts);
   if (text === null) return null;
-  return createConversationEvent(
-    eventPayload(identity, message.role, text, sourceOccurredAt, sourceSequence, occurredAt),
-    integrity
-  );
+  return eventPayload(identity, message.role, text, sourceOccurredAt, sourceSequence, occurredAt);
+}
+
+export function filterClaudeConversationRecord(input = {}) {
+  const payload = eligibleClaudeConversationPayload(input);
+  return payload === null ? null : createConversationEvent(payload, input.integrity);
 }
