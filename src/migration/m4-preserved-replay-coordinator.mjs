@@ -102,7 +102,7 @@ function signedEvidence(value, code) {
 function interval(value, code) {
   const item = snapshot(value, ['startExclusive', 'endInclusive', 'chain'], code);
   if (!Number.isSafeInteger(item.startExclusive) || item.startExclusive < 0
-    || !Number.isSafeInteger(item.endInclusive) || item.endInclusive <= item.startExclusive) fail(code);
+    || !Number.isSafeInteger(item.endInclusive) || item.endInclusive < item.startExclusive) fail(code);
   return {
     startExclusive: item.startExclusive,
     endInclusive: item.endInclusive,
@@ -176,6 +176,10 @@ function request(value, authorityValue) {
   }
   const after = checkpoint(item.after, 'm4_preserved_replay_request_invalid');
   const selected = authorityValue.sources[kind];
+  if (item.afterSequence > selected.interval.endInclusive
+    || (item.afterSequence > 0 && item.afterSequence <= selected.interval.startExclusive)) {
+    fail('m4_preserved_replay_checkpoint_drift');
+  }
   if (item.afterSequence === 0 && !same(after, selected.initialCheckpoint)) {
     fail('m4_preserved_replay_checkpoint_drift');
   }
@@ -391,12 +395,15 @@ export function createM4PreservedReplayCoordinator(input = {}) {
             sourceKind: opened.sourceKind,
             pauseCheckpoint: structuredClone(opened.selected.pauseCheckpoint),
             interval: structuredClone(opened.selected.interval),
+            afterSequence: opened.afterSequence,
           });
         } catch {
           fail('m4_preserved_replay_reader_open_failed');
         }
         const reader = readerAttestation(readerValue, opened);
-        let previousPosition = opened.selected.interval.startExclusive;
+        let previousPosition = opened.afterSequence === 0
+          ? opened.selected.interval.startExclusive
+          : opened.afterSequence - 1;
         let visited = 0;
         let emitted = 0;
         let resume = opened.afterSequence === 0 ? null : opened.after;
