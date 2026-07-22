@@ -18,6 +18,9 @@ export const M4_CROSS_PHASE_IDENTITY_AUTHORITY_SCHEMA = 'amf.m4-cross-phase-iden
 export const M4_CROSS_PHASE_IDENTITY_PAGE_SCHEMA = 'amf.m4-cross-phase-identity-page/v1';
 export const M4_CROSS_PHASE_IDENTITY_MAX_PAGE_ENTRIES = 10_000;
 export const M4_CROSS_PHASE_IDENTITY_MAX_TOTAL_ENTRIES = 2_000_000;
+export const M4_CROSS_PHASE_IDENTITY_MAX_PAGE_BYTES = 32 * 1024 * 1024;
+export const M4_CROSS_PHASE_IDENTITY_MAX_AUTHORITY_PAGES = 768;
+export const M4_CROSS_PHASE_IDENTITY_MAX_CACHE_BYTES = 64 * 1024 * 1024;
 
 const SESSION_ID = /^ses_[a-f0-9]{64}$/;
 const EVENT_ID = /^evt_[a-f0-9]{64}$/;
@@ -33,9 +36,10 @@ const ROLES = new Set(['user', 'assistant']);
 const DIRECTIONS = new Set(['inbound', 'outbound']);
 const STATES = new Set(['active', 'edited', 'replacement', 'tombstone', 'conflict']);
 const NATIVE_SOURCES = new Set(['codex', 'claude', 'hermes', 'openclaw']);
-const MAX_PAGE_BYTES = 32 * 1024 * 1024;
-const MAX_AUTHORITY_PAGES = 768;
+const MAX_PAGE_BYTES = M4_CROSS_PHASE_IDENTITY_MAX_PAGE_BYTES;
+const MAX_AUTHORITY_PAGES = M4_CROSS_PHASE_IDENTITY_MAX_AUTHORITY_PAGES;
 const MAX_CACHE_PAGES = 256;
+const MAX_CACHE_BYTES = M4_CROSS_PHASE_IDENTITY_MAX_CACHE_BYTES;
 
 function fail(code) { const error = new Error(code); error.code = code; throw error; }
 function exact(value, keys) {
@@ -218,9 +222,11 @@ function descriptor(value) {
     || value.sessionCount + value.eventCount < 1 || value.sessionCount + value.eventCount > M4_CROSS_PHASE_IDENTITY_MAX_PAGE_ENTRIES
     || value.pageKey !== `${value.bucket}-${value.entryKind === 'event' ? 'e' : 's'}-${String(value.shard).padStart(4, '0')}`
     || (value.entryKind === 'event' && (value.sessionCount !== 0 || value.eventCount < 1
-      || !EVENT_ID.test(value.firstId) || !EVENT_ID.test(value.lastId)))
+      || !EVENT_ID.test(value.firstId) || !EVENT_ID.test(value.lastId)
+      || bucketFor(value.firstId, 'evt_') !== value.bucket || bucketFor(value.lastId, 'evt_') !== value.bucket))
     || (value.entryKind === 'session' && (value.eventCount !== 0 || value.sessionCount < 1
-      || !SESSION_ID.test(value.firstId) || !SESSION_ID.test(value.lastId)))
+      || !SESSION_ID.test(value.firstId) || !SESSION_ID.test(value.lastId)
+      || bucketFor(value.firstId, 'ses_') !== value.bucket || bucketFor(value.lastId, 'ses_') !== value.bucket))
     || value.firstId > value.lastId) {
     fail('m4_cross_phase_identity_authority_invalid');
   }
@@ -233,6 +239,19 @@ function descriptors(value) {
   const result = value.map(descriptor);
   for (let index = 1; index < result.length; index += 1) {
     if (result[index - 1].pageKey >= result[index].pageKey) fail('m4_cross_phase_identity_authority_invalid');
+  }
+  const byPartition = new Map();
+  for (const item of result) {
+    const partition = `${item.entryKind}:${item.bucket}`; const current = byPartition.get(partition) ?? [];
+    current.push(item); byPartition.set(partition, current);
+  }
+  for (const current of byPartition.values()) {
+    current.sort((left, right) => left.shard - right.shard);
+    for (let index = 0; index < current.length; index += 1) {
+      if (current[index].shard !== index || (index > 0 && current[index - 1].lastId >= current[index].firstId)) {
+        fail('m4_cross_phase_identity_authority_invalid');
+      }
+    }
   }
   return result;
 }
@@ -283,6 +302,34 @@ function partitionPages(values, entryKind, id, prefix) {
   return pages;
 }
 
+// These constructors deliberately accept only canonical, content-free page
+// material.  They let a bounded writer publish pages without accumulating the
+// full registry in process memory.
+export function createM4CrossPhaseIdentityPage({ bucket, entryKind, shard, entries } = {}) {
+  if (!Array.isArray(entries) || entries.length < 1) fail('m4_cross_phase_identity_page_invalid');
+  return structuredClone(createPage(bucket, entryKind, shard, entries));
+}
+
+export function describeM4CrossPhaseIdentityPage(value) {
+  let snapshot;
+  try { snapshot = structuredClone(value); } catch { fail('m4_cross_phase_identity_page_invalid'); }
+  if (!exact(snapshot, ['schema', 'version', 'pageKey', 'bucket', 'entryKind', 'shard', 'sessions', 'events', 'digest'])) {
+    fail('m4_cross_phase_identity_page_invalid');
+  }
+  const entries = snapshot.entryKind === 'event' ? snapshot.events : snapshot.sessions;
+  let page;
+  try { page = createPage(snapshot.bucket, snapshot.entryKind, snapshot.shard, entries); }
+  catch { fail('m4_cross_phase_identity_page_invalid'); }
+  if (page.digest !== snapshot.digest) fail('m4_cross_phase_identity_page_invalid');
+  return structuredClone(descriptorForPage(page));
+}
+
+export function createM4CrossPhaseIdentityAuthority({ coveredThrough, backfillBinding: binding, pageDescriptors } = {}, secret) {
+  const safeDescriptors = descriptors(pageDescriptors);
+  const unsigned = authorityBody(coveredThrough, binding, safeDescriptors);
+  return structuredClone({ ...unsigned, mac: mac(unsigned, key(secret)) });
+}
+
 export function createM4CrossPhaseIdentityRegistry({ coveredThrough, backfillBinding: binding, sessions = [], events = [] } = {}, secret) {
   const safeSessions = sortedEntries(sessions, sessionEntry, 'legacySessionId',
     'm4_cross_phase_identity_entries_invalid', M4_CROSS_PHASE_IDENTITY_MAX_TOTAL_ENTRIES);
@@ -295,8 +342,8 @@ export function createM4CrossPhaseIdentityRegistry({ coveredThrough, backfillBin
     ...partitionPages(safeSessions, 'session', 'legacySessionId', 'ses_')]
     .sort((left, right) => left.pageKey.localeCompare(right.pageKey));
   const pageDescriptors = pages.map(descriptorForPage);
-  const unsigned = authorityBody(coveredThrough, binding, pageDescriptors);
-  return structuredClone({ authority: { ...unsigned, mac: mac(unsigned, key(secret)) }, pages });
+  return structuredClone({ authority: createM4CrossPhaseIdentityAuthority({ coveredThrough, backfillBinding: binding,
+    pageDescriptors }, secret), pages });
 }
 
 export function verifyM4CrossPhaseIdentityAuthority(value, secret) {
@@ -352,17 +399,20 @@ export function createM4CrossPhaseIdentityResolver({ authority: input, loadPage,
     const current = descriptorsByKindBucket.get(keyValue) ?? [];
     current.push(item); descriptorsByKindBucket.set(keyValue, current);
   }
-  const cache = new Map(); const cutoff = timestampKey(authority.coveredThrough);
+  const cache = new Map(); let cacheBytes = 0; const cutoff = timestampKey(authority.coveredThrough);
   function load(pageKey) {
     const descriptorValue = descriptorsByPageKey.get(pageKey);
     if (!descriptorValue) fail('m4_cross_phase_identity_page_unavailable');
     if (cache.has(pageKey)) {
-      const page = cache.get(pageKey); cache.delete(pageKey); cache.set(pageKey, page); return page;
+      const cached = cache.get(pageKey); cache.delete(pageKey); cache.set(pageKey, cached); return cached.page;
     }
     let value; try { value = loadPage(pageKey); } catch { fail('m4_cross_phase_identity_page_unavailable'); }
     if (value === null || value === undefined) fail('m4_cross_phase_identity_page_unavailable');
-    const page = verifyPage(value, descriptorValue); cache.set(pageKey, page);
-    if (cache.size > MAX_CACHE_PAGES) cache.delete(cache.keys().next().value);
+    const page = verifyPage(value, descriptorValue); const bytes = Buffer.byteLength(canonicalJson(page), 'utf8');
+    cache.set(pageKey, { page, bytes }); cacheBytes += bytes;
+    while (cache.size > MAX_CACHE_PAGES || cacheBytes > MAX_CACHE_BYTES) {
+      const oldestKey = cache.keys().next().value; const oldest = cache.get(oldestKey); cache.delete(oldestKey); cacheBytes -= oldest.bytes;
+    }
     return page;
   }
   function find(entryKind, id, prefix) {
