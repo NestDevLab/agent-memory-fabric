@@ -1,6 +1,6 @@
 # M4 Recovery Pair Manifest v1
 
-`m4-recovery-pair` is a content-free, signed evidence contract for a later M4 cutover decision. It accepts a verified, complete reconciliation manifest and two independently restore-tested records in this fixed order:
+`amf.m4-recovery-pair/v1` is a content-free, signed evidence contract for a later M4 cutover decision. It is deliberately separate from the standard migration manifest and does not add a new migration phase. It accepts a verified, complete reconciliation manifest and two independently restore-tested records in this fixed order:
 
 ```mermaid
 flowchart TD

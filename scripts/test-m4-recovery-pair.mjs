@@ -32,6 +32,8 @@ async function rejects(call, code) { await assert.rejects(call, error => error?.
 test('creates and verifies a complete independent recovery pair', async () => {
   const request = await input(); const manifest = createM4RecoveryPairManifest(request); request.legacyRecord.archive = 'mutated';
   assert.deepEqual(verifyM4RecoveryPairManifest(manifest, recoveryKey), manifest);
+  assert.equal(manifest.schema, 'amf.m4-recovery-pair/v1');
+  assert.equal(Object.hasOwn(manifest, 'phase'), false);
   assert.deepEqual(manifest.archives.map(item => item.archive), ['legacy-v2', 'v3']);
   assert.doesNotMatch(JSON.stringify(manifest), /content|private|path|directory/i);
 });
@@ -56,4 +58,9 @@ test('rejects record extras, field tamper, wrong keys, signatures, and output mu
 test('rejects hostile getters without reading content', async () => {
   const hostile = {}; Object.defineProperty(hostile, 'manifestId', { enumerable: true, get() { throw new Error('getter'); } });
   await rejects(async () => createM4RecoveryPairManifest(hostile), 'm4_recovery_pair_input_invalid');
+});
+test('does not widen the standard migration manifest phase vocabulary', async () => {
+  const manifest = createM4RecoveryPairManifest(await input());
+  const mislabeled = { ...manifest, schema: 'amf.migration-manifest/v1', phase: 'recovery' };
+  await rejects(async () => verifyM4RecoveryPairManifest(mislabeled, recoveryKey), 'm4_recovery_pair_manifest_invalid');
 });
