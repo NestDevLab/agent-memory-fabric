@@ -410,6 +410,19 @@ export function createM4PreservedReplayCoordinator(input = {}) {
         let primary = null;
         try {
           while (true) {
+            if (resume === null && emitted >= opened.maxEvents) {
+              let probeValue;
+              try {
+                probeValue = await reader.next();
+              } catch {
+                fail('m4_preserved_replay_reader_read_failed');
+              }
+              const probe = snapshot(probeValue, ['value', 'done'], 'm4_preserved_replay_reader_invalid');
+              if (typeof probe.done !== 'boolean') fail('m4_preserved_replay_reader_invalid');
+              if (!probe.done) return;
+              await verifyCompletion(reader.completion, opened);
+              return;
+            }
             let nextValue;
             try {
               nextValue = await reader.next();
@@ -494,7 +507,6 @@ export function createM4PreservedReplayCoordinator(input = {}) {
               outcome,
               duplicate,
             );
-            if (emitted >= opened.maxEvents + 1) return;
           }
         } catch (error) {
           primary = normalizePrimary(error);
