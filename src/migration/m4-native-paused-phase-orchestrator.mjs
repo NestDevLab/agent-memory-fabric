@@ -78,8 +78,17 @@ function interval(value, code) {
     chain: checkpoint(value.chain, code) };
 }
 
+function projectionBinding(value, code) {
+  if (!exact(value, ['schema', 'runtime', 'sourceId', 'digest'])
+    || value.schema !== 'amf.m4-paused-projection-binding/v1'
+    || !['codex', 'claude', 'hermes', 'openclaw'].includes(value.runtime)
+    || typeof value.sourceId !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(value.sourceId)
+    || typeof value.digest !== 'string' || !DIGEST.test(value.digest)) fail(code);
+  return { schema: value.schema, runtime: value.runtime, sourceId: value.sourceId, digest: value.digest };
+}
+
 function authority(value, code) {
-  const keys = ['schema', 'pauseEvidence', 'source', 'sourceBinding', 'interval', 'initialCheckpoint'];
+  const keys = ['schema', 'pauseEvidence', 'source', 'sourceBinding', 'projectionBinding', 'interval', 'initialCheckpoint'];
   if (!exact(value, keys) || value.schema !== 'amf.m4-native-paused-interval-authority/v1'
     || typeof value.sourceBinding !== 'string' || !SOURCE_BINDING.test(value.sourceBinding)) fail(code);
   return {
@@ -87,6 +96,7 @@ function authority(value, code) {
     pauseEvidence: evidence(value.pauseEvidence, code),
     source: checkpoint(value.source, code),
     sourceBinding: value.sourceBinding,
+    projectionBinding: projectionBinding(value.projectionBinding, code),
     interval: interval(value.interval, code),
     initialCheckpoint: checkpoint(value.initialCheckpoint, code),
   };
@@ -261,7 +271,7 @@ function childPlan(value, ordinal, code) {
 function phaseIdentity(value, code) {
   const keys = ['gateEvidenceDigest', 'catalogDigest', 'legacyCompletionDigest', 'childPlans',
     'maxCallsPerInvocationPerShard', 'maxCallsPerInvocationTotal', 'receiptKeyId',
-    'completionManifestId', 'completionKeyId'];
+    'completionManifestId', 'completionKeyId', 'registryAuthorityDigest', 'sourceTagAuthorityDigest'];
   if (!exact(value, keys) || typeof value.gateEvidenceDigest !== 'string'
     || !DIGEST.test(value.gateEvidenceDigest) || typeof value.catalogDigest !== 'string'
     || !DIGEST.test(value.catalogDigest) || typeof value.legacyCompletionDigest !== 'string'
@@ -275,7 +285,9 @@ function phaseIdentity(value, code) {
     || value.maxCallsPerInvocationTotal > MAX_TOTAL_CALLS
     || typeof value.receiptKeyId !== 'string' || !ID.test(value.receiptKeyId)
     || typeof value.completionManifestId !== 'string' || !ID.test(value.completionManifestId)
-    || typeof value.completionKeyId !== 'string' || !ID.test(value.completionKeyId)) fail(code);
+    || typeof value.completionKeyId !== 'string' || !ID.test(value.completionKeyId)
+    || typeof value.registryAuthorityDigest !== 'string' || !DIGEST.test(value.registryAuthorityDigest)
+    || typeof value.sourceTagAuthorityDigest !== 'string' || !DIGEST.test(value.sourceTagAuthorityDigest)) fail(code);
   return {
     gateEvidenceDigest: value.gateEvidenceDigest,
     catalogDigest: value.catalogDigest,
@@ -286,6 +298,8 @@ function phaseIdentity(value, code) {
     receiptKeyId: value.receiptKeyId,
     completionManifestId: value.completionManifestId,
     completionKeyId: value.completionKeyId,
+    registryAuthorityDigest: value.registryAuthorityDigest,
+    sourceTagAuthorityDigest: value.sourceTagAuthorityDigest,
   };
 }
 
@@ -298,7 +312,7 @@ export function deriveM4NativePausedPhaseRunId(value) {
 function serialRequest(value, code) {
   const keys = ['gateInput', 'catalog', 'catalogKey', 'legacyCompletion',
     'maxCallsPerInvocationPerShard', 'maxCallsPerInvocationTotal', 'receiptKeyId',
-    'completionManifestId', 'completionKeyId'];
+    'completionManifestId', 'completionKeyId', 'registryAuthorityDigest', 'sourceTagAuthorityDigest'];
   try {
     if (!exact(value, keys)) fail(code);
     const catalogKey = clone(value.catalogKey, code);
@@ -312,7 +326,9 @@ function serialRequest(value, code) {
       || value.maxCallsPerInvocationTotal > MAX_TOTAL_CALLS
       || typeof value.receiptKeyId !== 'string' || !ID.test(value.receiptKeyId)
       || typeof value.completionManifestId !== 'string' || !ID.test(value.completionManifestId)
-      || typeof value.completionKeyId !== 'string' || !ID.test(value.completionKeyId)) fail(code);
+      || typeof value.completionKeyId !== 'string' || !ID.test(value.completionKeyId)
+      || typeof value.registryAuthorityDigest !== 'string' || !DIGEST.test(value.registryAuthorityDigest)
+      || typeof value.sourceTagAuthorityDigest !== 'string' || !DIGEST.test(value.sourceTagAuthorityDigest)) fail(code);
     if (value.receiptKeyId === catalog.integrity.keyId) {
       fail('m4_native_phase_key_separation_invalid');
     }
@@ -326,6 +342,8 @@ function serialRequest(value, code) {
       receiptKeyId: value.receiptKeyId,
       completionManifestId: value.completionManifestId,
       completionKeyId: value.completionKeyId,
+      registryAuthorityDigest: value.registryAuthorityDigest,
+      sourceTagAuthorityDigest: value.sourceTagAuthorityDigest,
     };
   } catch (error) {
     if (error?.code === code || error?.code?.startsWith?.('m4_native_phase_catalog_')
@@ -338,7 +356,11 @@ async function planFor(serial) {
   const childPlans = [];
   let verifiedGate = null;
   for (const item of serial.catalog.shards) {
-    const runId = deriveM4NativePausedRunId(item.authority, serial.prerequisite);
+    const authorityDigests = {
+      registryAuthorityDigest: serial.registryAuthorityDigest,
+      sourceTagAuthorityDigest: serial.sourceTagAuthorityDigest,
+    };
+    const runId = deriveM4NativePausedRunId(item.authority, serial.prerequisite, authorityDigests);
     const gateInput = { ...serial.gateInput, runId, phase: 'paused-native' };
     let planned;
     try {
@@ -347,6 +369,7 @@ async function planFor(serial) {
         maxEvents: item.maxEvents,
         authority: item.authority,
         legacyCompletion: serial.prerequisite,
+        ...authorityDigests,
       });
       if (verifiedGate === null) verifiedGate = verifyM4BackfillGate(gateInput);
     } catch {
@@ -377,6 +400,8 @@ async function planFor(serial) {
     receiptKeyId: serial.receiptKeyId,
     completionManifestId: serial.completionManifestId,
     completionKeyId: serial.completionKeyId,
+    registryAuthorityDigest: serial.registryAuthorityDigest,
+    sourceTagAuthorityDigest: serial.sourceTagAuthorityDigest,
   }, 'm4_native_phase_plan_invalid');
   const runId = deriveM4NativePausedPhaseRunId(identity);
   const confirmationDigest = digest({
@@ -488,7 +513,7 @@ async function leaseCall(action, context, code) {
 
 function batchRuntime(value, code) {
   const keys = ['gateInput', 'reader', 'derivationKey', 'derivationKeyId', 'verifyPauseEvidence',
-    'verifyLegacyCompletion', 'integrityFor', 'factories'];
+    'verifyLegacyCompletion', 'integrityFor', 'projectionIdentityResolver', 'factories'];
   try {
     if (!exact(value, keys)) fail(code);
     return {
@@ -499,6 +524,7 @@ function batchRuntime(value, code) {
       verifyPauseEvidence: value.verifyPauseEvidence,
       verifyLegacyCompletion: value.verifyLegacyCompletion,
       integrityFor: value.integrityFor,
+      projectionIdentityResolver: value.projectionIdentityResolver,
       factories: value.factories,
     };
   } catch (error) {
@@ -509,11 +535,14 @@ function batchRuntime(value, code) {
 
 function batchResult(value, expected, code) {
   const keys = ['schema', 'operation', 'runId', 'phase', 'authorityDigest',
-    'legacyCompletionDigest', 'processed', 'duplicates', 'lastCheckpoint', 'complete'];
+    'legacyCompletionDigest', 'registryAuthorityDigest', 'sourceTagAuthorityDigest',
+    'processed', 'duplicates', 'lastCheckpoint', 'complete'];
   if (!exact(value, keys) || value.schema !== 'amf.m4-native-paused-batch-result/v1'
     || value.operation !== 'run' || value.runId !== expected.runId || value.phase !== 'paused-native'
     || value.authorityDigest !== expected.authorityDigest
     || value.legacyCompletionDigest !== expected.legacyCompletionDigest
+    || value.registryAuthorityDigest !== expected.registryAuthorityDigest
+    || value.sourceTagAuthorityDigest !== expected.sourceTagAuthorityDigest
     || !Number.isSafeInteger(value.processed) || value.processed < 0
     || !Number.isSafeInteger(value.duplicates) || value.duplicates < 0
     || value.duplicates > value.processed || typeof value.complete !== 'boolean') fail(code);
@@ -524,11 +553,35 @@ function batchResult(value, expected, code) {
     phase: 'paused-native',
     authorityDigest: value.authorityDigest,
     legacyCompletionDigest: value.legacyCompletionDigest,
+    registryAuthorityDigest: value.registryAuthorityDigest,
+    sourceTagAuthorityDigest: value.sourceTagAuthorityDigest,
     processed: value.processed,
     duplicates: value.duplicates,
     lastCheckpoint: checkpoint(value.lastCheckpoint, code),
     complete: value.complete,
   };
+}
+
+export function verifyM4NativePausedPhaseChildResult(value, expected) {
+  const code = 'm4_native_phase_child_result_invalid';
+  try {
+    const snapshot = clone(expected, code);
+    const keys = ['ordinal', 'runId', 'confirmationDigest', 'authorityDigest',
+      'legacyCompletionDigest', 'registryAuthorityDigest', 'sourceTagAuthorityDigest'];
+    if (!exact(snapshot, keys) || typeof snapshot.registryAuthorityDigest !== 'string'
+      || !DIGEST.test(snapshot.registryAuthorityDigest)
+      || typeof snapshot.sourceTagAuthorityDigest !== 'string'
+      || !DIGEST.test(snapshot.sourceTagAuthorityDigest)) fail(code);
+    const { registryAuthorityDigest, sourceTagAuthorityDigest, ...child } = snapshot;
+    return batchResult(clone(value, code), {
+      ...childPlan(child, child.ordinal, code),
+      registryAuthorityDigest,
+      sourceTagAuthorityDigest,
+    }, code);
+  } catch (error) {
+    if (error?.code === code) throw error;
+    fail(code);
+  }
 }
 
 function receiptPayload(value, code) {
@@ -641,6 +694,8 @@ function completionCheckpoint(plan, receiptDigest) {
     gateEvidenceDigest: plan.gateEvidenceDigest,
     catalogDigest: plan.catalogDigest,
     legacyCompletionDigest: plan.legacyCompletionDigest,
+    registryAuthorityDigest: plan.registryAuthorityDigest,
+    sourceTagAuthorityDigest: plan.sourceTagAuthorityDigest,
     receiptKeyId: plan.receiptKeyId,
     receiptDigest,
   });
@@ -659,6 +714,8 @@ function completionFor(plan, receipts, keyDocument) {
       gateEvidenceDigest: plan.gateEvidenceDigest,
       catalogDigest: plan.catalogDigest,
       legacyCompletionDigest: plan.legacyCompletionDigest,
+      registryAuthorityDigest: plan.registryAuthorityDigest,
+      sourceTagAuthorityDigest: plan.sourceTagAuthorityDigest,
       receiptKeyId: plan.receiptKeyId,
       receiptDigest,
       checkpoint: completionCheckpoint(plan, receiptDigest),
@@ -686,10 +743,12 @@ function completionFor(plan, receipts, keyDocument) {
 
 function completionPayload(value, code) {
   const keys = ['schema', 'state', 'runId', 'gateEvidenceDigest', 'catalogDigest',
-    'legacyCompletionDigest', 'receiptKeyId', 'receiptDigest', 'checkpoint'];
+    'legacyCompletionDigest', 'registryAuthorityDigest', 'sourceTagAuthorityDigest',
+    'receiptKeyId', 'receiptDigest', 'checkpoint'];
   if (!exact(value, keys) || value.schema !== COMPLETION_SCHEMA || value.state !== 'complete'
     || typeof value.runId !== 'string' || !ID.test(value.runId)
-    || ![value.gateEvidenceDigest, value.catalogDigest, value.legacyCompletionDigest, value.receiptDigest]
+    || ![value.gateEvidenceDigest, value.catalogDigest, value.legacyCompletionDigest,
+      value.registryAuthorityDigest, value.sourceTagAuthorityDigest, value.receiptDigest]
       .every(item => typeof item === 'string' && DIGEST.test(item))
     || typeof value.receiptKeyId !== 'string' || !ID.test(value.receiptKeyId)) fail(code);
   const payload = {
@@ -699,6 +758,8 @@ function completionPayload(value, code) {
     gateEvidenceDigest: value.gateEvidenceDigest,
     catalogDigest: value.catalogDigest,
     legacyCompletionDigest: value.legacyCompletionDigest,
+    registryAuthorityDigest: value.registryAuthorityDigest,
+    sourceTagAuthorityDigest: value.sourceTagAuthorityDigest,
     receiptKeyId: value.receiptKeyId,
     receiptDigest: value.receiptDigest,
     checkpoint: checkpoint(value.checkpoint, code),
@@ -709,7 +770,8 @@ function completionPayload(value, code) {
 
 export function verifyM4NativePausedPhaseCompletion(value, keyDocument) {
   const keys = ['schema', 'state', 'runId', 'gateEvidenceDigest', 'catalogDigest',
-    'legacyCompletionDigest', 'receiptKeyId', 'receiptDigest', 'checkpoint', 'evidence'];
+    'legacyCompletionDigest', 'registryAuthorityDigest', 'sourceTagAuthorityDigest',
+    'receiptKeyId', 'receiptDigest', 'checkpoint', 'evidence'];
   if (!exact(value, keys) || !exact(value.evidence,
     ['manifestId', 'keyId', 'digest', 'signature'])
     || typeof value.evidence.manifestId !== 'string' || !ID.test(value.evidence.manifestId)
@@ -725,6 +787,8 @@ export function verifyM4NativePausedPhaseCompletion(value, keyDocument) {
     gateEvidenceDigest: value.gateEvidenceDigest,
     catalogDigest: value.catalogDigest,
     legacyCompletionDigest: value.legacyCompletionDigest,
+    registryAuthorityDigest: value.registryAuthorityDigest,
+    sourceTagAuthorityDigest: value.sourceTagAuthorityDigest,
     receiptKeyId: value.receiptKeyId,
     receiptDigest: value.receiptDigest,
     checkpoint: value.checkpoint,
@@ -753,7 +817,7 @@ export function verifyM4NativePausedPhaseCompletion(value, keyDocument) {
 function runSerial(input) {
   const keys = ['gateInput', 'catalog', 'catalogKey', 'legacyCompletion',
     'maxCallsPerInvocationPerShard', 'maxCallsPerInvocationTotal', 'receiptKeyId',
-    'completionManifestId', 'completionKeyId'];
+    'completionManifestId', 'completionKeyId', 'registryAuthorityDigest', 'sourceTagAuthorityDigest'];
   const value = {};
   try {
     for (const key of keys) value[key] = input[key];
@@ -766,7 +830,7 @@ function runSerial(input) {
 export async function runM4NativePausedPhase(input = {}) {
   const keys = ['gateInput', 'catalog', 'catalogKey', 'legacyCompletion',
     'maxCallsPerInvocationPerShard', 'maxCallsPerInvocationTotal', 'receiptKeyId',
-    'completionManifestId', 'completionKeyId', 'confirmedPlanDigest',
+    'completionManifestId', 'completionKeyId', 'registryAuthorityDigest', 'sourceTagAuthorityDigest', 'confirmedPlanDigest',
     'verifyCurrentCatalog', 'verifyLegacyCompletion', 'factories'];
   if (!exact(input, keys)) fail('m4_native_phase_run_input_invalid');
   const serial = runSerial(input);
@@ -882,20 +946,26 @@ export async function runM4NativePausedPhase(input = {}) {
         try {
           const runtime = batchRuntime(shardResource.value,
             'm4_native_phase_shard_factory_result_invalid');
-          output = batchResult(await runM4NativePausedBatch({
+          output = verifyM4NativePausedPhaseChildResult(await runM4NativePausedBatch({
             gateInput: runtime.gateInput,
             maxEvents: item.maxEvents,
             authority: item.authority,
             legacyCompletion: serial.prerequisite,
+            registryAuthorityDigest: serial.registryAuthorityDigest,
+            sourceTagAuthorityDigest: serial.sourceTagAuthorityDigest,
             confirmedPlanDigest: child.confirmationDigest,
             reader: runtime.reader,
+            projectionIdentityResolver: runtime.projectionIdentityResolver,
             derivationKey: runtime.derivationKey,
             derivationKeyId: runtime.derivationKeyId,
             verifyPauseEvidence: runtime.verifyPauseEvidence,
             verifyLegacyCompletion: runtime.verifyLegacyCompletion,
             integrityFor: runtime.integrityFor,
             factories: runtime.factories,
-          }), child, 'm4_native_phase_child_result_invalid');
+          }), { ...child,
+            registryAuthorityDigest: serial.registryAuthorityDigest,
+            sourceTagAuthorityDigest: serial.sourceTagAuthorityDigest,
+          });
         } catch (error) {
           shardPrimary = error;
           throw error;

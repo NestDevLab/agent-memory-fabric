@@ -15,17 +15,25 @@ import {
   deriveM4NativePausedPhaseRunId,
   planM4NativePausedPhase,
   runM4NativePausedPhase,
+  verifyM4NativePausedPhaseChildResult,
   verifyM4NativePausedPhaseCompletion,
   verifyM4NativePausedShardCatalog,
 } from '../src/migration/m4-native-paused-phase-orchestrator.mjs';
 import { M4NativePausedPhaseStore } from '../src/migration/m4-native-paused-phase-store.mjs';
 import { M4ProgressStore } from '../src/migration/m4-progress-store.mjs';
+import { M4PostCutoffIdentityStore } from '../src/migration/m4-post-cutoff-identity-store.mjs';
 
 const EVENT_KEY = Buffer.alloc(32, 7);
 const DERIVATION_KEY = Buffer.alloc(32, 3);
 const CATALOG_KEY = keyDocument('native-catalog-key', 12);
 const RECEIPT_KEY = keyDocument('native-receipt-key', 14);
 const COMPLETION_KEY = keyDocument('native-phase-completion-key', 13);
+const PROJECTION_BINDING = {
+  schema: 'amf.m4-paused-projection-binding/v1',
+  runtime: 'codex',
+  sourceId: 'source-one',
+  digest: digest('projection'),
+};
 
 function digest(value) {
   return `sha256:${crypto.createHash('sha256').update(String(value)).digest('hex')}`;
@@ -125,6 +133,7 @@ function authorityFor(gateFiles, startExclusive, endInclusive, options = {}) {
     pauseEvidence: temporaryGate.pauseEvidence,
     source: gateFiles.pauseManifest.pause.nativeTranscriptAuthority,
     sourceBinding: options.sourceBinding ?? sourceBinding(),
+    projectionBinding: options.projectionBinding ?? PROJECTION_BINDING,
     interval: {
       startExclusive,
       endInclusive,
@@ -170,6 +179,52 @@ function serialInput(gateFiles, catalog, completion, overrides = {}) {
     receiptKeyId: RECEIPT_KEY.keyId,
     completionManifestId: 'native-phase-completion',
     completionKeyId: COMPLETION_KEY.keyId,
+    registryAuthorityDigest: overrides.registryAuthorityDigest ?? digest('registry'),
+    sourceTagAuthorityDigest: overrides.sourceTagAuthorityDigest ?? digest('source-tags'),
+  };
+}
+
+function projectionIdentity(position) {
+  return {
+    schema: 'amf.m4-paused-projection-identity/v1',
+    binding: PROJECTION_BINDING,
+    runtime: 'codex',
+    sourceId: 'source-one',
+    sourceKind: 'codex',
+    observationClass: 'native',
+    authoritativeDeletion: false,
+    occurredAt: `2026-07-22T00:00:${String(position).padStart(2, '0')}Z`,
+    editedAt: null,
+    legacy: {
+      sessionId: `ses_${'a'.repeat(64)}`,
+      eventId: `evt_${String(position).padStart(2, '0')}${'b'.repeat(62)}`,
+      priorEventId: null,
+    },
+    routing: {
+      role: 'user', direction: 'inbound', conversationKind: 'session',
+      authorizationContextTags: {
+        sender: [`hmac-sha256:test:${'c'.repeat(64)}`],
+        conversation: [`hmac-sha256:test:${'d'.repeat(64)}`],
+      },
+    },
+    lifecycle: { change: 'new', nativeRevision: null },
+  };
+}
+
+function projectionIdentityResolver() {
+  return {
+    resolve({ identity, attestation }) {
+      assert.deepEqual(attestation, PROJECTION_BINDING);
+      return {
+        eventId: `cevt_${crypto.createHash('sha256').update(identity.legacy.eventId).digest('hex')}`,
+        conversationId: `ccon_${'f'.repeat(64)}`,
+        sourceInstanceId: `src_${'1'.repeat(64)}`,
+        conversationKind: identity.routing.conversationKind,
+        authorizationContextTags: identity.routing.authorizationContextTags,
+        priorEventId: null,
+        postCutoffBinding: null,
+      };
+    },
   };
 }
 
@@ -191,6 +246,7 @@ function nativeReader(authorityValue) {
         sourceOccurredAt: timestamp,
       },
       sessionHint: 'session-one',
+      projectionIdentity: projectionIdentity(position),
       value: {
         type: 'response_item',
         session_id: 'session-one',
@@ -217,6 +273,7 @@ function nativeReader(authorityValue) {
         interval: authorityValue.interval,
         runtime: 'codex',
         sourceId: 'source-one',
+        projectionBinding: PROJECTION_BINDING,
         records: (async function* iterate() { yield* records; }()),
         completion: async () => ({
           schema: 'amf.m4-native-paused-completion/v1',
@@ -242,6 +299,10 @@ function batchFactories(root, calls, ordinal) {
     lease: async () => {
       calls.push(`lease-${ordinal}`);
       return { async acquire() {}, async heartbeat() {}, async release() {} };
+    },
+    postCutoffStore: async input => {
+      calls.push(`identity-${ordinal}`);
+      return new M4PostCutoffIdentityStore({ rootPath: path.join(root, 'identity'), ...input });
     },
     outbox: async () => {
       calls.push(`outbox-${ordinal}`);
@@ -294,6 +355,7 @@ function shardRuntime(gateFiles, authorityValue, completion, root, calls, ordina
       sentAt: '2026-07-22T00:00:30Z',
       nonce: `eventnonce${String(ordinal).padStart(7, '0')}`,
     }),
+    projectionIdentityResolver: projectionIdentityResolver(),
     factories: batchFactories(root, calls, ordinal),
   };
 }
@@ -390,6 +452,8 @@ test('plans internally and completes two real shards in strict durable order', a
       receiptKeyId: value.plan.receiptKeyId,
       completionManifestId: value.plan.completionManifestId,
       completionKeyId: value.plan.completionKeyId,
+      registryAuthorityDigest: value.plan.registryAuthorityDigest,
+      sourceTagAuthorityDigest: value.plan.sourceTagAuthorityDigest,
     }), value.plan.runId);
     const result = await runM4NativePausedPhase(value.runtime);
     assert.equal(result.complete, true);
@@ -412,6 +476,69 @@ test('plans internally and completes two real shards in strict durable order', a
       .get().count, 3);
     archive.close();
     assert.doesNotMatch(JSON.stringify(result), /synthetic message|payload text|private/);
+  } finally {
+    cleanup(value);
+  }
+});
+
+test('binds every paused shard and phase plan to projection and registry authorities', async () => {
+  const gateFiles = gateFixture();
+  const authority = authorityFor(gateFiles, 0, 1);
+  const catalog = catalogFor([authority]);
+  const completion = legacyCompletion();
+  const first = await planM4NativePausedPhase(serialInput(gateFiles, catalog, completion));
+  const changedRegistry = await planM4NativePausedPhase(serialInput(gateFiles, catalog, completion, {
+    registryAuthorityDigest: digest('registry-changed'),
+  }));
+  const changedSourceTags = await planM4NativePausedPhase(serialInput(gateFiles, catalog, completion, {
+    sourceTagAuthorityDigest: digest('source-tags-changed'),
+  }));
+  assert.notEqual(first.runId, changedRegistry.runId);
+  assert.notEqual(first.runId, changedSourceTags.runId);
+  assert.notEqual(first.childPlans[0].runId, changedRegistry.childPlans[0].runId);
+  assert.notEqual(first.childPlans[0].runId, changedSourceTags.childPlans[0].runId);
+  assert.throws(() => createM4NativePausedShardCatalog({
+    pauseEvidence: authority.pauseEvidence,
+    source: authority.source,
+    initialCheckpoint: authority.initialCheckpoint,
+    shards: [{ ordinal: 0, authority: (() => {
+      const { projectionBinding, ...staleAuthority } = authority;
+      return staleAuthority;
+    })(), maxEvents: 1 }],
+    keyDocument: CATALOG_KEY,
+  }), { code: 'm4_native_phase_catalog_invalid' });
+});
+
+test('rejects mismatched child authority digests before a receipt can be constructed', async () => {
+  const value = await setup({ authorities: [authorityFor(gateFixture(), 0, 1)] });
+  try {
+    const child = value.plan.childPlans[0];
+    const expected = {
+      ...child,
+      registryAuthorityDigest: value.plan.registryAuthorityDigest,
+      sourceTagAuthorityDigest: value.plan.sourceTagAuthorityDigest,
+    };
+    const result = {
+      schema: 'amf.m4-native-paused-batch-result/v1',
+      operation: 'run',
+      runId: child.runId,
+      phase: 'paused-native',
+      authorityDigest: child.authorityDigest,
+      legacyCompletionDigest: child.legacyCompletionDigest,
+      registryAuthorityDigest: expected.registryAuthorityDigest,
+      sourceTagAuthorityDigest: expected.sourceTagAuthorityDigest,
+      processed: 1,
+      duplicates: 0,
+      lastCheckpoint: checkpoint('child-result-checkpoint'),
+      complete: true,
+    };
+    assert.deepEqual(verifyM4NativePausedPhaseChildResult(result, expected), result);
+    for (const field of ['registryAuthorityDigest', 'sourceTagAuthorityDigest']) {
+      assert.throws(() => verifyM4NativePausedPhaseChildResult({
+        ...result,
+        [field]: digest(`wrong-${field}`),
+      }, expected), { code: 'm4_native_phase_child_result_invalid' });
+    }
   } finally {
     cleanup(value);
   }
@@ -809,6 +936,13 @@ test('completion verification rejects checkpoint, payload, signature, and key su
     assert.throws(() => verifyM4NativePausedPhaseCompletion(payloadTamper, COMPLETION_KEY), {
       code: 'm4_native_phase_completion_invalid',
     });
+    for (const field of ['registryAuthorityDigest', 'sourceTagAuthorityDigest']) {
+      const authorityTamper = structuredClone(result.completion);
+      authorityTamper[field] = digest(`other-${field}`);
+      assert.throws(() => verifyM4NativePausedPhaseCompletion(authorityTamper, COMPLETION_KEY), {
+        code: 'm4_native_phase_completion_invalid',
+      });
+    }
     const signatureTamper = structuredClone(result.completion);
     signatureTamper.evidence.signature = 'a'.repeat(43);
     assert.throws(() => verifyM4NativePausedPhaseCompletion(signatureTamper, COMPLETION_KEY), {
