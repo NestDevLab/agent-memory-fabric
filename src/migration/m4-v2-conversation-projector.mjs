@@ -53,8 +53,19 @@ export function deriveM4V3EventIdFromLegacyEventId(eventId) {
   return `cevt_${opaqueHash('amf.m4/v2-event-id/v1', [eventId])}`;
 }
 
-function deriveSourceInstanceId(sessionId, sourceTags) {
+export function deriveM4V3SourceInstanceIdFromLegacySession(sessionId, sourceTags) {
+  if (typeof sessionId !== 'string' || !V2_SESSION_ID.test(sessionId)
+    || !Array.isArray(sourceTags) || sourceTags.length < 1 || sourceTags.length > 64
+    || sourceTags.some(sourceTag => typeof sourceTag !== 'string' || !SOURCE_TAG.test(sourceTag))
+    || new Set(sourceTags).size !== sourceTags.length
+    || sourceTags.some((sourceTag, index) => index > 0 && sourceTags[index - 1] >= sourceTag)) {
+    fail('m4_v2_projector_source_binding_invalid');
+  }
   return `src_${opaqueHash('amf.m4/v2-source-instance/v1', [sessionId, sourceTags])}`;
+}
+
+function deriveSourceInstanceId(sessionId, sourceTags) {
+  return deriveM4V3SourceInstanceIdFromLegacySession(sessionId, sourceTags);
 }
 
 function copyLogical(value) {
