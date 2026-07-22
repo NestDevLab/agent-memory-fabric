@@ -46,6 +46,46 @@ function eventPayload(identity, role, text, sourceOccurredAt, sourceSequence, oc
   return payload;
 }
 
+function lifecyclePayload(payload, lifecycle, resolved) {
+  if (!isObject(payload) || !isObject(lifecycle) || !isObject(resolved)) return null;
+  const change = lifecycle.change;
+  const prior = resolved.priorEventId;
+  if (change === 'new') {
+    if (prior !== null || !(lifecycle.nativeRevision === null || lifecycle.nativeRevision === 0 || lifecycle.nativeRevision === 1)) return null;
+    return { ...payload, state: 'active', revision: 1 };
+  }
+  if (change === 'changed') {
+    if (typeof prior !== 'string' || !Number.isSafeInteger(lifecycle.nativeRevision) || lifecycle.nativeRevision < 2) return null;
+    return { ...payload, state: 'edited', revision: lifecycle.nativeRevision, replacesEventId: prior };
+  }
+  if (change === 'deleted') {
+    if (typeof prior !== 'string' || !Number.isSafeInteger(lifecycle.nativeRevision) || lifecycle.nativeRevision < 2) return null;
+    const { visibleText, attachments, ...tombstone } = payload;
+    return { ...tombstone, state: 'tombstone', revision: lifecycle.nativeRevision, tombstonesEventId: prior };
+  }
+  return null;
+}
+
+function hermesBasePayload({ value, identity, sourceSequence, occurredAt, sessionHint } = {}) {
+  if (!isObject(value) || !['user', 'assistant'].includes(value.role)
+    || !firstIdentifier(value.session_id, sessionHint) || !firstIdentifier(value.revisionEventId, value.stableNativeMessageId)
+    || !isConversationEventUtcTimestamp(value.timestamp)) return null;
+  if (!['message', 'message.deleted'].includes(value.subtype)) return null;
+  if (value.authoritativeDeletion === true) {
+    if (value.subtype !== 'message.deleted') return null;
+    return eventPayload(identity, value.role, null, value.timestamp, sourceSequence, occurredAt);
+  }
+  if (value.subtype !== 'message' || typeof value.content !== 'string') return null;
+  const text = visibleText([value.content]);
+  return text === null ? null : eventPayload(identity, value.role, text, value.timestamp, sourceSequence, occurredAt);
+}
+
+function lifecycleFromEligible(eligible, options) {
+  const payload = eligible(options);
+  if (payload === null) return null;
+  return lifecyclePayload(payload, options.lifecycle, options.resolved);
+}
+
 export function eligibleCodexConversationPayload({
   value, identity, sourceSequence, occurredAt, sessionHint
 } = {}) {
@@ -71,6 +111,10 @@ export function eligibleCodexConversationPayload({
 export function filterCodexConversationRecord(input = {}) {
   const payload = eligibleCodexConversationPayload(input);
   return payload === null ? null : createConversationEvent(payload, input.integrity);
+}
+
+export function eligibleCodexConversationLifecyclePayload(input = {}) {
+  return lifecycleFromEligible(eligibleCodexConversationPayload, input);
 }
 
 export function eligibleClaudeConversationPayload({
@@ -103,6 +147,10 @@ export function filterClaudeConversationRecord(input = {}) {
   return payload === null ? null : createConversationEvent(payload, input.integrity);
 }
 
+export function eligibleClaudeConversationLifecyclePayload(input = {}) {
+  return lifecycleFromEligible(eligibleClaudeConversationPayload, input);
+}
+
 export function eligibleOpenClawConversationPayload({
   value, identity, sourceSequence, occurredAt, sessionHint
 } = {}) {
@@ -132,4 +180,19 @@ export function eligibleOpenClawConversationPayload({
 export function filterOpenClawConversationRecord(input = {}) {
   const payload = eligibleOpenClawConversationPayload(input);
   return payload === null ? null : createConversationEvent(payload, input.integrity);
+}
+
+export function eligibleOpenClawConversationLifecyclePayload(input = {}) {
+  return lifecycleFromEligible(eligibleOpenClawConversationPayload, input);
+}
+
+export function eligibleHermesConversationPayload({ value, identity, sourceSequence, occurredAt, sessionHint } = {}) {
+  const base = hermesBasePayload({ value, identity, sourceSequence, occurredAt, sessionHint });
+  return base?.visibleText === null ? null : base;
+}
+
+export function eligibleHermesConversationLifecyclePayload(input = {}) {
+  const base = hermesBasePayload(input);
+  if (base === null) return null;
+  return lifecyclePayload(base, input.lifecycle, input.resolved);
 }

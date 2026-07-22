@@ -16,6 +16,7 @@ import {
   runM4NativePausedBatch,
 } from '../src/migration/m4-native-paused-batch-runner.mjs';
 import { M4ProgressStore } from '../src/migration/m4-progress-store.mjs';
+import { M4PostCutoffIdentityStore } from '../src/migration/m4-post-cutoff-identity-store.mjs';
 
 const EVENT_KEY = Buffer.alloc(32, 7);
 const DERIVATION_KEY = Buffer.alloc(32, 3);
@@ -23,6 +24,9 @@ const digest = value => `sha256:${crypto.createHash('sha256').update(String(valu
 const checkpoint = (id, value = id) => ({ id, digest: digest(value) });
 const keyDocument = (id, byte) => ({ schema: 'amf.migration-signing-key/v1', keyId: id,
   key: Buffer.alloc(32, byte).toString('base64') });
+const projectionBinding = { schema: 'amf.m4-paused-projection-binding/v1', runtime: 'codex', sourceId: 'source-one', digest: digest('projection') };
+function projectionIdentity(position) { return { schema: 'amf.m4-paused-projection-identity/v1', binding: projectionBinding, runtime: 'codex', sourceId: 'source-one', sourceKind: 'codex', observationClass: 'native', authoritativeDeletion: false, occurredAt: `2026-07-22T00:00:${String(position).padStart(2, '0')}Z`, editedAt: null, legacy: { sessionId: `ses_${'a'.repeat(64)}`, eventId: `evt_${String(position).padStart(2, '0')}${'b'.repeat(62)}`, priorEventId: null }, routing: { role: 'user', direction: 'inbound', conversationKind: 'session', authorizationContextTags: { sender: [`hmac-sha256:test:${'c'.repeat(64)}`], conversation: [`hmac-sha256:test:${'d'.repeat(64)}`] } }, lifecycle: { change: 'new', nativeRevision: null } }; }
+function resolver() { return { resolve({ identity, attestation }) { assert.deepEqual(attestation, projectionBinding); const eventId = `cevt_${crypto.createHash('sha256').update(identity.legacy.eventId).digest('hex')}`; return { eventId, conversationId: `ccon_${'f'.repeat(64)}`, sourceInstanceId: `src_${'1'.repeat(64)}`, conversationKind: identity.routing.conversationKind, authorizationContextTags: identity.routing.authorizationContextTags, priorEventId: null, postCutoffBinding: null }; } }; }
 
 function gateFixture() {
   const pauseKey = keyDocument('native-pause-key', 10);
@@ -67,7 +71,7 @@ function authorityFor(gateFiles, interval = { startExclusive: 0, endInclusive: 1
   const sourceBinding = `hmac-sha256:source-v1:${crypto.createHmac('sha256', DERIVATION_KEY)
     .update(canonicalJson(['amf.m4-native-paused/tag/source-v1/v1', 'codex', 'source-one']), 'utf8').digest('hex')}`;
   return { schema: 'amf.m4-native-paused-interval-authority/v1', pauseEvidence: gate.pauseEvidence,
-    source: gateFiles.pauseManifest.pause.nativeTranscriptAuthority, sourceBinding, interval,
+    source: gateFiles.pauseManifest.pause.nativeTranscriptAuthority, sourceBinding, projectionBinding, interval,
     initialCheckpoint: gate.sourceCheckpoint };
 }
 
@@ -79,7 +83,8 @@ function legacyCompletion(value = 'one') {
 }
 
 function gateInput(gateFiles, authority, completion) {
-  return { runId: deriveM4NativePausedRunId(authority, completion), phase: 'paused-native', ...gateFiles };
+  const digests = { registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') };
+  return { runId: deriveM4NativePausedRunId(authority, completion, digests), phase: 'paused-native', ...gateFiles };
 }
 
 function reader(authority, { openError = null } = {}) {
@@ -89,6 +94,7 @@ function reader(authority, { openError = null } = {}) {
     const messageId = `message-${position}`;
     return { native: { runtime: 'codex', sourceId: 'source-one', conversationId: 'session-one',
       threadId: null, messageId, position, sourceOccurredAt: timestamp }, sessionHint: 'session-one',
+    projectionIdentity: projectionIdentity(position),
     value: { type: 'response_item', session_id: 'session-one', id: messageId, timestamp,
       payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: `hello ${position}` }] } } };
   });
@@ -96,7 +102,7 @@ function reader(authority, { openError = null } = {}) {
     if (openError) throw openError;
     assert.deepEqual(input, { schema: authority.schema, source: authority.source, interval: authority.interval });
     return { schema: 'amf.m4-native-paused-reader/v1', source: authority.source, interval: authority.interval,
-      runtime: 'codex', sourceId: 'source-one', records: (async function* () { yield* records; })(),
+      runtime: 'codex', sourceId: 'source-one', projectionBinding, records: (async function* () { yield* records; })(),
       completion: async () => ({ schema: 'amf.m4-native-paused-completion/v1', source: authority.source,
         endInclusive: authority.interval.endInclusive, chain: authority.interval.chain }) };
   } };
@@ -117,6 +123,7 @@ function pauseVerifier(authority, calls = null) {
 function factories(root, calls) {
   return {
     lease: async () => { calls.push('lease'); return { async acquire() {}, async heartbeat() {}, async release() {} }; },
+    postCutoffStore: async input => { calls.push('identity'); return new M4PostCutoffIdentityStore({ rootPath: path.join(root, 'identity'), ...input }); },
     outbox: async () => { calls.push('outbox'); return new ConversationEventPlaintextOutbox({
       rootPath: path.join(root, 'outbox'), resolveIntegrityKey: keyId => keyId === 'event-k1' ? EVENT_KEY : null,
       clock: () => Date.parse('2026-07-22T00:01:00Z'), nonceFactory: () => 'deliverynonce000001' }); },
@@ -131,8 +138,9 @@ function factories(root, calls) {
 
 function runInput(gateFiles, authority, completion, plan, root, calls) {
   return { gateInput: gateInput(gateFiles, authority, completion), maxEvents: 1, authority,
-    legacyCompletion: completion,
+    legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags'),
     confirmedPlanDigest: plan.confirmationDigest, reader: reader(authority),
+    projectionIdentityResolver: resolver(),
     derivationKey: DERIVATION_KEY, derivationKeyId: 'native-test-k1',
     verifyPauseEvidence: pauseVerifier(authority, calls),
     verifyLegacyCompletion: legacyVerifier(completion, calls),
@@ -142,15 +150,15 @@ function runInput(gateFiles, authority, completion, plan, root, calls) {
 
 test('plans without resources, runs one real paused-native shard, and resumes its isolated progress', async () => {
   const gateFiles = gateFixture(); const authority = authorityFor(gateFiles); const completion = legacyCompletion();
-  const input = { gateInput: gateInput(gateFiles, authority, completion), maxEvents: 1, authority, legacyCompletion: completion };
+  const input = { gateInput: gateInput(gateFiles, authority, completion), maxEvents: 1, authority, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') };
   const plan = await planM4NativePausedBatch(input);
-  assert.deepEqual(Object.keys(plan), ['schema', 'operation', 'runId', 'phase', 'maxEvents', 'authorityDigest', 'legacyCompletionDigest', 'confirmationDigest']);
+  assert.deepEqual(Object.keys(plan), ['schema', 'operation', 'runId', 'phase', 'maxEvents', 'authorityDigest', 'legacyCompletionDigest', 'registryAuthorityDigest', 'sourceTagAuthorityDigest', 'confirmationDigest']);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-native-batch-')); const calls = [];
   try {
     const first = await runM4NativePausedBatch(runInput(gateFiles, authority, completion, plan, root, calls));
     assert.equal(first.processed, 1); assert.equal(first.complete, true); assert.equal(first.phase, 'paused-native');
     assert.equal(first.legacyCompletionDigest, plan.legacyCompletionDigest);
-    assert.deepEqual(calls, ['legacy', 'pause', 'lease', 'outbox', 'archive', 'checkpoint', 'pause']);
+    assert.deepEqual(calls, ['legacy', 'pause', 'lease', 'identity', 'outbox', 'archive', 'checkpoint', 'pause']);
     const secondCalls = [];
     const second = await runM4NativePausedBatch(runInput(gateFiles, authority, completion, plan, root, secondCalls));
     assert.equal(second.processed, 0); assert.equal(second.complete, true);
@@ -164,7 +172,7 @@ test('plans without resources, runs one real paused-native shard, and resumes it
 
 test('confirmation and pause evidence fail before any resource factory', async () => {
   const gateFiles = gateFixture(); const authority = authorityFor(gateFiles); const completion = legacyCompletion();
-  const plan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, authority, completion), maxEvents: 1, authority, legacyCompletion: completion });
+  const plan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, authority, completion), maxEvents: 1, authority, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-native-batch-')); const calls = [];
   try {
     const wrong = runInput(gateFiles, authority, completion, plan, root, calls); wrong.confirmedPlanDigest = digest('wrong');
@@ -181,26 +189,26 @@ test('confirmation and pause evidence fail before any resource factory', async (
 test('plan binds the paused phase, exact gate evidence, authority, and one run namespace per shard', async () => {
   const gateFiles = gateFixture(); const completion = legacyCompletion(); const first = authorityFor(gateFiles);
   const second = authorityFor(gateFiles, { startExclusive: 1, endInclusive: 2, chain: checkpoint('native-chain-two') });
-  assert.notEqual(deriveM4NativePausedRunId(first, completion), deriveM4NativePausedRunId(second, completion));
-  const firstPlan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, first, completion), maxEvents: 1, authority: first, legacyCompletion: completion });
-  const secondPlan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, second, completion), maxEvents: 1, authority: second, legacyCompletion: completion });
+  assert.notEqual(deriveM4NativePausedRunId(first, completion, { registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') }), deriveM4NativePausedRunId(second, completion, { registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') }));
+  const firstPlan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, first, completion), maxEvents: 1, authority: first, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') });
+  const secondPlan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, second, completion), maxEvents: 1, authority: second, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') });
   assert.notEqual(firstPlan.confirmationDigest, secondPlan.confirmationDigest);
   await assert.rejects(() => planM4NativePausedBatch({ gateInput: { ...gateInput(gateFiles, first, completion), phase: 'v2-archive' },
-    maxEvents: 1, authority: first, legacyCompletion: completion }), { code: 'm4_native_batch_gate_mismatch' });
+    maxEvents: 1, authority: first, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') }), { code: 'm4_native_batch_gate_mismatch' });
   await assert.rejects(() => planM4NativePausedBatch({ gateInput: { ...gateInput(gateFiles, first, completion), runId: 'wrong-native-run' },
-    maxEvents: 1, authority: first, legacyCompletion: completion }), { code: 'm4_native_batch_gate_mismatch' });
+    maxEvents: 1, authority: first, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') }), { code: 'm4_native_batch_gate_mismatch' });
   await assert.rejects(() => planM4NativePausedBatch({ gateInput: gateInput(gateFiles, first, completion), maxEvents: 1,
-    authority: { ...first, initialCheckpoint: checkpoint('other-source-checkpoint') }, legacyCompletion: completion }),
+    authority: { ...first, initialCheckpoint: checkpoint('other-source-checkpoint') }, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') }),
   { code: 'm4_native_batch_gate_mismatch' });
 });
 
 test('snapshots reader, factory, and pause-attestation getters once', async () => {
   const gateFiles = gateFixture(); const authority = authorityFor(gateFiles); const completion = legacyCompletion();
-  const plan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, authority, completion), maxEvents: 1, authority, legacyCompletion: completion });
+  const plan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, authority, completion), maxEvents: 1, authority, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-native-batch-')); const calls = [];
   try {
     const input = runInput(gateFiles, authority, completion, plan, root, calls);
-    const counts = { reader: 0, pause: 0, lease: 0, outbox: 0, archive: 0, checkpointStore: 0 };
+    const counts = { reader: 0, pause: 0, lease: 0, postCutoffStore: 0, outbox: 0, archive: 0, checkpointStore: 0 };
     const originalReader = input.reader;
     input.reader = Object.defineProperty({}, 'open', { enumerable: true, get() {
       counts.reader += 1; return originalReader.open;
@@ -214,7 +222,7 @@ test('snapshots reader, factory, and pause-attestation getters once', async () =
       sourceCheckpoint: { enumerable: true, get() { counts.pause += 1; return authority.initialCheckpoint; } },
     });
     await runM4NativePausedBatch(input);
-    assert.deepEqual(counts, { reader: 1, pause: 6, lease: 1, outbox: 1, archive: 1, checkpointStore: 1 });
+    assert.deepEqual(counts, { reader: 1, pause: 6, lease: 1, postCutoffStore: 1, outbox: 1, archive: 1, checkpointStore: 1 });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -223,24 +231,24 @@ test('binds the authenticated native authority and legacy completion into the pl
   const substituted = { ...authority, source: checkpoint('substituted-native-authority') };
   await assert.rejects(() => planM4NativePausedBatch({
     gateInput: gateInput(gateFiles, substituted, completion), maxEvents: 1,
-    authority: substituted, legacyCompletion: completion,
+    authority: substituted, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags'),
   }), { code: 'm4_native_batch_gate_mismatch' });
   const otherCompletion = legacyCompletion('two');
-  assert.notEqual(deriveM4NativePausedRunId(authority, completion), deriveM4NativePausedRunId(authority, otherCompletion));
+  assert.notEqual(deriveM4NativePausedRunId(authority, completion, { registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') }), deriveM4NativePausedRunId(authority, otherCompletion, { registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') }));
   const first = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, authority, completion),
-    maxEvents: 1, authority, legacyCompletion: completion });
+    maxEvents: 1, authority, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') });
   const second = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, authority, otherCompletion),
-    maxEvents: 1, authority, legacyCompletion: otherCompletion });
+    maxEvents: 1, authority, legacyCompletion: otherCompletion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') });
   assert.notEqual(first.confirmationDigest, second.confirmationDigest);
 });
 
 test('does not read runtime dependencies before confirmation and normalizes hostile getters', async () => {
   const gateFiles = gateFixture(); const completion = legacyCompletion(); const authority = authorityFor(gateFiles);
   const plan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, authority, completion),
-    maxEvents: 1, authority, legacyCompletion: completion });
+    maxEvents: 1, authority, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') });
   const input = { gateInput: gateInput(gateFiles, authority, completion), maxEvents: 1, authority,
-    legacyCompletion: completion, confirmedPlanDigest: digest('wrong') };
-  const dependencyNames = ['reader', 'derivationKey', 'derivationKeyId', 'verifyPauseEvidence',
+    legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags'), confirmedPlanDigest: digest('wrong') };
+  const dependencyNames = ['reader', 'projectionIdentityResolver', 'derivationKey', 'derivationKeyId', 'verifyPauseEvidence',
     'verifyLegacyCompletion', 'integrityFor', 'factories'];
   let reads = 0;
   for (const name of dependencyNames) Object.defineProperty(input, name, { enumerable: true, get() {
@@ -257,7 +265,7 @@ test('does not read runtime dependencies before confirmation and normalizes host
 test('requires current legacy completion before resource factories', async () => {
   const gateFiles = gateFixture(); const completion = legacyCompletion(); const authority = authorityFor(gateFiles);
   const plan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, authority, completion),
-    maxEvents: 1, authority, legacyCompletion: completion });
+    maxEvents: 1, authority, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-native-batch-')); const calls = [];
   try {
     const input = runInput(gateFiles, authority, completion, plan, root, calls);
@@ -274,9 +282,9 @@ test('resumes a partial multi-event shard and isolates two shards in one progres
   const secondAuthority = authorityFor(gateFiles, { startExclusive: 2, endInclusive: 3,
     chain: checkpoint('native-chain-second') });
   const firstPlan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, firstAuthority, completion),
-    maxEvents: 1, authority: firstAuthority, legacyCompletion: completion });
+    maxEvents: 1, authority: firstAuthority, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') });
   const secondPlan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, secondAuthority, completion),
-    maxEvents: 1, authority: secondAuthority, legacyCompletion: completion });
+    maxEvents: 1, authority: secondAuthority, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-native-batch-'));
   try {
     const first = await runM4NativePausedBatch(runInput(gateFiles, firstAuthority, completion, firstPlan, root, []));
@@ -293,7 +301,7 @@ test('resumes a partial multi-event shard and isolates two shards in one progres
 test('cleans resources and reports a stable error when the second pause verification fails', async () => {
   const gateFiles = gateFixture(); const completion = legacyCompletion(); const authority = authorityFor(gateFiles);
   const plan = await planM4NativePausedBatch({ gateInput: gateInput(gateFiles, authority, completion),
-    maxEvents: 1, authority, legacyCompletion: completion });
+    maxEvents: 1, authority, legacyCompletion: completion, registryAuthorityDigest: digest('registry'), sourceTagAuthorityDigest: digest('source-tags') });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-native-batch-')); const closed = [];
   try {
     const input = runInput(gateFiles, authority, completion, plan, root, []);

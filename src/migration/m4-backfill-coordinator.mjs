@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 
 import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
+import { isConversationEventUtcTimestamp } from '../conversation-event-v3.mjs';
 
 export const M4_BACKFILL_MAX_EVENTS = 1_000;
 
@@ -134,7 +135,7 @@ export async function planM4BackfillBatch({ gateVerifier, maxEvents } = {}) {
   };
 }
 
-function validateDependencies({ lease, source, outbox, sink, checkpointStore }) {
+function validateDependencies({ lease, source, outbox, sink, checkpointStore, postCutoffStore }, phase) {
   if (!isObject(lease)
     || typeof lease.acquire !== 'function'
     || typeof lease.heartbeat !== 'function'
@@ -148,7 +149,9 @@ function validateDependencies({ lease, source, outbox, sink, checkpointStore }) 
     || typeof sink.deliver !== 'function'
     || !isObject(checkpointStore)
     || typeof checkpointStore.load !== 'function'
-    || typeof checkpointStore.commit !== 'function') {
+    || typeof checkpointStore.commit !== 'function'
+    || (phase === 'paused-native' && (!isObject(postCutoffStore) || typeof postCutoffStore.load !== 'function' || typeof postCutoffStore.commit !== 'function'))
+    || (phase === 'v2-archive' && postCutoffStore !== null)) {
     fail('m4_backfill_dependency_invalid');
   }
 }
@@ -199,8 +202,25 @@ function sourceIterator(value) {
   }
 }
 
-function copyRow(value, previousSequence, previousCheckpoint) {
-  if (!hasExactKeys(value, ['sequence', 'checkpoint', 'event'])
+function copyPostCutoffBinding(value, phase) {
+  if (phase === 'v2-archive') { if (value !== null && value !== undefined) fail('m4_backfill_post_cutoff_binding_invalid'); return null; }
+  if (value === null || value === undefined) return null;
+  if (!hasExactKeys(value, ['legacyEventId', 'legacySessionId', 'eventId', 'conversationId', 'sourceInstanceId', 'sourceTags', 'observedAt'])
+    || typeof value.legacyEventId !== 'string' || !/^evt_[a-f0-9]{64}$/.test(value.legacyEventId)
+    || typeof value.legacySessionId !== 'string' || !/^ses_[a-f0-9]{64}$/.test(value.legacySessionId)
+    || typeof value.eventId !== 'string' || !EVENT_ID_PATTERN.test(value.eventId)
+    || typeof value.conversationId !== 'string' || !/^ccon_[a-z0-9][a-z0-9_-]{7,127}$/.test(value.conversationId)
+    || typeof value.sourceInstanceId !== 'string' || !/^src_[a-z0-9][a-z0-9_-]{7,127}$/.test(value.sourceInstanceId)
+    || !Array.isArray(value.sourceTags) || value.sourceTags.length < 1 || value.sourceTags.length > 64
+    || value.sourceTags.some(tag => typeof tag !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}:[a-f0-9]{64}$/.test(tag))
+    || new Set(value.sourceTags).size !== value.sourceTags.length || value.sourceTags.some((tag, i) => i > 0 && value.sourceTags[i - 1] >= tag)
+    || !isConversationEventUtcTimestamp(value.observedAt)) fail('m4_backfill_post_cutoff_binding_invalid');
+  return structuredClone(value);
+}
+
+function copyRow(value, previousSequence, previousCheckpoint, phase) {
+  const allowed = phase === 'v2-archive' ? ['sequence', 'checkpoint', 'event'] : ['sequence', 'checkpoint', 'event', 'postCutoffBinding'];
+  if (!hasExactKeys(value, allowed)
     || !Number.isSafeInteger(value.sequence)
     || value.sequence < 1
     || value.sequence <= previousSequence
@@ -221,7 +241,7 @@ function copyRow(value, previousSequence, previousCheckpoint) {
     sequence: value.sequence,
     checkpoint,
     event: value.event,
-    eventMetadata: {
+    postCutoffBinding: copyPostCutoffBinding(value.postCutoffBinding, phase), eventMetadata: {
       eventId: value.event.eventId,
       payloadDigest: value.event.integrity.payloadDigest,
     },
@@ -326,12 +346,13 @@ export async function runM4BackfillBatch({
   outbox,
   sink,
   checkpointStore,
+  postCutoffStore = null,
 } = {}) {
   const plan = await planM4BackfillBatch({ gateVerifier, maxEvents });
   if (typeof confirmedPlanDigest !== 'string' || confirmedPlanDigest !== plan.planDigest) {
     fail('m4_backfill_plan_confirmation_invalid');
   }
-  validateDependencies({ lease, source, outbox, sink, checkpointStore });
+  validateDependencies({ lease, source, outbox, sink, checkpointStore, postCutoffStore }, plan.phase);
 
   let acquired = false;
   let iterator = null;
@@ -372,7 +393,7 @@ export async function runM4BackfillBatch({
         exhausted = true;
         break;
       }
-      const row = copyRow(next.value, previousSequence, lastCheckpoint);
+      const row = copyRow(next.value, previousSequence, lastCheckpoint, plan.phase);
       await call(() => lease.heartbeat({ runId: plan.runId, phase: plan.phase }), 'm4_backfill_lease_heartbeat_failed');
       const queued = copyQueueReceipt(await call(
         () => outbox.enqueue(row.event),
@@ -382,6 +403,10 @@ export async function runM4BackfillBatch({
         () => outbox.deliver(queued.eventId, sink),
         'm4_backfill_delivery_failed',
       ), queued);
+      if (row.postCutoffBinding !== null) {
+        const committed = await call(() => postCutoffStore.commit(row.postCutoffBinding), 'm4_backfill_post_cutoff_commit_failed');
+        if (canonicalJson(committed) !== canonicalJson(row.postCutoffBinding)) fail('m4_backfill_post_cutoff_ack_invalid');
+      }
       const progress = nextProgress(plan, row, acknowledgement);
       const commitInput = copyProgress(progress, plan);
       const commitAcknowledgement = await call(

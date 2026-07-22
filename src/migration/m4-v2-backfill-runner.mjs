@@ -37,8 +37,10 @@ async function planFor(gateInput, maxEvents) {
   catch { fail('m4_runner_plan_invalid'); }
 }
 
-function factorySet(value) {
-  const keys = ['lease', 'source', 'outbox', 'archive', 'checkpointStore'];
+function factorySet(value, phase) {
+  const keys = phase === 'paused-native'
+    ? ['lease', 'postCutoffStore', 'source', 'outbox', 'archive', 'checkpointStore']
+    : ['lease', 'source', 'outbox', 'archive', 'checkpointStore'];
   return validated('m4_runner_factories_invalid', () => {
     if (!exact(value, keys)) fail('m4_runner_factories_invalid');
     const entries = keys.map(key => [key, value[key]]);
@@ -73,6 +75,7 @@ function archiveResult(value) {
   });
 }
 function checkpointStoreResult(value) { return validated('m4_runner_factory_result_invalid', () => { if (!object(value) || typeof value.load !== 'function' || typeof value.commit !== 'function') fail('m4_runner_factory_result_invalid'); return value; }); }
+function postCutoffStoreResult(value) { return validated('m4_runner_factory_result_invalid', () => { if (!object(value) || typeof value.load !== 'function' || typeof value.commit !== 'function') fail('m4_runner_factory_result_invalid'); return value; }); }
 
 function copyResult(value, plan) {
   return validated('m4_runner_result_invalid', () => {
@@ -108,12 +111,15 @@ export async function runM4V2Backfill(input = {}) {
   const request = runInput(input);
   const plan = await planFor(request.gateInput, request.maxEvents);
   if (request.confirmedPlanDigest !== plan.planDigest) fail('m4_runner_plan_confirmation_invalid');
-  const factories = factorySet(request.factories);
+  const factories = factorySet(request.factories, plan.phase);
   const created = [];
   let primary = null;
   try {
     const parameters = invocation(plan);
     const lease = leaseResult(await callFactory(factories, 'lease', parameters)); created.push(lease);
+    const postCutoffStore = plan.phase === 'paused-native'
+      ? postCutoffStoreResult(await callFactory(factories, 'postCutoffStore', parameters)) : null;
+    if (postCutoffStore !== null) created.push(postCutoffStore);
     const source = sourceResult(await callFactory(factories, 'source', parameters)); created.push(source);
     const outbox = outboxResult(await callFactory(factories, 'outbox', parameters)); created.push(outbox);
     const archive = archiveResult(await callFactory(factories, 'archive', parameters)); created.push(archive.archive);
@@ -122,7 +128,7 @@ export async function runM4V2Backfill(input = {}) {
     let result;
     try {
       result = await runM4BackfillBatch({ gateVerifier: createM4BackfillGateVerifier(request.gateInput), maxEvents: request.maxEvents,
-        confirmedPlanDigest: plan.planDigest, lease, source, outbox, sink, checkpointStore });
+        confirmedPlanDigest: plan.planDigest, lease, source, outbox, sink, checkpointStore, postCutoffStore });
     } catch (error) {
       if (error?.code?.startsWith?.('m4_')) throw error;
       fail('m4_runner_execution_failed');

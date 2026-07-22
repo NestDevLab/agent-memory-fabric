@@ -165,6 +165,31 @@ async function confirmedRun(rows, options = {}) {
   return { result, deps, plan };
 }
 
+function pausedBinding() { return { legacyEventId: `evt_${'a'.repeat(64)}`, legacySessionId: `ses_${'b'.repeat(64)}`, eventId: `cevt_${'c'.repeat(64)}`, conversationId: `ccon_${'d'.repeat(64)}`, sourceInstanceId: `src_${'e'.repeat(64)}`, sourceTags: [`source:${'f'.repeat(64)}`], observedAt: '2026-07-22T00:00:00Z' }; }
+async function pausedRun(binding = pausedBinding(), options = {}) {
+  const gateVerifier = async () => gate({ phase: 'paused-native' }); const plan = await planM4BackfillBatch({ gateVerifier, maxEvents: 1 }); const calls = [];
+  const deps = dependencies([{ ...row(1), postCutoffBinding: binding }], { calls, commitFailure: options.progressFailure });
+  deps.postCutoffStore = options.postCutoffStore ?? { async load() { return null; }, async commit(value) { calls.push(['binding', value?.legacyEventId ?? null]); if (options.bindingFailure) throw new Error('private'); return structuredClone(value); } };
+  const result = await runM4BackfillBatch({ gateVerifier, maxEvents: 1, confirmedPlanDigest: plan.planDigest, ...deps }); return { result, calls };
+}
+
+test('paused bindings commit strictly after delivery and before progress; null covered rows are accepted', async () => {
+  const result = await pausedRun(); assert.equal(result.result.processed, 1); assert.deepEqual(result.calls.map(item => item[0]), ['acquire', 'load', 'open', 'heartbeat', 'enqueue', 'deliver', 'binding', 'commit', 'release']);
+  const covered = await pausedRun(null); assert.equal(covered.result.processed, 1);
+});
+
+test('paused binding failure prevents progress and v2 rows reject non-null bindings', async () => {
+  await assert.rejects(() => pausedRun(pausedBinding(), { bindingFailure: true }), { code: 'm4_backfill_post_cutoff_commit_failed' });
+  await assert.rejects(() => confirmedRun([{ ...row(1), postCutoffBinding: pausedBinding() }]), { code: 'm4_backfill_row_invalid' });
+});
+
+test('crash after durable binding and before progress replays delivery then idempotent binding', async () => {
+  const committed = new Map(); let commits = 0;
+  const store = { async load(id) { return committed.get(id) ?? null; }, async commit(value) { commits += 1; const prior = committed.get(value.legacyEventId); if (prior) { assert.deepEqual(prior, value); return structuredClone(prior); } committed.set(value.legacyEventId, structuredClone(value)); return structuredClone(value); } };
+  await assert.rejects(() => pausedRun(pausedBinding(), { progressFailure: true, postCutoffStore: store }), { code: 'm4_backfill_checkpoint_commit_failed' });
+  const replay = await pausedRun(pausedBinding(), { postCutoffStore: store }); assert.equal(replay.result.processed, 1); assert.equal(commits, 2);
+});
+
 test('planning is deterministic, fixture-backed, gate-first, and mutation-free', async () => {
   let gateCalls = 0;
   const gateVerifier = async () => { gateCalls += 1; return fixture.gate; };

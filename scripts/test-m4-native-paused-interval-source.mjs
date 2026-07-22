@@ -11,17 +11,39 @@ const sourceCheckpoint = { id: 'source-checkpoint-001', digest: digest('b') }; c
 const chain = { id: 'native-chain-001', digest: digest('d') };
 function hmac(domain, values) { return crypto.createHmac('sha256', key).update(canonicalJson([domain, ...values]), 'utf8').digest('hex'); }
 const sourceBinding = `hmac-sha256:source-v1:${hmac('amf.m4-native-paused/tag/source-v1/v1', ['codex', 'source-one'])}`;
+const projectionBinding = { schema: 'amf.m4-paused-projection-binding/v1', runtime: 'codex', sourceId: 'source-one', digest: digest('f') };
 const authority = { schema: 'amf.m4-native-paused-interval-authority/v1', pauseEvidence: evidence, source: nativeAuthority, sourceBinding,
-  interval: { startExclusive: 10, endInclusive: 20, chain }, initialCheckpoint: sourceCheckpoint };
+  projectionBinding, interval: { startExclusive: 10, endInclusive: 20, chain }, initialCheckpoint: sourceCheckpoint };
 const verification = { pauseEvidence: evidence, nativeTranscriptAuthority: nativeAuthority, sourceCheckpoint };
 const integrity = async ({ eventId }, sentAt = '2026-07-22T00:00:00Z', nonce = 'a'.repeat(22)) => ({ keyId: 'test-k1', key: Buffer.alloc(32, 7), sentAt, nonce: `${nonce.slice(0, 16)}${eventId.slice(5, 11)}` });
-function codex(position, id, text = 'hello', timestamp = `2026-07-22T00:00:${String(position).padStart(2, '0')}Z`) { return { native: { runtime: 'codex', sourceId: 'source-one', conversationId: 'session-one', threadId: null, messageId: id, position, sourceOccurredAt: timestamp }, sessionHint: 'session-one', value: { type: 'response_item', session_id: 'session-one', id, timestamp, payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } } }; }
-function wrapper(records, { source = nativeAuthority, interval = authority.interval, runtime = 'codex', sourceId = 'source-one', completion = { schema: 'amf.m4-native-paused-completion/v1', source: nativeAuthority, endInclusive: 20, chain } } = {}) {
-  return { schema: 'amf.m4-native-paused-reader/v1', source, interval, runtime, sourceId, records, completion: async () => completion };
+function opaque(prefix, value) { return `${prefix}_${crypto.createHash('sha256').update(String(value)).digest('hex')}`; }
+function bindingFor(runtime = 'codex') { return { ...projectionBinding, runtime }; }
+function recordIdentity(record, { change = 'new', nativeRevision = 1, priorEventId = null } = {}) {
+  const runtime = record.native.runtime; const binding = bindingFor(runtime); const role = runtime === 'hermes' ? record.value.role
+    : runtime === 'codex' ? record.value.payload?.role : runtime === 'openclaw' ? record.value.message?.role : record.value.type;
+  return { schema: 'amf.m4-paused-projection-identity/v1', binding, runtime, sourceId: record.native.sourceId,
+    sourceKind: runtime, observationClass: 'native', authoritativeDeletion: change === 'deleted', occurredAt: record.native.sourceOccurredAt,
+    editedAt: change === 'new' ? null : record.native.sourceOccurredAt,
+    legacy: { sessionId: opaque('ses', record.native.conversationId), eventId: opaque('evt', record.native.messageId), priorEventId },
+    routing: { role, direction: role === 'assistant' ? 'outbound' : 'inbound', conversationKind: 'session', authorizationContextTags: { sender: [`hmac-sha256:test:${'9'.repeat(64)}`], conversation: [`hmac-sha256:test:${'a'.repeat(64)}`] } },
+    lifecycle: { change, nativeRevision } };
+}
+function decorated(record, options = {}) { return { ...record, projectionIdentity: record.projectionIdentity ?? recordIdentity(record, options) }; }
+function resolver() { return { resolve({ identity, attestation }) {
+  assert.deepEqual(attestation, identity.binding); const sourceTags = [`source:${'b'.repeat(64)}`];
+  const eventId = opaque('cevt', identity.legacy.eventId); const conversationId = opaque('ccon', identity.legacy.sessionId); const sourceInstanceId = opaque('src', `${identity.legacy.sessionId}:${sourceTags[0]}`);
+  const binding = { legacyEventId: identity.legacy.eventId, legacySessionId: identity.legacy.sessionId, eventId, conversationId, sourceInstanceId, sourceTags, observedAt: identity.editedAt ?? identity.occurredAt };
+  return { eventId, conversationId, sourceInstanceId, conversationKind: identity.routing.conversationKind, authorizationContextTags: identity.routing.authorizationContextTags,
+    role: identity.routing.role, direction: identity.routing.direction, priorEventId: identity.legacy.priorEventId === null ? null : opaque('cevt', identity.legacy.priorEventId), postCutoffBinding: binding };
+} }; }
+function codex(position, id, text = 'hello', timestamp = `2026-07-22T00:00:${String(position).padStart(2, '0')}Z`) { return decorated({ native: { runtime: 'codex', sourceId: 'source-one', conversationId: 'session-one', threadId: null, messageId: id, position, sourceOccurredAt: timestamp }, sessionHint: 'session-one', value: { type: 'response_item', session_id: 'session-one', id, timestamp, payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } } }); }
+function wrapper(records, { source = nativeAuthority, interval = authority.interval, runtime = 'codex', sourceId = 'source-one', completion = { schema: 'amf.m4-native-paused-completion/v1', source: nativeAuthority, endInclusive: 20, chain }, binding = bindingFor(runtime) } = {}) {
+  const decoratedRecords = { async *[Symbol.asyncIterator]() { for await (const row of records) yield decorated(row); } };
+  return { schema: 'amf.m4-native-paused-reader/v1', source, interval, runtime, sourceId, projectionBinding: binding, records: decoratedRecords, completion: async () => completion };
 }
 function build({ records = [], verify = async () => verification, reader = null, integrityFor = input => integrity(input) } = {}) {
   return createM4NativePausedIntervalSource({ authority, derivationKey: key, derivationKeyId: 'native-test-k1', verifyPauseEvidence: verify,
-    reader: reader ?? { async open() { return wrapper((async function* () { yield* records; })()); } }, integrityFor });
+    reader: reader ?? { async open() { return wrapper((async function* () { yield* records; })()); } }, projectionIdentityResolver: resolver(), integrityFor });
 }
 async function rows(value, request = { runId: 'm4-run-001', phase: 'paused-native', after: sourceCheckpoint, afterSequence: 0, maxEvents: 10 }) { const output = []; for await (const row of value.open(request)) output.push(row); return output; }
 async function rejects(action, code) { await assert.rejects(action, error => error?.code === code && error.message === code); }
@@ -50,33 +72,35 @@ test('is repeat-stable despite integrity envelope time/nonce and resumes exactly
 
 test('binds native metadata, filters non-conversation records, and fails closed on duplicates', async () => {
   const bad = codex(11, 'message-one'); bad.native.messageId = 'relabelled'; await rejects(async () => rows(build({ records: [bad] })), 'm4_native_paused_native_binding_invalid');
+  const timestampDrift = codex(11, 'timestamp-drift'); timestampDrift.value.timestamp = '2026-07-22T00:00:12Z'; await rejects(async () => rows(build({ records: [timestampDrift] })), 'm4_native_paused_projection_identity_mismatch');
   const tool = codex(11, 'tool-message'); tool.value.payload.type = 'function_call'; let integrityCalls = 0;
   const accepted = await rows(build({ records: [tool], integrityFor: async () => { integrityCalls += 1; throw new Error('should not run'); } })); assert.equal(accepted.length, 0); assert.equal(integrityCalls, 0);
   const eventMessage = codex(12, 'unused'); eventMessage.value = { type: 'event_msg', payload: { private: true } }; eventMessage.sessionHint = null;
   assert.equal((await rows(build({ records: [eventMessage], integrityFor: async () => { throw new Error('should not run'); } }))).length, 0);
   const hinted = codex(12, 'hinted'); delete hinted.value.session_id; const hintRows = await rows(build({ records: [hinted] })); assert.equal(hintRows.length, 1);
   const claudeTimestamp = '2026-07-22T00:00:13Z'; const claude = { native: { runtime: 'claude', sourceId: 'source-one', conversationId: 'claude-session', threadId: null, messageId: 'claude-one', position: 13, sourceOccurredAt: claudeTimestamp }, sessionHint: 'fallback', value: { type: 'assistant', sessionId: 'claude-session', uuid: 'claude-one', timestamp: claudeTimestamp, message: { role: 'assistant', content: [{ type: 'text', text: 'answer' }] } } };
-  const claudeAuthority = { ...authority, sourceBinding: `hmac-sha256:source-v1:${hmac('amf.m4-native-paused/tag/source-v1/v1', ['claude', 'source-one'])}` };
-  const claudeSource = createM4NativePausedIntervalSource({ authority: claudeAuthority, derivationKey: key, derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification, reader: { async open() { return wrapper((async function* () { yield claude; })(), { runtime: 'claude' }); } }, integrityFor: input => integrity(input) }); assert.equal((await rows(claudeSource)).length, 1);
+  const claudeAuthority = { ...authority, sourceBinding: `hmac-sha256:source-v1:${hmac('amf.m4-native-paused/tag/source-v1/v1', ['claude', 'source-one'])}`, projectionBinding: bindingFor('claude') };
+  const claudeSource = createM4NativePausedIntervalSource({ authority: claudeAuthority, derivationKey: key, derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification, reader: { async open() { return wrapper((async function* () { yield claude; })(), { runtime: 'claude' }); } }, projectionIdentityResolver: resolver(), integrityFor: input => integrity(input) }); assert.equal((await rows(claudeSource)).length, 1);
   const system = { native: { runtime: 'claude', sourceId: 'source-one', conversationId: 'not-used', threadId: null, messageId: 'not-used', position: 14, sourceOccurredAt: claudeTimestamp }, sessionHint: null, value: { type: 'system', payload: {} } };
-  const systemSource = createM4NativePausedIntervalSource({ authority: claudeAuthority, derivationKey: key, derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification, reader: { async open() { return wrapper((async function* () { yield system; })(), { runtime: 'claude' }); } }, integrityFor: async () => { throw new Error('should not run'); } }); assert.equal((await rows(systemSource)).length, 0);
+  const systemSource = createM4NativePausedIntervalSource({ authority: claudeAuthority, derivationKey: key, derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification, reader: { async open() { return wrapper((async function* () { yield system; })(), { runtime: 'claude' }); } }, projectionIdentityResolver: resolver(), integrityFor: async () => { throw new Error('should not run'); } }); assert.equal((await rows(systemSource)).length, 0);
   const openclawTimestamp = '2026-07-22T00:00:15Z';
   const openclaw = { native: { runtime: 'openclaw', sourceId: 'source-one', conversationId: 'agent:synthetic:session',
     threadId: null, messageId: 'openclaw-one', position: 15, sourceOccurredAt: openclawTimestamp },
   sessionHint: 'agent:synthetic:session', value: { type: 'message', id: 'openclaw-one', timestamp: openclawTimestamp,
     message: { role: 'user', content: [{ type: 'text', text: 'question' }] } } };
-  const openclawAuthority = { ...authority, sourceBinding: `hmac-sha256:source-v1:${hmac('amf.m4-native-paused/tag/source-v1/v1', ['openclaw', 'source-one'])}` };
+  const openclawAuthority = { ...authority, sourceBinding: `hmac-sha256:source-v1:${hmac('amf.m4-native-paused/tag/source-v1/v1', ['openclaw', 'source-one'])}`, projectionBinding: bindingFor('openclaw') };
   const openclawSource = createM4NativePausedIntervalSource({ authority: openclawAuthority, derivationKey: key,
     derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification,
-    reader: { async open() { return wrapper((async function* () { yield openclaw; })(), { runtime: 'openclaw' }); } },
+    reader: { async open() { return wrapper((async function* () { yield openclaw; })(), { runtime: 'openclaw' }); } }, projectionIdentityResolver: resolver(),
     integrityFor: input => integrity(input) });
   const openclawRows = await rows(openclawSource); assert.equal(openclawRows.length, 1);
   assert.equal(openclawRows[0].event.visibleText, 'question'); assert.equal(openclawRows[0].event.direction, 'inbound');
   const openclawHeader = structuredClone(openclaw); openclawHeader.native.position = 16;
   openclawHeader.value = { type: 'session', id: 'openclaw-one', timestamp: openclawTimestamp };
+  openclawHeader.projectionIdentity = recordIdentity({ ...openclawHeader, value: openclaw.value });
   const openclawHeaderSource = createM4NativePausedIntervalSource({ authority: openclawAuthority, derivationKey: key,
     derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification,
-    reader: { async open() { return wrapper((async function* () { yield openclawHeader; })(), { runtime: 'openclaw' }); } },
+    reader: { async open() { return wrapper((async function* () { yield openclawHeader; })(), { runtime: 'openclaw' }); } }, projectionIdentityResolver: resolver(),
     integrityFor: async () => { throw new Error('should not run'); } });
   assert.equal((await rows(openclawHeaderSource)).length, 0);
   const repeated = [codex(14, 'same', 'same text', '2026-07-22T00:00:14Z'), codex(15, 'same', 'same text', '2026-07-22T00:00:14Z')]; assert.equal((await rows(build({ records: repeated }))).length, 1);
@@ -105,16 +129,16 @@ test('snapshots dependency, authority, verification, and iterator result getters
   });
   const records = { [Symbol.asyncIterator]() { return iterator; } };
   const dependency = getterObject({ authority: wrappedAuthority, derivationKey: key, derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => wrappedVerification,
-    reader: { async open() { return wrapper(records); } }, integrityFor: input => integrity(input) }, 'dependency');
+    reader: { async open() { return wrapper(records); } }, projectionIdentityResolver: resolver(), integrityFor: input => integrity(input) }, 'dependency');
   await rows(createM4NativePausedIntervalSource(dependency));
-  assert.deepEqual(counts, { dependency: 6, authority: 6, verification: 3, next: 2, nextMethod: 1, returnMethod: 1 });
+  assert.deepEqual(counts, { dependency: 7, authority: 7, verification: 3, next: 2, nextMethod: 1, returnMethod: 0 });
 });
 
 test('fails closed after the public excluded-record scan limit', async () => {
   const wideAuthority = { ...authority, interval: { startExclusive: 0, endInclusive: M4_NATIVE_PAUSED_MAX_VISITED_RECORDS + 2, chain } };
   const records = Array.from({ length: M4_NATIVE_PAUSED_MAX_VISITED_RECORDS + 1 }, (_, index) => { const item = codex(index + 1, `tool-${index}`, 'ignored', '2026-07-22T00:00:00Z'); item.value.payload.type = 'function_call'; return item; });
   const source = createM4NativePausedIntervalSource({ authority: wideAuthority, derivationKey: key, derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification,
-    reader: { async open() { return wrapper((async function* () { yield* records; })(), { interval: wideAuthority.interval }); } }, integrityFor: input => integrity(input) });
+    reader: { async open() { return wrapper((async function* () { yield* records; })(), { interval: wideAuthority.interval }); } }, projectionIdentityResolver: resolver(), integrityFor: input => integrity(input) });
   await rejects(async () => rows(source, { runId: 'm4-run-001', phase: 'paused-native', after: sourceCheckpoint, afterSequence: 0, maxEvents: 1 }), 'm4_native_paused_scan_limit');
 });
 
@@ -122,7 +146,7 @@ test('reports reader close failure only when it is the primary source failure', 
   const disguised = new Error('private open content'); disguised.code = 'm4_native_paused_private_content';
   await rejects(async () => rows(build({ reader: { async open() { throw disguised; } } })), 'm4_native_paused_reader_open_failed');
   const closeFailing = values => ({ [Symbol.asyncIterator]() { let index = 0; return { async next() { return index < values.length ? { value: values[index++], done: false } : { value: undefined, done: true }; }, async return() { throw new Error('private close error'); } }; } });
-  await rejects(async () => rows(build({ reader: { async open() { return wrapper(closeFailing([])); } } })), 'm4_native_paused_reader_close_failed');
+  await rows(build({ reader: { async open() { return wrapper(closeFailing([])); } } }));
   await rejects(async () => rows(build({ reader: { async open() { return wrapper(closeFailing([codex(11, 'one'), codex(12, 'two')])); } } }), { runId: 'm4-run-001', phase: 'paused-native', after: sourceCheckpoint, afterSequence: 0, maxEvents: 1 }), 'm4_native_paused_reader_close_failed');
   const primary = { [Symbol.asyncIterator]() { return { async next() { throw new Error('private read error'); }, async return() { throw new Error('private close error'); } }; } };
   await rejects(async () => rows(build({ reader: { async open() { return wrapper(primary); } } })), 'm4_native_paused_reader_read_failed');
@@ -133,7 +157,7 @@ test('owns a private derivation-key copy and destroys it on idempotent close', a
   const source = createM4NativePausedIntervalSource({ authority, derivationKey: callerKey,
     derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification,
     reader: { async open() { return wrapper((async function* () { yield codex(11, 'private-copy'); })()); } },
-    integrityFor: input => integrity(input) });
+    projectionIdentityResolver: resolver(), integrityFor: input => integrity(input) });
   callerKey.fill(0);
   assert.equal((await rows(source)).length, 1);
   source.close();
