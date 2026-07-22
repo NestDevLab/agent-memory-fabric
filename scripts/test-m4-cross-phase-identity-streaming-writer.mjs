@@ -12,6 +12,7 @@ import {
   estimateM4CrossPhaseIdentityStreamingCapacity,
   M4_CROSS_PHASE_IDENTITY_STREAMING_MAX_PAGE_BYTES,
   preflightM4CrossPhaseIdentityStreamingCapacity,
+  readM4CrossPhaseIdentityStreamingCoverage,
 } from '../src/migration/m4-cross-phase-identity-streaming-writer.mjs';
 import { createM4CrossPhaseIdentityResolver } from '../src/migration/m4-cross-phase-identity-registry.mjs';
 import {
@@ -20,6 +21,7 @@ import {
   deriveM4V3SourceInstanceIdFromLegacySession,
 } from '../src/migration/m4-v2-conversation-projector.mjs';
 import { canonicalJson } from '../src/ingest/transcripts/canonical.mjs';
+import { digest as fixtureDigest, fixture, sign } from './helpers/m4-traversal-completion-fixtures.mjs';
 
 const SECRET = Buffer.alloc(32, 17);
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
@@ -29,8 +31,6 @@ const digest = value => `sha256:${hash(value)}`;
 const sessionId = value => `ses_${hash(`session:${value}`)}`;
 const eventId = value => `evt_${hash(`event:${value}`)}`;
 const compact = (kind, index) => `${kind}_aa${index.toString(16).padStart(62, '0')}`;
-const binding = () => ({ completionDigest: digest('backfill'), catalogRevisionDigest: digest('catalog') });
-const cutoff = '2026-07-22T00:00:00Z';
 
 function block(label, options = {}) {
   const legacySessionId = options.legacySessionId ?? sessionId(`session:${label}`);
@@ -51,9 +51,13 @@ function temporary() { return fs.mkdtempSync(path.join(os.tmpdir(), 'amf-m4-stre
 function writer(root, sink, options = {}) {
   const defaultPreflight = { availableBytes: 5 * 1024 * 1024 * 1024, sampleBlocks: [block('preflight')], expectedBlockCount: 20_000 };
   return createM4CrossPhaseIdentityStreamingWriter({ databasePath: path.join(root, 'private', 'identity.sqlite'), registrySecret: SECRET,
-    capacityPreflight: defaultPreflight, pageSink: sink, ...options });
+    registryKeyId:'registry-fixture-key', capacityPreflight: defaultPreflight, pageSink: sink, ...options });
 }
 function sink(pages) { return { writePage: async page => { pages.set(page.pageKey, structuredClone(page)); return { pageKey: page.pageKey, digest: page.digest }; } }; }
+const completions = new Map();
+function completion(root, options = {}) { if (!completions.has(root)) completions.set(root, fixture({ coverage:readM4CrossPhaseIdentityStreamingCoverage({ databasePath:path.join(root, 'private', 'identity.sqlite') }), registrySecret:SECRET, ...options })); return completions.get(root); }
+function seal(value, root, options = {}) { const item = completion(root, options); return value.seal({ traversalCompletion:item.traversalCompletion, completionKeyDocument:item.completionKeyDocument }); }
+function resignCompletion(value, keyDocument) { const signed=structuredClone(value); const { integrity, ...body }=signed; signed.integrity={ algorithm:'hmac-sha256', keyId:keyDocument.keyId, payloadDigest:fixtureDigest(body), signature:sign('amf.m4-cross-phase-identity-traversal-completion/v1/integrity',body,keyDocument) }; return signed; }
 
 test('preflight samples only bounded content-free blocks and rejects before state creation', () => {
   const sample = block('capacity'); const estimate = estimateM4CrossPhaseIdentityStreamingCapacity({ sampleBlocks: [sample], expectedBlockCount: 200 });
@@ -71,7 +75,7 @@ test('spools exact content-free blocks, acks deterministic pages, and resolves t
   const root = temporary(); const pages = new Map(); const first = block('first'); const second = block('second');
   try {
     const value = writer(root, sink(pages)); assert.equal(value.accept(first).accepted, true); assert.equal(value.accept(first).accepted, false); value.accept(second);
-    const sealed = await value.seal({ coveredThrough: cutoff, backfillBinding: binding() });
+    const sealed = await seal(value, root);
     assert.deepEqual(sealed.coverage, { acceptedBlockCount: 2, sessionCount: 2, eventCount: 2, pageCount: 4 });
     const resolver = createM4CrossPhaseIdentityResolver({ authority: sealed.authority, loadPage: key => pages.get(key) }, SECRET);
     const bound = resolver.resolveBinding({ legacyEventId: first.events[0].legacyEventId, legacySessionId: first.session.legacySessionId,
@@ -81,10 +85,11 @@ test('spools exact content-free blocks, acks deterministic pages, and resolves t
     for (const page of pages.values()) assert.equal(Buffer.byteLength(canonicalJson(page), 'utf8') <= M4_CROSS_PHASE_IDENTITY_STREAMING_MAX_PAGE_BYTES, true);
     const database = fs.readFileSync(path.join(root, 'private', 'identity.sqlite'), 'utf8');
     for (const forbidden of ['visibleText', 'ciphertext', 'normalizedPayloadDigest', 'logicalMessageId', 'nativeEventId', 'integrity']) assert.equal(database.includes(forbidden), false, forbidden);
-    assert.deepEqual(await value.seal({ coveredThrough: cutoff, backfillBinding: binding() }), sealed);
+    assert.deepEqual(await seal(value, root), sealed);
     assert.throws(() => value.accept(first), { code: 'm4_cross_phase_identity_streaming_sealed' }); value.close(); assert.throws(() => value.accept(first), { code: 'm4_cross_phase_identity_streaming_closed' });
-    const reopened = writer(root, sink(pages)); assert.deepEqual(await reopened.seal({ coveredThrough: cutoff, backfillBinding: binding() }), sealed);
-    await assert.rejects(() => reopened.seal({ coveredThrough: '2026-07-23T00:00:00Z', backfillBinding: binding() }), { code: 'm4_cross_phase_identity_streaming_seal_binding_invalid' }); reopened.close();
+    const reopened = writer(root, sink(pages)); assert.deepEqual(await seal(reopened, root), sealed);
+    const altered = structuredClone(completion(root).traversalCompletion); altered.coveredThrough = '2026-07-23T00:00:00Z';
+    await assert.rejects(() => reopened.seal({ traversalCompletion:altered, completionKeyDocument:completion(root).completionKeyDocument }), { code: 'm4_cross_phase_identity_traversal_completion_signature_invalid' }); reopened.close();
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -130,7 +135,7 @@ test('snapshots the least-authority page sink at construction', async () => {
   const target = { get writePage() { reads += 1; return implementation; } };
   try {
     const value = writer(root, target); implementation = async () => { throw new Error('mutated'); };
-    value.accept(block('sink-snapshot')); await value.seal({ coveredThrough: cutoff, backfillBinding: binding() });
+    value.accept(block('sink-snapshot')); await seal(value, root);
     assert.equal(reads, 1); assert.equal(pages.size, 2); value.close();
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -139,7 +144,7 @@ test('normalizes page sink exceptions without echoing private-looking text', asy
   const root = temporary(); const privateText = '/private/identity.sqlite confidential-token';
   try {
     const value = writer(root, { writePage: async () => { throw new Error(privateText); } }); value.accept(block('sink-error'));
-    await assert.rejects(() => value.seal({ coveredThrough: cutoff, backfillBinding: binding() }), error => {
+    await assert.rejects(() => seal(value, root), error => {
       assert.equal(error.code, 'm4_cross_phase_identity_streaming_page_write_failed'); assert.equal(error.message.includes(privateText), false); return true;
     }); value.close();
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
@@ -150,7 +155,7 @@ test('preflight expected-block bound rejects a novel block before partial insert
   try {
     const value = writer(root, sink(pages), { capacityPreflight: preflight }); value.accept(block('bound-first'));
     assert.throws(() => value.accept(block('bound-second')), { code: 'm4_cross_phase_identity_streaming_bounds_exceeded' });
-    const sealed = await value.seal({ coveredThrough: cutoff, backfillBinding: binding() });
+    const sealed = await seal(value, root);
     assert.deepEqual(sealed.coverage, { acceptedBlockCount: 1, sessionCount: 1, eventCount: 1, pageCount: 2 }); value.close();
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -161,7 +166,7 @@ test('streams multiple buckets through primary-key ranges instead of bucket scan
   try {
     const value = writer(root, sink(pages), { capacityPreflight: preflight }); value.accept(block('range-one', { legacyEventId: firstEvent }));
     value.accept(block('range-two', { legacySessionId: secondSession, legacyEventId: secondEvent }));
-    await value.seal({ coveredThrough: cutoff, backfillBinding: binding() }); value.close();
+    await seal(value, root); value.close();
     const db = new Database(path.join(root, 'private', 'identity.sqlite'), { readonly: true });
     const plan = db.prepare('EXPLAIN QUERY PLAN SELECT legacy_event_id FROM m4_stream_events WHERE legacy_event_id>? AND legacy_event_id<? ORDER BY legacy_event_id LIMIT ?').all('evt_bb', 'evt_bc', 10);
     const rows = db.prepare('SELECT legacy_event_id FROM m4_stream_events WHERE legacy_event_id>? AND legacy_event_id<? ORDER BY legacy_event_id').all('evt_bb', 'evt_bc'); db.close();
@@ -176,11 +181,11 @@ test('rejects symlink and non-private spool targets before mutation', () => {
   try {
     fs.mkdirSync(target, { mode: 0o700 }); fs.symlinkSync(target, link);
     assert.throws(() => createM4CrossPhaseIdentityStreamingWriter({ databasePath: path.join(link, 'identity.sqlite'), registrySecret: SECRET,
-      capacityPreflight: { availableBytes: 5 * 1024 * 1024 * 1024, sampleBlocks: [block('resource')], expectedBlockCount: 1 }, pageSink: sink(new Map()) }), { code: 'm4_cross_phase_identity_streaming_resource_unsafe' });
+      registryKeyId:'registry-fixture-key', capacityPreflight: { availableBytes: 5 * 1024 * 1024 * 1024, sampleBlocks: [block('resource')], expectedBlockCount: 1 }, pageSink: sink(new Map()) }), { code: 'm4_cross_phase_identity_streaming_resource_unsafe' });
     assert.equal(fs.existsSync(targetFile), false);
     const publicRoot = path.join(root, 'public'); fs.mkdirSync(publicRoot, { mode: 0o755 }); fs.chmodSync(publicRoot, 0o755);
     assert.throws(() => createM4CrossPhaseIdentityStreamingWriter({ databasePath: path.join(publicRoot, 'identity.sqlite'), registrySecret: SECRET,
-      capacityPreflight: { availableBytes: 5 * 1024 * 1024 * 1024, sampleBlocks: [block('resource')], expectedBlockCount: 1 }, pageSink: sink(new Map()) }), { code: 'm4_cross_phase_identity_streaming_resource_unsafe' });
+      registryKeyId:'registry-fixture-key', capacityPreflight: { availableBytes: 5 * 1024 * 1024 * 1024, sampleBlocks: [block('resource')], expectedBlockCount: 1 }, pageSink: sink(new Map()) }), { code: 'm4_cross_phase_identity_streaming_resource_unsafe' });
     assert.equal(fs.existsSync(path.join(publicRoot, 'identity.sqlite')), false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -188,9 +193,9 @@ test('rejects symlink and non-private spool targets before mutation', () => {
 test('rejects reopening a sealed spool with a different registry secret', async () => {
   const root = temporary(); const pages = new Map();
   try {
-    const first = writer(root, sink(pages)); first.accept(block('secret')); await first.seal({ coveredThrough: cutoff, backfillBinding: binding() }); first.close();
+    const first = writer(root, sink(pages)); first.accept(block('secret')); await seal(first, root); first.close();
     assert.throws(() => createM4CrossPhaseIdentityStreamingWriter({ databasePath: path.join(root, 'private', 'identity.sqlite'), registrySecret: Buffer.alloc(32, 99),
-      capacityPreflight: { availableBytes: 5 * 1024 * 1024 * 1024, sampleBlocks: [block('preflight')], expectedBlockCount: 20_000 }, pageSink: sink(pages) }), { code: 'm4_cross_phase_identity_streaming_state_invalid' });
+      registryKeyId:'registry-fixture-key', capacityPreflight: { availableBytes: 5 * 1024 * 1024 * 1024, sampleBlocks: [block('preflight')], expectedBlockCount: 20_000 }, pageSink: sink(pages) }), { code: 'm4_cross_phase_identity_streaming_state_invalid' });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -201,7 +206,7 @@ test('validates cross-block references through SQL before publishing a page', as
   edited.events[0].state = 'edited'; edited.events[0].revision = 2; edited.events[0].replacesLegacyEventId = eventId('missing');
   try {
     const value = writer(root, sink(pages)); value.accept(original); value.accept(edited);
-    await assert.rejects(() => value.seal({ coveredThrough: cutoff, backfillBinding: binding() }), { code: 'm4_cross_phase_identity_streaming_reference_invalid' });
+    await assert.rejects(() => seal(value, root), { code: 'm4_cross_phase_identity_streaming_reference_invalid' });
     assert.equal(pages.size, 0); value.close();
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -211,10 +216,11 @@ test('acknowledgement failure leaves deterministic orphan pages and retry re-emi
   try {
     const value = writer(root, { writePage: async page => { seen.push([page.pageKey, page.digest]); pages.set(page.pageKey, structuredClone(page)); if (badAck) return { pageKey: page.pageKey, digest: digest('wrong') }; return { pageKey: page.pageKey, digest: page.digest }; } });
     value.accept(block('retry'));
-    await assert.rejects(() => value.seal({ coveredThrough: cutoff, backfillBinding: binding() }), { code: 'm4_cross_phase_identity_streaming_page_ack_invalid' });
+    await assert.rejects(() => seal(value, root), { code: 'm4_cross_phase_identity_streaming_page_ack_invalid' });
     value.close(); badAck = false; const resumed = writer(root, { writePage: async page => { seen.push([page.pageKey, page.digest]); pages.set(page.pageKey, structuredClone(page)); return { pageKey: page.pageKey, digest: page.digest }; } });
-    await assert.rejects(() => resumed.seal({ coveredThrough: '2026-07-23T00:00:00Z', backfillBinding: binding() }), { code: 'm4_cross_phase_identity_streaming_seal_binding_invalid' });
-    const sealed = await resumed.seal({ coveredThrough: cutoff, backfillBinding: binding() });
+    const altered = structuredClone(completion(root).traversalCompletion); altered.coveredThrough = '2026-07-23T00:00:00Z';
+    await assert.rejects(() => resumed.seal({ traversalCompletion:altered, completionKeyDocument:completion(root).completionKeyDocument }), { code: 'm4_cross_phase_identity_traversal_completion_signature_invalid' });
+    const sealed = await seal(resumed, root);
     assert.equal(sealed.coverage.pageCount, 2); assert.deepEqual(seen[0], seen[1]); resumed.close();
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -231,7 +237,7 @@ test('streams a 10,001-event hot bucket without retaining the pages', async () =
       }
       value.accept(base);
     }
-    const sealed = await value.seal({ coveredThrough: cutoff, backfillBinding: binding() });
+    const sealed = await seal(value, root);
     const eventPages = [...pages.values()].filter(page => page.entryKind === 'event');
     assert.equal(eventPages.reduce((sum, page) => sum + page.events.length, 0), 10_001);
     assert.equal(eventPages.length >= 2, true); assert.equal(eventPages.every(page => page.events.length <= 10_000
@@ -239,4 +245,61 @@ test('streams a 10,001-event hot bucket without retaining the pages', async () =
     assert.equal(sealed.coverage.eventCount, 10_001);
     assert.equal(sealed.coverage.pageCount, 3); value.close();
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('requires signed completion coverage to exactly match partial, extra, and capacity-mismatched spools before seal intent', async () => {
+  const root = temporary(); const pages = new Map(); const preflight={ availableBytes:5*1024*1024*1024, sampleBlocks:[block('coverage-sample')], expectedBlockCount:2 };
+  try {
+    const value=writer(root,sink(pages),{ capacityPreflight:preflight }); value.accept(block('coverage-first'));
+    const actual=readM4CrossPhaseIdentityStreamingCoverage({ databasePath:path.join(root,'private','identity.sqlite') });
+    const partial=fixture({ coverage:{ ...actual, blockCount:2, sessionCount:2, eventCount:2 }, registrySecret:SECRET, groupCount:2 });
+    await assert.rejects(() => value.seal({ traversalCompletion:partial.traversalCompletion, completionKeyDocument:partial.completionKeyDocument }), { code:'m4_cross_phase_identity_streaming_completion_coverage_mismatch' });
+    const capacity=fixture({ coverage:{ ...actual, expectedBlockCount:3 }, registrySecret:SECRET });
+    await assert.rejects(() => value.seal({ traversalCompletion:capacity.traversalCompletion, completionKeyDocument:capacity.completionKeyDocument }), { code:'m4_cross_phase_identity_streaming_completion_coverage_mismatch' });
+    const exact=fixture({ coverage:actual, registrySecret:SECRET }); value.accept(block('coverage-extra'));
+    await assert.rejects(() => value.seal({ traversalCompletion:exact.traversalCompletion, completionKeyDocument:exact.completionKeyDocument }), { code:'m4_cross_phase_identity_streaming_completion_coverage_mismatch' });
+    assert.equal(readM4CrossPhaseIdentityStreamingCoverage({ databasePath:path.join(root,'private','identity.sqlite') }).state,'open'); value.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
+test('rejects a tampered completion before recording seal intent', async () => {
+  const root=temporary(); const pages=new Map();
+  try {
+    const value=writer(root,sink(pages)); value.accept(block('tampered-completion')); const item=completion(root); const tampered=structuredClone(item.traversalCompletion); tampered.catalogBaselineDigest='sha256:'.concat('a'.repeat(64));
+    await assert.rejects(() => value.seal({ traversalCompletion:tampered, completionKeyDocument:item.completionKeyDocument }), { code:'m4_cross_phase_identity_traversal_completion_invalid' });
+    assert.equal(readM4CrossPhaseIdentityStreamingCoverage({ databasePath:path.join(root,'private','identity.sqlite') }).state,'open'); value.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
+test('fails before page emission when a seal-intent completion digest is corrupted', async () => {
+  const root=temporary(); const pages=new Map(); let writes=0;
+  try {
+    const value=writer(root,{ writePage:async page => { writes += 1; pages.set(page.pageKey,structuredClone(page)); return { pageKey:page.pageKey,digest:digest('bad-ack') }; } }); value.accept(block('intent-corruption'));
+    await assert.rejects(() => seal(value,root), { code:'m4_cross_phase_identity_streaming_page_ack_invalid' }); value.close(); const beforeRetry=writes;
+    const db=new Database(path.join(root,'private','identity.sqlite')); db.prepare("UPDATE m4_stream_meta SET value=? WHERE key='seal_completion_digest'").run('sha256:'.concat('b'.repeat(64))); db.close();
+    const resumed=writer(root,sink(pages)); await assert.rejects(() => seal(resumed,root), { code:'m4_cross_phase_identity_streaming_seal_binding_invalid' }); assert.equal(writes,beforeRetry); resumed.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
+test('snapshots the completion key document once before verification and separation', async () => {
+  const root=temporary(); const pages=new Map();
+  try {
+    const value=writer(root,sink(pages)); value.accept(block('hostile-completion-key')); const item=completion(root); const signingDocument={ schema:'amf.migration-signing-key/v1', keyId:item.completionKeyDocument.keyId, key:SECRET.toString('base64') };
+    const signed=resignCompletion(item.traversalCompletion,signingDocument); let reads=0; const hostile={ schema:'amf.migration-signing-key/v1', keyId:item.completionKeyDocument.keyId, get key() { reads += 1; return reads === 1 ? SECRET.toString('base64') : Buffer.alloc(32,99).toString('base64'); } };
+    await assert.rejects(() => value.seal({ traversalCompletion:signed, completionKeyDocument:hostile }), { code:'m4_cross_phase_identity_streaming_completion_key_separation_invalid' });
+    assert.equal(reads,1); assert.equal(readM4CrossPhaseIdentityStreamingCoverage({ databasePath:path.join(root,'private','identity.sqlite') }).state,'open'); value.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
+test('requires a matching registry key identity, secret commitment, and constructor binding', async () => {
+  const root=temporary(); const pages=new Map();
+  try {
+    const missing={ databasePath:path.join(root,'missing','identity.sqlite'), registrySecret:SECRET, capacityPreflight:{ availableBytes:5*1024*1024*1024, sampleBlocks:[block('registry-missing')], expectedBlockCount:1 }, pageSink:sink(pages) };
+    assert.throws(() => createM4CrossPhaseIdentityStreamingWriter(missing), { code:'m4_cross_phase_identity_streaming_request_invalid' });
+    const value=writer(root,sink(pages)); value.accept(block('registry-binding')); const item=completion(root);
+    const wrongCommitment=structuredClone(item.traversalCompletion); wrongCommitment.registryKeyCommitment='hmac-sha256:'.concat('a'.repeat(43));
+    await assert.rejects(() => value.seal({ traversalCompletion:resignCompletion(wrongCommitment,item.completionKeyDocument), completionKeyDocument:item.completionKeyDocument }), { code:'m4_cross_phase_identity_streaming_completion_registry_binding_invalid' }); value.close();
+    const wrongSecret=writer(root,sink(pages),{ registrySecret:Buffer.alloc(32,66) }); await assert.rejects(() => wrongSecret.seal({ traversalCompletion:item.traversalCompletion, completionKeyDocument:item.completionKeyDocument }), { code:'m4_cross_phase_identity_streaming_completion_registry_binding_invalid' }); wrongSecret.close();
+    const wrongKeyId=writer(root,sink(pages),{ registryKeyId:'other-registry-key' }); await assert.rejects(() => wrongKeyId.seal({ traversalCompletion:item.traversalCompletion, completionKeyDocument:item.completionKeyDocument }), { code:'m4_cross_phase_identity_streaming_completion_registry_binding_invalid' }); wrongKeyId.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
 });

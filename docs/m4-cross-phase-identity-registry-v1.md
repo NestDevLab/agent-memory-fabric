@@ -28,9 +28,20 @@ Registry creation rejects any event whose conversation, kind, or session routing
 does not exactly match its registered session.
 
 Before replay becomes ready, an operator must build entries from the exact
-accepted output of the v2 projector, publish owner-only pages, and independently
-match the signed coverage counts and page-root digest against the completed
-backfill. A valid signature alone does not prove complete coverage.
+accepted output of the v2 projector and create an immutable signed
+`amf.m4-cross-phase-identity-traversal-completion/v1` document. That document
+has its own manifest identifier and revision, binds the verified v2 archive
+completion and unchanged catalog baseline, a durable complete traversal record,
+and the exact read-only spool coverage. Its completion key, catalog key,
+archive-completion key, and registry key are distinct. The registry key is
+represented only by a keyed commitment in the document.
+
+The streaming writer accepts no caller-supplied cutoff or archive binding. It
+verifies that signed completion, requires its expected block, block, session,
+and event counts to exactly equal the durable spool counts, then derives the
+cutoff and archive binding from it. The completion digest is atomically stored
+with the seal intent; retries must provide the same document before any page is
+published. A valid signature alone does not prove complete coverage.
 
 For an already registered event, paused replay must present an equivalent
 content-free v2 projection and one of the bound source tags. A new revision of a

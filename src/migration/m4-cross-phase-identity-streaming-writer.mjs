@@ -20,6 +20,7 @@ import {
   deriveM4V3EventIdFromLegacyEventId,
   deriveM4V3SourceInstanceIdFromLegacySession,
 } from './m4-v2-conversation-projector.mjs';
+import { verifyM4CrossPhaseIdentityTraversalCompletion } from './m4-cross-phase-identity-traversal-completion.mjs';
 
 export const M4_CROSS_PHASE_IDENTITY_STREAMING_BLOCK_SCHEMA = 'amf.m4-cross-phase-projector-identity-block/v1';
 export const M4_CROSS_PHASE_IDENTITY_STREAMING_MAX_PAGE_BYTES = 8 * 1024 * 1024;
@@ -32,6 +33,8 @@ const CONVERSATION_ID = /^ccon_[a-z0-9][a-z0-9_-]{7,127}$/;
 const SOURCE_INSTANCE_ID = /^src_[a-z0-9][a-z0-9_-]{7,127}$/;
 const SOURCE_TAG = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}:[a-f0-9]{64}$/;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
+const KEY_ID = /^[a-z][a-z0-9-]{2,79}$/;
+const B64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const KINDS = new Set(['dm', 'group', 'channel', 'thread', 'session', 'unknown']);
 const ROLES = new Set(['user', 'assistant']);
 const DIRECTIONS = new Set(['inbound', 'outbound']);
@@ -43,6 +46,8 @@ function plain(value) { return value !== null && typeof value === 'object' && !A
 function exact(value, keys) { return plain(value) && Object.keys(value).sort().join('\0') === [...keys].sort().join('\0'); }
 function clone(value, code) { try { return structuredClone(value); } catch { fail(code); } }
 function digest(value) { return `sha256:${crypto.createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex')}`; }
+function safeEqual(left, right) { const a = Buffer.from(String(left), 'utf8'); const b = Buffer.from(String(right), 'utf8'); return a.length === b.length && crypto.timingSafeEqual(a, b); }
+function completionKeyMaterial(value) { const safe = clone(value, 'm4_cross_phase_identity_streaming_completion_key_invalid'); if (!exact(safe, ['schema','keyId','key']) || safe.schema !== 'amf.migration-signing-key/v1' || !KEY_ID.test(safe.keyId) || typeof safe.key !== 'string' || !B64.test(safe.key)) fail('m4_cross_phase_identity_streaming_completion_key_invalid'); const material = Buffer.from(safe.key,'base64'); if (material.length < 32 || material.length > 64 || material.toString('base64') !== safe.key) { material.fill(0); fail('m4_cross_phase_identity_streaming_completion_key_invalid'); } return material; }
 function privateMode(stat) { return stat.uid === process.getuid() && (stat.mode & 0o077) === 0; }
 function canonicalBytes(value) { return Buffer.byteLength(canonicalJson(value), 'utf8'); }
 function bucketFor(value, prefix) { return value.slice(prefix.length, prefix.length + 2); }
@@ -161,6 +166,12 @@ function ensurePrivateDirectory(directory) {
   if (!privateMode(stat)) fail('m4_cross_phase_identity_streaming_resource_unsafe');
   return { path: directory, dev: stat.dev, ino: stat.ino };
 }
+function readPrivateDirectory(directory) {
+  if (!path.isAbsolute(directory) || path.resolve(directory) !== directory) fail('m4_cross_phase_identity_streaming_resource_unsafe');
+  const parsed = path.parse(directory); const segments = directory.slice(parsed.root.length).split(path.sep).filter(Boolean); let current = parsed.root;
+  for (const segment of segments) { current = path.join(current, segment); let stat; try { stat = fs.lstatSync(current); } catch { fail('m4_cross_phase_identity_streaming_resource_unsafe'); } if (stat.isSymbolicLink() || !stat.isDirectory()) fail('m4_cross_phase_identity_streaming_resource_unsafe'); }
+  const stat = fs.lstatSync(directory); if (!privateMode(stat)) fail('m4_cross_phase_identity_streaming_resource_unsafe'); return { path:directory, dev:stat.dev, ino:stat.ino };
+}
 function openPinnedDirectory(anchor) {
   let fd; try { fd = fs.openSync(anchor.path, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW); }
   catch { fail('m4_cross_phase_identity_streaming_resource_unsafe'); }
@@ -196,7 +207,7 @@ INSERT OR IGNORE INTO m4_stream_meta(key,value) VALUES ('schema_version','1');
 INSERT OR IGNORE INTO m4_stream_meta(key,value) VALUES ('accepted_blocks','0');`);
 }
 const TABLES = new Set(['m4_stream_meta', 'm4_stream_blocks', 'm4_stream_sessions', 'm4_stream_events', 'm4_stream_references']);
-const META_KEYS = new Set(['schema_version', 'accepted_blocks', 'expected_block_count', 'seal_binding', 'sealed_result']);
+const META_KEYS = new Set(['schema_version', 'accepted_blocks', 'expected_block_count', 'seal_binding', 'seal_completion_digest', 'sealed_result']);
 const TABLE_SQL = new Map([
   ['m4_stream_meta', 'CREATE TABLE m4_stream_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID'],
   ['m4_stream_blocks', 'CREATE TABLE m4_stream_blocks (block_digest TEXT PRIMARY KEY) WITHOUT ROWID'],
@@ -228,6 +239,26 @@ function validateSchema(db) {
   return values;
 }
 function bucketAt(index) { return index.toString(16).padStart(2, '0'); }
+
+// Read-only inspection for a later trusted completion stage. It never creates
+// a directory, database, journal, row, or page.
+export function readM4CrossPhaseIdentityStreamingCoverage({ databasePath } = {}) {
+  if (typeof databasePath !== 'string' || !path.isAbsolute(databasePath) || path.resolve(databasePath) !== databasePath) fail('m4_cross_phase_identity_streaming_request_invalid');
+  const directory = path.dirname(databasePath); const anchor = openPinnedDirectory(readPrivateDirectory(directory)); const pinnedPath = `/proc/self/fd/${anchor.fd}/${path.basename(databasePath)}`;
+  let db;
+  try {
+    const before = assertFile(pinnedPath, anchor); db = new Database(pinnedPath, { readonly: true, fileMustExist: true }); assertPinnedFile(pinnedPath, anchor, before);
+    const meta = validateSchema(db); const expected = Number(meta.get('expected_block_count'));
+    if (!Number.isSafeInteger(expected) || expected < 1) fail('m4_cross_phase_identity_streaming_state_invalid');
+    const hasBinding = meta.has('seal_binding'); const hasCompletion = meta.has('seal_completion_digest'); const hasResult = meta.has('sealed_result');
+    if (hasBinding !== hasCompletion || (hasResult && !hasBinding)) fail('m4_cross_phase_identity_streaming_state_invalid');
+    const counts = db.prepare('SELECT (SELECT count(*) FROM m4_stream_blocks) AS blockCount,(SELECT count(*) FROM m4_stream_sessions) AS sessionCount,(SELECT count(*) FROM m4_stream_events) AS eventCount').get();
+    if (![counts.blockCount, counts.sessionCount, counts.eventCount].every(value => Number.isSafeInteger(value) && value >= 0)) fail('m4_cross_phase_identity_streaming_state_invalid');
+    const state = hasResult ? 'sealed' : hasBinding ? 'seal-intent' : 'open';
+    return Object.freeze({ schema: 'amf.m4-cross-phase-identity-streaming-coverage/v1', state, expectedBlockCount: expected, blockCount: counts.blockCount, sessionCount: counts.sessionCount, eventCount: counts.eventCount });
+  } catch (error) { if (typeof error?.code === 'string' && error.code.startsWith('m4_cross_phase_identity_')) throw error; fail('m4_cross_phase_identity_streaming_state_invalid'); }
+  finally { try { db?.close(); } catch {} try { fs.closeSync(anchor.fd); } catch {} }
+}
 function bucketRange(prefix, bucketIndex, cursor) {
   const bucket = bucketAt(bucketIndex); const lower = cursor || `${prefix}${bucket}`;
   const upper = bucketIndex === 255 ? `${prefix}g` : `${prefix}${bucketAt(bucketIndex + 1)}`;
@@ -252,10 +283,11 @@ function pageAck(value, page) {
   }
 }
 
-export function createM4CrossPhaseIdentityStreamingWriter({ databasePath, registrySecret, capacityPreflight, pageSink } = {}) {
+export function createM4CrossPhaseIdentityStreamingWriter({ databasePath, registrySecret, registryKeyId, capacityPreflight, pageSink } = {}) {
   if (typeof databasePath !== 'string' || !path.isAbsolute(databasePath) || path.resolve(databasePath) !== databasePath
     || path.basename(databasePath) !== databasePath.split(path.sep).at(-1)
     || !Buffer.isBuffer(registrySecret) || registrySecret.length !== 32
+    || typeof registryKeyId !== 'string' || !KEY_ID.test(registryKeyId)
     || !exact(pageSink, ['writePage'])) fail('m4_cross_phase_identity_streaming_request_invalid');
   const writePage = pageSink.writePage;
   if (typeof writePage !== 'function') fail('m4_cross_phase_identity_streaming_request_invalid');
@@ -292,9 +324,10 @@ export function createM4CrossPhaseIdentityStreamingWriter({ databasePath, regist
     else if (expectedStored !== String(preflight.expectedBlockCount)) fail('m4_cross_phase_identity_streaming_state_invalid');
     initialMeta = validateSchema(db);
   } catch { abortConstructor('m4_cross_phase_identity_streaming_state_invalid'); }
-  let sealedBinding = initialMeta.get('seal_binding') ?? null; let sealedResult = initialMeta.get('sealed_result') ?? null;
+  let sealedBinding = initialMeta.get('seal_binding') ?? null; let sealCompletionDigest = initialMeta.get('seal_completion_digest') ?? null; let sealedResult = initialMeta.get('sealed_result') ?? null;
   if (!(sealedBinding === null || typeof sealedBinding === 'string') || !(sealedResult === null || typeof sealedResult === 'string')
-    || (sealedResult !== null && sealedBinding === null)) abortConstructor('m4_cross_phase_identity_streaming_state_invalid');
+    || !(sealCompletionDigest === null || DIGEST.test(sealCompletionDigest)) || (sealedResult !== null && (sealedBinding === null || sealCompletionDigest === null))
+    || (sealedBinding !== null && sealCompletionDigest === null) || (sealedBinding === null && sealCompletionDigest !== null)) abortConstructor('m4_cross_phase_identity_streaming_state_invalid');
   let closed = false; let sealing = false; let sealed = sealedResult !== null;
   if (sealed) {
     try {
@@ -303,7 +336,7 @@ export function createM4CrossPhaseIdentityStreamingWriter({ databasePath, regist
         || !Number.isSafeInteger(parsed.coverage.acceptedBlockCount) || parsed.coverage.acceptedBlockCount < 0
         || parsed.coverage.sessionCount !== authority.coverage.sessionCount || parsed.coverage.eventCount !== authority.coverage.eventCount
         || parsed.coverage.pageCount !== authority.pages.length || parsed.coverage.acceptedBlockCount !== Number(initialMeta.get('accepted_blocks'))
-        || sealedBinding !== canonicalJson({ coveredThrough: authority.coveredThrough, backfillBinding: authority.backfillBinding })) fail('m4_cross_phase_identity_streaming_state_invalid');
+        || sealedBinding !== canonicalJson({ coveredThrough: authority.coveredThrough, backfillBinding: authority.backfillBinding, completionDigest: sealCompletionDigest })) fail('m4_cross_phase_identity_streaming_state_invalid');
       secret.fill(0); secret = null;
     } catch { try { db.close(); fs.closeSync(parent.fd); } catch {} fail('m4_cross_phase_identity_streaming_state_invalid'); }
   }
@@ -319,6 +352,21 @@ export function createM4CrossPhaseIdentityStreamingWriter({ databasePath, regist
   const acceptedCount = statement("SELECT value FROM m4_stream_meta WHERE key='accepted_blocks'");
   const counts = statement('SELECT (SELECT count(*) FROM m4_stream_blocks) AS blocks, (SELECT count(*) FROM m4_stream_sessions) AS sessions, (SELECT count(*) FROM m4_stream_events) AS events');
   const getMeta = statement('SELECT value FROM m4_stream_meta WHERE key=?');
+  const persistSealIntent = db.transaction((binding, completionDigest, signedCoverage) => {
+    const expectedBlockCount = getMeta.get('expected_block_count')?.value; const durableCounts = counts.get();
+    const expectedCoverage = { schema: 'amf.m4-cross-phase-identity-streaming-coverage/v1', state: signedCoverage.state,
+      expectedBlockCount: Number(expectedBlockCount), blockCount: durableCounts.blocks, sessionCount: durableCounts.sessions, eventCount: durableCounts.events };
+    if (!Number.isSafeInteger(expectedCoverage.expectedBlockCount) || expectedCoverage.expectedBlockCount < 1) fail('m4_cross_phase_identity_streaming_state_invalid');
+    if (canonicalJson(signedCoverage) !== canonicalJson(expectedCoverage)) fail('m4_cross_phase_identity_streaming_completion_coverage_mismatch');
+    const storedBinding = getMeta.get('seal_binding')?.value ?? null; const storedDigest = getMeta.get('seal_completion_digest')?.value ?? null;
+    if ((storedBinding === null) !== (storedDigest === null)) fail('m4_cross_phase_identity_streaming_state_invalid');
+    if (storedBinding !== null) {
+      if (storedBinding !== binding || storedDigest !== completionDigest) fail('m4_cross_phase_identity_streaming_seal_binding_invalid');
+      return { binding: storedBinding, completionDigest: storedDigest };
+    }
+    setMeta.run('seal_binding', binding); setMeta.run('seal_completion_digest', completionDigest);
+    return { binding, completionDigest };
+  }).immediate;
   function assertOpen() { if (closed) fail('m4_cross_phase_identity_streaming_closed'); assertPinnedFile(pinnedPath, parent, file); }
   const writeBlock = db.transaction(safeBlock => {
     const blockDigest = digest(safeBlock);
@@ -357,22 +405,25 @@ export function createM4CrossPhaseIdentityStreamingWriter({ databasePath, regist
     const invalidReference = db.prepare(`SELECT 1 FROM m4_stream_references r JOIN m4_stream_events e ON e.legacy_event_id=r.legacy_event_id LEFT JOIN m4_stream_events t ON t.legacy_event_id=r.target_legacy_event_id WHERE t.legacy_event_id IS NULL OR t.legacy_session_id<>e.legacy_session_id OR t.conversation_id<>e.conversation_id OR t.source_instance_id<>e.source_instance_id LIMIT 1`).get();
     if (invalidReference) fail('m4_cross_phase_identity_streaming_reference_invalid');
   }
-  async function seal({ coveredThrough, backfillBinding } = {}) {
+  async function seal({ traversalCompletion, completionKeyDocument } = {}) {
     assertOpen(); if (sealing) fail('m4_cross_phase_identity_streaming_sealed');
-    let requestedBinding; try { requestedBinding = canonicalJson({ coveredThrough, backfillBinding }); } catch { fail('m4_cross_phase_identity_streaming_seal_binding_invalid'); }
+    const safeCompletionKeyDocument = clone(completionKeyDocument, 'm4_cross_phase_identity_streaming_completion_key_invalid');
+    const completion = verifyM4CrossPhaseIdentityTraversalCompletion(traversalCompletion, safeCompletionKeyDocument); const completionDigest = digest(completion);
+    const coveredThrough = completion.coveredThrough; const backfillBinding = completion.archiveBinding;
+    const requestedBinding = canonicalJson({ coveredThrough, backfillBinding, completionDigest });
     if (sealed) {
-      if (requestedBinding !== sealedBinding) fail('m4_cross_phase_identity_streaming_seal_binding_invalid');
+      if (requestedBinding !== sealedBinding || completionDigest !== sealCompletionDigest) fail('m4_cross_phase_identity_streaming_seal_binding_invalid');
       try { return structuredClone(JSON.parse(sealedResult)); } catch { fail('m4_cross_phase_identity_streaming_state_invalid'); }
     }
+    const completionMaterial = completionKeyMaterial(safeCompletionKeyDocument);
+    try { const left = Buffer.alloc(64); const right = Buffer.alloc(64); try { secret.copy(left); completionMaterial.copy(right); if (crypto.timingSafeEqual(left,right)) fail('m4_cross_phase_identity_streaming_completion_key_separation_invalid'); } finally { left.fill(0); right.fill(0); } } finally { completionMaterial.fill(0); }
+    const actualCommitment = `hmac-sha256:${crypto.createHmac('sha256', secret).update(canonicalJson(['amf.m4-cross-phase-identity-traversal-completion/v1/registry-key', registryKeyId]), 'utf8').digest('base64url')}`;
+    if (completion.registryKeyId !== registryKeyId || !safeEqual(completion.registryKeyCommitment, actualCommitment)) fail('m4_cross_phase_identity_streaming_completion_registry_binding_invalid');
     // Validate the fixed authority inputs before recording an irreversible
     // seal intent; page descriptors are supplied only after bounded streaming.
     createM4CrossPhaseIdentityAuthority({ coveredThrough, backfillBinding, pageDescriptors: [] }, secret);
-    if (sealedBinding !== null && requestedBinding !== sealedBinding) fail('m4_cross_phase_identity_streaming_seal_binding_invalid');
-    if (sealedBinding === null) {
-      try { setMeta.run('seal_binding', requestedBinding); }
-      catch { fail('m4_cross_phase_identity_streaming_state_invalid'); }
-      sealedBinding = requestedBinding;
-    }
+    try { const persisted = persistSealIntent(requestedBinding, completionDigest, completion.coverage); sealedBinding = persisted.binding; sealCompletionDigest = persisted.completionDigest; }
+    catch (error) { if (typeof error?.code === 'string' && error.code.startsWith('m4_cross_phase_identity_')) throw error; fail('m4_cross_phase_identity_streaming_state_invalid'); }
     sealing = true;
     try {
       validateStoredReferences(); const descriptors = [];
