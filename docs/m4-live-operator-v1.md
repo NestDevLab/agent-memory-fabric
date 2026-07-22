@@ -88,6 +88,14 @@ window. The legacy and v3 snapshot and revision manifests use separate
 configured trust anchors, also HMAC-independent from the reconciliation and
 phase completion keys.
 
+The event file, revision manifest, and snapshot manifest must be published as
+one owner-only `amf.m4-snapshot-bundle/v1` directory. The completion marker is
+linked only after the three synced files exist. Reconciliation rejects an
+absent marker, a marker/file digest mismatch, a non-canonical bundle layout,
+or a bundle directory with group or other permissions. A crash can therefore
+leave cleanup work, but it cannot leave a partial directory that is accepted
+as complete evidence.
+
 The complete snapshot bytes are bound by the outer operator confirmation
 before the existing reconciliation runner opens either iterator. While the
 iterator is consumed, the operator recomputes the canonical ordered event-set

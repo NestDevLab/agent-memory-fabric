@@ -9,16 +9,25 @@ const MAX_LINE_BYTES = 1024 * 1024;
 
 function fail(code) { const error = new Error(code); error.code = code; throw error; }
 
-export function openM4ReconciliationSnapshot(filePath, manifest) {
+export function openM4ReconciliationSnapshot(filePath, manifest, { identity: borrowedIdentity } = {}) {
   const code = 'm4_live_operator_reconciliation_snapshot_invalid';
-  const identity = openPrivateDigest(filePath, code, { minBytes: 0, maxBytes: MAX_SNAPSHOT_BYTES });
+  let identity;
+  if (borrowedIdentity) {
+    let descriptor;
+    try {
+      descriptor = fs.openSync(`/proc/self/fd/${borrowedIdentity.descriptor}`, fs.constants.O_RDONLY);
+      identity = { ...borrowedIdentity, descriptor };
+      assertPrivateFileIdentity(identity, 'm4_live_operator_reconciliation_snapshot_changed');
+    } catch (error) { if (descriptor !== undefined) fs.closeSync(descriptor); throw error; }
+  } else identity = openPrivateDigest(filePath, code, { minBytes: 0, maxBytes: MAX_SNAPSHOT_BYTES });
   if (identity.digest !== manifest.eventFileDigest) { fs.closeSync(identity.descriptor); fail('m4_live_operator_reconciliation_snapshot_changed'); }
   let stream = null; let iteratorStarted = false; let closed = false; let verified = false;
   const close = async () => {
     if (closed) return; closed = true;
     if (stream) {
-      if (!stream.closed) await new Promise(resolve => { stream.once('close', resolve); stream.close(); });
-    } else fs.closeSync(identity.descriptor);
+      if (!stream.destroyed) await new Promise(resolve => { stream.once('close', resolve); stream.destroy(); });
+    }
+    try { fs.closeSync(identity.descriptor); } catch {}
   };
   const verifyComplete = () => { if (!verified) fail('m4_live_operator_reconciliation_snapshot_incomplete'); };
   const events = {

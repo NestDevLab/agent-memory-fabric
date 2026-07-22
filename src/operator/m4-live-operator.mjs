@@ -9,6 +9,7 @@ import { m4ReconciliationArchiveRevisionEvidence, verifyM4ReconciliationArchiveR
   verifyM4ReconciliationSnapshot } from '../migration/m4-reconciliation-snapshot.mjs';
 import { createM4RecoveryPairManifest, verifyM4RecoveryPairManifest } from '../migration/m4-recovery-pair.mjs';
 import { openM4ReconciliationSnapshot } from './m4-reconciliation-snapshots.mjs';
+import { openPrivateM4SnapshotBundle } from './private-snapshot-bundle.mjs';
 import {
   artifactPath,
   canonicalDigest,
@@ -138,8 +139,29 @@ async function prepareReconciliation(configPath, clock) {
     ['sourceRevisionManifest', config.sourceRevisionManifestPath], ['sourceRevisionKey', config.sourceRevisionTrustAnchorPath],
     ['targetRevisionManifest', config.targetRevisionManifestPath], ['targetRevisionKey', config.targetRevisionTrustAnchorPath],
   ].map(([name, target]) => [name, reference(target, code)]));
-  const sourceEventsDigest = privateFileDigest(config.sourceEventsPath, code, { minBytes: 0, maxBytes: 4 * 1024 * 1024 * 1024 });
-  const targetEventsDigest = privateFileDigest(config.targetEventsPath, code, { minBytes: 0, maxBytes: 4 * 1024 * 1024 * 1024 });
+  let sourceBundle; let targetBundle;
+  try {
+    sourceBundle = openPrivateM4SnapshotBundle({ eventsPath: config.sourceEventsPath,
+      revisionPath: config.sourceRevisionManifestPath, snapshotPath: config.sourceSnapshotManifestPath });
+    targetBundle = openPrivateM4SnapshotBundle({ eventsPath: config.targetEventsPath,
+      revisionPath: config.targetRevisionManifestPath, snapshotPath: config.targetSnapshotManifestPath });
+    if (sourceBundle.revisionFileDigest !== refs.sourceRevisionManifest.digest
+      || sourceBundle.snapshotFileDigest !== refs.sourceSnapshotManifest.digest
+      || targetBundle.revisionFileDigest !== refs.targetRevisionManifest.digest
+      || targetBundle.snapshotFileDigest !== refs.targetSnapshotManifest.digest) {
+      fail('m4_live_operator_reconciliation_snapshot_attestation_invalid');
+    }
+  } catch {
+    try { sourceBundle?.close(); } catch {} try { targetBundle?.close(); } catch {}
+    fail('m4_live_operator_reconciliation_snapshot_attestation_invalid');
+  }
+  const sourceEventsDigest = sourceBundle.eventFileDigest;
+  const targetEventsDigest = targetBundle.eventFileDigest;
+  refs.sourceRevisionManifest = { value: sourceBundle.revision, digest: sourceBundle.revisionFileDigest };
+  refs.sourceSnapshotManifest = { value: sourceBundle.snapshot, digest: sourceBundle.snapshotFileDigest };
+  refs.targetRevisionManifest = { value: targetBundle.revision, digest: targetBundle.revisionFileDigest };
+  refs.targetSnapshotManifest = { value: targetBundle.snapshot, digest: targetBundle.snapshotFileDigest };
+  try {
   let sourceSnapshot; let targetSnapshot; let sourceRevision; let targetRevision;
   try {
     sourceSnapshot = verifyM4ReconciliationSnapshot(refs.sourceSnapshotManifest.value, refs.sourceSnapshotKey.value);
@@ -181,19 +203,27 @@ async function prepareReconciliation(configPath, clock) {
   catch { fail('m4_live_operator_reconciliation_evidence_invalid'); }
   const inputDigests = { config: configReference.digest,
     ...Object.fromEntries(Object.entries(refs).map(([name, item]) => [name, item.digest])),
-    sourceEvents: sourceEventsDigest, targetEvents: targetEventsDigest };
+    sourceEvents: sourceEventsDigest, targetEvents: targetEventsDigest,
+    sourceBundle: sourceBundle.markerDigest, targetBundle: targetBundle.markerDigest };
+  sourceBundle.assertCurrent(); targetBundle.assertCurrent();
   return { config, refs, serial, innerPlan, sourceSnapshot, targetSnapshot, sourceRevision, targetRevision,
+    sourceBundle, targetBundle, close: () => { sourceBundle.close(); targetBundle.close(); },
     plan: reconciliationPlanFor(config, inputDigests, innerPlan) };
+  } catch (error) { sourceBundle.close(); targetBundle.close(); throw error; }
 }
 
 async function executeReconciliation(prepared, clock) {
   let sourceResource; let targetResource;
   const source = () => {
-    sourceResource = openM4ReconciliationSnapshot(prepared.config.sourceEventsPath, prepared.sourceSnapshot);
+    prepared.sourceBundle.assertCurrent();
+    sourceResource = openM4ReconciliationSnapshot(prepared.config.sourceEventsPath, prepared.sourceSnapshot,
+      { identity: prepared.sourceBundle.eventIdentity });
     return { value: { events: sourceResource.events, evidence: prepared.serial.sourceEvidence }, close: sourceResource.close };
   };
   const target = () => {
-    targetResource = openM4ReconciliationSnapshot(prepared.config.targetEventsPath, prepared.targetSnapshot);
+    prepared.targetBundle.assertCurrent();
+    targetResource = openM4ReconciliationSnapshot(prepared.config.targetEventsPath, prepared.targetSnapshot,
+      { identity: prepared.targetBundle.eventIdentity });
     return { value: { events: targetResource.events, evidence: prepared.serial.targetEvidence }, close: targetResource.close };
   };
   let result;
@@ -205,6 +235,7 @@ async function executeReconciliation(prepared, clock) {
       verifyCurrentNativePhaseCompletion: async () => readPrivateJson(prepared.config.nativePhaseCompletionPath,
         'm4_live_operator_reconciliation_evidence_invalid'),
       factories: { source, target, reconciliationKey: async () => {
+        prepared.sourceBundle.assertCurrent(); prepared.targetBundle.assertCurrent();
         assertReconciliationRevisionsCurrent(prepared.sourceRevision, prepared.targetRevision, clock);
         return { value: clone(prepared.refs.reconciliationKey.value,
           'm4_live_operator_reconciliation_evidence_invalid'), close: null };
@@ -305,13 +336,16 @@ async function prepare(stage, configPath, clock) {
 }
 
 export async function planM4LiveOperator({ stage, configPath } = {}, { clock = () => new Date() } = {}) {
-  try { return clone((await prepare(stage, configPath, clock)).plan, 'm4_live_operator_plan_invalid'); }
+  let prepared;
+  try { prepared = await prepare(stage, configPath, clock); return clone(prepared.plan, 'm4_live_operator_plan_invalid'); }
   catch (error) { if (error?.code?.startsWith?.('m4_live_operator_')) throw error; fail('m4_live_operator_plan_invalid'); }
+  finally { prepared?.close?.(); }
 }
 
 export async function runM4LiveOperator({ stage, configPath, confirmedPlanDigest } = {}, { clock = () => new Date() } = {}) {
   if (typeof confirmedPlanDigest !== 'string' || !DIGEST.test(confirmedPlanDigest)) fail('m4_live_operator_confirmation_invalid');
   const prepared = await prepare(stage, configPath, clock);
+  try {
   if (prepared.plan.confirmationDigest !== confirmedPlanDigest) fail('m4_live_operator_confirmation_invalid');
   outputAvailable(prepared.config.artifactRoot, stage, prepared.config.manifestId, prepared.config.revision,
     'm4_live_operator_artifact_missing');
@@ -323,6 +357,7 @@ export async function runM4LiveOperator({ stage, configPath, confirmedPlanDigest
   }
   if (stage === 'reconciliation') {
     const candidate = await executeReconciliation(prepared, clock);
+    prepared.sourceBundle.assertCurrent(); prepared.targetBundle.assertCurrent();
     assertReconciliationRevisionsCurrent(prepared.sourceRevision, prepared.targetRevision, clock);
     writePrivateArtifact(prepared.config.artifactRoot, stage, prepared.config.manifestId,
       prepared.config.revision, candidate);
@@ -331,4 +366,5 @@ export async function runM4LiveOperator({ stage, configPath, confirmedPlanDigest
   writePrivateArtifact(prepared.config.artifactRoot, stage, prepared.config.manifestId,
     prepared.config.revision, prepared.candidate);
   return resultFor(stage, prepared.candidate, prepared.plan);
+  } finally { prepared?.close?.(); }
 }
