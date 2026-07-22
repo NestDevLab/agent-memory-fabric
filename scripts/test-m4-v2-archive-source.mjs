@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { MemoryCatalog } from '../src/fabric-store.mjs';
+import { FileRawStore, MemoryCatalog, SqliteCatalog } from '../src/fabric-store.mjs';
 import { ciphertextContentId, normalizeIngestKeyRing, normalizedObservationDigest } from '../src/ingest/raw-event-contract.mjs';
 import { EncryptedOutbox } from '../src/ingest/outbox.mjs';
 import { deriveEventIdV2, deriveLogicalMessageIds, deriveSessionIdV2, opaqueContextTag } from '../src/ingest/raw-projection-v2.mjs';
@@ -32,6 +32,20 @@ function exactError(action, code) { return assert.rejects(action, error => error
 function integrityFor() {
   let sequence = 0;
   return async () => ({ keyId: 'm4-test-k1', key: Buffer.alloc(32, 5), sentAt: '2026-07-21T12:01:00Z', nonce: `nonce${String(++sequence).padStart(11, '0')}` });
+}
+
+function fixtureValues() {
+  return [
+    item({ suffix: 'user' }), item({ suffix: 'assistant', role: 'assistant' }),
+    item({ suffix: 'system', role: 'system', direction: 'internal', contentType: 'structured', value: { ignored: true } }),
+    item({ suffix: 'edit-1', logicalSuffix: 'edits', nativeRevision: 1 }),
+    item({ suffix: 'edit-2', logicalSuffix: 'edits', nativeRevision: 2 }),
+    item({ suffix: 'edit-3', logicalSuffix: 'edits', nativeRevision: 3, deletion: true }),
+    item({ suffix: 'conflict-1', logicalSuffix: 'conflict', nativeRevision: null, occurredAt: '2026-07-21T12:00:01.000000000Z' }),
+    item({ suffix: 'conflict-2', logicalSuffix: 'conflict', nativeRevision: null, occurredAt: '2026-07-21T12:00:02.000000000Z' }),
+    item({ suffix: 'rotated-old', logicalSuffix: 'rotated', value: 'visible rotated', logicalKeys: ROTATING_KEYS.logicalMessageKeys }),
+    item({ suffix: 'rotated-new', logicalSuffix: 'rotated', value: 'visible rotated', logicalKeys: ROTATING_KEYS.logicalMessageKeys }),
+  ];
 }
 
 function item({ suffix, logicalSuffix = suffix, role = 'user', direction = role === 'assistant' ? 'outbound' : 'inbound', contentType = 'text', value = `visible ${suffix}`, nativeRevision = 1, occurredAt = null, deletion = false, logicalKeys = ROTATING_KEYS.logicalMessageKeys } = {}) {
@@ -74,17 +88,7 @@ function catalogRow(value, envelope) {
 async function fixture({ ingestKeys = ROTATING_KEYS } = {}) {
   const catalog = new MemoryCatalog();
   const envelopes = new Map();
-  const values = [
-    item({ suffix: 'user' }), item({ suffix: 'assistant', role: 'assistant' }),
-    item({ suffix: 'system', role: 'system', direction: 'internal', contentType: 'structured', value: { ignored: true } }),
-    item({ suffix: 'edit-1', logicalSuffix: 'edits', nativeRevision: 1 }),
-    item({ suffix: 'edit-2', logicalSuffix: 'edits', nativeRevision: 2 }),
-    item({ suffix: 'edit-3', logicalSuffix: 'edits', nativeRevision: 3, deletion: true }),
-    item({ suffix: 'conflict-1', logicalSuffix: 'conflict', nativeRevision: null, occurredAt: '2026-07-21T12:00:01.000000000Z' }),
-    item({ suffix: 'conflict-2', logicalSuffix: 'conflict', nativeRevision: null, occurredAt: '2026-07-21T12:00:02.000000000Z' }),
-    item({ suffix: 'rotated-old', logicalSuffix: 'rotated', value: 'visible rotated', logicalKeys: ROTATING_KEYS.logicalMessageKeys }),
-    item({ suffix: 'rotated-new', logicalSuffix: 'rotated', value: 'visible rotated', logicalKeys: ROTATING_KEYS.logicalMessageKeys }),
-  ];
+  const values = fixtureValues();
   for (const value of values) {
     const envelope = encrypt(value); const row = catalogRow(value, envelope);
     if (value.event.raw.line === Buffer.from('native-raw-rotated-old').toString('base64')) row.logicalMessageId = value.projection.logicalMessageAliases[0].logicalMessageId;
@@ -102,6 +106,35 @@ async function fixture({ ingestKeys = ROTATING_KEYS } = {}) {
   auditDecrypt: async input => { calls.audit.push(structuredClone(input)); return { recorded: true, eventId: input.eventId, contentId: input.contentId }; },
   integrityFor: integrityFor(), startCheckpoint: START, pageLimit: 2 });
   return { catalog, envelopes, values, source, calls };
+}
+
+async function persistentFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-m4-source-persistent-'));
+  const databasePath = path.join(root, 'catalog.sqlite');
+  const rawPath = path.join(root, 'raw');
+  const rawEncryptionKey = Buffer.alloc(32, 11).toString('base64');
+  const catalog = new SqliteCatalog({ databasePath });
+  const rawStore = new FileRawStore({ rootPath: rawPath, encryptionKey: rawEncryptionKey, keyId: 'raw-k1' });
+  const values = fixtureValues();
+  for (const value of values) {
+    const envelope = encrypt(value);
+    const row = catalogRow(value, envelope);
+    if (value.event.raw.line === Buffer.from('native-raw-rotated-old').toString('base64')) row.logicalMessageId = value.projection.logicalMessageAliases[0].logicalMessageId;
+    const stored = await rawStore.commitClientCiphertext(row.contentId, envelope);
+    await catalog.ingestRawEventV2(row, { ...stored, mediaType: 'application/json', createdAt: row.createdAt },
+      { id: `audit-${row.eventId.slice(4, 36)}`, ts: row.createdAt, actorTag: OWNER, action: 'synthetic', targetId: row.eventId, details: {} });
+  }
+  const createSource = (sourceCatalog = catalog, sourceRawStore = rawStore) => createM4V2ArchiveSource({
+    catalog: sourceCatalog,
+    rawStore: sourceRawStore,
+    ingestKeys: ROTATING_KEYS,
+    verifyCatalogBinding: async () => ({ owner: true, source: true }),
+    auditDecrypt: async input => ({ recorded: true, eventId: input.eventId, contentId: input.contentId }),
+    integrityFor: integrityFor(),
+    startCheckpoint: START,
+    pageLimit: 2,
+  });
+  return { root, databasePath, rawPath, rawEncryptionKey, catalog, rawStore, values, source: createSource(), createSource };
 }
 
 async function rows(source, request = {}) {
@@ -131,6 +164,49 @@ test('real v2 catalog, client ciphertext, reader and projector produce only conv
   for (const input of [...env.calls.binding, ...env.calls.audit]) assert.equal(JSON.stringify(input).includes('visible '), false);
   output[0].event.visibleText = 'mutated output';
   assert.equal((await rows(env.source)).some(row => row.event.visibleText === 'mutated output'), false);
+});
+
+test('persistent SQLite catalog and filesystem ciphertext reopen, page and resume without duplicates', async () => {
+  const env = await persistentFixture();
+  let reopened;
+  try {
+    const initial = await rows(env.source);
+    assert.equal(initial.length, 8);
+    assert.ok(initial.every((row, index) => row.sequence === index + 1));
+    env.catalog.db.close();
+
+    reopened = new SqliteCatalog({ databasePath: env.databasePath });
+    const reopenedRawStore = new FileRawStore({ rootPath: env.rawPath, encryptionKey: env.rawEncryptionKey, keyId: 'raw-k1' });
+    const source = env.createSource(reopened, reopenedRawStore);
+    const replayed = await rows(source);
+    const stableIdentity = row => ({ sequence: row.sequence, checkpoint: row.checkpoint, eventId: row.event.eventId,
+      payloadDigest: row.event.integrity.payloadDigest });
+    assert.deepEqual(replayed.map(stableIdentity), initial.map(stableIdentity));
+
+    const checkpoint = replayed[2];
+    const resumed = await rows(source, { after: checkpoint.checkpoint, afterSequence: checkpoint.sequence });
+    assert.deepEqual(resumed.map(stableIdentity), replayed.slice(3).map(stableIdentity));
+    assert.equal(new Set([...replayed.slice(0, 3), ...resumed].map(row => row.event.eventId)).size, replayed.length);
+
+    const forgedCheckpoint = { ...checkpoint.checkpoint, digest: `sha256:${'f'.repeat(64)}` };
+    await exactError(async () => { for await (const _ of source.open({ runId: 'm4-run-001', phase: 'v2-archive', after: forgedCheckpoint, afterSequence: checkpoint.sequence, maxEvents: 1000 })) {} }, 'm4_v2_source_checkpoint_drift');
+
+    const firstRow = reopened.db.prepare('SELECT event_id,content_id,payload_digest FROM raw_events_v2 ORDER BY event_id LIMIT 1').get();
+    reopened.db.prepare('UPDATE raw_events_v2 SET payload_digest=? WHERE event_id=?').run(`hmac-sha256:v1:${'f'.repeat(64)}`, firstRow.event_id);
+    await exactError(async () => { await rows(source); }, 'm4_v2_source_read_failed');
+    reopened.db.prepare('UPDATE raw_events_v2 SET payload_digest=? WHERE event_id=?').run(firstRow.payload_digest, firstRow.event_id);
+
+    const firstContentId = firstRow.content_id;
+    const envelopePath = reopenedRawStore.clientBlobPath(firstContentId);
+    const envelope = JSON.parse(fs.readFileSync(envelopePath, 'utf8'));
+    envelope.ciphertext = `${envelope.ciphertext.slice(0, -4)}AAAA`;
+    fs.writeFileSync(envelopePath, JSON.stringify(envelope));
+    await exactError(async () => { await rows(source); }, 'm4_v2_source_envelope_unavailable');
+  } finally {
+    if (reopened?.db?.open) reopened.db.close();
+    if (env.catalog?.db?.open) env.catalog.db.close();
+    fs.rmSync(env.root, { recursive: true, force: true });
+  }
 });
 
 test('the source supplies one completion probe and stable checkpoints, then resumes exactly', async () => {
