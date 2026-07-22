@@ -27,6 +27,7 @@
     "test:conversation-archive": "node --test scripts/test-conversation-archive-v1-adapters.mjs",
     "test:m4-reconciliation": "node --test scripts/test-m4-reconciliation-reader.mjs",
     "test:m4-reconciliation-snapshot": "node --test scripts/test-m4-reconciliation-snapshot.mjs",
+    "test:m4-reconciliation-collector": "node --test scripts/test-m4-reconciliation-collector.mjs scripts/test-m4-reconciliation-collector-sources.mjs scripts/test-m4-legacy-reconciliation-source.mjs scripts/test-private-snapshot-bundle.mjs scripts/test-m4-reconciliation-collector-operator.mjs",
     "test:m4-reconciliation-manifest": "node --test scripts/test-m4-reconciliation-manifest.mjs",
     "test:m4-recovery-pair": "node --test scripts/test-m4-recovery-pair.mjs",
     "test:m4-backfill-coordinator": "node --test scripts/test-m4-backfill-coordinator.mjs",

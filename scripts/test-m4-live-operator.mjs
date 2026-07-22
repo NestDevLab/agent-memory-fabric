@@ -32,6 +32,12 @@ const checkpoint = (id, marker = id) => ({ id, digest: sha(marker) });
 const sign = (document, domain, valueDigest) => crypto.createHmac('sha256', Buffer.from(document.key, 'base64'))
   .update(canonicalJson([domain, valueDigest, document.keyId]), 'utf8').digest('base64url');
 const RECONCILIATION_CLOCK = { clock: () => new Date('2026-07-22T12:00:00Z') };
+function descriptorsFor(target) {
+  const real = fs.realpathSync(target);
+  return fs.readdirSync('/proc/self/fd').filter(name => {
+    try { return fs.readlinkSync(`/proc/self/fd/${name}`) === real; } catch { return false; }
+  });
+}
 
 function reconciliationPrerequisites(fixture) {
   const gateInput = { runId: 'live-reconciliation-gate', phase: 'paused-native', pauseManifest: fixture.paused,
@@ -71,7 +77,9 @@ function reconciliationConfig(item, fixture, targetEvent = null) {
       sourceCheckpoint: checkpoint('live-source'), nativeTranscriptAuthority: checkpoint('live-native-authority') } };
   const event = { eventId: 'cevt_liveevent01', payloadDigest: sha('live-payload'), logicalDigest: sha('live-logical'),
     sourceOccurredAt: '2026-01-01T00:00:00Z', occurredAt: '2026-01-01T00:00:01Z', state: 'active' };
-  const sourceEventsPath = path.join(item.root, 'source.jsonl'); const targetEventsPath = path.join(item.root, 'target.jsonl');
+  const sourceBundle = path.join(item.root, 'live-source-bundle'); const targetBundle = path.join(item.root, 'live-target-bundle');
+  fs.mkdirSync(sourceBundle, { mode: 0o700 }); fs.mkdirSync(targetBundle, { mode: 0o700 });
+  const sourceEventsPath = path.join(sourceBundle, 'events.jsonl'); const targetEventsPath = path.join(targetBundle, 'events.jsonl');
   fs.writeFileSync(sourceEventsPath, `${JSON.stringify(event)}\n`, { mode: 0o600 });
   const targetValue = targetEvent ?? event;
   fs.writeFileSync(targetEventsPath, `${JSON.stringify(targetValue)}\n`, { mode: 0o600 });
@@ -94,15 +102,27 @@ function reconciliationConfig(item, fixture, targetEvent = null) {
     prerequisites.legacy, prerequisites.legacy.checkpoint);
   const targetSnapshot = snapshot('v3', targetValue, targetEventsPath, targetSnapshotKey, targetRevision,
     prerequisites.native, prerequisites.native.checkpoint);
+  const writeBundle = (directory, bundleId, revisionManifest, snapshotManifest) => {
+    const revisionPath = path.join(directory, 'revision.json'); const snapshotPath = path.join(directory, 'snapshot.json');
+    fs.writeFileSync(revisionPath, `${JSON.stringify(revisionManifest, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(snapshotPath, `${JSON.stringify(snapshotManifest, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(path.join(directory, 'complete.json'), `${JSON.stringify({ schema: 'amf.m4-snapshot-bundle/v1',
+      bundleId, eventFileDigest: snapshotManifest.eventFileDigest, eventCount: snapshotManifest.eventCount,
+      eventSetDigest: snapshotManifest.eventSetDigest, revisionDigest: canonicalDigest(revisionManifest),
+      snapshotDigest: canonicalDigest(snapshotManifest) }, null, 2)}\n`, { mode: 0o600 });
+    return { revisionPath, snapshotPath };
+  };
+  const sourceFiles = writeBundle(sourceBundle, 'live-source-bundle', sourceRevision, sourceSnapshot);
+  const targetFiles = writeBundle(targetBundle, 'live-target-bundle', targetRevision, targetSnapshot);
   return item.write({ schema: 'amf.m4-live-reconciliation-operator/v1', artifactRoot: item.artifactRoot,
     manifestId: 'live-reconciliation-one', revision: 1, gateInputPath: item.write(prerequisites.gateInput),
     legacyCompletionPath: item.write(prerequisites.legacy), legacyCompletionKeyPath: item.write(prerequisites.legacyKey),
     nativePhaseCompletionPath: item.write(prerequisites.native), nativePhaseCompletionKeyPath: item.write(prerequisites.nativeKey),
     sourceStaticEvidencePath: item.write(evidence), targetStaticEvidencePath: item.write(evidence), sourceEventsPath,
-    targetEventsPath, sourceSnapshotManifestPath: item.write(sourceSnapshot), sourceSnapshotTrustAnchorPath: item.write(sourceSnapshotKey),
-    targetSnapshotManifestPath: item.write(targetSnapshot), targetSnapshotTrustAnchorPath: item.write(targetSnapshotKey),
-    sourceRevisionManifestPath: item.write(sourceRevision), sourceRevisionTrustAnchorPath: item.write(sourceRevisionKey),
-    targetRevisionManifestPath: item.write(targetRevision), targetRevisionTrustAnchorPath: item.write(targetRevisionKey),
+    targetEventsPath, sourceSnapshotManifestPath: sourceFiles.snapshotPath, sourceSnapshotTrustAnchorPath: item.write(sourceSnapshotKey),
+    targetSnapshotManifestPath: targetFiles.snapshotPath, targetSnapshotTrustAnchorPath: item.write(targetSnapshotKey),
+    sourceRevisionManifestPath: sourceFiles.revisionPath, sourceRevisionTrustAnchorPath: item.write(sourceRevisionKey),
+    targetRevisionManifestPath: targetFiles.revisionPath, targetRevisionTrustAnchorPath: item.write(targetRevisionKey),
     reconciliationKeyPath: item.write(reconciliationKey), maxVisitedEvents: 100,
     maxMismatchSamples: 10 }, 'reconciliation-config.json');
 }
@@ -145,6 +165,19 @@ async function execute(stage, configPath, dependencies) {
   const plan = await planM4LiveOperator({ stage, configPath }, selected);
   const result = await runM4LiveOperator({ stage, configPath, confirmedPlanDigest: plan.confirmationDigest }, selected);
   return { plan, result };
+}
+
+function refreshBundleMarker(config, role) {
+  const eventsPath = config[`${role}EventsPath`];
+  const revisionPath = config[`${role}RevisionManifestPath`];
+  const snapshotPath = config[`${role}SnapshotManifestPath`];
+  const markerPath = path.join(path.dirname(eventsPath), 'complete.json');
+  const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+  const revisionManifest = JSON.parse(fs.readFileSync(revisionPath, 'utf8'));
+  const snapshotManifest = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+  fs.writeFileSync(markerPath, `${JSON.stringify({ ...marker, eventFileDigest: snapshotManifest.eventFileDigest,
+    eventCount: snapshotManifest.eventCount, eventSetDigest: snapshotManifest.eventSetDigest,
+    revisionDigest: canonicalDigest(revisionManifest), snapshotDigest: canonicalDigest(snapshotManifest) }, null, 2)}\n`);
 }
 
 test('recovery plan is side-effect free and run writes one immutable owner-only artifact', async t => {
@@ -205,6 +238,7 @@ test('matching truncated snapshots cannot satisfy signed completeness attestatio
     ...accumulator.finish(), eventFileDigest: privateFileDigest(config.sourceEventsPath),
     staticEvidenceDigest: canonicalDigest(JSON.parse(fs.readFileSync(config.sourceStaticEvidencePath, 'utf8'))) }, signingKey);
   fs.writeFileSync(config.sourceSnapshotManifestPath, `${JSON.stringify(forgedCompleteness)}\n`);
+  refreshBundleMarker(config, 'source');
   const plan = await planM4LiveOperator({ stage: 'reconciliation', configPath }, RECONCILIATION_CLOCK);
   await assert.rejects(() => runM4LiveOperator({ stage: 'reconciliation', configPath,
     confirmedPlanDigest: plan.confirmationDigest }, RECONCILIATION_CLOCK));
@@ -232,9 +266,10 @@ test('same-inode snapshot mutation after anchoring fails before completeness can
   const accumulator = createM4ReconciliationEventAccumulator(); accumulator.add(first);
   const manifest = { ...accumulator.finish(), eventFileDigest: privateFileDigest(file) };
   const resource = openM4ReconciliationSnapshot(file, manifest);
+  assert.equal(descriptorsFor(file).length, 1);
   fs.writeFileSync(file, `${JSON.stringify(changed)}\n`);
   await assert.rejects(async () => { for await (const ignored of resource.events) void ignored; });
-  await resource.close();
+  await resource.close(); assert.equal(descriptorsFor(file).length, 0);
 });
 
 test('an attested empty archive snapshot completes without a sentinel row', async t => {
@@ -244,6 +279,7 @@ test('an attested empty archive snapshot completes without a sentinel row', asyn
     eventFileDigest: privateFileDigest(file, 'empty_snapshot_invalid', { minBytes: 0 }) });
   const rows = []; for await (const value of resource.events) rows.push(value);
   resource.verifyComplete(); await resource.close(); assert.deepEqual(rows, []);
+  assert.equal(descriptorsFor(file).length, 0);
 });
 
 test('canary records truthful passed and failed outcomes without exposing aggregate details', async t => {
@@ -301,6 +337,7 @@ test('zero-padded HMAC-equivalent authorities are rejected across snapshot roles
   const { integrity, ...body } = target; void integrity;
   fs.writeFileSync(config.targetSnapshotTrustAnchorPath, `${JSON.stringify(equivalent)}\n`);
   fs.writeFileSync(config.targetSnapshotManifestPath, `${JSON.stringify(createM4ReconciliationSnapshot(body, equivalent))}\n`);
+  refreshBundleMarker(config, 'target');
   await assert.rejects(() => planM4LiveOperator({ stage: 'reconciliation', configPath }, RECONCILIATION_CLOCK),
     { code: 'm4_live_operator_reconciliation_key_separation_invalid' });
 });
