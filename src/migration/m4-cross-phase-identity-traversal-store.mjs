@@ -28,6 +28,43 @@ function group(value, code) { const safe=clone(value,code); if (!exact(safe,['se
 function chain(result, prior) { return digest(['amf.m4-cross-phase-identity-traversal-store/v1/chain',prior,result]); }
 function traversalDigest(value) { return digest(['amf.m4-cross-phase-identity-traversal-store/v1/traversal',value.traversalChain,value.acceptedGroupCount,value.excludedGroupCount]); }
 function initial(bindingValue) { const traversalChain=digest(['amf.m4-cross-phase-identity-traversal-store/v1/chain','initial',bindingValue]); return { schema:SCHEMA,binding:clone(bindingValue,'m4_cross_phase_identity_traversal_store_state_invalid'),sequence:0,checkpoint:null,acceptedGroupCount:0,excludedGroupCount:0,traversalChain,traversalDigest:digest(['amf.m4-cross-phase-identity-traversal-store/v1/traversal',traversalChain,0,0]),lastResultDigest:null,complete:false,record:null }; }
+
+// A runner can replay a bounded, content-free prefix after a restart and
+// compare it to the durable aggregate before it appends a new checkpoint.
+// Keeping this derivation here prevents a second implementation of the chain
+// format from becoming an unaudited source of resume drift.
+export function createM4CrossPhaseIdentityTraversalPrefixAccumulator(input = {}) {
+  const safeBinding = binding(input, 'm4_cross_phase_identity_traversal_store_dependency_invalid');
+  let value = initial(safeBinding);
+  return Object.freeze({
+    append(inputGroup = {}) {
+      const next = group(inputGroup, 'm4_cross_phase_identity_traversal_store_group_invalid');
+      if (next.sequence !== value.sequence + 1) fail('m4_cross_phase_identity_traversal_store_gap');
+      value = {
+        ...value,
+        sequence: next.sequence,
+        checkpoint: next.checkpoint,
+        acceptedGroupCount: value.acceptedGroupCount + (next.outcome === 'accepted' ? 1 : 0),
+        excludedGroupCount: value.excludedGroupCount + (next.outcome === 'excluded' ? 1 : 0),
+        traversalChain: chain(next.checkpoint.digest, value.traversalChain),
+        lastResultDigest: next.checkpoint.digest,
+      };
+      value.traversalDigest = traversalDigest(value);
+      return clone(value, 'm4_cross_phase_identity_traversal_store_state_invalid');
+    },
+    snapshot() { return clone(value, 'm4_cross_phase_identity_traversal_store_state_invalid'); },
+    matches(stateValue) {
+      const safeState = state(stateValue, safeBinding, 'm4_cross_phase_identity_traversal_store_state_invalid');
+      return safeState.sequence === value.sequence
+        && safeState.acceptedGroupCount === value.acceptedGroupCount
+        && safeState.excludedGroupCount === value.excludedGroupCount
+        && safeState.traversalChain === value.traversalChain
+        && safeState.traversalDigest === value.traversalDigest
+        && same(safeState.checkpoint, value.checkpoint)
+        && safeState.lastResultDigest === value.lastResultDigest;
+    },
+  });
+}
 function state(value, expected, code) {
   const safe=clone(value,code); if (!exact(safe,['schema','binding','sequence','checkpoint','acceptedGroupCount','excludedGroupCount','traversalChain','traversalDigest','lastResultDigest','complete','record']) || safe.schema !== SCHEMA || !same(binding(safe.binding,code),expected) || !Number.isSafeInteger(safe.sequence) || safe.sequence < 0 || safe.sequence > 2_000_000 || !Number.isSafeInteger(safe.acceptedGroupCount) || safe.acceptedGroupCount < 0 || !Number.isSafeInteger(safe.excludedGroupCount) || safe.excludedGroupCount < 0 || safe.acceptedGroupCount + safe.excludedGroupCount !== safe.sequence || !DIGEST.test(safe.traversalChain) || !DIGEST.test(safe.traversalDigest) || safe.traversalDigest !== traversalDigest(safe) || !(safe.sequence === 0 ? safe.checkpoint === null && safe.lastResultDigest === null : safe.checkpoint !== null && typeof safe.lastResultDigest === 'string' && DIGEST.test(safe.lastResultDigest)) || typeof safe.complete !== 'boolean' || !((safe.complete && safe.record !== null) || (!safe.complete && safe.record === null))) fail(code);
   if (safe.checkpoint !== null) { checkpoint(safe.checkpoint,code); if (safe.checkpoint.digest !== safe.lastResultDigest || safe.checkpoint.id !== `m4id-${safe.lastResultDigest.slice(7)}`) fail(code); }

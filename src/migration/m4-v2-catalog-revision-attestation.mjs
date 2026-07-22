@@ -47,6 +47,28 @@ function timestampKey(value) {
   if (!match) fail('m4_v2_catalog_attestation_catalog_invalid');
   return `${match[1]}.${(match[2] ?? '').padEnd(9, '0')}`;
 }
+export function createM4V2CatalogRevisionAccumulator() {
+  let groups=0; let observations=0; let coveredThrough=null;
+  let chain=digest(['amf.m4-v2-catalog-revision-attestation/v2/chain','initial']);
+  return Object.freeze({
+    append(group) {
+      if (!group || !group.logical || !Array.isArray(group.observations)) fail('m4_v2_catalog_attestation_catalog_invalid');
+      groups+=1; observations+=group.observations.length;
+      if (groups>MAX_GROUPS || observations>MAX_OBSERVATIONS) fail('m4_v2_catalog_attestation_bounds_exceeded');
+      for (const observation of group.observations) {
+        const timestamp=observation.projection.editedAt??observation.projection.occurredAt;
+        if (timestamp===null) fail('m4_v2_catalog_attestation_observation_timestamp_missing');
+        const effective=utcTimestamp(timestamp,'m4_v2_catalog_attestation_catalog_invalid');
+        if (coveredThrough===null||timestampKey(effective)>timestampKey(coveredThrough)) coveredThrough=effective;
+      }
+      chain=digest(['amf.m4-v2-catalog-revision-attestation/v2/chain',chain,group.logical.logicalMessageId,digest(group)]);
+    },
+    traversal(pageLimit) {
+      if (!Number.isSafeInteger(pageLimit)||pageLimit<1||pageLimit>100) fail('m4_v2_catalog_attestation_input_invalid');
+      return {pageLimit,groupCount:groups,observationCount:observations,finalChain:chain,coveredThrough,catalogRevisionDigest:digest(['amf.m4-v2-catalog-revision-attestation/v2/revision',groups,observations,chain,coveredThrough])};
+    },
+  });
+}
 function traversal(value, schema, code) {
   const v1 = schema === M4_V2_CATALOG_REVISION_ATTESTATION_V1_SCHEMA;
   if (!exact(value, v1 ? ['pageLimit', 'groupCount', 'observationCount', 'finalChain', 'catalogRevisionDigest'] : ['pageLimit', 'groupCount', 'observationCount', 'finalChain', 'coveredThrough', 'catalogRevisionDigest'])
@@ -88,8 +110,7 @@ function dependencies(input) {
 export async function attestM4V2CatalogRevision(input = {}) {
   const safe = dependencies(input);
   try {
-    let after = null; let groups = 0; let observations = 0; let coveredThrough = null;
-    let chain = digest(['amf.m4-v2-catalog-revision-attestation/v2/chain', 'initial']);
+    let after = null; const accumulator=createM4V2CatalogRevisionAccumulator();
     while (true) {
       let page; try { page = await safe.list({ after, limit: safe.pageLimit }); } catch { fail('m4_v2_catalog_attestation_catalog_failed'); }
       if (!exact(page, ['items', 'next']) || !Array.isArray(page.items) || page.items.length > safe.pageLimit
@@ -105,24 +126,13 @@ export async function attestM4V2CatalogRevision(input = {}) {
       if (page.items.length === 0) break;
       for (const candidate of page.items) {
         let group; try { group = buildM4V2LogicalGroup(candidate.logical, candidate.observations); } catch { fail('m4_v2_catalog_attestation_catalog_invalid'); }
-        groups += 1; observations += group.observations.length;
-        if (groups > MAX_GROUPS || observations > MAX_OBSERVATIONS) fail('m4_v2_catalog_attestation_bounds_exceeded');
-        const groupDigest = digest(group);
-        for (const observation of group.observations) {
-          const timestamp = observation.projection.editedAt ?? observation.projection.occurredAt;
-          if (timestamp === null) fail('m4_v2_catalog_attestation_observation_timestamp_missing');
-          const effective = utcTimestamp(timestamp, 'm4_v2_catalog_attestation_catalog_invalid');
-          if (coveredThrough === null || timestampKey(effective) > timestampKey(coveredThrough)) coveredThrough = effective;
-        }
-        chain = digest(['amf.m4-v2-catalog-revision-attestation/v2/chain', chain, group.logical.logicalMessageId, groupDigest]);
+        accumulator.append(group);
       }
       if (page.next === null) break;
       after = page.next;
     }
     const safePayload = payload({ schema: M4_V2_CATALOG_REVISION_ATTESTATION_SCHEMA,
-      traversal: { pageLimit: safe.pageLimit, groupCount: groups, observationCount: observations,
-        finalChain: chain, coveredThrough,
-        catalogRevisionDigest: digest(['amf.m4-v2-catalog-revision-attestation/v2/revision', groups, observations, chain, coveredThrough]) } }, 'm4_v2_catalog_attestation_invalid');
+      traversal: accumulator.traversal(safe.pageLimit) }, 'm4_v2_catalog_attestation_invalid');
     const payloadDigest = digest(safePayload);
     return { ...safePayload, integrity: { algorithm: 'hmac-sha256', keyId: safe.key.keyId, payloadDigest,
       signature: signature(integrityDomain(safePayload.schema), payloadDigest, safe.key) } };
