@@ -25,7 +25,14 @@ those keys. A trust anchor may not reuse either the key identifier or key
 material of the preservation, cleanup, or cutover signer it constrains.
 
 Validity timestamps use strict UTC calendar validation, including leap-year and
-nanosecond rules; nonexistent dates are rejected rather than normalized.
+nanosecond rules; nonexistent dates are rejected rather than normalized. Each
+authority window is limited to seven exact days.
+
+Offline evidence timestamps do not establish wall-clock freshness by
+themselves. Any cutover or cleanup executor must compare its trusted current UTC
+time with `validThrough` and re-verify the snapshot immediately before acting.
+Back-dating `provedAt`, `authorizedAt`, or `inventoriedAt` never extends an
+expired authority window.
 
 The collectors accept abstract read-only sources and do not contain a live
 database adapter, service address, credential, route switch, or mutation. The

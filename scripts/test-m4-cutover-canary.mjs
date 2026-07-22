@@ -58,4 +58,5 @@ test('tamper, wrong key id, wrong key material, and extra fields fail closed', (
 test('hostile input and malformed verifier values expose fixed errors', () => {
   assert.throws(() => createM4CutoverCanaryManifest(new Proxy({}, { get() { throw new Error('private'); } })), /m4_cutover_canary_input_invalid/);
   assert.throws(() => verifyM4CutoverCanaryManifest({}, key()), /m4_cutover_canary_manifest_invalid/);
+  assert.throws(() => verifyM4CutoverCanaryManifest({ uncloneable: () => 'private' }, key()), error => error.code === 'm4_cutover_canary_manifest_invalid');
 });

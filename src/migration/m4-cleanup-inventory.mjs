@@ -153,7 +153,7 @@ export function createM4CleanupInventory(value, authorities) {
 
 export function verifyM4CleanupInventory(value, cleanupKeyDocument) {
   let manifest; try { manifest = signed(structuredClone(value), 'm4_cleanup_inventory_manifest_invalid'); }
-  catch (error) { if (error?.code) throw error; fail('m4_cleanup_inventory_manifest_invalid'); }
+  catch (error) { if (typeof error?.code === 'string' && error.code.startsWith('m4_')) throw error; fail('m4_cleanup_inventory_manifest_invalid'); }
   const loaded = keyDocument(structuredClone(cleanupKeyDocument), 'm4_cleanup_inventory_key_invalid');
   try {
     if (manifest.integrity.keyId !== loaded.keyId) fail('m4_cleanup_inventory_key_id_mismatch');
@@ -215,7 +215,7 @@ export function createM4CleanupManifest(value) {
 export function verifyM4CleanupManifest(value, migrationKeyDocument) {
   let item;
   try { item = snapshot(structuredClone(value), ['schema', 'manifestId', 'phase', 'revision', 'cleanup', 'integrity'], 'm4_cleanup_manifest_invalid'); }
-  catch (error) { if (error?.code) throw error; fail('m4_cleanup_manifest_invalid'); }
+  catch (error) { if (typeof error?.code === 'string' && error.code.startsWith('m4_')) throw error; fail('m4_cleanup_manifest_invalid'); }
   const body = cleanupManifestPayload({ schema: item.schema, manifestId: item.manifestId, phase: item.phase, revision: item.revision, cleanup: item.cleanup }, 'm4_cleanup_manifest_invalid');
   const integrity = snapshot(item.integrity, ['algorithm', 'keyId', 'payloadDigest', 'signature'], 'm4_cleanup_manifest_invalid');
   if (integrity.algorithm !== 'hmac-sha256' || !ID.test(integrity.keyId) || !DIGEST.test(integrity.payloadDigest) || !SIGNATURE.test(integrity.signature)) fail('m4_cleanup_manifest_invalid');

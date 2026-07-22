@@ -79,6 +79,7 @@ test('tamper, wrong authority, extras, and hostile values fail closed', async ()
   const second = await input(); assert.throws(() => verifyM4PreservationProof(createM4PreservationProof(second, authorities()), key('other-key', 2)), /m4_preservation_proof_key_id_mismatch/);
   const extra = await input(); extra.command = 'never'; assert.throws(() => createM4PreservationProof(extra, authorities()), /m4_preservation_proof_input_invalid/);
   assert.throws(() => createM4PreservationProof(new Proxy({}, { get() { throw new Error('private'); } }), authorities()), /m4_preservation_proof_input_invalid/);
+  assert.throws(() => verifyM4PreservationProof({ uncloneable: () => 'private' }, key()), error => error.code === 'm4_preservation_proof_manifest_invalid');
 });
 
 test('scope trust anchor cannot be supplied by the claimant or reuse preservation authority', async () => {

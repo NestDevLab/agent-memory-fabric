@@ -52,6 +52,8 @@ test('tamper, wrong authority, unsafe projection, extras, and hostile input fail
   assert.throws(() => m4CleanupManifestEvidence(clean, fixture.keys.cleanup, changedCutover, fixture.keys.authorization), /m4_cleanup_inventory_projection_invalid/);
   const extra = structuredClone(value); extra.glob = '*'; assert.throws(() => createM4CleanupInventory(extra, authorities), /m4_cleanup_inventory_input_invalid/);
   assert.throws(() => createM4CleanupInventory(new Proxy({}, { get() { throw new Error('private'); } }), authorities), /m4_cleanup_inventory_input_invalid/);
+  assert.throws(() => verifyM4CleanupInventory({ uncloneable: () => 'private' }, fixture.keys.cleanup), error => error.code === 'm4_cleanup_inventory_manifest_invalid');
+  assert.throws(() => verifyM4CleanupManifest({ uncloneable: () => 'private' }, fixture.keys.cleanup), error => error.code === 'm4_cleanup_manifest_invalid');
 });
 
 test('inventory rejects stale and tampered catalog authority evidence', async () => {

@@ -39,6 +39,7 @@ test('tamper, wrong authority, extras, and hostile inputs fail closed', async ()
   assert.throws(() => verifyM4CutoverAuthorization(authorize(fixture), keyDocument('other-authorization-key', 8)), /m4_cutover_authorization_key_id_mismatch/);
   const extra = structuredClone(fixture.authorizationInput); extra.path = '/forbidden'; assert.throws(() => createM4CutoverAuthorization(extra, { selectorScopeKeyDocument: fixture.keys.selectorScope }), /m4_cutover_authorization_input_invalid/);
   assert.throws(() => createM4CutoverAuthorization(new Proxy({}, { get() { throw new Error('private'); } }), { selectorScopeKeyDocument: fixture.keys.selectorScope }), /m4_cutover_authorization_input_invalid/);
+  assert.throws(() => verifyM4CutoverAuthorization({ uncloneable: () => 'private' }, fixture.keys.authorization), error => error.code === 'm4_cutover_authorization_manifest_invalid');
 });
 
 test('authorization re-verifies the exact authoritative selector scope and freshness', async () => {
