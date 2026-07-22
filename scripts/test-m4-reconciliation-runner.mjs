@@ -70,10 +70,13 @@ function nativeCompletion(gateInput, legacy, receiptMarker = 'receipts') {
   const payload = { schema: 'amf.m4-native-paused-phase-completion/v1', state: 'complete',
     runId: 'native-phase-runner', gateEvidenceDigest: gateDigest(gateInput),
     catalogDigest: sha('catalog'), legacyCompletionDigest: sha(legacy),
+    registryAuthorityDigest: sha('registry-authority'), sourceTagAuthorityDigest: sha('source-tag-authority'),
     receiptKeyId: 'receipt-key-runner', receiptDigest: sha(receiptMarker) };
   const checkpointDigest = sha({ schema: 'amf.m4-native-paused-phase-final-checkpoint/v1',
     runId: payload.runId, gateEvidenceDigest: payload.gateEvidenceDigest,
     catalogDigest: payload.catalogDigest, legacyCompletionDigest: payload.legacyCompletionDigest,
+    registryAuthorityDigest: payload.registryAuthorityDigest,
+    sourceTagAuthorityDigest: payload.sourceTagAuthorityDigest,
     receiptKeyId: payload.receiptKeyId, receiptDigest: payload.receiptDigest });
   payload.checkpoint = { id: `m4nativephase-${checkpointDigest.slice(7)}`, digest: checkpointDigest };
   const evidenceDigest = sha({ schema: 'amf.m4-native-paused-phase-completion-evidence/v1',
