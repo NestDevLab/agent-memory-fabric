@@ -26,6 +26,7 @@
     "test:conversation-archive": "node --test scripts/test-conversation-archive-v1-adapters.mjs",
     "test:m4-reconciliation": "node --test scripts/test-m4-reconciliation-reader.mjs",
     "test:m4-reconciliation-manifest": "node --test scripts/test-m4-reconciliation-manifest.mjs",
+    "test:m4-recovery-pair": "node --test scripts/test-m4-recovery-pair.mjs",
     "test:m4-backfill-coordinator": "node --test scripts/test-m4-backfill-coordinator.mjs",
     "test:m4-v2-backfill-runner": "node --test scripts/test-m4-v2-backfill-runner.mjs",
     "test:m4-v2-backfill-operator": "node --test scripts/test-m4-v2-backfill-operator.mjs",

@@ -193,7 +193,8 @@ export function createM4ReconciliationManifest(value) {
   }
   const verified = verifiedEvidence(item);
   const key = signingKey(item.reconciliationKeyDocument, 'm4_reconciliation_manifest_key_invalid');
-  const reconciliation = reconciliationBody({
+  try {
+    const reconciliation = reconciliationBody({
     state: report.state,
     pauseEvidence: evidenceFor(verified.pauseManifest),
     rollbackEvidence: evidenceFor(verified.rollbackManifest),
@@ -211,28 +212,24 @@ export function createM4ReconciliationManifest(value) {
     reconciliation,
   }, 'm4_reconciliation_manifest_report_invalid');
   const payloadDigest = digest(payload);
-  return {
-    ...payload,
-    integrity: {
-      algorithm: 'hmac-sha256',
-      keyId: key.keyId,
-      payloadDigest,
-      signature: signatureFor(payloadDigest, key),
-    },
-  };
+    return { ...payload, integrity: { algorithm: 'hmac-sha256', keyId: key.keyId,
+      payloadDigest, signature: signatureFor(payloadDigest, key) } };
+  } finally { key.key.fill(0); }
 }
 
 export function verifyM4ReconciliationManifest(value, keyDocument) {
   const manifest = manifestWithIntegrity(value);
   const key = signingKey(keyDocument, 'm4_reconciliation_manifest_key_invalid');
-  if (manifest.integrity.keyId !== key.keyId) fail('m4_reconciliation_manifest_key_id_mismatch');
-  const { integrity, ...payload } = manifest;
-  const payloadDigest = digest(payload);
-  if (payloadDigest !== integrity.payloadDigest) fail('m4_reconciliation_manifest_digest_mismatch');
-  const expected = Buffer.from(signatureFor(payloadDigest, key), 'base64url');
-  const received = Buffer.from(integrity.signature, 'base64url');
-  if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) {
-    fail('m4_reconciliation_manifest_signature_mismatch');
-  }
-  return structuredClone(manifest);
+  try {
+    if (manifest.integrity.keyId !== key.keyId) fail('m4_reconciliation_manifest_key_id_mismatch');
+    const { integrity, ...payload } = manifest;
+    const payloadDigest = digest(payload);
+    if (payloadDigest !== integrity.payloadDigest) fail('m4_reconciliation_manifest_digest_mismatch');
+    const expected = Buffer.from(signatureFor(payloadDigest, key), 'base64url');
+    const received = Buffer.from(integrity.signature, 'base64url');
+    if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) {
+      fail('m4_reconciliation_manifest_signature_mismatch');
+    }
+    return structuredClone(manifest);
+  } finally { key.key.fill(0); }
 }
