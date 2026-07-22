@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
 import { verifyM4ReconciliationManifest } from './m4-reconciliation-manifest.mjs';
 
-const SCHEMA = 'amf.migration-manifest/v1';
+const SCHEMA = 'amf.m4-recovery-pair/v1';
 const KEY_SCHEMA = 'amf.migration-signing-key/v1';
 const DOMAIN = 'amf.migration-manifest/v1/integrity';
 const ID = /^[a-z][a-z0-9-]{2,79}$/;
@@ -60,17 +60,17 @@ function distinctArchives(records, code) {
   }
 }
 function payload(value, code) {
-  const item = snapshot(value, ['schema', 'manifestId', 'phase', 'revision', 'reconciliationEvidence', 'archives'], code);
-  if (item.schema !== SCHEMA || item.phase !== 'recovery' || typeof item.manifestId !== 'string' || !ID.test(item.manifestId) || !Number.isSafeInteger(item.revision) || item.revision < 1 || !Array.isArray(item.archives) || item.archives.length !== 2) fail(code);
+  const item = snapshot(value, ['schema', 'manifestId', 'revision', 'reconciliationEvidence', 'archives'], code);
+  if (item.schema !== SCHEMA || typeof item.manifestId !== 'string' || !ID.test(item.manifestId) || !Number.isSafeInteger(item.revision) || item.revision < 1 || !Array.isArray(item.archives) || item.archives.length !== 2) fail(code);
   const evidence = snapshot(item.reconciliationEvidence, ['manifestId', 'digest', 'signature'], code);
   if (typeof evidence.manifestId !== 'string' || !ID.test(evidence.manifestId) || typeof evidence.digest !== 'string' || !DIGEST.test(evidence.digest) || typeof evidence.signature !== 'string' || !SIGNATURE.test(evidence.signature)) fail(code);
   const archives = ARCHIVES.map((archive, index) => record(item.archives[index], archive, code));
   distinctArchives(archives, code);
-  return { schema: SCHEMA, manifestId: item.manifestId, phase: 'recovery', revision: item.revision, reconciliationEvidence: evidence, archives };
+  return { schema: SCHEMA, manifestId: item.manifestId, revision: item.revision, reconciliationEvidence: evidence, archives };
 }
 function signedManifest(value, code) {
-  const item = snapshot(value, ['schema', 'manifestId', 'phase', 'revision', 'reconciliationEvidence', 'archives', 'integrity'], code);
-  const body = payload({ schema: item.schema, manifestId: item.manifestId, phase: item.phase, revision: item.revision, reconciliationEvidence: item.reconciliationEvidence, archives: item.archives }, code);
+  const item = snapshot(value, ['schema', 'manifestId', 'revision', 'reconciliationEvidence', 'archives', 'integrity'], code);
+  const body = payload({ schema: item.schema, manifestId: item.manifestId, revision: item.revision, reconciliationEvidence: item.reconciliationEvidence, archives: item.archives }, code);
   const integrity = snapshot(item.integrity, ['algorithm', 'keyId', 'payloadDigest', 'signature'], code);
   if (integrity.algorithm !== 'hmac-sha256' || typeof integrity.keyId !== 'string' || !ID.test(integrity.keyId) || typeof integrity.payloadDigest !== 'string' || !DIGEST.test(integrity.payloadDigest) || typeof integrity.signature !== 'string' || !SIGNATURE.test(integrity.signature)) fail(code);
   return { ...body, integrity };
@@ -84,7 +84,7 @@ export function createM4RecoveryPairManifest(value) {
   if (reconciliation.reconciliation.state !== 'complete' || reconciliation.reconciliation.completeness !== 1 || reconciliation.reconciliation.tolerance !== 0 || reconciliation.reconciliation.unresolvedMismatchCount !== 0) fail('m4_recovery_pair_reconciliation_incomplete');
   const key = keyDocument(item.recoveryKeyDocument, 'm4_recovery_pair_key_invalid');
   try {
-    const body = payload({ schema: SCHEMA, manifestId: item.manifestId, phase: 'recovery', revision: item.revision, reconciliationEvidence: reconciliationEvidence(reconciliation, 'm4_recovery_pair_reconciliation_invalid'), archives: [item.legacyRecord, item.v3Record] }, 'm4_recovery_pair_record_invalid');
+    const body = payload({ schema: SCHEMA, manifestId: item.manifestId, revision: item.revision, reconciliationEvidence: reconciliationEvidence(reconciliation, 'm4_recovery_pair_reconciliation_invalid'), archives: [item.legacyRecord, item.v3Record] }, 'm4_recovery_pair_record_invalid');
     const payloadDigest = digest(body);
     return { ...body, integrity: { algorithm: 'hmac-sha256', keyId: key.keyId, payloadDigest, signature: signatureFor(payloadDigest, key) } };
   } finally { key.key.fill(0); }
