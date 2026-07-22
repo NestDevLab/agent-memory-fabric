@@ -1,9 +1,10 @@
 import crypto from 'node:crypto';
 
-import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
+import { canonicalJson, strictIsoTimestamp } from '../ingest/transcripts/canonical.mjs';
 import { buildM4V2LogicalGroup } from './m4-v2-catalog-groups.mjs';
 
-export const M4_V2_CATALOG_REVISION_ATTESTATION_SCHEMA = 'amf.m4-v2-catalog-revision-attestation/v1';
+export const M4_V2_CATALOG_REVISION_ATTESTATION_SCHEMA = 'amf.m4-v2-catalog-revision-attestation/v2';
+const M4_V2_CATALOG_REVISION_ATTESTATION_V1_SCHEMA = 'amf.m4-v2-catalog-revision-attestation/v1';
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const LOGICAL_ID = /^lmsg_[a-f0-9]{64}$/;
@@ -18,6 +19,7 @@ function exact(value, keys) { return plain(value) && Object.keys(value).length =
 function clone(value, code) { try { return structuredClone(value); } catch { fail(code); } }
 function digest(value) { return `sha256:${crypto.createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex')}`; }
 function signature(domain, payloadDigest, key) { return crypto.createHmac('sha256', key.key).update(canonicalJson([domain, payloadDigest, key.keyId]), 'utf8').digest('base64url'); }
+function integrityDomain(schema) { return `${schema}/integrity`; }
 function equal(left, right) { const a = Buffer.from(left, 'base64url'); const b = Buffer.from(right, 'base64url'); return a.length === b.length && crypto.timingSafeEqual(a, b); }
 
 function signingKey(value, code) {
@@ -29,20 +31,43 @@ function signingKey(value, code) {
   return { keyId: safe.keyId, key };
 }
 
-function traversal(value, code) {
-  if (!exact(value, ['pageLimit', 'groupCount', 'observationCount', 'finalChain', 'catalogRevisionDigest'])
+function utcTimestamp(value, code) {
+  if (strictIsoTimestamp(value) !== value) fail(code);
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  const epochMilliseconds = match ? Date.parse(`${match[1]}${match[3]}`) : NaN;
+  if (!Number.isFinite(epochMilliseconds)) fail(code);
+  const epochNanoseconds = BigInt(epochMilliseconds) * 1_000_000n + BigInt((match[2] ?? '').padEnd(9, '0') || '0');
+  if (epochNanoseconds < 0n) fail(code);
+  const instant = new Date(Number(epochNanoseconds / 1_000_000n)); if (Number.isNaN(instant.getTime())) fail(code);
+  const fraction = (epochNanoseconds % 1_000_000_000n).toString().padStart(9, '0').replace(/0+$/, '');
+  return `${instant.toISOString().slice(0, 19)}${fraction ? `.${fraction}` : ''}Z`;
+}
+function timestampKey(value) {
+  const match = /^(.*?)(?:\.(\d{1,9}))?Z$/.exec(value);
+  if (!match) fail('m4_v2_catalog_attestation_catalog_invalid');
+  return `${match[1]}.${(match[2] ?? '').padEnd(9, '0')}`;
+}
+function traversal(value, schema, code) {
+  const v1 = schema === M4_V2_CATALOG_REVISION_ATTESTATION_V1_SCHEMA;
+  if (!exact(value, v1 ? ['pageLimit', 'groupCount', 'observationCount', 'finalChain', 'catalogRevisionDigest'] : ['pageLimit', 'groupCount', 'observationCount', 'finalChain', 'coveredThrough', 'catalogRevisionDigest'])
     || !Number.isSafeInteger(value.pageLimit) || value.pageLimit < 1 || value.pageLimit > 100
     || !Number.isSafeInteger(value.groupCount) || value.groupCount < 0 || value.groupCount > MAX_GROUPS
     || !Number.isSafeInteger(value.observationCount) || value.observationCount < 0 || value.observationCount > MAX_OBSERVATIONS
-    || ![value.finalChain, value.catalogRevisionDigest].every(item => typeof item === 'string' && DIGEST.test(item))) fail(code);
+    || ![value.finalChain, value.catalogRevisionDigest].every(item => typeof item === 'string' && DIGEST.test(item))
+    || (!v1 && (value.coveredThrough !== null && strictIsoTimestamp(value.coveredThrough) !== value.coveredThrough
+      || (value.observationCount === 0) !== (value.coveredThrough === null)))) fail(code);
   const safe = clone(value, code);
-  if (safe.catalogRevisionDigest !== digest(['amf.m4-v2-catalog-revision-attestation/v1/revision', safe.groupCount, safe.observationCount, safe.finalChain])) fail(code);
+  if (!v1 && safe.coveredThrough !== null && utcTimestamp(safe.coveredThrough, code) !== safe.coveredThrough) fail(code);
+  const revision = v1
+    ? ['amf.m4-v2-catalog-revision-attestation/v1/revision', safe.groupCount, safe.observationCount, safe.finalChain]
+    : ['amf.m4-v2-catalog-revision-attestation/v2/revision', safe.groupCount, safe.observationCount, safe.finalChain, safe.coveredThrough];
+  if (safe.catalogRevisionDigest !== digest(revision)) fail(code);
   return safe;
 }
 
 function payload(value, code) {
-  if (!exact(value, ['schema', 'traversal']) || value.schema !== M4_V2_CATALOG_REVISION_ATTESTATION_SCHEMA) fail(code);
-  return { schema: value.schema, traversal: traversal(value.traversal, code) };
+  if (!exact(value, ['schema', 'traversal']) || ![M4_V2_CATALOG_REVISION_ATTESTATION_V1_SCHEMA, M4_V2_CATALOG_REVISION_ATTESTATION_SCHEMA].includes(value.schema)) fail(code);
+  return { schema: value.schema, traversal: traversal(value.traversal, value.schema, code) };
 }
 
 function document(value, code) {
@@ -63,8 +88,8 @@ function dependencies(input) {
 export async function attestM4V2CatalogRevision(input = {}) {
   const safe = dependencies(input);
   try {
-    let after = null; let groups = 0; let observations = 0;
-    let chain = digest(['amf.m4-v2-catalog-revision-attestation/v1/chain', 'initial']);
+    let after = null; let groups = 0; let observations = 0; let coveredThrough = null;
+    let chain = digest(['amf.m4-v2-catalog-revision-attestation/v2/chain', 'initial']);
     while (true) {
       let page; try { page = await safe.list({ after, limit: safe.pageLimit }); } catch { fail('m4_v2_catalog_attestation_catalog_failed'); }
       if (!exact(page, ['items', 'next']) || !Array.isArray(page.items) || page.items.length > safe.pageLimit
@@ -83,17 +108,24 @@ export async function attestM4V2CatalogRevision(input = {}) {
         groups += 1; observations += group.observations.length;
         if (groups > MAX_GROUPS || observations > MAX_OBSERVATIONS) fail('m4_v2_catalog_attestation_bounds_exceeded');
         const groupDigest = digest(group);
-        chain = digest(['amf.m4-v2-catalog-revision-attestation/v1/chain', chain, group.logical.logicalMessageId, groupDigest]);
+        for (const observation of group.observations) {
+          const timestamp = observation.projection.editedAt ?? observation.projection.occurredAt;
+          if (timestamp === null) fail('m4_v2_catalog_attestation_observation_timestamp_missing');
+          const effective = utcTimestamp(timestamp, 'm4_v2_catalog_attestation_catalog_invalid');
+          if (coveredThrough === null || timestampKey(effective) > timestampKey(coveredThrough)) coveredThrough = effective;
+        }
+        chain = digest(['amf.m4-v2-catalog-revision-attestation/v2/chain', chain, group.logical.logicalMessageId, groupDigest]);
       }
       if (page.next === null) break;
       after = page.next;
     }
     const safePayload = payload({ schema: M4_V2_CATALOG_REVISION_ATTESTATION_SCHEMA,
       traversal: { pageLimit: safe.pageLimit, groupCount: groups, observationCount: observations,
-        finalChain: chain, catalogRevisionDigest: digest(['amf.m4-v2-catalog-revision-attestation/v1/revision', groups, observations, chain]) } }, 'm4_v2_catalog_attestation_invalid');
+        finalChain: chain, coveredThrough,
+        catalogRevisionDigest: digest(['amf.m4-v2-catalog-revision-attestation/v2/revision', groups, observations, chain, coveredThrough]) } }, 'm4_v2_catalog_attestation_invalid');
     const payloadDigest = digest(safePayload);
     return { ...safePayload, integrity: { algorithm: 'hmac-sha256', keyId: safe.key.keyId, payloadDigest,
-      signature: signature('amf.m4-v2-catalog-revision-attestation/v1/integrity', payloadDigest, safe.key) } };
+      signature: signature(integrityDomain(safePayload.schema), payloadDigest, safe.key) } };
   } finally { safe.key.key.fill(0); }
 }
 
@@ -103,7 +135,7 @@ export function verifyM4V2CatalogRevisionAttestation(value, keyDocument) {
     if (safe.integrity.keyId !== key.keyId) fail('m4_v2_catalog_attestation_key_mismatch');
     const { integrity, ...unsigned } = safe; const payloadDigest = digest(unsigned);
     if (payloadDigest !== integrity.payloadDigest) fail('m4_v2_catalog_attestation_digest_mismatch');
-    if (!equal(integrity.signature, signature('amf.m4-v2-catalog-revision-attestation/v1/integrity', payloadDigest, key))) fail('m4_v2_catalog_attestation_signature_mismatch');
+    if (!equal(integrity.signature, signature(integrityDomain(safe.schema), payloadDigest, key))) fail('m4_v2_catalog_attestation_signature_mismatch');
     return clone(safe, 'm4_v2_catalog_attestation_invalid');
   } finally { key.key.fill(0); }
 }

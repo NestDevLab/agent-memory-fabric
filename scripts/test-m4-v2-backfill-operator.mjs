@@ -82,6 +82,7 @@ test('catalog revision attestation traverses a non-empty catalog deterministical
       const baseline = await attestM4V2CatalogRevision({ catalog: store.catalog, keyDocument: catalogKey, pageLimit: 1 });
       assert.deepEqual(baseline.traversal.groupCount, 3);
       assert.deepEqual(baseline.traversal.observationCount, 3);
+      assert.equal(baseline.traversal.coveredThrough, '2026-07-22T12:00:00Z');
 
       const reordered = {
         async listM4V2LogicalGroups(request) {
@@ -102,6 +103,28 @@ test('catalog revision attestation traverses a non-empty catalog deterministical
       const changedAttestation = await attestM4V2CatalogRevision({ catalog: changed, keyDocument: catalogKey, pageLimit: 1 });
       assert.notEqual(changedAttestation.traversal.finalChain, baseline.traversal.finalChain);
       assert.notEqual(changedAttestation.traversal.catalogRevisionDigest, baseline.traversal.catalogRevisionDigest);
+      const timed = {
+        async listM4V2LogicalGroups(request) {
+          const copy = structuredClone(store.catalog.listM4V2LogicalGroups(request));
+          for (const item of copy.items) for (const observation of item.observations) {
+            observation.projection.occurredAt = '2026-07-21T08:00:00Z';
+            observation.projection.editedAt = observation.eventId === copy.items[0].observations[0].eventId ? '2026-07-24T15:14:15.123456789+02:00' : null;
+          }
+          return copy;
+        },
+      };
+      const timedOne = await attestM4V2CatalogRevision({ catalog: timed, keyDocument: catalogKey, pageLimit: 1 });
+      const timedTwo = await attestM4V2CatalogRevision({ catalog: timed, keyDocument: catalogKey, pageLimit: 2 });
+      assert.equal(timedOne.traversal.coveredThrough, '2026-07-24T13:14:15.123456789Z');
+      assert.equal(timedTwo.traversal.coveredThrough, timedOne.traversal.coveredThrough);
+      const missingTimestamp = {
+        async listM4V2LogicalGroups(request) {
+          const copy = structuredClone(store.catalog.listM4V2LogicalGroups(request));
+          if (copy.items.length > 0) { copy.items[0].observations[0].projection.occurredAt = null; copy.items[0].observations[0].projection.editedAt = null; }
+          return copy;
+        },
+      };
+      await assert.rejects(() => attestM4V2CatalogRevision({ catalog: missingTimestamp, keyDocument: catalogKey, pageLimit: 1 }), { code: 'm4_v2_catalog_attestation_observation_timestamp_missing' });
     } finally { await store.close(); }
   } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
 });
@@ -164,6 +187,7 @@ test('v2 completion publishes only after a complete run with matching signed cat
       fs.readdirSync(stage).find(name => name.startsWith('v2catalog-'))), 'utf8'));
     const binding = deriveM4V2ArchiveRegistryBinding(artifact, key('archive-completion-k1', 22), baseline, key('catalog-attestation-k1', 21));
     assert.match(binding.completionDigest, /^sha256:/); assert.equal(binding.catalogRevisionDigest, baseline.traversal.catalogRevisionDigest);
+    assert.equal(baseline.traversal.coveredThrough, '2026-07-22T12:00:00Z');
     await assert.rejects(() => runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: completePlan.confirmationDigest }), { code: 'm4_operator_completion_artifact_exists' });
   } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
 });
