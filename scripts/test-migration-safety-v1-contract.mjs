@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import test from 'node:test';
 
 import { canonicalJson } from '../src/ingest/transcripts/canonical.mjs';
+import { createM4CleanupInventory, createM4CleanupManifest, verifyM4CleanupManifest } from '../src/migration/m4-cleanup-inventory.mjs';
+import { createM4CutoverAuthorization } from '../src/migration/m4-cutover-authorization.mjs';
+import { m4CutoverFixture } from './helpers/m4-cutover-fixtures.mjs';
 
 const schema = JSON.parse(fs.readFileSync(new URL('../config/contracts/amf.migration-manifest-v1.schema.json', import.meta.url), 'utf8'));
 const fixtures = JSON.parse(fs.readFileSync(new URL('./fixtures/migration-manifest-v1.conformance.json', import.meta.url), 'utf8'));
@@ -63,6 +66,19 @@ test('declared invalid fixtures fail schema or integrity at their declared safet
 });
 test('cleanup targets are exact identifiers and manifests exclude paths, globs, commands, and copy instructions', () => {
   const cleanup = fixtures.valid.find(item => item.phase === 'cleanup').cleanup; for (const target of cleanup.targets) assert.match(target.id, /^[a-z][a-z0-9-]{2,79}$/); const published = JSON.stringify(schema); assert.doesNotMatch(published, /(?:filesystem|shell command|data cop(?:y|ies)|glob)/i);
+});
+test('runtime M4 evidence projects into the existing cleanup phase without widening phase vocabulary', async () => {
+  const fixture = await m4CutoverFixture(); const cutover = createM4CutoverAuthorization(fixture.authorizationInput, { selectorScopeKeyDocument: fixture.keys.selectorScope });
+  const inventory = createM4CleanupInventory({ manifestId: 'runtime-cleanup-inventory', revision: 1, inventoriedAt: '2026-01-02T01:04:00Z', cutoverManifest: cutover,
+    cutoverKeyDocument: fixture.keys.authorization, preservationManifest: fixture.preservation, preservationKeyDocument: fixture.keys.preservation,
+    catalogSnapshotManifest: fixture.catalogSnapshot, targets: fixture.catalogSnapshot.eligibleTargets, cleanupKeyDocument: fixture.keys.cleanup },
+  { catalogSnapshotKeyDocument: fixture.keys.catalogSnapshot });
+  const manifest = createM4CleanupManifest({ manifestId: 'runtime-cleanup-manifest', revision: 1, inventory,
+    inventoryKeyDocument: fixture.keys.cleanup, cutoverAuthorization: cutover, cutoverKeyDocument: fixture.keys.authorization,
+    migrationKeyDocument: fixture.keys.cleanup });
+  assert.deepEqual(validate(manifest), []); assert.equal(manifest.phase, 'cleanup');
+  assert.deepEqual(Object.keys(manifest).filter(name => ['pause', 'rollback', 'reconciliation', 'cleanup'].includes(name)), ['cleanup']);
+  assert.deepEqual(verifyM4CleanupManifest(manifest, fixture.keys.cleanup), manifest);
 });
 test('public documents retain conflict controls and cover TLS, replay, and plaintext residual risks', () => {
   const conflict = docs['idempotency-conflict-resolution-v1.md']; for (const phrase of ['same stable ID', 'full payload digest', 'immutable conflict', 'outbox', 'acknowledgement', 'accept_existing', 'accept_received_as_replacement', 'reject_received', 'expected revision', 'append-only', 'fails resolution closed', 'No automatic resolution']) assert.match(conflict, new RegExp(phrase.replace(/ /g, '\\s+'), 'i'));
