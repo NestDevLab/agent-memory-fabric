@@ -57,9 +57,12 @@ function reconciliationPrerequisites(fixture) {
     targetCheckpoint: rollback.rollback.targetCheckpoint });
   const nativePayload = { schema: 'amf.m4-native-paused-phase-completion/v1', state: 'complete',
     runId: 'live-native-phase', gateEvidenceDigest, catalogDigest: sha('live-catalog'), legacyCompletionDigest: sha(legacy),
+    registryAuthorityDigest: sha('live-registry-authority'), sourceTagAuthorityDigest: sha('live-source-tag-authority'),
     receiptKeyId: 'live-receipt-key', receiptDigest: sha('live-receipts') };
   const finalDigest = sha({ schema: 'amf.m4-native-paused-phase-final-checkpoint/v1', runId: nativePayload.runId,
     gateEvidenceDigest, catalogDigest: nativePayload.catalogDigest, legacyCompletionDigest: nativePayload.legacyCompletionDigest,
+    registryAuthorityDigest: nativePayload.registryAuthorityDigest,
+    sourceTagAuthorityDigest: nativePayload.sourceTagAuthorityDigest,
     receiptKeyId: nativePayload.receiptKeyId, receiptDigest: nativePayload.receiptDigest });
   nativePayload.checkpoint = { id: `m4nativephase-${finalDigest.slice(7)}`, digest: finalDigest };
   const nativeDigest = sha({ schema: 'amf.m4-native-paused-phase-completion-evidence/v1',
