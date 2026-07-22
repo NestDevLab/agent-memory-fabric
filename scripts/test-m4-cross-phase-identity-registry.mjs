@@ -111,6 +111,27 @@ test('resolves a registered edit through its validated legacy predecessor', () =
   assert.deepEqual(resolved.conflictsWithEventIds, []);
 });
 
+test('resolveBinding matches full-v2 resolution and derives post-cutoff source instances from canonical tag sets', () => {
+  const value = fixture(); const sourceTags = [tag('a'), tag('b')].sort();
+  const bound = value.resolver.resolveBinding({ legacyEventId: value.inputProjection.eventId,
+    legacySessionId: value.inputProjection.sessionId, sourceTags, conversationKind: value.inputProjection.conversationKind,
+    authorizationContextTags: value.inputProjection.contextTags, role: value.inputProjection.role,
+    direction: value.inputProjection.direction, effectiveTimestamp: value.inputProjection.occurredAt });
+  const full = value.resolver.resolve({ projection: value.inputProjection, sourceTag: tag('a') });
+  assert.deepEqual(bound, full);
+  assert.throws(() => value.resolver.resolveBinding({ legacyEventId: value.inputProjection.eventId,
+    legacySessionId: value.inputProjection.sessionId, sourceTags: [tag('a')], allowSourceTagMember: true,
+    conversationKind: value.inputProjection.conversationKind, authorizationContextTags: value.inputProjection.contextTags,
+    role: value.inputProjection.role, direction: value.inputProjection.direction,
+    effectiveTimestamp: value.inputProjection.occurredAt }), { code: 'm4_cross_phase_identity_input_invalid' });
+  const next = value.resolver.resolveBinding({ legacyEventId: event('multi-tag-post-cutoff'),
+    legacySessionId: value.inputProjection.sessionId, sourceTags, conversationKind: 'dm',
+    authorizationContextTags: value.inputProjection.contextTags, role: 'user', direction: 'inbound',
+    effectiveTimestamp: '2026-07-22T00:00:01Z' });
+  assert.equal(next.sourceInstanceId, deriveM4V3SourceInstanceIdFromLegacySession(value.inputProjection.sessionId, sourceTags));
+  assert.deepEqual(next.postCutoffBinding.sourceTags, sourceTags);
+});
+
 test('validates cross-page edit, tombstone, and conflict targets with bounded page caching', () => {
   const value = crossPageLifecycleFixture();
   const pages = new Map(value.pages.map(page => [page.pageKey, page])); let loads = 0;

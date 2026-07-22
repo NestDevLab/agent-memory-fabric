@@ -316,18 +316,28 @@ export function verifyM4CrossPhaseIdentityAuthority(value, secret) {
 }
 
 function postCutoffBinding(value, expectedLegacyEventId, cutoff) {
-  if (!exact(value, ['legacyEventId', 'legacySessionId', 'eventId', 'conversationId',
-    'sourceInstanceId', 'sourceTag', 'observedAt'])
+  const hasTags = exact(value, ['legacyEventId', 'legacySessionId', 'eventId', 'conversationId',
+    'sourceInstanceId', 'sourceTags', 'observedAt']);
+  const hasTag = exact(value, ['legacyEventId', 'legacySessionId', 'eventId', 'conversationId',
+    'sourceInstanceId', 'sourceTag', 'observedAt']);
+  if (!(hasTags || hasTag)
     || value.legacyEventId !== expectedLegacyEventId || !EVENT_ID.test(value.legacyEventId)
     || !SESSION_ID.test(value.legacySessionId) || !CONVERSATION_ID.test(value.conversationId)
-    || !SOURCE_INSTANCE_ID.test(value.sourceInstanceId) || !SOURCE_TAG.test(value.sourceTag)
+    || !SOURCE_INSTANCE_ID.test(value.sourceInstanceId)
     || deriveM4V3EventIdFromLegacyEventId(value.legacyEventId) !== value.eventId
     || deriveM4V3ConversationIdFromLegacySessionId(value.legacySessionId) !== value.conversationId
-    || deriveM4V3SourceInstanceIdFromLegacySession(value.legacySessionId, [value.sourceTag]) !== value.sourceInstanceId
     || timestampKey(timestamp(value.observedAt, 'm4_cross_phase_identity_local_binding_invalid')) <= cutoff) {
     fail('m4_cross_phase_identity_local_binding_invalid');
   }
-  return structuredClone(value);
+  let sourceTags;
+  try { sourceTags = hasTags ? sortedSourceTags(value.sourceTags) : sortedSourceTags([value.sourceTag]); }
+  catch { fail('m4_cross_phase_identity_local_binding_invalid'); }
+  if (deriveM4V3SourceInstanceIdFromLegacySession(value.legacySessionId, sourceTags) !== value.sourceInstanceId) {
+    fail('m4_cross_phase_identity_local_binding_invalid');
+  }
+  return { legacyEventId: value.legacyEventId, legacySessionId: value.legacySessionId, eventId: value.eventId,
+    conversationId: value.conversationId, sourceInstanceId: value.sourceInstanceId, sourceTags,
+    observedAt: value.observedAt };
 }
 
 export function createM4CrossPhaseIdentityResolver({ authority: input, loadPage, loadPostCutoffEvent = null } = {}, secret) {
@@ -375,9 +385,86 @@ export function createM4CrossPhaseIdentityResolver({ authority: input, loadPage,
     }
     return target.eventId;
   }
+  function resolveBindingInternal({ legacyEventId, legacySessionId, sourceTags, conversationKind,
+    authorizationContextTags, role, direction, effectiveTimestamp, priorLegacyEventId = null } = {},
+  allowSourceTagMember = false) {
+    if (!EVENT_ID.test(legacyEventId) || !SESSION_ID.test(legacySessionId)
+      || !CONVERSATION_KINDS.has(conversationKind) || !ROLES.has(role) || !DIRECTIONS.has(direction)
+      || !(priorLegacyEventId === null || (typeof priorLegacyEventId === 'string' && EVENT_ID.test(priorLegacyEventId)))) {
+      fail('m4_cross_phase_identity_input_invalid');
+    }
+    let tags; let normalizedContext;
+    try { tags = sortedSourceTags(sourceTags); normalizedContext = normalizeContextTags(authorizationContextTags); }
+    catch { fail('m4_cross_phase_identity_input_invalid'); }
+    let observed;
+    try { observed = timestamp(effectiveTimestamp, 'm4_cross_phase_identity_input_invalid'); }
+    catch { fail('m4_cross_phase_identity_input_invalid'); }
+    const registeredSession = findSession(legacySessionId); const registeredEvent = findEvent(legacyEventId);
+    let sessionBinding;
+    try { sessionBinding = sessionContextBinding(normalizedContext); }
+    catch { fail('m4_cross_phase_identity_input_invalid'); }
+    if (registeredSession && (registeredSession.conversationKind !== conversationKind
+      || canonicalJson(registeredSession.sessionContextTags) !== canonicalJson(sessionBinding))) {
+      fail('m4_cross_phase_identity_binding_mismatch');
+    }
+    if (registeredEvent) {
+      if (registeredEvent.legacySessionId !== legacySessionId
+        || (allowSourceTagMember ? !tags.every(tag => registeredEvent.sourceTags.includes(tag))
+          : canonicalJson(registeredEvent.sourceTags) !== canonicalJson(tags))
+        || registeredEvent.conversationKind !== conversationKind || registeredEvent.role !== role
+        || registeredEvent.direction !== direction
+        || canonicalJson(registeredEvent.authorizationContextTags) !== canonicalJson(normalizedContext)) {
+        fail('m4_cross_phase_identity_binding_mismatch');
+      }
+      return { legacyEventId, legacySessionId, eventId: registeredEvent.eventId,
+        conversationId: registeredEvent.conversationId, sourceInstanceId: registeredEvent.sourceInstanceId,
+        conversationKind, authorizationContextTags: normalizedContext, covered: true, state: registeredEvent.state,
+        revision: registeredEvent.revision,
+        replacesEventId: resolveRegisteredReference(registeredEvent.replacesLegacyEventId, registeredEvent),
+        tombstonesEventId: resolveRegisteredReference(registeredEvent.tombstonesLegacyEventId, registeredEvent),
+        conflictsWithEventIds: registeredEvent.conflictsWithLegacyEventIds.map(item => resolveRegisteredReference(item, registeredEvent)),
+        priorEventId: null };
+    }
+    if (timestampKey(observed) <= cutoff) fail('m4_cross_phase_identity_registry_missing');
+    let prior = null;
+    if (priorLegacyEventId !== null) {
+      prior = findEvent(priorLegacyEventId);
+      if (prior === null) {
+        if (loadPostCutoffEvent === null) fail('m4_cross_phase_identity_local_predecessor_missing');
+        let localValue;
+        try { localValue = loadPostCutoffEvent(priorLegacyEventId); } catch { fail('m4_cross_phase_identity_local_predecessor_missing'); }
+        if (localValue === null || localValue === undefined) fail('m4_cross_phase_identity_local_predecessor_missing');
+        prior = postCutoffBinding(localValue, priorLegacyEventId, cutoff);
+      }
+      const priorTags = prior.sourceTags;
+      if (prior.legacySessionId !== legacySessionId || (allowSourceTagMember
+        ? !tags.every(tag => priorTags.includes(tag)) : canonicalJson(priorTags) !== canonicalJson(tags))) {
+        fail('m4_cross_phase_identity_binding_mismatch');
+      }
+    }
+    const conversationId = registeredSession?.conversationId ?? deriveM4V3ConversationIdFromLegacySessionId(legacySessionId);
+    const sourceInstanceId = prior?.sourceInstanceId ?? deriveM4V3SourceInstanceIdFromLegacySession(legacySessionId, tags);
+    return { legacyEventId, legacySessionId, eventId: deriveM4V3EventIdFromLegacyEventId(legacyEventId), conversationId,
+      sourceInstanceId, conversationKind, authorizationContextTags: normalizedContext, covered: false,
+      state: null, revision: null, replacesEventId: null, tombstonesEventId: null, conflictsWithEventIds: [],
+      priorEventId: priorLegacyEventId === null ? null : prior.eventId,
+      postCutoffBinding: { legacyEventId, legacySessionId, eventId: deriveM4V3EventIdFromLegacyEventId(legacyEventId),
+        conversationId, sourceInstanceId, ...(allowSourceTagMember ? { sourceTag: tags[0] } : { sourceTags: tags }),
+        observedAt: observed } };
+  }
+  function publicBindingInput(value) {
+    const required = ['legacyEventId', 'legacySessionId', 'sourceTags', 'conversationKind', 'authorizationContextTags',
+      'role', 'direction', 'effectiveTimestamp'];
+    const permitted = new Set([...required, 'priorLegacyEventId']);
+    if (value === null || typeof value !== 'object' || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype
+      || required.some(item => !Object.hasOwn(value, item))
+      || Object.keys(value).some(item => !permitted.has(item))) fail('m4_cross_phase_identity_input_invalid');
+    return value;
+  }
   return Object.freeze({
     kind: 'm4-cross-phase-identity-registry-v1', coveredThrough: authority.coveredThrough,
     coverageBinding: Object.freeze({ ...authority.coverage }),
+    resolveBinding(input) { return resolveBindingInternal(publicBindingInput(input)); },
     resolve({ projection: inputProjection, sourceTag, priorLegacyEventId = null } = {}) {
       if (typeof sourceTag !== 'string' || !SOURCE_TAG.test(sourceTag)
         || !(priorLegacyEventId === null || (typeof priorLegacyEventId === 'string' && EVENT_ID.test(priorLegacyEventId)))) {
@@ -392,60 +479,10 @@ export function createM4CrossPhaseIdentityResolver({ authority: input, loadPage,
       let sessionBinding; let authorizationContextTags;
       try { sessionBinding = sessionContextBinding(projection.contextTags); authorizationContextTags = normalizeContextTags(projection.contextTags); }
       catch { fail('m4_cross_phase_identity_input_invalid'); }
-      const registeredSession = findSession(projection.sessionId); const registeredEvent = findEvent(projection.eventId);
-      const effectiveTimestamp = projection.editedAt ?? projection.occurredAt;
-      if (registeredSession && (registeredSession.conversationKind !== projection.conversationKind
-        || canonicalJson(registeredSession.sessionContextTags) !== canonicalJson(sessionBinding))) {
-        fail('m4_cross_phase_identity_binding_mismatch');
-      }
-      if (registeredEvent) {
-        if (registeredEvent.legacySessionId !== projection.sessionId || !registeredEvent.sourceTags.includes(sourceTag)
-          || registeredEvent.conversationKind !== projection.conversationKind || registeredEvent.role !== projection.role
-          || registeredEvent.direction !== projection.direction
-          || canonicalJson(registeredEvent.authorizationContextTags) !== canonicalJson(authorizationContextTags)) {
-          fail('m4_cross_phase_identity_binding_mismatch');
-        }
-        return { legacyEventId: projection.eventId, legacySessionId: projection.sessionId,
-          eventId: registeredEvent.eventId, conversationId: registeredEvent.conversationId,
-          sourceInstanceId: registeredEvent.sourceInstanceId, conversationKind: projection.conversationKind,
-          authorizationContextTags, covered: true, state: registeredEvent.state,
-          revision: registeredEvent.revision,
-          replacesEventId: resolveRegisteredReference(registeredEvent.replacesLegacyEventId, registeredEvent),
-          tombstonesEventId: resolveRegisteredReference(registeredEvent.tombstonesLegacyEventId, registeredEvent),
-          conflictsWithEventIds: registeredEvent.conflictsWithLegacyEventIds
-            .map(item => resolveRegisteredReference(item, registeredEvent)),
-          priorEventId: null };
-      }
-      if (timestampKey(effectiveTimestamp) <= cutoff) fail('m4_cross_phase_identity_registry_missing');
-      let prior = null;
-      if (priorLegacyEventId !== null) {
-        prior = findEvent(priorLegacyEventId);
-        if (prior === null) {
-          if (loadPostCutoffEvent === null) fail('m4_cross_phase_identity_local_predecessor_missing');
-          let localValue;
-          try { localValue = loadPostCutoffEvent(priorLegacyEventId); }
-          catch { fail('m4_cross_phase_identity_local_predecessor_missing'); }
-          if (localValue === null || localValue === undefined) fail('m4_cross_phase_identity_local_predecessor_missing');
-          prior = postCutoffBinding(localValue, priorLegacyEventId, cutoff);
-        }
-        const acceptsSource = Array.isArray(prior.sourceTags)
-          ? prior.sourceTags.includes(sourceTag) : prior.sourceTag === sourceTag;
-        if (prior.legacySessionId !== projection.sessionId || !acceptsSource) {
-          fail('m4_cross_phase_identity_binding_mismatch');
-        }
-      }
-      const conversationId = registeredSession?.conversationId
-        ?? deriveM4V3ConversationIdFromLegacySessionId(projection.sessionId);
-      const sourceInstanceId = prior?.sourceInstanceId
-        ?? deriveM4V3SourceInstanceIdFromLegacySession(projection.sessionId, [sourceTag]);
-      return { legacyEventId: projection.eventId, legacySessionId: projection.sessionId,
-        eventId: deriveM4V3EventIdFromLegacyEventId(projection.eventId), conversationId, sourceInstanceId,
-        conversationKind: projection.conversationKind, authorizationContextTags, covered: false,
-        state: null, revision: null, replacesEventId: null, tombstonesEventId: null, conflictsWithEventIds: [],
-        priorEventId: priorLegacyEventId === null ? null : prior.eventId,
-        postCutoffBinding: { legacyEventId: projection.eventId, legacySessionId: projection.sessionId,
-          eventId: deriveM4V3EventIdFromLegacyEventId(projection.eventId), conversationId, sourceInstanceId,
-          sourceTag, observedAt: effectiveTimestamp } };
+      return resolveBindingInternal({ legacyEventId: projection.eventId, legacySessionId: projection.sessionId,
+        sourceTags: [sourceTag], conversationKind: projection.conversationKind, authorizationContextTags,
+        role: projection.role, direction: projection.direction,
+        effectiveTimestamp: projection.editedAt ?? projection.occurredAt, priorLegacyEventId }, true);
     },
   });
 }
