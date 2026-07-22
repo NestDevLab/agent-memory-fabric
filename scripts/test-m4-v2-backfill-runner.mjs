@@ -250,3 +250,10 @@ test('closeable resources close in reverse factory order after a successful empt
   await runM4V2Backfill({ gateInput: gate, maxEvents: 1, confirmedPlanDigest: plan.planDigest, factories });
   assert.deepEqual(closed, ['checkpointStore', 'archive', 'outbox', 'source', 'lease']);
 });
+
+test('v2 archive runner rejects rather than constructing post-cutoff identity state', async () => {
+  const gate = gateInput(); const plan = await planM4V2Backfill({ gateInput: gate, maxEvents: 1 }); let constructed = 0;
+  const factories = { lease: async () => ({}), source: async () => ({}), outbox: async () => ({}), archive: async () => ({}), checkpointStore: async () => ({}), postCutoffStore: async () => { constructed += 1; return {}; } };
+  await assert.rejects(() => runM4V2Backfill({ gateInput: gate, maxEvents: 1, confirmedPlanDigest: plan.planDigest, factories }), { code: 'm4_runner_factories_invalid' });
+  assert.equal(constructed, 0);
+});

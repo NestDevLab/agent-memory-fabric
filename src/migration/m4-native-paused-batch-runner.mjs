@@ -42,12 +42,19 @@ function interval(value, code) {
     chain: checkpoint(value.chain, code) };
 }
 
+function projectionBinding(value, code) {
+  if (!exact(value, ['schema', 'runtime', 'sourceId', 'digest']) || value.schema !== 'amf.m4-paused-projection-binding/v1'
+    || !['codex', 'claude', 'hermes', 'openclaw'].includes(value.runtime) || typeof value.sourceId !== 'string'
+    || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(value.sourceId) || typeof value.digest !== 'string' || !DIGEST.test(value.digest)) fail(code);
+  return { schema: value.schema, runtime: value.runtime, sourceId: value.sourceId, digest: value.digest };
+}
+
 function authority(value, code = 'm4_native_batch_authority_invalid') {
-  if (!exact(value, ['schema', 'pauseEvidence', 'source', 'sourceBinding', 'interval', 'initialCheckpoint'])
+  if (!exact(value, ['schema', 'pauseEvidence', 'source', 'sourceBinding', 'projectionBinding', 'interval', 'initialCheckpoint'])
     || value.schema !== AUTHORITY_SCHEMA || typeof value.sourceBinding !== 'string'
     || !SOURCE_BINDING.test(value.sourceBinding)) fail(code);
   return { schema: AUTHORITY_SCHEMA, pauseEvidence: evidence(value.pauseEvidence, code),
-    source: checkpoint(value.source, code), sourceBinding: value.sourceBinding,
+    source: checkpoint(value.source, code), sourceBinding: value.sourceBinding, projectionBinding: projectionBinding(value.projectionBinding, code),
     interval: interval(value.interval, code), initialCheckpoint: checkpoint(value.initialCheckpoint, code) };
 }
 
@@ -59,25 +66,35 @@ function legacyCompletion(value, code = 'm4_native_batch_legacy_completion_inval
     checkpoint: checkpoint(value.checkpoint, code), evidence: evidence(value.evidence, code) };
 }
 
-export function deriveM4NativePausedRunId(value, prerequisite) {
+function authorityDigests(value, code) {
+  if (!exact(value, ['registryAuthorityDigest', 'sourceTagAuthorityDigest']) || typeof value.registryAuthorityDigest !== 'string'
+    || !DIGEST.test(value.registryAuthorityDigest) || typeof value.sourceTagAuthorityDigest !== 'string' || !DIGEST.test(value.sourceTagAuthorityDigest)) fail(code);
+  return { registryAuthorityDigest: value.registryAuthorityDigest, sourceTagAuthorityDigest: value.sourceTagAuthorityDigest };
+}
+
+export function deriveM4NativePausedRunId(value, prerequisite, digests) {
   const accepted = authority(value);
   const completed = legacyCompletion(prerequisite);
-  return `m4-native-${digest(['amf.m4-native-paused-batch/run-id/v1', accepted, completed]).slice(7)}`;
+  const authorities = authorityDigests(digests, 'm4_native_batch_authority_digest_invalid');
+  return `m4-native-${digest(['amf.m4-native-paused-batch/run-id/v1', accepted, completed, authorities]).slice(7)}`;
 }
 
 function request(value, run = false) {
   const keys = run
-    ? ['gateInput', 'maxEvents', 'authority', 'legacyCompletion', 'confirmedPlanDigest', 'reader', 'derivationKey',
+    ? ['gateInput', 'maxEvents', 'authority', 'legacyCompletion', 'registryAuthorityDigest', 'sourceTagAuthorityDigest', 'confirmedPlanDigest', 'reader', 'projectionIdentityResolver', 'derivationKey',
       'derivationKeyId', 'verifyPauseEvidence', 'verifyLegacyCompletion', 'integrityFor', 'factories']
-    : ['gateInput', 'maxEvents', 'authority', 'legacyCompletion'];
+    : ['gateInput', 'maxEvents', 'authority', 'legacyCompletion', 'registryAuthorityDigest', 'sourceTagAuthorityDigest'];
   const code = run ? 'm4_native_batch_run_input_invalid' : 'm4_native_batch_plan_input_invalid';
   try {
     if (!exact(value, keys)) fail(code);
     const confirmedPlanDigest = run ? value.confirmedPlanDigest : null;
     if (run && (typeof confirmedPlanDigest !== 'string' || !DIGEST.test(confirmedPlanDigest))) fail(code);
+    if (typeof value.registryAuthorityDigest !== 'string' || !DIGEST.test(value.registryAuthorityDigest)
+      || typeof value.sourceTagAuthorityDigest !== 'string' || !DIGEST.test(value.sourceTagAuthorityDigest)) fail(code);
     return { gateInput: clone(value.gateInput, code), maxEvents: value.maxEvents,
       authority: authority(clone(value.authority, code), code),
       legacyCompletion: legacyCompletion(clone(value.legacyCompletion, code)),
+      registryAuthorityDigest: value.registryAuthorityDigest, sourceTagAuthorityDigest: value.sourceTagAuthorityDigest,
       ...(run ? { confirmedPlanDigest, runtimeInput: value } : {}) };
   } catch (error) { if (error?.code === code) throw error; fail(code); }
 }
@@ -93,13 +110,15 @@ async function prepared(value) {
   if (basePlan.phase !== 'paused-native' || !same(basePlan.pauseEvidence, value.authority.pauseEvidence)
     || !same(signedNativeAuthority, value.authority.source)
     || !same(basePlan.sourceCheckpoint, value.authority.initialCheckpoint)
-    || basePlan.runId !== deriveM4NativePausedRunId(value.authority, value.legacyCompletion)) fail('m4_native_batch_gate_mismatch');
+    || basePlan.runId !== deriveM4NativePausedRunId(value.authority, value.legacyCompletion, { registryAuthorityDigest: value.registryAuthorityDigest, sourceTagAuthorityDigest: value.sourceTagAuthorityDigest })) fail('m4_native_batch_gate_mismatch');
   const authorityDigest = digest(value.authority);
   const legacyCompletionDigest = digest(value.legacyCompletion);
   const confirmationDigest = digest({ schema: 'amf.m4-native-paused-batch-confirmation/v1',
-    basePlanDigest: basePlan.planDigest, authorityDigest, legacyCompletionDigest });
+    basePlanDigest: basePlan.planDigest, authorityDigest, legacyCompletionDigest,
+    registryAuthorityDigest: value.registryAuthorityDigest, sourceTagAuthorityDigest: value.sourceTagAuthorityDigest });
   const plan = { schema: PLAN_SCHEMA, operation: 'plan', runId: basePlan.runId, phase: 'paused-native',
-    maxEvents: basePlan.maxEvents, authorityDigest, legacyCompletionDigest, confirmationDigest };
+    maxEvents: basePlan.maxEvents, authorityDigest, legacyCompletionDigest,
+    registryAuthorityDigest: value.registryAuthorityDigest, sourceTagAuthorityDigest: value.sourceTagAuthorityDigest, confirmationDigest };
   return { basePlan, plan };
 }
 
@@ -111,11 +130,15 @@ function runtime(value) {
     const derivationKeyId = value.derivationKeyId;
     const verifyPauseEvidence = value.verifyPauseEvidence;
     const verifyLegacyCompletion = value.verifyLegacyCompletion;
-    const integrityFor = value.integrityFor;
+    const integrityFor = value.integrityFor; const projectionIdentityResolver = value.projectionIdentityResolver;
+    const registryAuthorityDigest = value.registryAuthorityDigest; const sourceTagAuthorityDigest = value.sourceTagAuthorityDigest;
     const rawFactories = value.factories;
-    const factoryNames = ['lease', 'outbox', 'archive', 'checkpointStore'];
+    const factoryNames = ['lease', 'postCutoffStore', 'outbox', 'archive', 'checkpointStore'];
     if (typeof open !== 'function' || !Buffer.isBuffer(derivationKey) || derivationKey.length !== 32
       || typeof derivationKeyId !== 'string' || !/^[A-Za-z0-9._-]{1,64}$/.test(derivationKeyId)
+      || !object(projectionIdentityResolver) || typeof projectionIdentityResolver.resolve !== 'function'
+      || typeof registryAuthorityDigest !== 'string' || !DIGEST.test(registryAuthorityDigest)
+      || typeof sourceTagAuthorityDigest !== 'string' || !DIGEST.test(sourceTagAuthorityDigest)
       || typeof verifyPauseEvidence !== 'function' || typeof verifyLegacyCompletion !== 'function'
       || typeof integrityFor !== 'function' || !exact(rawFactories, factoryNames)) {
       fail('m4_native_batch_dependency_invalid');
@@ -127,7 +150,8 @@ function runtime(value) {
       factories[name] = factory;
     }
     return { reader: { open: open.bind(reader) }, derivationKey: Buffer.from(derivationKey),
-      derivationKeyId, verifyPauseEvidence, verifyLegacyCompletion, integrityFor, factories };
+      derivationKeyId, projectionIdentityResolver, registryAuthorityDigest, sourceTagAuthorityDigest,
+      verifyPauseEvidence, verifyLegacyCompletion, integrityFor, factories };
   } catch (error) {
     if (error?.code === 'm4_native_batch_dependency_invalid') throw error;
     fail('m4_native_batch_dependency_invalid');
@@ -171,6 +195,7 @@ function copyResult(value, plan) {
     || typeof value.complete !== 'boolean') fail('m4_native_batch_result_invalid');
   return { schema: RESULT_SCHEMA, operation: 'run', runId: value.runId, phase: 'paused-native',
     authorityDigest: plan.authorityDigest, legacyCompletionDigest: plan.legacyCompletionDigest,
+    registryAuthorityDigest: plan.registryAuthorityDigest, sourceTagAuthorityDigest: plan.sourceTagAuthorityDigest,
     processed: value.processed, duplicates: value.duplicates,
     lastCheckpoint: checkpoint(value.lastCheckpoint, 'm4_native_batch_result_invalid'), complete: value.complete };
 }
@@ -187,6 +212,9 @@ export async function runM4NativePausedBatch(input = {}) {
     fail('m4_native_batch_confirmation_invalid');
   }
   const dependencies = runtime(accepted.runtimeInput);
+  if (dependencies.registryAuthorityDigest !== accepted.registryAuthorityDigest || dependencies.sourceTagAuthorityDigest !== accepted.sourceTagAuthorityDigest) {
+    fail('m4_native_batch_authority_digest_mismatch');
+  }
   let source = null;
   try {
     await preflightLegacy(dependencies.verifyLegacyCompletion, accepted.legacyCompletion);
@@ -194,12 +222,16 @@ export async function runM4NativePausedBatch(input = {}) {
     source = createM4NativePausedIntervalSource({ authority: accepted.authority,
       derivationKey: dependencies.derivationKey, derivationKeyId: dependencies.derivationKeyId,
       verifyPauseEvidence: dependencies.verifyPauseEvidence, reader: dependencies.reader,
+      projectionIdentityResolver: dependencies.projectionIdentityResolver,
       integrityFor: dependencies.integrityFor });
     let result;
     try {
       result = await runM4V2Backfill({ gateInput: accepted.gateInput, maxEvents: accepted.maxEvents,
         confirmedPlanDigest: planned.basePlan.planDigest,
-        factories: { ...dependencies.factories, source: async () => source } });
+        factories: { ...dependencies.factories,
+          postCutoffStore: async parameters => dependencies.factories.postCutoffStore({ runId: parameters.runId, phase: parameters.phase, planDigest: parameters.planDigest,
+            registryAuthorityDigest: dependencies.registryAuthorityDigest, sourceTagAuthorityDigest: dependencies.sourceTagAuthorityDigest }),
+          source: async () => source } });
     } catch (error) {
       if (error?.code?.startsWith?.('m4_')) throw error;
       fail('m4_native_batch_execution_failed');

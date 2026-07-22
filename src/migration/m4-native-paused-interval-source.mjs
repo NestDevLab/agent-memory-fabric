@@ -2,8 +2,10 @@ import crypto from 'node:crypto';
 
 import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
 import { createConversationEvent, isConversationEventUtcTimestamp } from '../conversation-event-v3.mjs';
-import { eligibleClaudeConversationPayload, eligibleCodexConversationPayload,
-  eligibleOpenClawConversationPayload } from '../ingest/transcripts/conversation-v3.mjs';
+import { normalizeContextTags } from '../ingest/raw-projection-v2.mjs';
+import { eligibleCodexConversationLifecyclePayload,
+  eligibleClaudeConversationLifecyclePayload, eligibleOpenClawConversationLifecyclePayload,
+  eligibleHermesConversationLifecyclePayload } from '../ingest/transcripts/conversation-v3.mjs';
 
 const AUTHORITY_SCHEMA = 'amf.m4-native-paused-interval-authority/v1';
 const READER_SCHEMA = 'amf.m4-native-paused-reader/v1';
@@ -44,7 +46,6 @@ function evidence(value, code) {
 }
 function digest(value) { return `sha256:${crypto.createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex')}`; }
 function hmac(key, domain, values) { return crypto.createHmac('sha256', key).update(canonicalJson([domain, ...values]), 'utf8').digest('hex'); }
-function opaque(key, prefix, domain, values) { return `${prefix}${hmac(key, domain, values)}`; }
 function tag(key, namespace, tuple) { return `hmac-sha256:${namespace}:${hmac(key, `amf.m4-native-paused/tag/${namespace}/v1`, tuple)}`; }
 function interval(value, code) {
   const item = snapshot(value, ['startExclusive', 'endInclusive', 'chain'], code);
@@ -54,23 +55,32 @@ function interval(value, code) {
 }
 
 function authority(value) {
-  const item = snapshot(value, ['schema', 'pauseEvidence', 'source', 'sourceBinding', 'interval', 'initialCheckpoint'], 'm4_native_paused_authority_invalid');
+  const item = snapshot(value, ['schema', 'pauseEvidence', 'source', 'sourceBinding', 'projectionBinding', 'interval', 'initialCheckpoint'], 'm4_native_paused_authority_invalid');
   if (item.schema !== AUTHORITY_SCHEMA) fail('m4_native_paused_authority_invalid');
   if (typeof item.sourceBinding !== 'string' || !/^hmac-sha256:source-v1:[a-f0-9]{64}$/.test(item.sourceBinding)) fail('m4_native_paused_authority_invalid');
   return { schema: AUTHORITY_SCHEMA, pauseEvidence: evidence(item.pauseEvidence, 'm4_native_paused_authority_invalid'),
-    source: checkpoint(item.source, 'm4_native_paused_authority_invalid'), sourceBinding: item.sourceBinding, interval: interval(item.interval, 'm4_native_paused_authority_invalid'),
+    source: checkpoint(item.source, 'm4_native_paused_authority_invalid'), sourceBinding: item.sourceBinding,
+    projectionBinding: projectionBinding(item.projectionBinding, 'm4_native_paused_authority_invalid'), interval: interval(item.interval, 'm4_native_paused_authority_invalid'),
     initialCheckpoint: checkpoint(item.initialCheckpoint, 'm4_native_paused_authority_invalid') };
 }
 
 function dependencies(value) {
-  const item = snapshot(value, ['authority', 'derivationKey', 'derivationKeyId', 'verifyPauseEvidence', 'reader', 'integrityFor'], 'm4_native_paused_dependency_invalid');
+  const item = snapshot(value, ['authority', 'derivationKey', 'derivationKeyId', 'verifyPauseEvidence', 'reader', 'projectionIdentityResolver', 'integrityFor'], 'm4_native_paused_dependency_invalid');
   if (!Buffer.isBuffer(item.derivationKey) || item.derivationKey.length !== 32 || typeof item.derivationKeyId !== 'string'
     || !/^[A-Za-z0-9._-]{1,64}$/.test(item.derivationKeyId) || typeof item.verifyPauseEvidence !== 'function'
     || typeof item.integrityFor !== 'function') fail('m4_native_paused_dependency_invalid');
   const reader = snapshot(item.reader, ['open'], 'm4_native_paused_dependency_invalid');
   if (typeof reader.open !== 'function') fail('m4_native_paused_dependency_invalid');
+  if (!plain(item.projectionIdentityResolver) || typeof item.projectionIdentityResolver.resolve !== 'function') fail('m4_native_paused_dependency_invalid');
   return { authority: authority(item.authority), derivationKey: Buffer.from(item.derivationKey), derivationKeyId: item.derivationKeyId,
-    verifyPauseEvidence: item.verifyPauseEvidence, reader, integrityFor: item.integrityFor };
+    verifyPauseEvidence: item.verifyPauseEvidence, reader, projectionIdentityResolver: item.projectionIdentityResolver, integrityFor: item.integrityFor };
+}
+
+function projectionBinding(value, code) {
+  const item = snapshot(value, ['schema', 'runtime', 'sourceId', 'digest'], code);
+  if (item.schema !== 'amf.m4-paused-projection-binding/v1' || !['codex', 'claude', 'hermes', 'openclaw'].includes(item.runtime)
+    || typeof item.sourceId !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(item.sourceId) || typeof item.digest !== 'string' || !DIGEST.test(item.digest)) fail(code);
+  return item;
 }
 
 function request(value, initialCheckpoint) {
@@ -85,28 +95,45 @@ function request(value, initialCheckpoint) {
 
 function native(value) {
   const item = snapshot(value, ['runtime', 'sourceId', 'conversationId', 'threadId', 'messageId', 'position', 'sourceOccurredAt'], 'm4_native_paused_reader_invalid');
-  if (!['codex', 'claude', 'openclaw'].includes(item.runtime) || ![item.sourceId, item.conversationId, item.messageId].every(nativeId)
+  if (!['codex', 'claude', 'hermes', 'openclaw'].includes(item.runtime) || ![item.sourceId, item.conversationId, item.messageId].every(nativeId)
     || !(item.threadId === null || nativeId(item.threadId)) || !Number.isSafeInteger(item.position) || item.position < 0
     || !isConversationEventUtcTimestamp(item.sourceOccurredAt)) fail('m4_native_paused_reader_invalid');
   return item;
 }
 function nativeId(value) { return typeof value === 'string' && NATIVE_ID.test(value) && Buffer.byteLength(value, 'utf8') <= 1024; }
 function record(value) {
-  const item = snapshot(value, ['native', 'value', 'sessionHint'], 'm4_native_paused_reader_invalid');
+  const item = snapshot(value, ['native', 'value', 'sessionHint', 'projectionIdentity'], 'm4_native_paused_reader_invalid');
   let raw;
   try { raw = structuredClone(item.value); } catch { fail('m4_native_paused_reader_invalid'); }
   if (!(item.sessionHint === null || nativeId(item.sessionHint))) fail('m4_native_paused_reader_invalid');
-  return { native: native(item.native), value: raw, sessionHint: item.sessionHint };
+  let projectionIdentity; try { projectionIdentity = readerProjectionIdentity(item.projectionIdentity); } catch { fail('m4_native_paused_reader_invalid'); }
+  return { native: native(item.native), value: raw, sessionHint: item.sessionHint, projectionIdentity };
 }
 
-function identity(nativeValue, key) {
-  const ids = [nativeValue.runtime, nativeValue.sourceId, nativeValue.conversationId, nativeValue.threadId, nativeValue.messageId];
-  return { eventId: opaque(key, 'cevt_', 'amf.m4-native-paused/event/v1', ids),
-    conversationId: opaque(key, 'ccon_', 'amf.m4-native-paused/conversation/v1', ids.slice(0, 3)),
-    sourceInstanceId: opaque(key, 'src_', 'amf.m4-native-paused/source/v1', ids.slice(0, 2)),
-    ...(nativeValue.threadId === null ? {} : { threadId: opaque(key, 'cthr_', 'amf.m4-native-paused/thread/v1', ids.slice(0, 4)) }),
-    conversationKind: 'session', authorizationContextTags: { conversation: [tag(key, 'native-v1', ids.slice(0, 3))] } };
+function readerProjectionIdentity(value) {
+  const item = snapshot(value, ['schema', 'binding', 'runtime', 'sourceId', 'sourceKind', 'observationClass', 'authoritativeDeletion', 'occurredAt', 'editedAt', 'legacy', 'routing', 'lifecycle'], 'm4_native_paused_reader_invalid');
+  const binding = projectionBinding(item.binding, 'm4_native_paused_reader_invalid');
+  if (item.schema !== 'amf.m4-paused-projection-identity/v1' || item.runtime !== binding.runtime || item.sourceId !== binding.sourceId
+    || item.sourceKind !== item.runtime || item.observationClass !== 'native' || typeof item.authoritativeDeletion !== 'boolean'
+    || !isConversationEventUtcTimestamp(item.occurredAt) || !(item.editedAt === null || isConversationEventUtcTimestamp(item.editedAt))
+    || !plain(item.legacy) || !snapshot(item.legacy, ['sessionId', 'eventId', 'priorEventId'], 'm4_native_paused_reader_invalid')
+    || !/^ses_[a-f0-9]{64}$/.test(item.legacy.sessionId) || !/^evt_[a-f0-9]{64}$/.test(item.legacy.eventId)
+    || !(item.legacy.priorEventId === null || /^evt_[a-f0-9]{64}$/.test(item.legacy.priorEventId))
+    || !plain(item.routing) || !snapshot(item.routing, ['role', 'direction', 'conversationKind', 'authorizationContextTags'], 'm4_native_paused_reader_invalid')
+    || !['user', 'assistant', 'system', 'tool', 'unknown'].includes(item.routing.role)
+    || !['inbound', 'outbound', 'internal', 'unknown'].includes(item.routing.direction)
+    || !['dm', 'group', 'channel', 'thread', 'session', 'unknown'].includes(item.routing.conversationKind)
+    || !plain(item.lifecycle) || !snapshot(item.lifecycle, ['change', 'nativeRevision'], 'm4_native_paused_reader_invalid')
+    || !['new', 'changed', 'deleted'].includes(item.lifecycle.change)
+    || !(item.lifecycle.nativeRevision === null || (Number.isSafeInteger(item.lifecycle.nativeRevision) && item.lifecycle.nativeRevision >= 0))
+    || item.authoritativeDeletion !== (item.lifecycle.change === 'deleted')
+    || ((item.lifecycle.change === 'new') !== (item.legacy.priorEventId === null))) fail('m4_native_paused_reader_invalid');
+  let context; try { context = normalizeContextTags(item.routing.authorizationContextTags); } catch { fail('m4_native_paused_reader_invalid'); }
+  return { ...structuredClone(item), routing: { ...structuredClone(item.routing), authorizationContextTags: context } };
 }
+function resolverEligible(identity) { return ['user', 'assistant'].includes(identity.routing.role) && ['inbound', 'outbound'].includes(identity.routing.direction)
+  && ['dm', 'group', 'channel', 'thread', 'session'].includes(identity.routing.conversationKind); }
+
 function rowCheckpoint(authorityValue, key, nativeValue, event) {
   const opaqueNative = hmac(key, 'amf.m4-native-paused/checkpoint-native/v1', [nativeValue.runtime, nativeValue.sourceId, nativeValue.conversationId, nativeValue.threadId, nativeValue.messageId]);
   return { id: `m4np-${opaqueNative}`, digest: digest({ schema: 'amf.m4-native-paused-checkpoint/v1', authority: authorityValue.source,
@@ -123,10 +150,10 @@ async function verified(deps) {
 }
 
 function readerAttestation(value, authorityValue, key) {
-  const item = snapshot(value, ['schema', 'source', 'interval', 'runtime', 'sourceId', 'records', 'completion'], 'm4_native_paused_reader_invalid');
+  const item = snapshot(value, ['schema', 'source', 'interval', 'runtime', 'sourceId', 'projectionBinding', 'records', 'completion'], 'm4_native_paused_reader_invalid');
   if (item.schema !== READER_SCHEMA || !same(checkpoint(item.source, 'm4_native_paused_reader_invalid'), authorityValue.source)
     || !same(interval(item.interval, 'm4_native_paused_reader_invalid'), authorityValue.interval)
-    || !['codex', 'claude', 'openclaw'].includes(item.runtime) || !nativeId(item.sourceId)
+    || !['codex', 'claude', 'hermes', 'openclaw'].includes(item.runtime) || !nativeId(item.sourceId)
     || tag(key, 'source-v1', [item.runtime, item.sourceId]) !== authorityValue.sourceBinding
     || typeof item.completion !== 'function') fail('m4_native_paused_reader_attestation_mismatch');
   let records; let next; let close;
@@ -138,7 +165,9 @@ function readerAttestation(value, authorityValue, key) {
     close = records?.return;
   } catch (error) { if (error?.code === 'm4_native_paused_reader_invalid') throw error; fail('m4_native_paused_reader_invalid'); }
   if (typeof next !== 'function' || (close !== undefined && typeof close !== 'function')) fail('m4_native_paused_reader_invalid');
-  return { next: next.bind(records), close: close?.bind(records), completion: item.completion, runtime: item.runtime, sourceId: item.sourceId };
+  const binding = projectionBinding(item.projectionBinding, 'm4_native_paused_reader_invalid');
+  if (!same(binding, authorityValue.projectionBinding) || binding.runtime !== item.runtime || binding.sourceId !== item.sourceId) fail('m4_native_paused_reader_attestation_mismatch');
+  return { next: next.bind(records), close: close?.bind(records), completion: item.completion, runtime: item.runtime, sourceId: item.sourceId, projectionBinding: binding };
 }
 async function complete(completion, authorityValue) {
   let result;
@@ -159,6 +188,10 @@ function boundNativeMetadata(value, runtime, sessionHint) {
     return { conversationId: firstNativeId(value.sessionKey, value.session_key, value.sessionId,
       value.session_id, sessionHint), messageId: firstNativeId(value.id, value.uuid,
       value.messageId, value.message_id, value.message.id) };
+  }
+  if (runtime === 'hermes') {
+    if (!['user', 'assistant'].includes(value.role)) return null;
+    return { conversationId: firstNativeId(value.session_id, sessionHint), messageId: firstNativeId(value.revisionEventId) };
   }
   if (!['user', 'assistant'].includes(value.type) || !plain(value.message)) return null;
   return { conversationId: firstNativeId(value.sessionId, value.session_id, value.conversationId, sessionHint), messageId: firstNativeId(value.uuid, value.id, value.message.id) };
@@ -196,18 +229,32 @@ export function createM4NativePausedIntervalSource(input = {}) {
           const candidate = record(result.value);
           if (candidate.native.position <= previousPosition || candidate.native.position > deps.authority.interval.endInclusive) fail('m4_native_paused_reader_invalid');
           previousPosition = candidate.native.position;
-          const eventIdentity = identity(candidate.native, deps.derivationKey);
+          if (candidate.native.runtime !== attested.runtime || candidate.native.sourceId !== attested.sourceId
+            || !same(candidate.projectionIdentity.binding, attested.projectionBinding)
+            || candidate.projectionIdentity.occurredAt !== candidate.native.sourceOccurredAt) fail('m4_native_paused_projection_identity_mismatch');
+          if (!resolverEligible(candidate.projectionIdentity)) continue;
+          let resolved;
+          try { resolved = deps.projectionIdentityResolver.resolve({ identity: candidate.projectionIdentity, attestation: attested.projectionBinding }); }
+          catch { fail('m4_native_paused_projection_identity_unresolved'); }
+          const eventIdentity = { eventId: resolved.eventId, conversationId: resolved.conversationId, sourceInstanceId: resolved.sourceInstanceId,
+            conversationKind: resolved.conversationKind, authorizationContextTags: resolved.authorizationContextTags };
           let payload;
           try {
             const options = { value: candidate.value, identity: eventIdentity, sourceSequence: candidate.native.position,
-              occurredAt: candidate.native.sourceOccurredAt, sessionHint: candidate.sessionHint };
-            payload = candidate.native.runtime === 'codex' ? eligibleCodexConversationPayload(options)
-              : candidate.native.runtime === 'openclaw' ? eligibleOpenClawConversationPayload(options)
-                : eligibleClaudeConversationPayload(options);
+              occurredAt: candidate.projectionIdentity.editedAt ?? candidate.projectionIdentity.occurredAt, sessionHint: candidate.sessionHint,
+              lifecycle: candidate.projectionIdentity.lifecycle, resolved };
+            payload = candidate.native.runtime === 'codex' ? eligibleCodexConversationLifecyclePayload(options)
+              : candidate.native.runtime === 'openclaw' ? eligibleOpenClawConversationLifecyclePayload(options)
+                : candidate.native.runtime === 'hermes' ? eligibleHermesConversationLifecyclePayload(options)
+                  : eligibleClaudeConversationLifecyclePayload(options);
           } catch { fail('m4_native_paused_projection_failed'); }
           if (payload === null) continue;
+          if (payload.sourceOccurredAt !== candidate.projectionIdentity.occurredAt) fail('m4_native_paused_projection_identity_mismatch');
+          if (payload.role !== candidate.projectionIdentity.routing.role || payload.direction !== candidate.projectionIdentity.routing.direction
+            || payload.conversationKind !== candidate.projectionIdentity.routing.conversationKind
+            || !same(payload.authorizationContextTags, candidate.projectionIdentity.routing.authorizationContextTags)) fail('m4_native_paused_projection_identity_mismatch');
           const metadata = boundNativeMetadata(candidate.value, candidate.native.runtime, candidate.sessionHint);
-          if (candidate.native.runtime !== attested.runtime || candidate.native.sourceId !== attested.sourceId || metadata === null
+          if (metadata === null
             || candidate.native.conversationId !== metadata.conversationId || candidate.native.messageId !== metadata.messageId) fail('m4_native_paused_native_binding_invalid');
           let integrity;
           try { integrity = await deps.integrityFor({ eventId: eventIdentity.eventId, derivationKeyId: deps.derivationKeyId }); } catch { fail('m4_native_paused_integrity_unavailable'); }
@@ -222,7 +269,8 @@ export function createM4NativePausedIntervalSource(input = {}) {
           const checkpointValue = rowCheckpoint(deps.authority, deps.derivationKey, candidate.native, event);
           if (resume !== null) { if (same(resume, checkpointValue)) { resume = null; continue; } continue; }
           emitted += 1;
-          yield { sequence: opened.afterSequence + emitted, checkpoint: checkpointValue, event: structuredClone(event) };
+          yield { sequence: opened.afterSequence + emitted, checkpoint: checkpointValue, event: structuredClone(event),
+            postCutoffBinding: resolved.postCutoffBinding === undefined ? null : structuredClone(resolved.postCutoffBinding) };
           if (emitted >= opened.maxEvents + 1) return;
         }
       } catch (error) {
