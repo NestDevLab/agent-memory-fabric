@@ -45,7 +45,8 @@ function deriveConversationId(sessionId) {
   return `ccon_${opaqueHash('amf.m4/v2-conversation-id/v1', [sessionId])}`;
 }
 
-function deriveEventId(eventId) {
+export function deriveM4V3EventIdFromLegacyEventId(eventId) {
+  if (typeof eventId !== 'string' || !V2_EVENT_ID.test(eventId)) fail('m4_v2_projector_legacy_event_id_invalid');
   return `cevt_${opaqueHash('amf.m4/v2-event-id/v1', [eventId])}`;
 }
 
@@ -378,7 +379,7 @@ export async function projectM4V2LogicalGroup({ logical, observations, integrity
     const state = index === 0 ? 'active' : chain ? 'edited' : 'conflict';
     const event = await createProjectedEvent({
       observation,
-      eventId: deriveEventId(observation.eventId),
+      eventId: deriveM4V3EventIdFromLegacyEventId(observation.eventId),
       conversationId,
       sourceInstanceId,
       state,
@@ -395,7 +396,7 @@ export async function projectM4V2LogicalGroup({ logical, observations, integrity
     const event = await createProjectedEvent({
       observation: deletion,
       semanticObservation: representatives.at(-1),
-      eventId: deriveEventId(deletion.eventId),
+      eventId: deriveM4V3EventIdFromLegacyEventId(deletion.eventId),
       conversationId,
       sourceInstanceId,
       state: 'tombstone',

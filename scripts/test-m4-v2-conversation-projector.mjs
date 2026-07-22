@@ -5,7 +5,10 @@ import test from 'node:test';
 
 import { validateConversationEvent } from '../src/conversation-event-v3.mjs';
 import { selectLogicalMessage } from '../src/ingest/raw-projection-v2.mjs';
-import { projectM4V2LogicalGroup } from '../src/migration/m4-v2-conversation-projector.mjs';
+import {
+  deriveM4V3EventIdFromLegacyEventId,
+  projectM4V2LogicalGroup,
+} from '../src/migration/m4-v2-conversation-projector.mjs';
 
 const fixture = JSON.parse(fs.readFileSync(
   new URL('./fixtures/m4-v2-conversation-projector.synthetic.json', import.meta.url),
@@ -427,4 +430,19 @@ test('integrity failures are content-free and output ordering is deterministic',
   await assert.rejects(() => projectM4V2LogicalGroup({
     logical: logical([first]), observations: [first], integrityFor: async () => { throw new Error('synthetic text'); },
   }), error => error.code === 'm4_v2_projector_integrity_unavailable' && error.message === 'm4_v2_projector_integrity_unavailable');
+});
+
+test('exports the stable legacy event mapping used by preserved replay', () => {
+  const legacyId = v2EventId('a');
+  assert.equal(
+    deriveM4V3EventIdFromLegacyEventId(legacyId),
+    `cevt_${crypto.createHash('sha256').update(JSON.stringify([
+      'amf.m4/v2-event-id/v1',
+      legacyId,
+    ])).digest('hex')}`,
+  );
+  assert.throws(
+    () => deriveM4V3EventIdFromLegacyEventId('not-a-legacy-event'),
+    { code: 'm4_v2_projector_legacy_event_id_invalid' },
+  );
 });
