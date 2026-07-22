@@ -3,10 +3,14 @@ import crypto from 'node:crypto';
 import test from 'node:test';
 
 import {
+  createM4CrossPhaseIdentityAuthority,
+  createM4CrossPhaseIdentityPage,
   createM4CrossPhaseIdentityRegistry,
   createM4CrossPhaseIdentityResolver,
+  describeM4CrossPhaseIdentityPage,
   verifyM4CrossPhaseIdentityAuthority,
 } from '../src/migration/m4-cross-phase-identity-registry.mjs';
+import { canonicalJson } from '../src/ingest/transcripts/canonical.mjs';
 import {
   deriveM4V3ConversationIdFromLegacySessionId,
   deriveM4V3EventIdFromLegacyEventId,
@@ -58,6 +62,58 @@ function fixture() {
   return { ...created, resolver: createM4CrossPhaseIdentityResolver({ authority: created.authority,
     loadPage: pageKey => structuredClone(pages.get(pageKey)) }, secret), inputProjection, editProjection };
 }
+
+test('constructs and describes one canonical page before signing descriptor-only authority', () => {
+  const value = fixture(); const sourcePage = value.pages.find(item => item.entryKind === 'event');
+  const page = createM4CrossPhaseIdentityPage({ bucket: sourcePage.bucket, entryKind: sourcePage.entryKind,
+    shard: sourcePage.shard, entries: sourcePage.events });
+  const descriptor = describeM4CrossPhaseIdentityPage(page);
+  const sessionPage = value.pages.find(item => item.entryKind === 'session');
+  const session = createM4CrossPhaseIdentityPage({ bucket: sessionPage.bucket, entryKind: sessionPage.entryKind,
+    shard: sessionPage.shard, entries: sessionPage.sessions });
+  const authority = createM4CrossPhaseIdentityAuthority({ coveredThrough: value.authority.coveredThrough,
+    backfillBinding: value.authority.backfillBinding, pageDescriptors: [descriptor, describeM4CrossPhaseIdentityPage(session)].sort((left, right) => left.pageKey.localeCompare(right.pageKey)) }, secret);
+  const { mac: ignored, ...unsigned } = authority;
+  assert.deepEqual(verifyM4CrossPhaseIdentityAuthority(authority, secret), unsigned);
+  assert.throws(() => createM4CrossPhaseIdentityAuthority({ coveredThrough: value.authority.coveredThrough,
+    backfillBinding: value.authority.backfillBinding, pageDescriptors: [{ ...descriptor, shard: 1, pageKey: `${descriptor.bucket}-e-0001` }] }, secret), { code: 'm4_cross_phase_identity_authority_invalid' });
+  const wrongBucket = descriptor.bucket === 'ff' ? 'fe' : 'ff';
+  assert.throws(() => createM4CrossPhaseIdentityAuthority({ coveredThrough: value.authority.coveredThrough,
+    backfillBinding: value.authority.backfillBinding, pageDescriptors: [{ ...descriptor, bucket: wrongBucket, pageKey: `${wrongBucket}-e-0000` }] }, secret), { code: 'm4_cross_phase_identity_authority_invalid' });
+});
+
+test('evicts LRU pages by byte cap while preserving registered resolution', () => {
+  const sourceTags = Array.from({ length: 64 }, (_, index) => `${'x'.repeat(124)}${index.toString(16).padStart(4, '0')}:${'a'.repeat(64)}`);
+  const context = { sender: [opaque('cache-sender')], conversation: [opaque('cache-conversation')], room: [opaque('cache-room')] };
+  function makePage(bucket) {
+    const legacySessionId = `ses_${bucket}${'0'.repeat(62)}`; const conversationId = deriveM4V3ConversationIdFromLegacySessionId(legacySessionId);
+    const sourceInstanceId = deriveM4V3SourceInstanceIdFromLegacySession(legacySessionId, sourceTags);
+    const events = Array.from({ length: 1_800 }, (_, index) => {
+      const legacyEventId = `evt_${bucket}${index.toString(16).padStart(62, '0')}`;
+      return { legacyEventId, legacySessionId, eventId: deriveM4V3EventIdFromLegacyEventId(legacyEventId), conversationId,
+        sourceInstanceId, sourceTags, conversationKind: 'dm', authorizationContextTags: context, role: 'user', direction: 'inbound',
+        state: 'active', revision: 1, replacesLegacyEventId: null, tombstonesLegacyEventId: null, conflictsWithLegacyEventIds: [] };
+    });
+    return createM4CrossPhaseIdentityPage({ bucket, entryKind: 'event', shard: 0, entries: events });
+  }
+  const pages = ['aa', 'bb', 'cc'].map(makePage); const pageMap = new Map(pages.map(page => [page.pageKey, page]));
+  const authority = createM4CrossPhaseIdentityAuthority({ coveredThrough: '2026-07-22T00:00:00Z',
+    backfillBinding: { completionDigest: `sha256:${hex('cache-completion')}`, catalogRevisionDigest: `sha256:${hex('cache-catalog')}` },
+    pageDescriptors: pages.map(describeM4CrossPhaseIdentityPage).sort((left, right) => left.pageKey.localeCompare(right.pageKey)) }, secret);
+  assert.equal(pages.reduce((sum, page) => sum + Buffer.byteLength(canonicalJson(page), 'utf8'), 0) > 64 * 1024 * 1024, true);
+  const loads = new Map(); const resolver = createM4CrossPhaseIdentityResolver({ authority, loadPage: key => {
+    loads.set(key, (loads.get(key) ?? 0) + 1); return structuredClone(pageMap.get(key));
+  } }, secret);
+  for (const page of pages) {
+    const entry = page.events[0]; const resolved = resolver.resolveBinding({ legacyEventId: entry.legacyEventId, legacySessionId: entry.legacySessionId,
+      sourceTags, conversationKind: 'dm', authorizationContextTags: context, role: 'user', direction: 'inbound', effectiveTimestamp: '2026-07-21T00:00:00Z' });
+    assert.equal(resolved.eventId, entry.eventId);
+  }
+  const first = pages[0].events[0];
+  assert.equal(resolver.resolveBinding({ legacyEventId: first.legacyEventId, legacySessionId: first.legacySessionId,
+    sourceTags, conversationKind: 'dm', authorizationContextTags: context, role: 'user', direction: 'inbound', effectiveTimestamp: '2026-07-21T00:00:00Z' }).eventId, first.eventId);
+  assert.equal(loads.get(pages[0].pageKey), 2); assert.equal(loads.get(pages[1].pageKey), 1); assert.equal(loads.get(pages[2].pageKey), 1);
+});
 
 function crossPageLifecycleFixture() {
   const legacySessionId = `ses_aa${'1'.padStart(62, '0')}`;
