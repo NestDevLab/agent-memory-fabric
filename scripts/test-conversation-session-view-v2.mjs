@@ -260,6 +260,15 @@ test('conversation view rejects scan limits beyond its fixed bound', () => {
   archive.close();
 });
 
+test('conversation view retains an independent cursor key copy', () => {
+  const archive = new SqliteConversationArchive(archiveOptions());
+  const callerKey = Buffer.alloc(32, 31); const expected = Buffer.from(callerKey);
+  const reader = new SqliteConversationSessionView({ db: archive.db, cursorKey: callerKey });
+  callerKey.fill(0);
+  assert.equal(reader.cursorKey.equals(expected), true);
+  archive.close();
+});
+
 if (process.env.AMF_ARCHIVE_POSTGRES_TEST_URL) {
   await scenarios('PostgreSQL conversation session compatibility view', async () => {
     const archive = new PostgresConversationArchive({ connectionString: process.env.AMF_ARCHIVE_POSTGRES_TEST_URL, ...archiveOptions() });
