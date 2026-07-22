@@ -94,8 +94,8 @@ function replayFixture({
   };
 }
 
-function completionFor(kind) {
-  const selected = authority.sources[kind];
+function completionFor(kind, authorityValue = authority) {
+  const selected = authorityValue.sources[kind];
   return {
     schema: 'amf.m4-preserved-replay-completion/v2',
     sourceKind: kind,
@@ -111,14 +111,19 @@ class FixtureReader {
     this.options = options;
     this.openCalls = 0;
     this.completionCalls = 0;
+    this.openInputs = [];
   }
 
   async open(input) {
     this.openCalls += 1;
-    const selected = authority.sources[input.sourceKind];
+    this.openInputs.push(structuredClone(input));
+    const authorityValue = this.options.authority ?? authority;
+    const selected = authorityValue.sources[input.sourceKind];
+    const values = this.recordsByKind[input.sourceKind] ?? [];
+    const startIndex = input.afterSequence === 0 ? 0 : input.afterSequence - 1;
     const records = this.options.records ?? (async function* enumerate(values) {
       for (const value of values) yield value;
-    })(this.recordsByKind[input.sourceKind] ?? []);
+    })(values.slice(startIndex));
     return {
       schema: 'amf.m4-preserved-replay-reader/v2',
       sourceKind: this.options.attestedKind ?? input.sourceKind,
@@ -127,7 +132,7 @@ class FixtureReader {
       records,
       completion: async () => {
         this.completionCalls += 1;
-        return this.options.completion ?? completionFor(input.sourceKind);
+        return this.options.completion ?? completionFor(input.sourceKind, authorityValue);
       },
     };
   }
@@ -237,6 +242,7 @@ function coordinator({
   nativeSink = new FixtureNativeSink(),
   authorize = async () => true,
   verifyPauseEvidence = async () => ({ pauseEvidence, pendingOutbox, acknowledgements, deadLetters }),
+  authorityValue = authority,
 } = {}) {
   const grouped = recordsByKind ?? {
     outbox: fixtures.filter(item => item.record.sourceKind === 'outbox').map(item => item.record),
@@ -244,10 +250,10 @@ function coordinator({
   };
   return {
     value: createM4PreservedReplayCoordinator({
-      authority,
+      authority: authorityValue,
       derivationKey: DERIVATION_KEY,
       verifyPauseEvidence,
-      reader: reader ?? new FixtureReader(grouped),
+      reader: reader ?? new FixtureReader(grouped, { authority: authorityValue }),
       authorize,
       decoder: decoder ?? new FixtureDecoder(decodedMap(fixtures)),
       outbox,
@@ -438,12 +444,24 @@ test('resumes from an exact row checkpoint without re-enqueuing earlier records'
   const fixtures = [1, 2, 3].map(position => replayFixture({ position }));
   const baseline = await rows(coordinator({ fixtures }).value);
   const resumeOutbox = new MemoryOutbox();
-  const resumed = await rows(coordinator({ fixtures, outbox: resumeOutbox }).value, {
+  const resumeReader = new FixtureReader({ outbox: fixtures.map(item => item.record), deadletter: [] });
+  const resumed = await rows(coordinator({ fixtures, reader: resumeReader, outbox: resumeOutbox }).value, {
     after: baseline[0].checkpoint,
     afterSequence: 1,
   });
   assert.deepEqual(resumed.map(item => item.sequence), [2, 3]);
   assert.equal(resumeOutbox.enqueueCalls, 2);
+  assert.equal(resumeReader.openInputs[0].afterSequence, 1);
+
+  const finalReader = new FixtureReader({ outbox: fixtures.map(item => item.record), deadletter: [] });
+  const finalOutbox = new MemoryOutbox();
+  const final = await rows(coordinator({ fixtures, reader: finalReader, outbox: finalOutbox }).value, {
+    after: baseline[1].checkpoint,
+    afterSequence: 2,
+  });
+  assert.deepEqual(final.map(item => item.sequence), [3]);
+  assert.equal(finalOutbox.enqueueCalls, 1);
+  assert.equal(finalReader.openInputs[0].afterSequence, 2);
 
   const reader = new FixtureReader({ outbox: fixtures.map(item => item.record), deadletter: [] });
   const unknownOutbox = new MemoryOutbox();
@@ -453,6 +471,30 @@ test('resumes from an exact row checkpoint without re-enqueuing earlier records'
   }), 'm4_preserved_replay_checkpoint_drift');
   assert.equal(unknownOutbox.enqueueCalls, 0);
   assert.equal(reader.completionCalls, 0);
+});
+
+test('accepts an empty attested interval and rejects an out-of-range resume before opening the reader', async () => {
+  const emptyAuthority = structuredClone(authority);
+  for (const kind of ['outbox', 'deadletter']) {
+    emptyAuthority.sources[kind].interval = {
+      startExclusive: 0,
+      endInclusive: 0,
+      chain: checkpoint(`${kind}-empty-chain`, kind === 'outbox' ? '4' : '5'),
+    };
+    emptyAuthority.sources[kind].initialCheckpoint = checkpoint(`${kind}-empty-initial`, kind === 'outbox' ? '6' : '7');
+  }
+  const reader = new FixtureReader({ outbox: [], deadletter: [] }, { authority: emptyAuthority });
+  const empty = coordinator({ fixtures: [], reader, authorityValue: emptyAuthority }).value;
+  assert.deepEqual(await rows(empty, { after: emptyAuthority.sources.outbox.initialCheckpoint }), []);
+  assert.equal(reader.openCalls, 1);
+  assert.equal(reader.completionCalls, 1);
+
+  const deniedReader = new FixtureReader({ outbox: [], deadletter: [] }, { authority: emptyAuthority });
+  await rejects(() => rows(coordinator({ fixtures: [], reader: deniedReader, authorityValue: emptyAuthority }).value, {
+    after: { id: `m4pr-${'f'.repeat(64)}`, digest: digest('8') },
+    afterSequence: 1,
+  }), 'm4_preserved_replay_checkpoint_drift');
+  assert.equal(deniedReader.openCalls, 0);
 });
 
 test('uses maxEvents plus one as a probe and accepts completion only at natural exhaustion', async () => {

@@ -14,11 +14,17 @@ chain checkpoint, and its own initial resume checkpoint. Before a reader is
 opened, the coordinator verifies the pause evidence and both queue checkpoints,
 not only the selected queue.
 
+An empty preserved queue is represented by an interval whose
+`endInclusive` equals `startExclusive`; natural completion is still required.
+
 The reader attests its source kind, pause checkpoint, interval, chain, and
 natural completion. Positions must be strictly increasing inside the selected
 interval. A batch emits at most `maxEvents + 1` acknowledgements and visits at
 most 10,000 records. Ciphertext must be a non-empty buffer no larger than 16
-MiB. Unknown resume checkpoints and incomplete scans fail closed.
+MiB. On resume, `afterSequence` is passed to the reader so it can begin with
+the previously acknowledged row; the coordinator re-derives and verifies that
+row checkpoint before processing its successor. Unknown resume checkpoints,
+out-of-range sequences, and incomplete scans fail closed.
 
 ## Authorized normalization and identity
 
