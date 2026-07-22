@@ -9,17 +9,16 @@ preferences, commitments, and reusable conclusions.  Operational events,
 failures, counters, deployment state, and metrics are rejected; they belong in
 the operational ledger.
 
-The extractor never reads RAW object files or keys.  It runs on CT107, where
-Joseph's subscription-authenticated Codex login exists, and reads completed
-sessions from the Fabric only through authenticated HTTPS extraction/session
-endpoints.  The Fabric performs authorization,
-decryption, redaction, auditing, and cursor binding.  Vitae scopes are not
-granted to this service.  Extracted records are always
+The extractor never reads RAW object files or keys. It runs beside a
+subscription-authenticated model client and reads completed sessions from the
+Fabric only through authenticated HTTPS extraction/session endpoints. The
+Fabric performs authorization, decryption, redaction, auditing, and cursor
+binding. Tenant-specific scopes are not granted to this service. Extracted records are always
 `{type:"shared",id:"shared:global"}` with `visibility:"shared"`.
 
 ## Continuous bounded execution
 
-Run one `oneshot` systemd service from a timer on CT107.  The service
+Run one `oneshot` systemd service from a timer on the extraction host. The service
 uses a non-blocking lock; a missed tick is harmless.  Defaults are deliberately
 small and deployment-owned:
 
@@ -61,22 +60,36 @@ ledger records more than reserved and the next reservation is rejected.
 
 ## Newest-first resumable cursor
 
-The state file is private, atomic JSON:
+The legacy reader state file is private, atomic JSON. The conversation-v3
+reader uses a different file and schema:
 
 ```json
 {
-  "schema": "amf.raw-memory-extractor-state/v1",
+  "schema": "amf.raw-memory-extractor-state/v2",
+  "version": 2,
   "stream": "shared:global",
   "phase": "newest-first",
+  "readerGeneration": "conversation-v3",
   "cursor": "signed-newest-first-cursor",
   "inFlight": null,
   "days": {"2026-07-20": {"reservedInputTokens": 0, "reservedOutputTokens": 0, "usedInputTokens": 0, "usedOutputTokens": 0}},
-  "version": 1
+  "legacyBoundary": {
+    "schema": "amf.raw-memory-extractor-state/v1",
+    "stateDigest": "sha256:content-free-state-digest"
+  }
 }
 ```
 
-The server returns a signed newest-first keyset cursor.  The extractor first
-persists `inFlight` with the session id and deterministic claim fingerprints,
+Set `readerGeneration` in the extractor configuration to `legacy-v2` or
+`conversation-v3`. A v3 configuration requires both a new `stateFile` and a
+different `legacyStateFile`. On the first production v3 tick, migration is
+allowed only when the legacy cursor and `inFlight` values are both null. The
+legacy file is hashed into the v3 boundary evidence and is never overwritten,
+so rollback can resume it unchanged. Dry runs create no state file.
+
+The server returns a signed newest-first keyset cursor. The extractor first
+persists `inFlight` with the route id, stable extraction identity, and
+deterministic claim fingerprints,
 then proposes with a deterministic idempotency key.  On restart it repeats that
 same proposal and observes the Fabric duplicate acknowledgement before moving
 the cursor.  A no-memory result also advances only after its triage/extraction
@@ -110,9 +123,11 @@ session plus the decrypted transcript digest.
 Before submission, comparison normalizes plaintext claim content and compares
 it against authorized canonical record content returned by the Fabric/PAM
 read path.  It never compares encrypted object bytes or ciphertext content ids.
-The deterministic proposal idempotency key additionally binds extractor version,
-session id and normalized plaintext claim digest, making retries safe even
-across RAW key rotation.
+The deterministic proposal idempotency key additionally binds extractor
+version, stable extraction identity, and normalized plaintext claim digest,
+making retries safe across RAW key rotation and the legacy-to-v3 reader switch.
+The signed alias manifest maps backfilled conversations to their deterministic
+legacy session identity; native conversations retain their conversation id.
 
 The only write is the existing `POST /v2/memory/proposals` propose path.  The
 existing authenticated curator and receipt applicator consume that proposal and

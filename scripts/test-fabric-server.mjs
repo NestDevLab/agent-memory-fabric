@@ -79,7 +79,7 @@ function canonicalProposal(text, scope = 'main-lab', revision = 1) {
 }
 
 async function withServer(run, { sessionOptions, clock, configuredSessionReader = true, conversationSessionReaderConfigured = configuredSessionReader,
-  sessionReader: sessionReaderOverride, conversationSessionReader: conversationSessionReaderOverride,
+  sessionReader: sessionReaderOverride, conversationSessionReader: conversationSessionReaderOverride, extractorSessionReader,
   fabricStore: fabricStoreOverride, backend: backendOverride,
   canonicalStore, documentStore, contextVerifier, receiptCoordinator, routeManifestSetup, migrationPause } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-server-'));
@@ -192,6 +192,7 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
     contextVerifier: effectiveContextVerifier, routeManifestPath: effectiveRouteManifestPath, receiptCoordinator,
     sessionReader: configuredSessionReader ? sessionReader : undefined,
     conversationSessionReader: conversationSessionReaderConfigured ? (conversationSessionReaderOverride || sessionReader) : undefined,
+    extractorSessionReader,
     sessionOptions, clock,
     policyPath: testPolicyPath, migrationPause });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -324,10 +325,13 @@ test('raw extractor can read only service-authorized redacted sessions', async (
     const headers = { authorization: 'Bearer extractor-token' };
     const page = await api('/v2/internal/extractor/sessions?limit=1', { headers });
     assert.equal(page.response.status, 200); assert.equal(page.body.data.items[0].id, 'ses_extract'); assert.equal(page.body.data.nextCursor, 'signed-next');
+    const metadata = await api('/v2/internal/extractor/sessions/ses_extract', { headers });
+    assert.equal(metadata.response.status, 200); assert.equal(metadata.body.data.id, 'ses_extract');
     const transcript = await api('/v2/internal/extractor/sessions/ses_extract/transcript?limit=100&window=newest', { headers });
     assert.equal(transcript.response.status, 200); assert.equal(transcript.body.data.view, 'redacted'); assert.equal(transcript.body.data.items[0].text, 'We decided to keep it slow.');
     const denied = await api('/v2/internal/extractor/sessions?limit=1');
     assert.equal(denied.response.status, 403);
+    assert.ok(fabricStore.catalog.auditEvents.some(event => event.action === 'raw_extractor_session_read'));
     assert.ok(fabricStore.catalog.auditEvents.some(event => event.action === 'raw_extractor_transcript_read'));
   }, { sessionReader });
 });
@@ -1112,9 +1116,10 @@ test('session reader capability is explicit and unconfigured access returns 503'
   }, { configuredSessionReader: false });
 });
 
-test('public v2 and MCP session reads use only the conversation reader while the extractor stays legacy', async () => {
+test('public and internal session routes use separate composed readers', async () => {
   let legacySearches = 0;
   let conversationSearches = 0;
+  let extractorSearches = 0;
   const legacyReader = {
     configured: true, kind: 'legacy-spy',
     async search() { legacySearches += 1; return { items: [{ id: 'legacy-session' }] }; },
@@ -1126,6 +1131,12 @@ test('public v2 and MCP session reads use only the conversation reader while the
     runtimeStatus() { return { mode: 'shadow', pending: 0, compared: 3, matched: 3, mismatched: 0, unavailable: 0, inconclusive: 0, skipped: 0 }; },
     async search() { conversationSearches += 1; return { items: [{ id: 'ccon_servercompat01', title: '', scope: '', ownerSelf: true, conversationKind: 'group', contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }], nextCursor: null }; },
     async get({ id }) { return { id, title: '', scope: '', ownerSelf: true, conversationKind: 'group', contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }; },
+    async transcript({ id }) { return { id, view: 'redacted', items: [], nextCursor: null }; }
+  };
+  const extractorReader = {
+    configured: true, kind: 'extractor-v3-spy',
+    async search() { extractorSearches += 1; return { items: [{ id: 'ccon_extractroute01', extractionIdentity: `ses_${'a'.repeat(64)}` }], nextCursor: null }; },
+    async get({ id }) { return { id, extractionIdentity: `ses_${'a'.repeat(64)}` }; },
     async transcript({ id }) { return { id, view: 'redacted', items: [], nextCursor: null }; }
   };
   await withServer(async ({ api, registry, writeRegistry }) => {
@@ -1157,8 +1168,8 @@ test('public v2 and MCP session reads use only the conversation reader while the
 
     const extractor = await api('/v2/internal/extractor/sessions?limit=1', { headers: { authorization: 'Bearer compat-extractor-token' } });
     assert.equal(extractor.response.status, 200);
-    assert.equal(legacySearches, 1);
-  }, { sessionReader: legacyReader, conversationSessionReader: conversationReader });
+    assert.equal(extractor.body.data.items[0].id, 'ccon_extractroute01'); assert.equal(extractorSearches, 1); assert.equal(legacySearches, 0);
+  }, { sessionReader: legacyReader, conversationSessionReader: conversationReader, extractorSessionReader: extractorReader });
 
   await withServer(async ({ api }) => {
     const input = { query: 'synthetic', purpose: 'continuity_resume' };
@@ -1166,7 +1177,7 @@ test('public v2 and MCP session reads use only the conversation reader while the
     const unavailable = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ ...input, contextToken }) });
     assert.equal(unavailable.response.status, 503);
     assert.equal(unavailable.body.error.code, 'session_reader_unconfigured');
-    assert.equal(legacySearches, 1);
+    assert.equal(legacySearches, 0);
   }, { sessionReader: legacyReader, conversationSessionReaderConfigured: false });
 });
 

@@ -1,6 +1,7 @@
 {
   "baseUrl": "https://memory.example",
   "tokenFile": "/etc/agent-memory-fabric/raw-extractor.token",
+  "readerGeneration": "legacy-v2",
   "stateFile": "/var/lib/agent-memory-fabric/raw-extractor/state.json",
   "codexWorkDir": "/var/lib/agent-memory-fabric/raw-extractor/codex",
   "model": "gpt-5.6-luna",
