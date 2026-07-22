@@ -7,6 +7,7 @@ import {
   M4_MAX_MISMATCH_SAMPLES,
   M4_MAX_VISITED_EVENTS,
   reconcileM4,
+  validateM4ReconciliationReport,
 } from '../src/migration/m4-reconciliation-reader.mjs';
 
 const fixture = JSON.parse(fs.readFileSync(
@@ -347,4 +348,24 @@ test('event and static validation reject forbidden, malformed, and ambiguous pro
     source: iterable([]), target: iterable([]),
     sourceEvidence: invalidEvidence, targetEvidence: staticEvidence(),
   }), { code: 'm4_reconciliation_static_evidence_invalid' });
+});
+
+test('report validation isolates a complete report and rejects unsafe bound evidence', async () => {
+  const report = await reconciliation([event(1)], [event(1)]);
+  const validated = validateM4ReconciliationReport(report);
+  assert.deepEqual(validated, report);
+  validated.dimensionEvidence[0].source.count = 99;
+  assert.notDeepEqual(validated, report);
+
+  const unsafe = structuredClone(report);
+  unsafe.dimensionEvidence[0].source.privateContent = 'forbidden';
+  assert.throws(() => validateM4ReconciliationReport(unsafe), {
+    code: 'm4_reconciliation_report_invalid',
+  });
+  const invalidRange = structuredClone(report);
+  const time = invalidRange.dimensionEvidence.find(item => item.name === 'time-ranges');
+  time.source.sourceOccurredAt.min = '2026-02-30T00:00:00Z';
+  assert.throws(() => validateM4ReconciliationReport(invalidRange), {
+    code: 'm4_reconciliation_report_invalid',
+  });
 });
