@@ -148,7 +148,7 @@ function ensurePrivateDirectory(root, relative, code) {
 
 export function artifactPath(rootPath, stage, manifestId, revision) {
   const root = validateArtifactRoot(rootPath);
-  if (!['reconciliation', 'recovery', 'canary', 'authorization', 'v2-backfill'].includes(stage)
+  if (!['reconciliation', 'recovery', 'canary', 'authorization', 'v2-backfill', 'cross-phase-identity'].includes(stage)
     || typeof manifestId !== 'string' || !/^[a-z][a-z0-9-]{2,79}$/.test(manifestId)
     || !Number.isSafeInteger(revision) || revision < 1) fail('private_artifact_target_invalid');
   return path.join(root, 'm4', stage, `${manifestId}-r${revision}.json`);
@@ -176,5 +176,17 @@ export function writePrivateArtifact(rootPath, stage, manifestId, revision, valu
     if (error?.code === 'EEXIST') fail('private_artifact_target_exists');
     if (error?.code?.startsWith?.('private_artifact_')) throw error;
     fail('private_artifact_write_failed');
+  }
+}
+
+export function writePrivateArtifactIdempotent(rootPath, stage, manifestId, revision, value) {
+  let safe; let expected; try { safe=structuredClone(value); expected=canonicalJson(safe); } catch { fail('private_artifact_value_invalid'); }
+  const target=artifactPath(rootPath,stage,manifestId,revision);
+  try { return writePrivateArtifact(rootPath,stage,manifestId,revision,safe); }
+  catch(error) {
+    if(error?.code!=='private_artifact_target_exists')throw error;
+    let existing; try { existing=readPrivateJson(target,'private_artifact_existing_invalid'); } catch { fail('private_artifact_existing_invalid'); }
+    if(canonicalJson(existing)!==expected)fail('private_artifact_conflict');
+    return target;
   }
 }

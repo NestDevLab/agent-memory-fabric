@@ -20,7 +20,7 @@ function digest(value) { return `sha256:${crypto.createHash('sha256').update(can
 function request(value) {
   const keys = ['source', 'traversalStore', 'lease', 'runId', 'planDigest', 'catalogBaseline', 'catalogKeyDocument',
     'archiveCompletion', 'archiveCompletionKeyDocument', 'completionKeyDocument', 'registryKeyDocument',
-    'manifestId', 'revision', 'registrySecret', 'registryKeyId', 'createWriter', 'catalogAttestor'];
+    'manifestId', 'revision', 'registrySecret', 'registryKeyId', 'createWriter', 'catalogAttestor', 'publish'];
   if (!exact(value, keys)) fail('m4_cross_phase_identity_traversal_runner_input_invalid');
   value = Object.fromEntries(keys.map(key => [key, value[key]]));
   const source = value.source; let binding = source?.binding; const sourceOpen = source?.open;
@@ -32,7 +32,7 @@ function request(value) {
     || typeof value.runId !== 'string' || !ID.test(value.runId) || typeof value.planDigest !== 'string' || !DIGEST.test(value.planDigest)
     || typeof value.manifestId !== 'string' || !ID.test(value.manifestId) || !Number.isSafeInteger(value.revision) || value.revision < 1
     || !(value.registrySecret instanceof Uint8Array) || value.registrySecret.byteLength !== 32 || typeof value.registryKeyId !== 'string' || !ID.test(value.registryKeyId)
-    || typeof value.createWriter !== 'function' || typeof value.catalogAttestor !== 'function') fail('m4_cross_phase_identity_traversal_runner_input_invalid');
+    || typeof value.createWriter !== 'function' || typeof value.catalogAttestor !== 'function' || typeof value.publish !== 'function') fail('m4_cross_phase_identity_traversal_runner_input_invalid');
   binding = Object.fromEntries(['runId', 'planDigest', 'catalogBaselineDigest', 'groupCount'].map(key => [key, binding[key]]));
   let baseline;
   try { baseline = verifyM4V2CatalogRevisionAttestation(value.catalogBaseline, value.catalogKeyDocument); }
@@ -55,7 +55,7 @@ function request(value) {
     completionKeyDocument: clone(value.completionKeyDocument, 'm4_cross_phase_identity_traversal_runner_input_invalid'),
     registryKeyDocument: clone(value.registryKeyDocument, 'm4_cross_phase_identity_traversal_runner_input_invalid'),
     manifestId: value.manifestId, revision: value.revision, registrySecret: Buffer.from(value.registrySecret), registryKeyId: value.registryKeyId,
-    createWriter: value.createWriter, catalogAttestor: value.catalogAttestor,
+    createWriter: value.createWriter, catalogAttestor: value.catalogAttestor, publish: value.publish,
   });
 }
 
@@ -83,11 +83,11 @@ function checkpointGroup(value) {
 
 function writerResult(value) {
   if (!exact(value, ['writer', 'databasePath'])) fail('m4_cross_phase_identity_traversal_runner_writer_invalid');
-  const writer = value.writer; const databasePath = value.databasePath; const accept = writer?.accept; const close = writer?.close;
-  if (!object(writer) || typeof accept !== 'function' || typeof close !== 'function' || typeof databasePath !== 'string') {
+  const writer = value.writer; const databasePath = value.databasePath; const accept = writer?.accept; const seal = writer?.seal; const close = writer?.close;
+  if (!object(writer) || typeof accept !== 'function' || typeof seal !== 'function' || typeof close !== 'function' || typeof databasePath !== 'string') {
     fail('m4_cross_phase_identity_traversal_runner_writer_invalid');
   }
-  return { writer, accept, close, databasePath };
+  return { writer, accept, seal, close, databasePath };
 }
 
 async function invoke(code, callback, receiver, value = undefined) {
@@ -151,7 +151,7 @@ export async function runM4CrossPhaseIdentityTraversal(input = {}) {
             let existingCoverage;
             try { existingCoverage = readM4CrossPhaseIdentityStreamingCoverage({ databasePath }); }
             catch { fail('m4_cross_phase_identity_traversal_runner_coverage_failed'); }
-            if (existingCoverage.state !== 'open' || existingCoverage.expectedBlockCount !== safe.baseline.traversal.groupCount
+            if (!['open','seal-intent','sealed'].includes(existingCoverage.state) || (existingCoverage.state !== 'open' && (!persisted.complete || existingCoverage.blockCount !== persisted.acceptedGroupCount)) || existingCoverage.expectedBlockCount !== safe.baseline.traversal.groupCount
               || ![persisted.acceptedGroupCount, persisted.acceptedGroupCount + 1].includes(existingCoverage.blockCount)) fail('m4_cross_phase_identity_traversal_runner_prefix_drift');
             pendingOrphan = existingCoverage.blockCount === persisted.acceptedGroupCount + 1;
           }
@@ -190,30 +190,45 @@ export async function runM4CrossPhaseIdentityTraversal(input = {}) {
     try { verifiedPost = verifyM4V2CatalogRevisionAttestation(postTraversalAttestation, safe.catalogKeyDocument); }
     catch { fail('m4_cross_phase_identity_traversal_runner_attestation_failed'); }
     if (!same(verifiedPost, safe.baseline)) fail('m4_cross_phase_identity_traversal_runner_catalog_drift');
-    let coverage; let emptyRegistry = null;
+    let coverage; let registry = null;
     if (traversalRecord.acceptedGroupCount === 0) {
       if (writer !== null || traversalRecord.excludedGroupCount < 1) fail('m4_cross_phase_identity_traversal_runner_zero_invalid');
       coverage = createM4CrossPhaseIdentityZeroStreamingCoverage();
     } else {
       if (writer === null) fail('m4_cross_phase_identity_traversal_runner_writer_missing');
       databasePath = writer.databasePath;
-      await invoke('m4_cross_phase_identity_traversal_runner_cleanup_failed', writer.close, writer.writer);
-      writerClosed = true;
       try { coverage = readM4CrossPhaseIdentityStreamingCoverage({ databasePath: writer.databasePath }); }
       catch { fail('m4_cross_phase_identity_traversal_runner_coverage_failed'); }
+      if (coverage.state === 'sealed' || coverage.state === 'seal-intent') coverage={...coverage,state:'open'};
     }
     let traversalCompletion;
     try { traversalCompletion = createM4CrossPhaseIdentityTraversalCompletion({ ...completionInput(safe, traversalRecord, coverage), preTraversalAttestation: verifiedPre, postTraversalAttestation: verifiedPost }); }
     catch { fail('m4_cross_phase_identity_traversal_runner_completion_failed'); }
     if (traversalRecord.acceptedGroupCount === 0) {
+      await invoke('m4_cross_phase_identity_traversal_runner_lease_heartbeat_failed', safe.heartbeat, safe.lease);
       try {
-        emptyRegistry = createM4CrossPhaseIdentityEmptyRegistry({ traversalCompletion, completionKeyDocument: safe.completionKeyDocument,
+        registry = createM4CrossPhaseIdentityEmptyRegistry({ traversalCompletion, completionKeyDocument: safe.completionKeyDocument,
           registrySecret: safe.registrySecret, registryKeyId: safe.registryKeyId });
       } catch { fail('m4_cross_phase_identity_traversal_runner_empty_registry_failed'); }
+    } else {
+      await invoke('m4_cross_phase_identity_traversal_runner_lease_heartbeat_failed', safe.heartbeat, safe.lease);
+      try { registry=await writer.seal.call(writer.writer,{traversalCompletion,completionKeyDocument:safe.completionKeyDocument}); }
+      catch (error) { if (error?.code==='m4_cross_phase_identity_streaming_seal_binding_invalid') fail('m4_cross_phase_identity_traversal_runner_seal_binding_invalid'); fail('m4_cross_phase_identity_traversal_runner_seal_failed'); }
     }
+    await invoke('m4_cross_phase_identity_traversal_runner_lease_heartbeat_failed', safe.heartbeat, safe.lease);
+    const postSealAttestation = await invoke('m4_cross_phase_identity_traversal_runner_attestation_failed', safe.catalogAttestor);
+    let verifiedPostSeal;
+    try { verifiedPostSeal=verifyM4V2CatalogRevisionAttestation(postSealAttestation,safe.catalogKeyDocument); } catch { fail('m4_cross_phase_identity_traversal_runner_attestation_failed'); }
+    if (!same(verifiedPostSeal,safe.baseline)) fail('m4_cross_phase_identity_traversal_runner_catalog_drift');
+    await invoke('m4_cross_phase_identity_traversal_runner_lease_heartbeat_failed', safe.heartbeat, safe.lease);
+    const publication=await invoke('m4_cross_phase_identity_traversal_runner_publish_failed',safe.publish,null,{traversalCompletion:clone(traversalCompletion,'m4_cross_phase_identity_traversal_runner_result_invalid'),registry:clone(registry,'m4_cross_phase_identity_traversal_runner_result_invalid'),coverage:clone(coverage,'m4_cross_phase_identity_traversal_runner_result_invalid')});
+    let safePublication;
+    try { if (!exact(publication,['state','artifactDigest'])) fail('m4_cross_phase_identity_traversal_runner_publish_invalid'); const snapshot={state:publication.state,artifactDigest:publication.artifactDigest}; if (snapshot.state!=='published'||typeof snapshot.artifactDigest!=='string'||!DIGEST.test(snapshot.artifactDigest)) fail('m4_cross_phase_identity_traversal_runner_publish_invalid'); safePublication=clone(snapshot,'m4_cross_phase_identity_traversal_runner_publish_invalid'); }
+    catch (error) { if (error?.code==='m4_cross_phase_identity_traversal_runner_publish_invalid') throw error; fail('m4_cross_phase_identity_traversal_runner_publish_invalid'); }
+    if (writer!==null) { await invoke('m4_cross_phase_identity_traversal_runner_cleanup_failed',writer.close,writer.writer); writerClosed=true; }
     return Object.freeze({ traversalRecord: clone(traversalRecord, 'm4_cross_phase_identity_traversal_runner_result_invalid'),
       traversalCompletion: clone(traversalCompletion, 'm4_cross_phase_identity_traversal_runner_result_invalid'), coverage,
-      databasePath, emptyRegistry });
+      databasePath, publication:safePublication });
   } catch (error) {
     primary = error;
     throw error;

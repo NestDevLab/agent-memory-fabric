@@ -28,7 +28,7 @@ function result(sequence, outcome, label = `g${sequence}`) {
 }
 function source(binding, rows) { return Object.freeze({ binding:Object.freeze(binding), open({afterSequence,afterCheckpoint}) { assert.equal(afterSequence,0); assert.equal(afterCheckpoint,null); return (async function* () { for (const row of rows) yield structuredClone(row); })(); } }); }
 function temporary() { return fs.mkdtempSync(path.join(os.tmpdir(),'amf-m4-runner-')); }
-function setup(root, rows, { lease = null, events = [], writerCalls = { count:0 }, attestor = null, groupCount = rows.length } = {}) {
+function setup(root, rows, { lease = null, events = [], writerCalls = { count:0 }, attestor = null, publish = null, writePage = null, groupCount = rows.length } = {}) {
   const registrySecret=Buffer.alloc(32,7); const item=fixture({coverage:{schema:'amf.m4-cross-phase-identity-streaming-coverage/v1',state:'open',expectedBlockCount:0,blockCount:0,sessionCount:0,eventCount:0},registrySecret,groupCount});
   const runId=item.input.traversalRecord.runId; const planDigest=item.input.traversalRecord.planDigest; const catalogBaselineDigest=digest(item.input.catalogBaseline);
   const store=new M4CrossPhaseIdentityTraversalStore({rootPath:path.join(root,'state'),runId,planDigest,catalogBaselineDigest});
@@ -37,14 +37,15 @@ function setup(root, rows, { lease = null, events = [], writerCalls = { count:0 
     catalogBaseline:item.input.catalogBaseline,catalogKeyDocument:item.input.catalogKeyDocument,archiveCompletion:item.input.archiveCompletion,archiveCompletionKeyDocument:item.input.archiveCompletionKeyDocument,
     completionKeyDocument:item.input.completionKeyDocument,registryKeyDocument:item.input.registryKeyDocument,manifestId:'runner-fixture',revision:1,registrySecret,registryKeyId:item.registryKeyId,
     catalogAttestor:attestor ?? (async()=>{events.push('attest');return structuredClone(item.input.catalogBaseline);}),
-    createWriter:async ({expectedBlockCount,firstBlock})=>{writerCalls.count+=1; assert.equal(expectedBlockCount,groupCount); const databasePath=path.join(root,'private','identity.sqlite'); return {databasePath,writer:createM4CrossPhaseIdentityStreamingWriter({databasePath,registrySecret:Buffer.alloc(32,7),registryKeyId:item.registryKeyId,capacityPreflight:{availableBytes:5*1024*1024*1024,sampleBlocks:[firstBlock],expectedBlockCount},pageSink:{writePage:async page=>({pageKey:page.pageKey,digest:page.digest})}})};}
+    createWriter:async ({expectedBlockCount,firstBlock})=>{writerCalls.count+=1; assert.equal(expectedBlockCount,groupCount); const databasePath=path.join(root,'private','identity.sqlite'); return {databasePath,writer:createM4CrossPhaseIdentityStreamingWriter({databasePath,registrySecret:Buffer.alloc(32,7),registryKeyId:item.registryKeyId,capacityPreflight:{availableBytes:5*1024*1024*1024,sampleBlocks:[firstBlock],expectedBlockCount},pageSink:{writePage:writePage ?? (async page=>({pageKey:page.pageKey,digest:page.digest}))}})};},
+    publish:publish ?? (async value=>{events.push('publish'); assert.deepEqual(Object.keys(value).sort(),['coverage','registry','traversalCompletion']); return {state:'published',artifactDigest:`sha256:${'a'.repeat(64)}`};})
   }};
 }
 
 test('all-excluded traversal never opens a writer and creates a deterministic empty authority', async () => {
   const root=temporary(); const calls={count:0}; const events=[];
   try { const prepared=setup(root,[result(1,'excluded'),result(2,'excluded')],{writerCalls:calls,events}); const original=Buffer.from(prepared.input.registrySecret); const output=await runM4CrossPhaseIdentityTraversal(prepared.input);
-    assert.equal(calls.count,0); assert.equal(output.databasePath,null); assert.ok(output.emptyRegistry); assert.equal(output.coverage.blockCount,0); assert.deepEqual(prepared.input.registrySecret,original); assert.deepEqual(events,['acquire','attest','heartbeat','heartbeat','attest','release']);
+    assert.equal(calls.count,0); assert.equal(output.databasePath,null); assert.equal(output.publication.state,'published'); assert.equal(output.coverage.blockCount,0); assert.deepEqual(prepared.input.registrySecret,original); assert.deepEqual(events,['acquire','attest','heartbeat','heartbeat','attest','heartbeat','heartbeat','attest','heartbeat','publish','release']);
   } finally { fs.rmSync(root,{recursive:true,force:true}); }
 });
 
@@ -121,5 +122,53 @@ test('a pending orphan cannot be followed by an excluded group', async () => {
   try { const first=result(1,'accepted'); const orphan=result(2,'accepted'); const excluded=result(2,'excluded'); const prepared=setup(root,[first,excluded],{writerCalls:calls}); prepared.store.commit({sequence:1,checkpoint:first.checkpoint,logicalMessageId:first.logicalMessageId,outcome:first.outcome,identityBlockDigest:first.identityBlockDigest});
     const spool=await prepared.input.createWriter({expectedBlockCount:2,firstBlock:first.identityBlock}); spool.writer.accept(first.identityBlock); spool.writer.accept(orphan.identityBlock); spool.writer.close();
     await assert.rejects(()=>runM4CrossPhaseIdentityTraversal(prepared.input),{code:'m4_cross_phase_identity_traversal_runner_prefix_drift'}); assert.equal(prepared.store.load().sequence,1); prepared.store.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
+test('publication runs under lease after final attestation and before writer close/release', async () => {
+  const root=temporary(); const events=[];
+  try { const prepared=setup(root,[result(1,'accepted')],{events}); const original=prepared.input.createWriter; prepared.input.createWriter=async input=>{const made=await original(input); const writer=made.writer; return {...made,writer:{accept:writer.accept.bind(writer),seal:writer.seal.bind(writer),close(){events.push('close');return writer.close();}}};};
+    await runM4CrossPhaseIdentityTraversal(prepared.input); assert.ok(events.indexOf('publish')<events.indexOf('close')); assert.ok(events.indexOf('close')<events.indexOf('release')); prepared.store.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
+test('post-seal catalog drift blocks publication and still closes/releases', async () => {
+  const root=temporary(); const events=[]; let attests=0;
+  try { const alternate=fixture({coverage:{schema:'amf.m4-cross-phase-identity-streaming-coverage/v1',state:'open',expectedBlockCount:0,blockCount:0,sessionCount:0,eventCount:0},registrySecret:Buffer.alloc(32,7),groupCount:1,coveredThrough:'2026-07-23T00:00:00Z'}); const prepared=setup(root,[result(1,'accepted')],{events,attestor:async()=>{attests+=1;return attests===3?structuredClone(alternate.input.catalogBaseline):structuredClone(prepared.input.catalogBaseline);}});
+    await assert.rejects(()=>runM4CrossPhaseIdentityTraversal(prepared.input),{code:'m4_cross_phase_identity_traversal_runner_catalog_drift'}); assert.equal(events.includes('publish'),false); assert.equal(events.at(-1),'release'); prepared.store.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
+test('hostile or failed publication cannot bypass close and lease release', async () => {
+  const root=temporary(); const events=[];
+  try { const prepared=setup(root,[result(1,'accepted')],{events,publish:async()=>({state:'published',get artifactDigest(){throw new Error('private');}})});
+    await assert.rejects(()=>runM4CrossPhaseIdentityTraversal(prepared.input),{code:'m4_cross_phase_identity_traversal_runner_publish_invalid'}); assert.equal(events.at(-1),'release'); prepared.store.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
+test('retry after sealed publication failure reopens, reseals, and republishes idempotently', async () => {
+  const root=temporary(); const row=result(1,'accepted'); const firstEvents=[]; const secondEvents=[];
+  try { const first=setup(root,[row],{events:firstEvents,publish:async()=>{throw new Error('publish interrupted');}});
+    await assert.rejects(()=>runM4CrossPhaseIdentityTraversal(first.input),{code:'m4_cross_phase_identity_traversal_runner_publish_failed'}); assert.equal(first.store.load().complete,true); first.store.close();
+    const second=setup(root,[row],{events:secondEvents}); const output=await runM4CrossPhaseIdentityTraversal(second.input);
+    assert.equal(output.publication.state,'published'); assert.equal(secondEvents.includes('publish'),true); assert.equal(secondEvents.at(-1),'release'); second.store.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
+test('retry after seal-intent page failure resumes the matching seal and publishes', async () => {
+  const root=temporary(); const row=result(1,'accepted'); let failedPages=0; let recoveredPages=0;
+  try { const first=setup(root,[row],{writePage:async()=>{failedPages+=1; throw new Error('page interrupted');}});
+    await assert.rejects(()=>runM4CrossPhaseIdentityTraversal(first.input),{code:'m4_cross_phase_identity_traversal_runner_seal_failed'}); assert.equal(first.store.load().complete,true); assert.ok(failedPages>0); first.store.close();
+    const second=setup(root,[row],{writePage:async page=>{recoveredPages+=1; return {pageKey:page.pageKey,digest:page.digest};}}); const output=await runM4CrossPhaseIdentityTraversal(second.input);
+    assert.equal(output.publication.state,'published'); assert.ok(recoveredPages>0); second.store.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
+test('sealed retry with a different re-derived completion binding fails distinctly without publishing', async () => {
+  const root=temporary(); const row=result(1,'accepted'); let publishCalls=0;
+  try { const first=setup(root,[row],{publish:async()=>{throw new Error('publish interrupted');}});
+    await assert.rejects(()=>runM4CrossPhaseIdentityTraversal(first.input),{code:'m4_cross_phase_identity_traversal_runner_publish_failed'}); first.store.close();
+    const second=setup(root,[row],{publish:async()=>{publishCalls+=1; throw new Error('must not publish');}}); second.input.completionKeyDocument={...second.input.completionKeyDocument,key:Buffer.alloc(32,99).toString('base64')};
+    await assert.rejects(()=>runM4CrossPhaseIdentityTraversal(second.input),{code:'m4_cross_phase_identity_traversal_runner_seal_binding_invalid'}); assert.equal(publishCalls,0); second.store.close();
   } finally { fs.rmSync(root,{recursive:true,force:true}); }
 });
