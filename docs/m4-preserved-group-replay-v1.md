@@ -1,15 +1,17 @@
 # M4 preserved logical-group replay v1
 
 `runM4PreservedGroupReplay` is an injected, file-free coordinator for immutable,
-content-free logical-group descriptors. Each descriptor carries canonical,
-sorted member bindings (`origin`, preserved `position`, `legacyEventId`,
-authority-bound `recordDigest`, and `projectionDigest`). Its `groupDigest` is
-recomputed from those members, the authority digest, and the logical-message ID
-before private input is accepted. The runner maps private observations by their
-unique legacy event IDs and recomputes the canonical projection digest for each
-member. `origin` and `position` remain closed-source locator evidence; they are
-never derived from runtime `sourceTag`, migration sequence, or projection source
-kind. A source therefore supplies complete private logical observations only
+content-free logical-group descriptors. Each canonical member has one
+`legacyEventId`, one `projectionDigest`, and a sorted nonempty `locators` list.
+Every locator carries its closed-source `origin`, preserved `position`, and
+authority-bound `recordDigest`. This permits one event present in archive,
+pending, and deadletter state to produce exactly one materialized observation.
+The runner recomputes `groupDigest` from canonical members, the authority digest,
+and the logical-message ID before private input is accepted. It maps private
+observations by unique legacy event ID and recomputes each projection digest.
+Origin and position remain closed-source locator evidence; they are never
+derived from runtime `sourceTag`, migration sequence, or projection source kind.
+A source therefore supplies complete private logical observations only
 after closing membership across the v2 archive and preserved queues. The
 coordinator projects each group with
 `projectM4V2LogicalGroup`, delivers its events in projector order, and commits

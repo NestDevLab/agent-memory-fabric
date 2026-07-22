@@ -30,13 +30,24 @@ function authority(value) {
 }
 
 function member(value) {
-  if (!exact(value, ['origin', 'position', 'legacyEventId', 'recordDigest', 'projectionDigest'])
-    || !['v2-archive', 'preserved-outbox', 'preserved-deadletter'].includes(value.origin)
-    || !Number.isSafeInteger(value.position) || value.position < 0
-    || !LEGACY_EVENT.test(value.legacyEventId) || !DIGEST.test(value.recordDigest) || !DIGEST.test(value.projectionDigest)) {
+  if (!exact(value, ['legacyEventId', 'projectionDigest', 'locators'])
+    || !LEGACY_EVENT.test(value.legacyEventId) || !DIGEST.test(value.projectionDigest)
+    || !Array.isArray(value.locators) || value.locators.length < 1) {
     fail('m4_group_descriptor_invalid');
   }
-  return structuredClone(value);
+  const locators = value.locators.map(locator => {
+    if (!exact(locator, ['origin', 'position', 'recordDigest'])
+      || !['v2-archive', 'preserved-outbox', 'preserved-deadletter'].includes(locator.origin)
+      || !Number.isSafeInteger(locator.position) || locator.position < 0 || !DIGEST.test(locator.recordDigest)) {
+      fail('m4_group_descriptor_invalid');
+    }
+    return structuredClone(locator);
+  });
+  const keys = locators.map(locator => `${locator.origin}\0${locator.position}`);
+  if (new Set(keys).size !== keys.length || canonicalJson(locators) !== canonicalJson([...locators].sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right))))) {
+    fail('m4_group_descriptor_invalid');
+  }
+  return { legacyEventId: value.legacyEventId, projectionDigest: value.projectionDigest, locators };
 }
 
 function descriptorDigest(value) {
