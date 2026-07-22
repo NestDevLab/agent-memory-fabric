@@ -20,7 +20,7 @@ import {
   deriveM4V3EventIdFromLegacyEventId,
   deriveM4V3SourceInstanceIdFromLegacySession,
 } from './m4-v2-conversation-projector.mjs';
-import { verifyM4CrossPhaseIdentityTraversalCompletion } from './m4-cross-phase-identity-traversal-completion.mjs';
+import { createM4CrossPhaseIdentityZeroStreamingCoverage, verifyM4CrossPhaseIdentityTraversalCompletion } from './m4-cross-phase-identity-traversal-completion.mjs';
 
 export const M4_CROSS_PHASE_IDENTITY_STREAMING_BLOCK_SCHEMA = 'amf.m4-cross-phase-projector-identity-block/v1';
 export const M4_CROSS_PHASE_IDENTITY_STREAMING_MAX_PAGE_BYTES = 8 * 1024 * 1024;
@@ -48,6 +48,7 @@ function clone(value, code) { try { return structuredClone(value); } catch { fai
 function digest(value) { return `sha256:${crypto.createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex')}`; }
 function safeEqual(left, right) { const a = Buffer.from(String(left), 'utf8'); const b = Buffer.from(String(right), 'utf8'); return a.length === b.length && crypto.timingSafeEqual(a, b); }
 function completionKeyMaterial(value) { const safe = clone(value, 'm4_cross_phase_identity_streaming_completion_key_invalid'); if (!exact(safe, ['schema','keyId','key']) || safe.schema !== 'amf.migration-signing-key/v1' || !KEY_ID.test(safe.keyId) || typeof safe.key !== 'string' || !B64.test(safe.key)) fail('m4_cross_phase_identity_streaming_completion_key_invalid'); const material = Buffer.from(safe.key,'base64'); if (material.length < 32 || material.length > 64 || material.toString('base64') !== safe.key) { material.fill(0); fail('m4_cross_phase_identity_streaming_completion_key_invalid'); } return material; }
+function registryCommitment(registrySecret, registryKeyId) { return `hmac-sha256:${crypto.createHmac('sha256', registrySecret).update(canonicalJson(['amf.m4-cross-phase-identity-traversal-completion/v1/registry-key', registryKeyId]), 'utf8').digest('base64url')}`; }
 function privateMode(stat) { return stat.uid === process.getuid() && (stat.mode & 0o077) === 0; }
 function canonicalBytes(value) { return Buffer.byteLength(canonicalJson(value), 'utf8'); }
 function bucketFor(value, prefix) { return value.slice(prefix.length, prefix.length + 2); }
@@ -283,6 +284,24 @@ function pageAck(value, page) {
   }
 }
 
+export function createM4CrossPhaseIdentityEmptyRegistry(input = {}) {
+  const safe = clone(input, 'm4_cross_phase_identity_empty_registry_input_invalid');
+  if (!exact(safe, ['traversalCompletion','completionKeyDocument','registrySecret','registryKeyId']) || typeof safe.registryKeyId !== 'string' || !KEY_ID.test(safe.registryKeyId) || !(safe.registrySecret instanceof Uint8Array) || safe.registrySecret.byteLength !== 32) fail('m4_cross_phase_identity_empty_registry_input_invalid');
+  const registrySecret = Buffer.from(safe.registrySecret); let completionMaterial;
+  try {
+    completionMaterial = completionKeyMaterial(safe.completionKeyDocument);
+    const completion = verifyM4CrossPhaseIdentityTraversalCompletion(safe.traversalCompletion, safe.completionKeyDocument);
+    if (canonicalJson(completion.coverage) !== canonicalJson(createM4CrossPhaseIdentityZeroStreamingCoverage())) fail('m4_cross_phase_identity_empty_registry_coverage_invalid');
+    if (completion.registryKeyId !== safe.registryKeyId) fail('m4_cross_phase_identity_empty_registry_binding_invalid');
+    const left = Buffer.alloc(64); const right = Buffer.alloc(64);
+    try { completionMaterial.copy(left); registrySecret.copy(right); if (safe.completionKeyDocument.keyId === safe.registryKeyId || crypto.timingSafeEqual(left,right)) fail('m4_cross_phase_identity_empty_registry_key_separation_invalid'); }
+    finally { left.fill(0); right.fill(0); }
+    if (!safeEqual(completion.registryKeyCommitment, registryCommitment(registrySecret,safe.registryKeyId))) fail('m4_cross_phase_identity_empty_registry_binding_invalid');
+    const authority = createM4CrossPhaseIdentityAuthority({ coveredThrough:completion.coveredThrough, backfillBinding:completion.archiveBinding, pageDescriptors:[] }, registrySecret);
+    return Object.freeze({ authority, coverage:Object.freeze({ acceptedBlockCount:0, sessionCount:0, eventCount:0, pageCount:0 }) });
+  } finally { completionMaterial?.fill(0); registrySecret.fill(0); safe.registrySecret.fill(0); }
+}
+
 export function createM4CrossPhaseIdentityStreamingWriter({ databasePath, registrySecret, registryKeyId, capacityPreflight, pageSink } = {}) {
   if (typeof databasePath !== 'string' || !path.isAbsolute(databasePath) || path.resolve(databasePath) !== databasePath
     || path.basename(databasePath) !== databasePath.split(path.sep).at(-1)
@@ -417,7 +436,7 @@ export function createM4CrossPhaseIdentityStreamingWriter({ databasePath, regist
     }
     const completionMaterial = completionKeyMaterial(safeCompletionKeyDocument);
     try { const left = Buffer.alloc(64); const right = Buffer.alloc(64); try { secret.copy(left); completionMaterial.copy(right); if (crypto.timingSafeEqual(left,right)) fail('m4_cross_phase_identity_streaming_completion_key_separation_invalid'); } finally { left.fill(0); right.fill(0); } } finally { completionMaterial.fill(0); }
-    const actualCommitment = `hmac-sha256:${crypto.createHmac('sha256', secret).update(canonicalJson(['amf.m4-cross-phase-identity-traversal-completion/v1/registry-key', registryKeyId]), 'utf8').digest('base64url')}`;
+    const actualCommitment = registryCommitment(secret, registryKeyId);
     if (completion.registryKeyId !== registryKeyId || !safeEqual(completion.registryKeyCommitment, actualCommitment)) fail('m4_cross_phase_identity_streaming_completion_registry_binding_invalid');
     // Validate the fixed authority inputs before recording an irreversible
     // seal intent; page descriptors are supplied only after bounded streaming.

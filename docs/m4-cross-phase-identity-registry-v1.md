@@ -43,6 +43,20 @@ cutoff and archive binding from it. The completion digest is atomically stored
 with the seal intent; retries must provide the same document before any page is
 published. A valid signature alone does not prove complete coverage.
 
+An all-excluded traversal of a nonempty catalog is represented by an open,
+signed zero-coverage completion. It creates a signed empty authority directly:
+there is no empty spool. The empty path still verifies the completion key,
+registry-key commitment, and independent key material before publishing its
+zero-page authority.
+
+Traversal progress has a separate owner-only durable state namespace. It binds
+one run identifier, plan digest, and catalog baseline digest; records only
+contiguous opaque group checkpoints, accepted/excluded counts, and digest
+chains; and atomically records a terminal traversal record. Checkpoints are
+derived from the group sequence, opaque logical identifier, outcome, and
+identity-block digest, so a valid checkpoint cannot be reused for another
+group. The state never contains conversation content or transcript material.
+
 For an already registered event, paused replay must present an equivalent
 content-free v2 projection and one of the bound source tags. A new revision of a
 registered event reuses its predecessor's conversation and source instance, so
