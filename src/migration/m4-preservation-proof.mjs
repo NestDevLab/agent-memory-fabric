@@ -164,7 +164,7 @@ export function createM4PreservationProof(value, authorities) {
 
 export function verifyM4PreservationProof(value, signingKeyDocument) {
   let manifest; try { manifest = signed(structuredClone(value), 'm4_preservation_proof_manifest_invalid'); }
-  catch (error) { if (error?.code) throw error; fail('m4_preservation_proof_manifest_invalid'); }
+  catch (error) { if (typeof error?.code === 'string' && error.code.startsWith('m4_')) throw error; fail('m4_preservation_proof_manifest_invalid'); }
   const loaded = keyDocument(structuredClone(signingKeyDocument), 'm4_preservation_proof_key_invalid');
   try {
     if (manifest.integrity.keyId !== loaded.keyId) fail('m4_preservation_proof_key_id_mismatch');

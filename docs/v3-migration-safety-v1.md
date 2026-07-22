@@ -123,6 +123,9 @@ memories, and documents. It binds route and extractor configuration revisions
 but does not change them. A separate scope-authority signature binds the full
 approved selector set to the active policy revision and digest; preservation
 and authorization both re-verify that snapshot inside its validity window.
+Authority windows are limited to seven days. A live route executor must
+re-verify the snapshot against trusted current UTC time; signed evidence times
+alone cannot extend an expired window.
 
 ## Cleanup boundary
 
@@ -142,6 +145,8 @@ identifiers and digests cannot overlap catalog evidence or protected proposal,
 canonical-memory, and document aggregates. Verified
 inventory evidence is projected into the existing `cleanup` phase; no canary,
 recovery, or cutover phase is added.
+A cleanup executor must re-verify the catalog snapshot against trusted current
+UTC time immediately before any separately approved destructive action.
 
 ## Manifest integrity
 

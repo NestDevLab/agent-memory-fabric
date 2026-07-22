@@ -18,6 +18,9 @@ restore evidence, or protected proposal, canonical-memory, and document
 aggregates.
 The catalog verification key is a configured trust anchor outside inventory
 input and cannot reuse the cleanup, preservation, or cutover signing authority.
+Before any separately approved cleanup execution, the executor must compare a
+trusted current UTC time with the catalog snapshot's `validThrough` and
+re-verify it. The signed `inventoriedAt` value is not a wall-clock substitute.
 
 The inventory verifies a signed cutover authorization and its preservation
 evidence before it can become `ready`. A projection helper emits the exact

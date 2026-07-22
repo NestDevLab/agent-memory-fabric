@@ -160,7 +160,7 @@ export function createM4CutoverAuthorization(value, authorities) {
 
 export function verifyM4CutoverAuthorization(value, authorizationKeyDocument) {
   let manifest; try { manifest = signed(structuredClone(value), 'm4_cutover_authorization_manifest_invalid'); }
-  catch (error) { if (error?.code) throw error; fail('m4_cutover_authorization_manifest_invalid'); }
+  catch (error) { if (typeof error?.code === 'string' && error.code.startsWith('m4_')) throw error; fail('m4_cutover_authorization_manifest_invalid'); }
   const loaded = keyDocument(structuredClone(authorizationKeyDocument), 'm4_cutover_authorization_key_invalid');
   try {
     if (manifest.integrity.keyId !== loaded.keyId) fail('m4_cutover_authorization_key_id_mismatch');

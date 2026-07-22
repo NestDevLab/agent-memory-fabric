@@ -128,7 +128,7 @@ export function createM4CutoverCanaryManifest(value) {
 
 export function verifyM4CutoverCanaryManifest(value, keyDocumentValue) {
   let manifest; try { manifest = signed(structuredClone(value), 'm4_cutover_canary_manifest_invalid'); }
-  catch (error) { if (error?.code) throw error; fail('m4_cutover_canary_manifest_invalid'); }
+  catch (error) { if (typeof error?.code === 'string' && error.code.startsWith('m4_')) throw error; fail('m4_cutover_canary_manifest_invalid'); }
   const loaded = keyDocument(structuredClone(keyDocumentValue), 'm4_cutover_canary_key_invalid');
   try {
     if (manifest.integrity.keyId !== loaded.keyId) fail('m4_cutover_canary_key_id_mismatch');

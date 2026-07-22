@@ -18,6 +18,7 @@ const TARGET_TYPES = new Set(['transcript-row', 'transcript-blob']);
 const MAX_TARGETS = 100_000;
 const MAX_REFERENCES = 1_000_000;
 const MAX_SELECTORS = 256;
+const MAX_AUTHORITY_WINDOW_NS = 7n * 24n * 60n * 60n * 1_000_000_000n;
 
 function fail(code) { const error = new Error(code); error.code = code; throw error; }
 function plain(value) { return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
@@ -56,6 +57,14 @@ function timestamp(value, code) {
 function timeKey(value) {
   const [whole, fraction = ''] = value.slice(0, -1).split('.');
   return `${whole}.${fraction.padEnd(9, '0')}Z`;
+}
+function timeNanoseconds(value) {
+  const [whole, fraction = ''] = value.slice(0, -1).split('.');
+  return BigInt(Date.parse(`${whole}Z`)) * 1_000_000n + BigInt(fraction.padEnd(9, '0') || '0');
+}
+function compareText(left, right) { return left < right ? -1 : left > right ? 1 : 0; }
+function validWindow(start, end) {
+  return timeKey(start) <= timeKey(end) && timeNanoseconds(end) - timeNanoseconds(start) <= MAX_AUTHORITY_WINDOW_NS;
 }
 export function timestampWithin(value, start, end) {
   const key = timeKey(timestamp(value, 'm4_authority_snapshot_time_invalid'));
@@ -100,14 +109,14 @@ function eligibleTargets(objects) {
 function selectorCountsFor(targets) {
   const counts = new Map();
   for (const target of targets) counts.set(target.sourceInstanceId, (counts.get(target.sourceInstanceId) || 0) + 1);
-  return [...counts].sort(([left], [right]) => left.localeCompare(right)).map(([sourceInstanceId, eligibleCount]) => ({ sourceInstanceId, contentClass: 'conversation', eligibleCount }));
+  return [...counts].sort(([left], [right]) => compareText(left, right)).map(([sourceInstanceId, eligibleCount]) => ({ sourceInstanceId, contentClass: 'conversation', eligibleCount }));
 }
 function catalogPayload(value, code) {
   const item = snapshot(value, ['schema', 'snapshotId', 'revision', 'catalogRevision', 'observedAt', 'validThrough', 'scanState', 'objects', 'scannedObjectCount', 'scannedReferenceCount', 'scanDigest', 'eligibleTargets', 'selectorCounts'], code);
   if (item.schema !== M4_CATALOG_REFERENCE_SNAPSHOT_SCHEMA || typeof item.snapshotId !== 'string' || !ID.test(item.snapshotId)
     || !Number.isSafeInteger(item.revision) || item.revision < 1 || item.scanState !== 'complete') fail(code);
   const observedAt = timestamp(item.observedAt, code); const validThrough = timestamp(item.validThrough, code);
-  if (timeKey(observedAt) > timeKey(validThrough)) fail(code);
+  if (!validWindow(observedAt, validThrough)) fail(code);
   const objects = catalogObjects(item.objects, code); const derivedTargets = eligibleTargets(objects); const derivedCounts = selectorCountsFor(derivedTargets);
   if (item.scannedObjectCount !== objects.length || item.scannedReferenceCount !== objects.reduce((sum, entry) => sum + entry.references.length, 0)
     || item.scanDigest !== sha(objects) || canonicalJson(item.eligibleTargets) !== canonicalJson(derivedTargets)
@@ -122,7 +131,7 @@ function scopePayload(value, code) {
     || !Number.isSafeInteger(item.revision) || item.revision < 1 || typeof item.policyRevision !== 'string' || !REVISION.test(item.policyRevision)
     || typeof item.policyDigest !== 'string' || !DIGEST.test(item.policyDigest)) fail(code);
   const observedAt = timestamp(item.observedAt, code); const validThrough = timestamp(item.validThrough, code);
-  if (timeKey(observedAt) > timeKey(validThrough)) fail(code);
+  if (!validWindow(observedAt, validThrough)) fail(code);
   const selected = selectors(item.selectors, code);
   if (item.selectorDigest !== sha(selected)) fail(code);
   return { schema: M4_SELECTOR_SCOPE_SNAPSHOT_SCHEMA, snapshotId: item.snapshotId, revision: item.revision,
@@ -148,8 +157,8 @@ export async function collectM4CatalogReferenceSnapshot(value) {
   const keys = ['snapshotId', 'revision', 'catalogRevision', 'observedAt', 'validThrough', 'catalogSource', 'keyDocument'];
   if (Object.keys(input).length !== keys.length || keys.some(key => !Object.hasOwn(input, key))) fail('m4_catalog_reference_snapshot_input_invalid');
   const objects = await collect(input.catalogSource, (entry, code) => catalogObject(entry, code, false), 'm4_catalog_reference_snapshot_input_invalid', MAX_TARGETS);
-  objects.sort((left, right) => left.id.localeCompare(right.id));
-  for (const object of objects) object.references.sort((left, right) => left.id.localeCompare(right.id));
+  objects.sort((left, right) => compareText(left.id, right.id));
+  for (const object of objects) object.references.sort((left, right) => compareText(left.id, right.id));
   const targets = eligibleTargets(objects); const counts = selectorCountsFor(targets);
   const body = catalogPayload({ schema: M4_CATALOG_REFERENCE_SNAPSHOT_SCHEMA, snapshotId: input.snapshotId, revision: input.revision,
     catalogRevision: input.catalogRevision, observedAt: input.observedAt, validThrough: input.validThrough, scanState: 'complete', objects,
@@ -163,7 +172,7 @@ export async function collectM4CatalogReferenceSnapshot(value) {
 export function verifyM4CatalogReferenceSnapshot(value, signingKeyDocument) {
   let item;
   try { item = snapshot(structuredClone(value), ['schema', 'snapshotId', 'revision', 'catalogRevision', 'observedAt', 'validThrough', 'scanState', 'objects', 'scannedObjectCount', 'scannedReferenceCount', 'scanDigest', 'eligibleTargets', 'selectorCounts', 'integrity'], 'm4_catalog_reference_snapshot_invalid'); }
-  catch (error) { if (error?.code) throw error; fail('m4_catalog_reference_snapshot_invalid'); }
+  catch (error) { if (typeof error?.code === 'string' && error.code.startsWith('m4_')) throw error; fail('m4_catalog_reference_snapshot_invalid'); }
   const { integrity: rawIntegrity, ...rawBody } = item;
   const body = catalogPayload(rawBody, 'm4_catalog_reference_snapshot_invalid'); const signed = integrity(rawIntegrity, 'm4_catalog_reference_snapshot_invalid');
   const loaded = keyDocument(structuredClone(signingKeyDocument), 'm4_catalog_reference_snapshot_key_invalid');
@@ -183,7 +192,7 @@ export async function collectM4SelectorScopeSnapshot(value) {
   let policy; try { policy = structuredClone(value.policy); } catch { fail('m4_selector_scope_snapshot_input_invalid'); }
   if (!plain(policy) || policy.schema !== 'amf.content-protection-policy/v1' || typeof policy.revision !== 'string' || !REVISION.test(policy.revision)) fail('m4_selector_scope_snapshot_input_invalid');
   const selected = await collect(value.selectorSource, selector, 'm4_selector_scope_snapshot_input_invalid', MAX_SELECTORS);
-  selected.sort((left, right) => left.sourceInstanceId.localeCompare(right.sourceInstanceId));
+  selected.sort((left, right) => compareText(left.sourceInstanceId, right.sourceInstanceId));
   const body = scopePayload({ schema: M4_SELECTOR_SCOPE_SNAPSHOT_SCHEMA, snapshotId: value.snapshotId, revision: value.revision,
     policyRevision: policy.revision, policyDigest: sha(policy), observedAt: value.observedAt, validThrough: value.validThrough,
     selectors: selected, selectorDigest: sha(selected) }, 'm4_selector_scope_snapshot_input_invalid');
@@ -195,7 +204,7 @@ export async function collectM4SelectorScopeSnapshot(value) {
 export function verifyM4SelectorScopeSnapshot(value, signingKeyDocument) {
   let item;
   try { item = snapshot(structuredClone(value), ['schema', 'snapshotId', 'revision', 'policyRevision', 'policyDigest', 'observedAt', 'validThrough', 'selectors', 'selectorDigest', 'integrity'], 'm4_selector_scope_snapshot_invalid'); }
-  catch (error) { if (error?.code) throw error; fail('m4_selector_scope_snapshot_invalid'); }
+  catch (error) { if (typeof error?.code === 'string' && error.code.startsWith('m4_')) throw error; fail('m4_selector_scope_snapshot_invalid'); }
   const { integrity: rawIntegrity, ...rawBody } = item;
   const body = scopePayload(rawBody, 'm4_selector_scope_snapshot_invalid'); const signed = integrity(rawIntegrity, 'm4_selector_scope_snapshot_invalid');
   const loaded = keyDocument(structuredClone(signingKeyDocument), 'm4_selector_scope_snapshot_key_invalid');

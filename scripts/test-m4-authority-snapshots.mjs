@@ -76,3 +76,41 @@ test('strict UTC validation rejects nonexistent dates and accepts a real leap da
     selectorSource: iterable([{ sourceInstanceId: source, contentClass: 'conversation' }]), keyDocument: key('selector-authority-key', 3) });
   assert.deepEqual(verifyM4SelectorScopeSnapshot(leap, key('selector-authority-key', 3)), leap);
 });
+
+test('canonical ordering is locale-independent for every signed identifier set', async () => {
+  const selectorManifest = await collectM4SelectorScopeSnapshot({ snapshotId: 'selector-ordering-one', revision: 1, policy,
+    observedAt: '2026-01-01T00:00:00Z', validThrough: '2026-01-02T00:00:00Z', selectorSource: iterable([
+      { sourceInstanceId: 'src_aa_bbbbbb', contentClass: 'conversation' },
+      { sourceInstanceId: 'src_aa0bbbbbb', contentClass: 'conversation' },
+    ]), keyDocument: key('selector-authority-key', 3) });
+  assert.deepEqual(selectorManifest.selectors.map(item => item.sourceInstanceId), ['src_aa0bbbbbb', 'src_aa_bbbbbb']);
+  assert.deepEqual(verifyM4SelectorScopeSnapshot(selectorManifest, key('selector-authority-key', 3)), selectorManifest);
+  const catalog = await collectM4CatalogReferenceSnapshot({ snapshotId: 'catalog-ordering-one', revision: 1,
+    catalogRevision: { id: 'catalog-ordering-revision', digest: digest('1') }, observedAt: '2026-01-01T00:00:00Z', validThrough: '2026-01-02T00:00:00Z',
+    catalogSource: iterable([
+      { id: 'legacy-object-z', digest: digest('2'), objectType: 'transcript-row', sourceInstanceId: 'src_aa_bbbbbb', contentClass: 'conversation', references: [{ id: 'reference-z', digest: digest('3') }, { id: 'reference-0', digest: digest('4') }] },
+      { id: 'legacy-object-0', digest: digest('5'), objectType: 'transcript-row', sourceInstanceId: 'src_aa0bbbbbb', contentClass: 'conversation', references: [] },
+    ]), keyDocument: key('catalog-authority-key', 1) });
+  assert.deepEqual(catalog.objects.map(item => item.id), ['legacy-object-0', 'legacy-object-z']);
+  assert.deepEqual(catalog.objects[1].references.map(item => item.id), ['reference-0', 'reference-z']);
+  assert.deepEqual(verifyM4CatalogReferenceSnapshot(catalog, key('catalog-authority-key', 1)), catalog);
+});
+
+test('authority windows are capped at seven exact days', async () => {
+  const exact = await collectM4SelectorScopeSnapshot({ snapshotId: 'selector-window-exact', revision: 1, policy,
+    observedAt: '2026-01-01T00:00:00.000000001Z', validThrough: '2026-01-08T00:00:00.000000001Z',
+    selectorSource: iterable([{ sourceInstanceId: source, contentClass: 'conversation' }]), keyDocument: key('selector-authority-key', 3) });
+  assert.deepEqual(verifyM4SelectorScopeSnapshot(exact, key('selector-authority-key', 3)), exact);
+  await assert.rejects(() => collectM4SelectorScopeSnapshot({ snapshotId: 'selector-window-long', revision: 1, policy,
+    observedAt: '2026-01-01T00:00:00Z', validThrough: '2026-01-08T00:00:00.000000001Z',
+    selectorSource: iterable([{ sourceInstanceId: source, contentClass: 'conversation' }]), keyDocument: key('selector-authority-key', 3) }), /m4_selector_scope_snapshot_input_invalid/);
+});
+
+test('uncloneable verifier input maps to fixed content-free errors', async () => {
+  const catalog = await catalogSnapshot(); const scope = await collectM4SelectorScopeSnapshot({ snapshotId: 'selector-uncloneable-one', revision: 1, policy,
+    observedAt: '2026-01-01T00:00:00Z', validThrough: '2026-01-02T00:00:00Z',
+    selectorSource: iterable([{ sourceInstanceId: source, contentClass: 'conversation' }]), keyDocument: key('selector-authority-key', 3) });
+  catalog.uncloneable = () => 'private'; scope.uncloneable = () => 'private';
+  assert.throws(() => verifyM4CatalogReferenceSnapshot(catalog, key('catalog-authority-key', 1)), error => error.code === 'm4_catalog_reference_snapshot_invalid');
+  assert.throws(() => verifyM4SelectorScopeSnapshot(scope, key('selector-authority-key', 3)), error => error.code === 'm4_selector_scope_snapshot_invalid');
+});
