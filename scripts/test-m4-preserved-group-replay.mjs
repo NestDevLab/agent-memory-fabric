@@ -42,10 +42,10 @@ function observation(value, options = {}) {
 function group(observations, token = String(observations[0].eventId.at(-1))) {
   const selected = selectLogicalMessage(observations.map(item => ({ eventId: item.eventId, projection: item.projection })));
   const logical = { ...selected, eventIds: observations.map(item => item.eventId).sort() };
-  const members = observations.map((item, position) => ({ origin: 'v2-archive', position,
-    legacyEventId: item.eventId,
-    recordDigest: sha(canonicalJson({ schema: 'amf.m4-group-locator/v1', authorityDigest: authority.authorityDigest,
-      origin: 'v2-archive', position, legacyEventId: item.eventId })), projectionDigest: sha(canonicalJson(item.projection))
+  const members = observations.map((item, position) => ({ legacyEventId: item.eventId,
+    projectionDigest: sha(canonicalJson(item.projection)), locators: [{ origin: 'v2-archive', position,
+      recordDigest: sha(canonicalJson({ schema: 'amf.m4-group-locator/v1', authorityDigest: authority.authorityDigest,
+        origin: 'v2-archive', position, legacyEventId: item.eventId })) }]
   })).sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
   return { descriptor: { schema: 'amf.m4-logical-group-descriptor/v1', authorityDigest: authority.authorityDigest,
     groupDigest: sha(canonicalJson({ schema: 'amf.m4-logical-group-binding/v1', authorityDigest: authority.authorityDigest,
@@ -108,7 +108,7 @@ test('delivers projector edit and tombstone order before one group checkpoint', 
 
 test('binds opaque runtime observations to closed-source members without conflating domains', async () => {
   const item = group([observation('a', { sourceKind: 'codex' })], 'opaque-origin');
-  assert.equal(item.descriptor.members[0].origin, 'v2-archive');
+  assert.equal(item.descriptor.members[0].locators[0].origin, 'v2-archive');
   assert.equal(item.observations[0].projection.sourceKind, 'codex');
   assert.match(item.observations[0].sourceTag, /^migration:/);
   const result = await runM4PreservedGroupReplay(input([item]));
@@ -161,4 +161,10 @@ test('preserves the primary failure when iterator close also fails', async () =>
       completion: async () => ({ schema: 'amf.m4-preserved-group-replay-source/v1', authorityDigest: authority.authorityDigest, complete: true }) };
   } };
   await assert.rejects(() => runM4PreservedGroupReplay(dependencies), { code: 'm4_group_materialization_mismatch' });
+});
+
+test('rejects duplicate locator coordinates inside one descriptor member', async () => {
+  const item = group([observation('a')], 'duplicate-locator');
+  item.descriptor.members[0].locators.push(structuredClone(item.descriptor.members[0].locators[0]));
+  await assert.rejects(() => runM4PreservedGroupReplay(input([item])), { code: 'm4_group_descriptor_invalid' });
 });
