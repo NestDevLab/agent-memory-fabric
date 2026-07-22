@@ -108,3 +108,16 @@ test('reports reader close failure only when it is the primary source failure', 
   const primary = { [Symbol.asyncIterator]() { return { async next() { throw new Error('private read error'); }, async return() { throw new Error('private close error'); } }; } };
   await rejects(async () => rows(build({ reader: { async open() { return wrapper(primary); } } })), 'm4_native_paused_reader_read_failed');
 });
+
+test('owns a private derivation-key copy and destroys it on idempotent close', async () => {
+  const callerKey = Buffer.from(key);
+  const source = createM4NativePausedIntervalSource({ authority, derivationKey: callerKey,
+    derivationKeyId: 'native-test-k1', verifyPauseEvidence: async () => verification,
+    reader: { async open() { return wrapper((async function* () { yield codex(11, 'private-copy'); })()); } },
+    integrityFor: input => integrity(input) });
+  callerKey.fill(0);
+  assert.equal((await rows(source)).length, 1);
+  source.close();
+  source.close();
+  await rejects(async () => rows(source), 'm4_native_paused_source_closed');
+});

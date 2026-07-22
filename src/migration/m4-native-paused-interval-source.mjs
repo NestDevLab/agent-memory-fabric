@@ -163,7 +163,9 @@ function duplicateSemanticDigest(event) {
 
 export function createM4NativePausedIntervalSource(input = {}) {
   const deps = dependencies(input);
+  let closed = false;
   return { open(openInput) {
+    if (closed) fail('m4_native_paused_source_closed');
     const opened = request(openInput, deps.authority.initialCheckpoint);
     return (async function* () {
       await verified(deps);
@@ -226,5 +228,9 @@ export function createM4NativePausedIntervalSource(input = {}) {
         catch { if (primaryError === null) fail('m4_native_paused_reader_close_failed'); }
       }
     })();
+  }, close() {
+    if (closed) return;
+    closed = true;
+    deps.derivationKey.fill(0);
   } };
 }
