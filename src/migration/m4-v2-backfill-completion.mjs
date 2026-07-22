@@ -88,6 +88,7 @@ export async function createM4V2ArchiveBackfillCompletion(input = {}) {
     if (result.runId !== planned.runId || result.phase !== planned.phase) fail('m4_v2_archive_completion_result_mismatch');
     const before = verifyM4V2CatalogRevisionAttestation(input.preCatalogAttestation, catalogKeyDocument);
     const after = verifyM4V2CatalogRevisionAttestation(input.postCatalogAttestation, catalogKeyDocument);
+    if (before.schema !== 'amf.m4-v2-catalog-revision-attestation/v2' || after.schema !== 'amf.m4-v2-catalog-revision-attestation/v2') fail('m4_v2_archive_completion_catalog_schema_invalid');
     const catalogAttestationDigest = digest(before);
     if (catalogAttestationDigest !== digest(after)) fail('m4_v2_archive_completion_catalog_changed');
     const unsigned = payload({ schema: M4_V2_ARCHIVE_BACKFILL_COMPLETION_SCHEMA, state: 'complete', manifestId: input.manifestId,
@@ -125,7 +126,8 @@ export function deriveM4V2ArchiveRegistryBinding(completion, completionKeyDocume
       catalogKey.key.copy(catalogBlock); completionKey.key.copy(completionBlock);
       if (catalogKey.keyId === completionKey.keyId || crypto.timingSafeEqual(catalogBlock, completionBlock)) fail('m4_v2_archive_completion_key_separation_invalid');
     } finally { catalogBlock.fill(0); completionBlock.fill(0); }
-    if (safeCompletion.catalogAttestationKeyId !== safeCatalog.integrity.keyId
+    if (safeCatalog.schema !== 'amf.m4-v2-catalog-revision-attestation/v2'
+      || safeCompletion.catalogAttestationKeyId !== safeCatalog.integrity.keyId
       || safeCompletion.catalogAttestationKeyId !== catalogKey.keyId
       || safeCompletion.catalogAttestationDigest !== digest(safeCatalog)) fail('m4_v2_archive_completion_catalog_binding_mismatch');
     return { completionDigest: digest(safeCompletion), catalogRevisionDigest: safeCatalog.traversal.catalogRevisionDigest };
