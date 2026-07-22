@@ -102,3 +102,34 @@ export function filterClaudeConversationRecord(input = {}) {
   const payload = eligibleClaudeConversationPayload(input);
   return payload === null ? null : createConversationEvent(payload, input.integrity);
 }
+
+export function eligibleOpenClawConversationPayload({
+  value, identity, sourceSequence, occurredAt, sessionHint
+} = {}) {
+  if (!isObject(value) || value.type !== 'message' || !isObject(value.message)) return null;
+  const message = value.message;
+  if (!['user', 'assistant'].includes(message.role)) return null;
+  if (!firstIdentifier(value.sessionKey, value.session_key, value.sessionId, value.session_id, sessionHint)) return null;
+  if (!firstIdentifier(value.id, value.uuid, value.messageId, value.message_id, message.id)) return null;
+  const sourceOccurredAt = value.timestamp ?? value.createdAt ?? message.timestamp;
+  if (!isConversationEventUtcTimestamp(sourceOccurredAt)) return null;
+
+  let parts;
+  if (typeof message.content === 'string') {
+    parts = [message.content];
+  } else if (Array.isArray(message.content) && message.content.length > 0
+             && message.content.every(part => isObject(part) && part.type === 'text'
+               && typeof part.text === 'string')) {
+    parts = message.content.map(part => part.text);
+  } else {
+    return null;
+  }
+  const text = visibleText(parts);
+  if (text === null) return null;
+  return eventPayload(identity, message.role, text, sourceOccurredAt, sourceSequence, occurredAt);
+}
+
+export function filterOpenClawConversationRecord(input = {}) {
+  const payload = eligibleOpenClawConversationPayload(input);
+  return payload === null ? null : createConversationEvent(payload, input.integrity);
+}
