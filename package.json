@@ -37,6 +37,7 @@
     "test:m4-v2-backfill-runner": "node --test scripts/test-m4-v2-backfill-runner.mjs",
     "test:m4-v2-backfill-operator": "node --test scripts/test-m4-v2-backfill-operator.mjs",
     "test:m4-cross-phase-identity-page-store": "node --test scripts/test-m4-cross-phase-identity-page-store.mjs",
+    "test:m4-cross-phase-identity-publication-reader": "node --test scripts/test-m4-cross-phase-identity-publication-reader.mjs",
     "test:m4-cross-phase-identity-traversal-operator": "node --test scripts/test-m4-cross-phase-identity-traversal-operator.mjs",
     "test:m4-live-operator": "node --test scripts/test-m4-live-operator.mjs",
     "test:m4-conversation-archive-sink": "node --test scripts/test-m4-conversation-archive-sink.mjs",

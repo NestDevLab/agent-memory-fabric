@@ -3,6 +3,7 @@ import { normalizeContextTags } from '../ingest/raw-projection-v2.mjs';
 import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
 import { createM4CrossPhaseIdentityResolver } from './m4-cross-phase-identity-registry.mjs';
 import { createM4PausedSourceTagResolver } from './m4-paused-source-tag-authority.mjs';
+import { createM4CrossPhaseIdentityPublicationReader } from '../operator/m4-cross-phase-identity-publication-reader.mjs';
 
 export const M4_PAUSED_PROJECTION_IDENTITY_SCHEMA = 'amf.m4-paused-projection-identity/v1';
 
@@ -23,6 +24,49 @@ function binding(value, code) {
     || !RUNTIME.has(value.runtime) || typeof value.sourceId !== 'string' || !SOURCE_ID.test(value.sourceId)
     || typeof value.digest !== 'string' || !DIGEST.test(value.digest)) fail(code);
   return { schema: value.schema, runtime: value.runtime, sourceId: value.sourceId, digest: value.digest };
+}
+
+export function createM4PausedProjectionIdentityResolverFromPublication(input = {}) {
+  if (!exact(input, ['artifactRoot', 'manifestId', 'revision',
+    'traversalCompletionKeyDocument', 'registrySecret', 'sourceTagAuthority',
+    'sourceTagSecret', 'loadPostCutoffEvent'])) {
+    fail('m4_paused_projection_identity_resolver_invalid');
+  }
+  const reader = createM4CrossPhaseIdentityPublicationReader({
+    artifactRoot: input.artifactRoot,
+    manifestId: input.manifestId,
+    revision: input.revision,
+    traversalCompletionKeyDocument: input.traversalCompletionKeyDocument,
+    registrySecret: input.registrySecret,
+  });
+  try {
+    const resolver = createM4PausedProjectionIdentityResolver({
+      registryAuthority: reader.authority,
+      loadPage: pageKey => reader.loadPage(pageKey),
+      loadPostCutoffEvent: input.loadPostCutoffEvent,
+      sourceTagAuthority: input.sourceTagAuthority,
+      registrySecret: input.registrySecret,
+      sourceTagSecret: input.sourceTagSecret,
+    });
+    let closed = false;
+    return Object.freeze({
+      kind: resolver.kind,
+      resolve(value) {
+        if (closed) fail('m4_paused_projection_identity_resolver_closed');
+        return resolver.resolve(value);
+      },
+      close() {
+        if (!closed) {
+          closed = true;
+          try { resolver.close(); }
+          finally { reader.close(); }
+        }
+      },
+    });
+  } catch (error) {
+    reader.close();
+    throw error;
+  }
 }
 function same(left, right) { return canonicalJson(left) === canonicalJson(right); }
 function copiedKey(value) {
@@ -64,19 +108,26 @@ export function createM4PausedProjectionIdentityResolver(input = {}) {
     fail('m4_paused_projection_identity_resolver_invalid');
   }
   const registrySecret = copiedKey(input.registrySecret); const sourceTagSecret = copiedKey(input.sourceTagSecret);
-  if (registrySecret.equals(sourceTagSecret)) fail('m4_paused_projection_identity_resolver_invalid');
+  if (registrySecret.equals(sourceTagSecret)) {
+    registrySecret.fill(0); sourceTagSecret.fill(0);
+    fail('m4_paused_projection_identity_resolver_invalid');
+  }
   let registryResolver;
   try { registryResolver = createM4CrossPhaseIdentityResolver({ authority: input.registryAuthority,
     loadPage: input.loadPage, loadPostCutoffEvent: input.loadPostCutoffEvent }, registrySecret); }
-  catch { fail('m4_paused_projection_identity_resolver_invalid'); }
-  const registryAuthority = structuredClone(input.registryAuthority); const sourceTagAuthority = structuredClone(input.sourceTagAuthority);
+  catch { registrySecret.fill(0); sourceTagSecret.fill(0); fail('m4_paused_projection_identity_resolver_invalid'); }
+  let registryAuthority; let sourceTagAuthority;
+  try { registryAuthority = structuredClone(input.registryAuthority); sourceTagAuthority = structuredClone(input.sourceTagAuthority); }
+  catch { registrySecret.fill(0); sourceTagSecret.fill(0); fail('m4_paused_projection_identity_resolver_invalid'); }
   let sourceTagResolver;
   try { sourceTagResolver = createM4PausedSourceTagResolver({ authority: sourceTagAuthority,
     registryAuthority, registrySecret, sourceTagSecret }); }
-  catch { fail('m4_paused_projection_identity_resolver_invalid'); }
+  catch { registrySecret.fill(0); sourceTagSecret.fill(0); fail('m4_paused_projection_identity_resolver_invalid'); }
+  let closed = false;
   return Object.freeze({
     kind: 'm4-paused-projection-identity-resolver-v1',
     resolve({ identity, attestation } = {}) {
+      if (closed) fail('m4_paused_projection_identity_resolver_closed');
       const safeIdentity = validateM4PausedProjectionIdentity(identity);
       let safeAttestation;
       try { safeAttestation = binding(attestation, 'm4_paused_projection_identity_attestation_invalid'); }
@@ -92,6 +143,12 @@ export function createM4PausedProjectionIdentityResolver(input = {}) {
         role: safeIdentity.routing.role, direction: safeIdentity.routing.direction,
         effectiveTimestamp: safeIdentity.editedAt ?? safeIdentity.occurredAt,
         priorLegacyEventId: safeIdentity.legacy.priorEventId });
+    },
+    close() {
+      if (!closed) {
+        closed = true;
+        registrySecret.fill(0); sourceTagSecret.fill(0);
+      }
     },
   });
 }
