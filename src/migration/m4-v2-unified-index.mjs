@@ -129,6 +129,9 @@ export async function prepareM4V2UnifiedIndex(input = {}) {
     return { archiveDigest, captured, entries, totalBytes, totalEntries };
   }
   const scanned = await scan({ collectEntries: true }); const { entries } = scanned;
+  const attestation = Object.freeze({ schema: 'amf.m4-v2-unified-index-attestation/v1',
+    authorityDigest: safeAuthority.authorityDigest, archiveDigest: scanned.archiveDigest,
+    totalEntries: scanned.totalEntries, totalBytes: scanned.totalBytes });
   const index = Object.freeze({ schema: 'amf.m4-unified-logical-index/v1', authorityDigest: safeAuthority.authorityDigest, origin: 'v2-archive', complete: true,
     entries: Object.freeze(entries.map(entry => Object.freeze({ ...entry, projectionDigests: Object.freeze(entry.projectionDigests.map(item => Object.freeze({ ...item }))) }))) });
   async function materializer(locator) {
@@ -158,5 +161,5 @@ export async function prepareM4V2UnifiedIndex(input = {}) {
     if (digest(observation.projection, 'm4_v2_unified_materialization_mismatch') !== safeLocator.projectionDigest) fail('m4_v2_unified_materialization_mismatch');
     return clone(observation, 'm4_v2_unified_materialization_invalid');
   }
-  return Object.freeze({ index, materializer, totalEntries: scanned.totalEntries, totalBytes: scanned.totalBytes });
+  return Object.freeze({ index, attestation, materializer, totalEntries: scanned.totalEntries, totalBytes: scanned.totalBytes });
 }

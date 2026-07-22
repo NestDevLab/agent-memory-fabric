@@ -90,6 +90,10 @@ test('indexes real v2 catalog envelopes without plaintext and materializes a rot
   const env = await fixture([{ value: rotated, selectAlias: true }, { value: first }]);
   const bridge = await prepareM4V2UnifiedIndex(env.input);
   assert.equal(bridge.index.complete, true); assert.equal(bridge.totalEntries, 2); assert.equal(bridge.index.entries.length, 2);
+  assert.deepEqual(bridge.attestation, { schema: 'amf.m4-v2-unified-index-attestation/v1',
+    authorityDigest: AUTHORITY.authorityDigest, archiveDigest: bridge.attestation.archiveDigest,
+    totalEntries: 2, totalBytes: bridge.totalBytes });
+  assert.match(bridge.attestation.archiveDigest, /^sha256:[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(bridge.index).includes('visible '), false); assert.equal(JSON.stringify(bridge.index).includes('ciphertext'), false);
   assert.throws(() => bridge.index.entries[0].projectionDigests.push({}), TypeError);
   const entry = bridge.index.entries.find(candidate => candidate.legacyEventId === rotated.event.eventId);
