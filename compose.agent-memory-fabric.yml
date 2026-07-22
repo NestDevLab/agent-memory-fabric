@@ -53,6 +53,7 @@ services:
       - ${AMF_INGEST_KEY_RING_SECRET_PATH:?mount the CT113 ingest key-ring secret}:/run/secrets/agent-memory-fabric-ingest-key-ring.json:ro
       - ${AMF_CONTEXT_KEY_RING_SECRET_PATH:?mount the context-token key-ring secret}:/run/secrets/agent-memory-fabric-context-key-ring.json:ro
       - ${AMF_SESSION_ROUTE_DIR:?mount the private signed session-route directory}:/run/amf-session-routes:ro
+      - ./runtime/migration-pause:/run/amf-migration-pause:ro
       - ${AMF_PAM_RUNTIME_PRIVATE_DIR:?mount the service-owned 0700 PAM runtime directory}:/run/amf-pam-private:ro
       - ${AMF_PAM_SOURCE_PATH:?mount the reviewed portable-agent-memory source}:/opt/portable-agent-memory:ro
       - ${AMF_PAM_WORKSPACE_PATH:?mount the canonical PAM workspace}:/srv/brain-shared:ro

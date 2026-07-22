@@ -180,6 +180,12 @@ test('startup fence accepts only an authenticated signed manifest pair', () => {
   } finally { fs.rmSync(setup.directory, { recursive: true, force: true }); }
 });
 
+test('production compose mounts pause evidence read-only without overriding runtime paths', () => {
+  const compose = fs.readFileSync(new URL('../compose.agent-memory-fabric.yml', import.meta.url), 'utf8');
+  assert.match(compose, /\.\/runtime\/migration-pause:\/run\/amf-migration-pause:ro/);
+  assert.doesNotMatch(compose, /^\s+AMF_MIGRATION_PAUSE_(?:MANIFEST|KEY)_PATH:/m);
+});
+
 test('strict CLI aggregates, signs, and recomputes the retained checkpoint set', () => {
   const setup = fixture(); const script = fileURLToPath(new URL('./amf-migration-pause.mjs', import.meta.url));
   try {
