@@ -41,9 +41,12 @@ function opaqueHash(domain, values) {
   return crypto.createHash('sha256').update(canonicalJson([domain, ...values]), 'utf8').digest('hex');
 }
 
-function deriveConversationId(sessionId) {
+export function deriveM4V3ConversationIdFromLegacySessionId(sessionId) {
+  if (typeof sessionId !== 'string' || !V2_SESSION_ID.test(sessionId)) fail('m4_v2_projector_legacy_session_id_invalid');
   return `ccon_${opaqueHash('amf.m4/v2-conversation-id/v1', [sessionId])}`;
 }
+
+function deriveConversationId(sessionId) { return deriveM4V3ConversationIdFromLegacySessionId(sessionId); }
 
 export function deriveM4V3EventIdFromLegacyEventId(eventId) {
   if (typeof eventId !== 'string' || !V2_EVENT_ID.test(eventId)) fail('m4_v2_projector_legacy_event_id_invalid');

@@ -47,6 +47,7 @@
     "test:content-protection": "node --test scripts/test-content-protection-v1-contract.mjs scripts/test-content-protection-v1-runtime.mjs scripts/test-content-protection-v1-measurements.mjs",
     "measure:content-protection": "node scripts/measure-content-protection-v1.mjs",
     "test:conversation-session-view": "node --test scripts/test-conversation-session-view-v2.mjs",
+    "test:conversation-session-runtime": "node --test scripts/test-conversation-session-runtime.mjs",
     "test": "node --test scripts/test-*.mjs",
     "test:auth": "node --test scripts/test-auth-registry.mjs"
   },

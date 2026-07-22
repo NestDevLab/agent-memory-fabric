@@ -19,6 +19,41 @@ The public status field and MCP capability named `sessionReader` describe this
 public compatibility reader only; they do not report the internal extractor's
 legacy reader state.
 
+## Runtime selection
+
+Production composition is explicit and defaults to disabled. Set
+`AMF_CONVERSATION_READER_MODE` to one of:
+
+- `disabled`: construct no archive reader and leave the public compatibility
+  surface unconfigured;
+- `shadow`: serve the legacy reader unchanged while bounded background work
+  compares complete legacy and v3 results;
+- `active`: serve the v3 archive-backed compatibility view.
+
+Shadow comparison maps deterministic legacy session and event identifiers to
+their v3 identifiers, ignores intentional presentation differences, and never
+delays or fails the primary response. Partial cursor pages are inconclusive.
+The public status reports only counters for matches, mismatches, unavailable or
+inconclusive comparisons, skipped work, and work currently pending. It contains
+no identifiers, queries, or content.
+
+Shadow and active modes require exactly one archive target:
+`AMF_CONVERSATION_ARCHIVE_SQLITE_PATH` or
+`AMF_CONVERSATION_ARCHIVE_POSTGRES_URL`. PostgreSQL TLS defaults to
+`verify-full`; `require` and `disable` are explicit alternatives for controlled
+environments. Connection URLs with query parameters or fragments are rejected
+so they cannot override the dedicated TLS or read-only settings.
+`AMF_CONVERSATION_READER_CURSOR_KEY_PATH` must name an owner-only regular file
+containing one canonical base64-encoded 32-byte key. The optional
+`AMF_CONVERSATION_READER_SCAN_LIMIT` is bounded from 1 through 500.
+
+On Linux, SQLite anchors the configured regular file and opens that descriptor
+read-only; it never creates an archive. Startup checks the required archive
+columns before listening. PostgreSQL performs an equivalent zero-row schema
+query and requests read-only sessions; deployments must also use a database role
+limited to read-only grants. Configuration, schema, or connectivity failure
+prevents startup with a content-free error.
+
 ## Authorization and content
 
 The existing v2 route, purpose, context-token, and session-route checks run

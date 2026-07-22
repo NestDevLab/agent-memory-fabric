@@ -10,6 +10,7 @@ import { validateAmfMemoryRecord } from './amf-memory-record-validator.mjs';
 import { createCanonicalPamBridgeFromEnv, createReceiptCoordinatorFromEnv, createUnconfiguredCanonicalStore } from './canonical-memory-bridge.mjs';
 import { createContextVerifierFromEnv, createUnconfiguredContextVerifier } from './context-token.mjs';
 import { createDocumentStoreFromEnv, createUnconfiguredDocumentStore } from './document-store.mjs';
+import { createConversationSessionRuntimeFromEnv } from './conversation-session-runtime.mjs';
 import { PURPOSES, buildContextRequest, exactContextIntersection, normalizeScopeList, scopeRequiresContext } from './access-contract.mjs';
 import { RAW_EVENT_HTTP_MAX_BODY_BYTES } from './ingest/raw-event-contract.mjs';
 import { validatePamRuntimePrivateDirFromEnv } from './operator/pam-runtime-private-dir.mjs';
@@ -1124,6 +1125,17 @@ function createUnconfiguredSessionReader() {
 }
 
 function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, conversationSessionReader = defaultSessionReader, migrationPause = null }) {
+  const sessionReader = { kind: conversationSessionReader.kind || 'custom', configured: Boolean(conversationSessionReader.configured) };
+  try {
+    const runtime = conversationSessionReader.runtimeStatus?.();
+    const keys = ['mode', 'pending', 'compared', 'matched', 'mismatched', 'unavailable', 'inconclusive', 'skipped'];
+    if (runtime && typeof runtime === 'object' && !Array.isArray(runtime)
+      && Object.keys(runtime).sort().join('\0') === keys.slice().sort().join('\0')
+      && ['shadow', 'active'].includes(runtime.mode)
+      && keys.slice(1).every(key => Number.isSafeInteger(runtime[key]) && runtime[key] >= 0)) {
+      sessionReader.runtime = structuredClone(runtime);
+    }
+  } catch {}
   return {
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
@@ -1133,7 +1145,7 @@ function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalSt
     canonicalStore: { kind: canonicalStore.kind || 'unconfigured', configured: Boolean(canonicalStore.configured) },
     documentStore: { kind: documentStore.kind || 'custom', configured: Boolean(documentStore.configured) },
     contextTokens: { configured: Boolean(contextVerifier.configured), conversationRecallRequired: true },
-    sessionReader: { kind: conversationSessionReader.kind || 'custom', configured: Boolean(conversationSessionReader.configured) },
+    sessionReader,
     compatibility: { restV1: true, mcpSse: true, mcpStreamableHttp: true },
     limits: LIMITS,
     ...(migrationPause ? { migration: { rawIngest: {
@@ -2565,7 +2577,15 @@ if (isMain) {
     let runtimeCanonicalStore;
     let runtimeDocumentStore;
     let runtimeReceiptCoordinator;
+    let runtimeConversationSessionRuntime;
     let runtimeServer;
+    const closeRuntimeResources = async () => {
+      try { await runtimeFabricStore?.close?.(); } catch {}
+      try { await runtimeCanonicalStore?.close?.(); } catch {}
+      try { await runtimeDocumentStore?.close?.(); } catch {}
+      try { await runtimeReceiptCoordinator?.close?.(); } catch {}
+      try { await runtimeConversationSessionRuntime?.close?.(); } catch {}
+    };
     try {
       const runtimeMigrationPause = loadVerifiedMigrationPauseFromEnv(process.env);
       validatePamRuntimePrivateDirFromEnv(process.env);
@@ -2575,13 +2595,15 @@ if (isMain) {
         ? createDocumentStoreFromEnv(process.env) : createUnconfiguredDocumentStore();
       const runtimeContextVerifier = createContextVerifierFromEnv(process.env);
       runtimeReceiptCoordinator = createReceiptCoordinatorFromEnv({ canonicalStore: runtimeCanonicalStore, proposalStore: runtimeFabricStore });
-      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore, canonicalStore: runtimeCanonicalStore, documentStore: runtimeDocumentStore, contextVerifier: runtimeContextVerifier, receiptCoordinator: runtimeReceiptCoordinator, migrationPause: runtimeMigrationPause });
+      const runtimeLegacySessionReader = runtimeFabricStore.createSessionReader?.() || null;
+      runtimeConversationSessionRuntime = await createConversationSessionRuntimeFromEnv({ env: process.env, rootPath: ROOT, legacyReader: runtimeLegacySessionReader });
+      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore, canonicalStore: runtimeCanonicalStore, documentStore: runtimeDocumentStore, contextVerifier: runtimeContextVerifier, receiptCoordinator: runtimeReceiptCoordinator, sessionReader: runtimeLegacySessionReader, conversationSessionReader: runtimeConversationSessionRuntime.reader, migrationPause: runtimeMigrationPause });
     } catch (error) {
       console.error(`agent-memory-fabric disabled: configuration failed: ${safeError(error)?.code || 'internal_error'}`);
+      await closeRuntimeResources();
       process.exitCode = 78;
     }
-    Promise.all([Promise.resolve(runtimeFabricStore?.ready?.()), Promise.resolve(runtimeDocumentStore?.ready?.())]).then(() => {
-      if (!runtimeServer) return;
+    if (runtimeServer) Promise.all([Promise.resolve(runtimeFabricStore?.ready?.()), Promise.resolve(runtimeDocumentStore?.ready?.()), Promise.resolve(runtimeConversationSessionRuntime?.ready?.())]).then(() => {
       runtimeServer.listen(PORT, () => {
         console.log(`${SERVICE_NAME} listening on :${PORT}`);
         console.log(`policy path: ${POLICY_PATH}`);
@@ -2590,10 +2612,7 @@ if (isMain) {
       });
     }).catch(async (error) => {
       console.error(`agent-memory-fabric disabled: catalog initialization failed: ${safeError(error)?.code || 'internal_error'}`);
-      try { await runtimeFabricStore?.close?.(); } catch {}
-      try { await runtimeCanonicalStore?.close?.(); } catch {}
-      try { await runtimeDocumentStore?.close?.(); } catch {}
-      try { await runtimeReceiptCoordinator?.close?.(); } catch {}
+      await closeRuntimeResources();
       process.exitCode = 78;
     });
   }

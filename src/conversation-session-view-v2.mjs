@@ -177,7 +177,7 @@ function transcriptItem(row) {
 
 class ConversationSessionView {
   constructor({ cursorKey, scanLimit = MAX_SCAN_LIMIT } = {}) {
-    this.cursorKey = requireCursorKey(cursorKey);
+    this.cursorKey = Buffer.from(requireCursorKey(cursorKey));
     if (!Number.isSafeInteger(scanLimit) || scanLimit < 1 || scanLimit > MAX_SCAN_LIMIT) throw new TypeError('conversation_session_view_scan_limit_invalid');
     this.scanLimit = scanLimit;
     this.configured = true;

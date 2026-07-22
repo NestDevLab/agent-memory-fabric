@@ -1123,6 +1123,7 @@ test('public v2 and MCP session reads use only the conversation reader while the
   };
   const conversationReader = {
     configured: true, kind: 'conversation-spy',
+    runtimeStatus() { return { mode: 'shadow', pending: 0, compared: 3, matched: 3, mismatched: 0, unavailable: 0, inconclusive: 0, skipped: 0 }; },
     async search() { conversationSearches += 1; return { items: [{ id: 'ccon_servercompat01', title: '', scope: '', ownerSelf: true, conversationKind: 'group', contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }], nextCursor: null }; },
     async get({ id }) { return { id, title: '', scope: '', ownerSelf: true, conversationKind: 'group', contextTags: { conversation: [ROOM_A], room: [ROOM_A] } }; },
     async transcript({ id }) { return { id, view: 'redacted', items: [], nextCursor: null }; }
@@ -1150,8 +1151,9 @@ test('public v2 and MCP session reads use only the conversation reader while the
 
     const status = await api('/v2/status');
     assert.equal(status.body.data.sessionReader.kind, 'conversation-spy');
+    assert.deepEqual(status.body.data.sessionReader.runtime, { mode: 'shadow', pending: 0, compared: 3, matched: 3, mismatched: 0, unavailable: 0, inconclusive: 0, skipped: 0 });
     const mcpStatus = await api('/mcp/test-client/compat', { method: 'POST', headers: { 'mcp-session-id': initialized.response.headers.get('mcp-session-id') }, body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'memory_status', arguments: {} } }) });
-    assert.equal(JSON.parse(mcpStatus.body.result.content[0].text).sessionReader.kind, 'conversation-spy');
+    assert.deepEqual(JSON.parse(mcpStatus.body.result.content[0].text).sessionReader, status.body.data.sessionReader);
 
     const extractor = await api('/v2/internal/extractor/sessions?limit=1', { headers: { authorization: 'Bearer compat-extractor-token' } });
     assert.equal(extractor.response.status, 200);
