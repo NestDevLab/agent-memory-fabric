@@ -114,6 +114,16 @@ source checkpoints in one checkpoint-and-digest binding. A complete record has
 Any mismatch blocks cutover. A pending reconciliation is valid evidence but is
 not cutover-ready.
 
+M4 cutover authorization remains separate from this four-phase manifest. The
+signed authorization verifies complete reconciliation, both independently
+restore-tested archives, exact extractor alias coverage, a passed bounded
+canary and rollback drill, closed plaintext reads for approved encrypted
+conversation selectors, and preservation evidence for proposals, canonical
+memories, and documents. It binds route and extractor configuration revisions
+but does not change them. A separate scope-authority signature binds the full
+approved selector set to the active policy revision and digest; preservation
+and authorization both re-verify that snapshot inside its validity window.
+
 ## Cleanup boundary
 
 Cleanup names exact legacy object identifiers and digests only: no wildcard or
@@ -122,6 +132,16 @@ manifest, signed catalog-unreferenced proof, a passed cutover canary, and one
 recovery copy with a passed restore test.
 Destructive execution is separately explicitly approved and is not implemented
 by this contract.
+
+The signed cleanup inventory accepts only transcript rows and blobs with zero
+catalog references. A separate catalog-authority collector signs its complete
+canonical object/reference scan, recomputed counts and digest, exact eligible
+targets, and validity window. The inventory must equal that target list. Its
+per-selector target counts must match the preservation proof, and its
+identifiers and digests cannot overlap catalog evidence or protected proposal,
+canonical-memory, and document aggregates. Verified
+inventory evidence is projected into the existing `cleanup` phase; no canary,
+recovery, or cutover phase is added.
 
 ## Manifest integrity
 
