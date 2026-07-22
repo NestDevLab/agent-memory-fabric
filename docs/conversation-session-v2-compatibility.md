@@ -13,11 +13,11 @@ artifact.
 
 The reader is independently injected. If it is not configured, public v2 and
 MCP session reads return `session_reader_unconfigured` with status 503 and do
-not call the legacy reader. The internal extractor remains on the legacy
-`sessionReader`; it does not receive archive-wide access through this view.
-The public status field and MCP capability named `sessionReader` describe this
-public compatibility reader only; they do not report the internal extractor's
-legacy reader state.
+not call the legacy reader. The internal extractor does not use this public
+view. It has a separate `legacy`/`v3` selection and a service-only reader whose
+cursors, alias manifest, and integrity keys are not exposed through public REST
+or MCP routes. The public status field and MCP capability named `sessionReader`
+describe this public compatibility reader only.
 
 ## Runtime selection
 
@@ -46,6 +46,13 @@ so they cannot override the dedicated TLS or read-only settings.
 `AMF_CONVERSATION_READER_CURSOR_KEY_PATH` must name an owner-only regular file
 containing one canonical base64-encoded 32-byte key. The optional
 `AMF_CONVERSATION_READER_SCAN_LIMIT` is bounded from 1 through 500.
+
+The internal extractor defaults independently to
+`AMF_CONVERSATION_EXTRACTOR_MODE=legacy`. Mode `v3` requires owner-only cursor
+and alias key files plus a verified signed alias manifest. All three runtime
+keys must have different values. The internal v3 reader returns redacted
+conversation data and an extraction identity that preserves proposal
+idempotency across the migration; it never changes the public reader mode.
 
 On Linux, SQLite anchors the configured regular file and opens that descriptor
 read-only; it never creates an archive. Startup checks the required archive

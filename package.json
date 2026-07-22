@@ -41,6 +41,8 @@
     "test:m4-native-paused-phase-store": "node --test scripts/test-m4-native-paused-phase-store.mjs",
     "test:m4-native-paused-phase": "node --test scripts/test-m4-native-paused-phase-orchestrator.mjs",
     "test:m4-reconciliation-runner": "node --test scripts/test-m4-reconciliation-runner.mjs",
+    "test:m4-conversation-extractor-aliases": "node --test scripts/test-m4-conversation-extractor-aliases.mjs",
+    "test:m4-v3-extractor-reader": "node --test scripts/test-m4-v3-extractor-reader.mjs",
     "test:m4-legacy-group-replay-batch": "node --test scripts/test-m4-legacy-group-replay-batch-runner.mjs",
     "test:m4-preserved-replay": "node --test scripts/test-m4-preserved-replay-coordinator.mjs",
     "test:m4-v2-observation-reader": "node --test scripts/test-m4-v2-observation-reader.mjs",

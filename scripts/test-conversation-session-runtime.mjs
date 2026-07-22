@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import BetterSqlite3 from 'better-sqlite3';
 import { createConversationSessionRuntimeFromEnv } from '../src/conversation-session-runtime.mjs';
+import { createM4ConversationExtractorAliases } from '../src/migration/m4-conversation-extractor-aliases.mjs';
 import { deriveM4V3ConversationIdFromLegacySessionId, deriveM4V3EventIdFromLegacyEventId } from '../src/migration/m4-v2-conversation-projector.mjs';
 
 function temp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'amf-runtime-')); }
@@ -15,10 +16,18 @@ function setup() {
   const archive = path.join(root, 'archive.sqlite'); const db = new BetterSqlite3(archive); db.exec('CREATE TABLE conversation_archive_events_v1 (event_id TEXT, conversation_id TEXT, source_instance_id TEXT, state TEXT, source_occurred_at TEXT, source_time_key TEXT, source_sequence INTEGER, event_json TEXT, expired INTEGER)'); db.close();
   return { root, env: { AMF_CONVERSATION_READER_MODE: 'active', AMF_CONVERSATION_ARCHIVE_SQLITE_PATH: 'archive.sqlite', AMF_CONVERSATION_READER_CURSOR_KEY_PATH: 'cursor.key', AMF_CONVERSATION_READER_SCAN_LIMIT: '2' } };
 }
+function enableExtractor(item) {
+  for (const [name, byte] of [['extractor-cursor.key', 10], ['alias.key', 11]]) fs.writeFileSync(path.join(item.root, name), `${Buffer.alloc(32, byte).toString('base64')}\n`, { mode: 0o600 });
+  const aliases = createM4ConversationExtractorAliases({ coveredThrough: '2026-07-22T10:00:00Z', aliases: [] }, Buffer.alloc(32, 11));
+  fs.writeFileSync(path.join(item.root, 'aliases.json'), `${JSON.stringify(aliases)}\n`, { mode: 0o600 });
+  Object.assign(item.env, { AMF_CONVERSATION_EXTRACTOR_MODE: 'v3', AMF_CONVERSATION_EXTRACTOR_CURSOR_KEY_PATH: 'extractor-cursor.key',
+    AMF_CONVERSATION_EXTRACTOR_ALIAS_PATH: 'aliases.json', AMF_CONVERSATION_EXTRACTOR_ALIAS_KEY_PATH: 'alias.key' });
+  return item;
+}
 test('disabled is zero-touch and content-free', async () => {
-  const hostile = new Proxy({}, { get(_target, name) { if (name === 'AMF_CONVERSATION_READER_MODE') return 'disabled'; throw new Error('touched'); } });
+  const hostile = new Proxy({}, { get(_target, name) { if (name === 'AMF_CONVERSATION_READER_MODE') return 'disabled'; if (name === 'AMF_CONVERSATION_EXTRACTOR_MODE') return 'legacy'; throw new Error('touched'); } });
   const runtime = await createConversationSessionRuntimeFromEnv({ env: hostile, rootPath: '/no-touch' });
-  assert.equal(runtime.reader, null); assert.deepEqual(runtime.status(), { mode: 'disabled', pending: 0, compared: 0, matched: 0, mismatched: 0, unavailable: 0, inconclusive: 0, skipped: 0 });
+  assert.equal(runtime.reader, null); assert.equal(runtime.extractorReader, null); assert.deepEqual(runtime.status(), { mode: 'disabled', pending: 0, compared: 0, matched: 0, mismatched: 0, unavailable: 0, inconclusive: 0, skipped: 0 });
 });
 test('validates config fail-closed without plaintext errors', async () => {
   await assert.rejects(() => createConversationSessionRuntimeFromEnv({ env: { AMF_CONVERSATION_READER_MODE: 'active' }, rootPath: temp() }), /conversation_session_runtime_config_invalid/);
@@ -83,6 +92,14 @@ test('active SQLite opens readonly, proves reachability, and closes', async () =
   await runtime.ready(); assert.equal(runtime.reader.runtimeStatus().mode, 'active'); assert.equal(runtime.reader.db.readonly, true);
   assert.deepEqual(await runtime.reader.search({ context: { contextTags: { conversation: [`hmac-sha256:test:${'a'.repeat(64)}`] } }, limit: 2 }), { items: [], total: 0, nextCursor: null });
   await runtime.close(); await runtime.close();
+});
+test('v3 extractor mode is separately gated, shares the read-only archive, and requires independent keys', async () => {
+  const item = enableExtractor(setup()); item.env.AMF_CONVERSATION_READER_MODE = 'disabled'; delete item.env.AMF_CONVERSATION_READER_CURSOR_KEY_PATH;
+  const runtime = await createConversationSessionRuntimeFromEnv({ env: item.env, rootPath: item.root });
+  await runtime.ready(); assert.equal(runtime.reader, null); assert.equal(runtime.extractorReader.kind, 'conversation-archive-v3-extractor');
+  assert.deepEqual(await runtime.extractorReader.search({ limit: 1 }), { items: [], total: 0, nextCursor: null }); await runtime.close();
+  const reused = enableExtractor(setup()); fs.copyFileSync(path.join(reused.root, 'extractor-cursor.key'), path.join(reused.root, 'alias.key'));
+  await assert.rejects(() => createConversationSessionRuntimeFromEnv({ env: reused.env, rootPath: reused.root }), /conversation_session_runtime_config_invalid/);
 });
 test('shadow serves legacy and records match, mismatch, unavailable, and bounded skips', async () => {
   const { root, env } = setup(); env.AMF_CONVERSATION_READER_MODE = 'shadow';

@@ -1646,7 +1646,7 @@ const defaultCanonicalStore = createUnconfiguredCanonicalStore();
 const defaultContextVerifier = createUnconfiguredContextVerifier();
 const defaultDocumentStore = createUnconfiguredDocumentStore();
 
-function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, conversationSessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), conversationEventIngest = null, clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null } = {}) {
+function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, conversationSessionReader = null, extractorSessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), conversationEventIngest = null, clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null } = {}) {
   if (conversationEventIngest !== null && typeof conversationEventIngest !== 'function') throw new Error('conversation_event_ingest_invalid');
   if (!Buffer.isBuffer(curationCursorKey) || curationCursorKey.length < 32) throw new Error('curation_cursor_key_invalid');
 if (!Number.isSafeInteger(rawIngestBodyBytes) || rawIngestBodyBytes < 1024 || rawIngestBodyBytes > 16 * 1024 * 1024) throw new Error('raw_ingest_body_limit_invalid');
@@ -1655,6 +1655,7 @@ if (!isVerifiedMigrationPause(migrationPause)) {
 }
 sessionReader = sessionReader || fabricStore.createSessionReader?.() || defaultSessionReader;
 conversationSessionReader = conversationSessionReader || defaultSessionReader;
+if (extractorSessionReader !== null && (!extractorSessionReader?.configured || ['search', 'get', 'transcript'].some(method => typeof extractorSessionReader[method] !== 'function'))) throw new Error('extractor_session_reader_invalid');
 const sessions = new Map();
 const sessionPolicy = { ...MCP_SESSION_DEFAULTS, ...sessionOptions };
 function pruneSessions(now = clock()) {
@@ -2054,11 +2055,31 @@ const requestHandler = async (req, res) => {
       requireRawExtractorAccess(policy, policies);
       const limit = normalizeSessionLimit(url.searchParams.get('limit') || '1');
       const ownerActors = authorizedSessionOwners(actor, policy);
-      const result = await sessionReader.search({ actor, ownerActors, query: '', cursor: url.searchParams.get('cursor') || null,
-        limit, from: null, to: null, purpose: 'memory_curation', context: null });
+      const result = extractorSessionReader
+        ? await extractorSessionReader.search({ cursor: url.searchParams.get('cursor') || null, limit })
+        : await sessionReader.search({ actor, ownerActors, query: '', cursor: url.searchParams.get('cursor') || null,
+          limit, from: null, to: null, purpose: 'memory_curation', context: null });
       await auditRequired(fabricStore, { actor, action: 'raw_extractor_sessions_read', outcome: 'allowed', requestId,
         details: { resultCount: result.items?.length || 0 } });
       return jsonNoStore(res, 200, v2Envelope(requestId, { items: result.items || [], nextCursor: result.nextCursor || null }));
+    } catch (error) {
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
+  if (pathnameParts[0] === 'v2' && pathnameParts[1] === 'internal' && pathnameParts[2] === 'extractor'
+      && pathnameParts[3] === 'sessions' && pathnameParts[4] && pathnameParts.length === 5 && req.method === 'GET') {
+    try {
+      requireRawExtractorAccess(policy, policies);
+      const sessionId = pathnameParts[4];
+      const ownerActors = authorizedSessionOwners(actor, policy);
+      const item = extractorSessionReader
+        ? await extractorSessionReader.get({ id: sessionId })
+        : await sessionReader.get({ actor, ownerActors, id: sessionId, purpose: 'memory_curation', context: null });
+      await auditRequired(fabricStore, { actor, action: 'raw_extractor_session_read', outcome: 'allowed', requestId,
+        targetId: sessionId, details: { reader: extractorSessionReader ? 'conversation-v3' : 'legacy-v2' } });
+      return jsonNoStore(res, 200, v2Envelope(requestId, item));
     } catch (error) {
       const failure = v2Error(requestId, error, 500);
       return jsonNoStore(res, failure.status, failure.body);
@@ -2074,11 +2095,19 @@ const requestHandler = async (req, res) => {
       const ownerActors = authorizedSessionOwners(actor, policy);
       // `get` proves the actor participates before the redacted decrypt.  No
       // context token is accepted or needed for the service-only global lane.
-      await sessionReader.get({ actor, ownerActors, id: sessionId, purpose: 'memory_curation', context: null });
-      const transcript = await sessionReader.transcript({ actor, ownerActors, id: sessionId, view: 'redacted', query: '',
-        cursor: url.searchParams.get('cursor') || null, limit: normalizeSessionLimit(url.searchParams.get('limit') || '100'),
-        from: null, to: null, purpose: 'memory_curation', context: null,
-        newest: url.searchParams.get('window') === 'newest' });
+      let transcript;
+      if (extractorSessionReader) {
+        await extractorSessionReader.get({ id: sessionId });
+        transcript = await extractorSessionReader.transcript({ id: sessionId, view: 'redacted',
+          cursor: url.searchParams.get('cursor') || null, limit: normalizeSessionLimit(url.searchParams.get('limit') || '100'),
+          newest: url.searchParams.get('window') === 'newest' });
+      } else {
+        await sessionReader.get({ actor, ownerActors, id: sessionId, purpose: 'memory_curation', context: null });
+        transcript = await sessionReader.transcript({ actor, ownerActors, id: sessionId, view: 'redacted', query: '',
+          cursor: url.searchParams.get('cursor') || null, limit: normalizeSessionLimit(url.searchParams.get('limit') || '100'),
+          from: null, to: null, purpose: 'memory_curation', context: null,
+          newest: url.searchParams.get('window') === 'newest' });
+      }
       await auditRequired(fabricStore, { actor, action: 'raw_extractor_transcript_read', outcome: 'allowed', requestId,
         targetId: sessionId, details: { resultCount: transcript.items?.length || 0, view: 'redacted' } });
       return jsonNoStore(res, 200, v2Envelope(requestId, transcript));
@@ -2597,7 +2626,7 @@ if (isMain) {
       runtimeReceiptCoordinator = createReceiptCoordinatorFromEnv({ canonicalStore: runtimeCanonicalStore, proposalStore: runtimeFabricStore });
       const runtimeLegacySessionReader = runtimeFabricStore.createSessionReader?.() || null;
       runtimeConversationSessionRuntime = await createConversationSessionRuntimeFromEnv({ env: process.env, rootPath: ROOT, legacyReader: runtimeLegacySessionReader });
-      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore, canonicalStore: runtimeCanonicalStore, documentStore: runtimeDocumentStore, contextVerifier: runtimeContextVerifier, receiptCoordinator: runtimeReceiptCoordinator, sessionReader: runtimeLegacySessionReader, conversationSessionReader: runtimeConversationSessionRuntime.reader, migrationPause: runtimeMigrationPause });
+      runtimeServer = createAgentMemoryFabricServer({ fabricStore: runtimeFabricStore, canonicalStore: runtimeCanonicalStore, documentStore: runtimeDocumentStore, contextVerifier: runtimeContextVerifier, receiptCoordinator: runtimeReceiptCoordinator, sessionReader: runtimeLegacySessionReader, conversationSessionReader: runtimeConversationSessionRuntime.reader, extractorSessionReader: runtimeConversationSessionRuntime.extractorReader, migrationPause: runtimeMigrationPause });
     } catch (error) {
       console.error(`agent-memory-fabric disabled: configuration failed: ${safeError(error)?.code || 'internal_error'}`);
       await closeRuntimeResources();

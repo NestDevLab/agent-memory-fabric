@@ -3,10 +3,13 @@ import path from 'node:path';
 
 import { canonicalJson } from './ingest/transcripts/canonical.mjs';
 import { PostgresConversationSessionView, SqliteConversationSessionView } from './conversation-session-view-v2.mjs';
+import { PostgresM4V3ExtractorReader, SqliteM4V3ExtractorReader } from './m4-v3-extractor-reader.mjs';
+import { createM4ConversationExtractorIdentityResolver } from './migration/m4-conversation-extractor-aliases.mjs';
 import { deriveM4V3ConversationIdFromLegacySessionId } from './migration/m4-v2-conversation-projector.mjs';
 import { deriveM4V3EventIdFromLegacyEventId } from './migration/m4-v2-conversation-projector.mjs';
 
 const MODES = new Set(['disabled', 'shadow', 'active']);
+const EXTRACTOR_MODES = new Set(['legacy', 'v3']);
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const STATUS_KEYS = ['mode', 'pending', 'compared', 'matched', 'mismatched', 'unavailable', 'inconclusive', 'skipped'];
 
@@ -15,7 +18,7 @@ function fail(code) { throw failure(code); }
 function snapshotEnv(env) {
   try {
     if (!env || typeof env !== 'object') fail('conversation_session_runtime_config_invalid');
-    const keys = ['AMF_CONVERSATION_READER_MODE', 'AMF_CONVERSATION_ARCHIVE_SQLITE_PATH', 'AMF_CONVERSATION_ARCHIVE_POSTGRES_URL', 'AMF_CONVERSATION_READER_CURSOR_KEY_PATH', 'AMF_CONVERSATION_READER_SCAN_LIMIT', 'AMF_CONVERSATION_ARCHIVE_POSTGRES_SSL_MODE', 'AMF_CONVERSATION_ARCHIVE_POSTGRES_CA_PATH'];
+    const keys = ['AMF_CONVERSATION_READER_MODE', 'AMF_CONVERSATION_EXTRACTOR_MODE', 'AMF_CONVERSATION_ARCHIVE_SQLITE_PATH', 'AMF_CONVERSATION_ARCHIVE_POSTGRES_URL', 'AMF_CONVERSATION_READER_CURSOR_KEY_PATH', 'AMF_CONVERSATION_READER_SCAN_LIMIT', 'AMF_CONVERSATION_EXTRACTOR_CURSOR_KEY_PATH', 'AMF_CONVERSATION_EXTRACTOR_ALIAS_PATH', 'AMF_CONVERSATION_EXTRACTOR_ALIAS_KEY_PATH', 'AMF_CONVERSATION_ARCHIVE_POSTGRES_SSL_MODE', 'AMF_CONVERSATION_ARCHIVE_POSTGRES_CA_PATH'];
     return Object.fromEntries(keys.map(key => [key, env[key]]));
   } catch { fail('conversation_session_runtime_config_invalid'); }
 }
@@ -119,30 +122,49 @@ function comparable(operation, value, mapLegacy) {
 }
 
 export async function createConversationSessionRuntimeFromEnv({ env = process.env, rootPath = process.cwd(), legacyReader, dependencies = {} } = {}) {
-  let mode; try { mode = env?.AMF_CONVERSATION_READER_MODE ?? 'disabled'; } catch { fail('conversation_session_runtime_config_invalid'); }
-  if (!MODES.has(mode)) fail('conversation_session_runtime_config_invalid');
-  if (mode === 'disabled') {
+  let mode; let extractorMode;
+  try { mode = env?.AMF_CONVERSATION_READER_MODE ?? 'disabled'; extractorMode = env?.AMF_CONVERSATION_EXTRACTOR_MODE ?? 'legacy'; }
+  catch { fail('conversation_session_runtime_config_invalid'); }
+  if (!MODES.has(mode) || !EXTRACTOR_MODES.has(extractorMode)) fail('conversation_session_runtime_config_invalid');
+  if (mode === 'disabled' && extractorMode === 'legacy') {
     const counters = { pending: 0, compared: 0, matched: 0, mismatched: 0, unavailable: 0, inconclusive: 0, skipped: 0 };
     const status = () => structuredClone(statusSnapshot(mode, counters));
-    return { reader: null, ready: async () => undefined, close: async () => undefined, status };
+    return { reader: null, extractorReader: null, ready: async () => undefined, close: async () => undefined, status };
   }
   const config = snapshotEnv(env);
+  if ((config.AMF_CONVERSATION_READER_MODE ?? 'disabled') !== mode || (config.AMF_CONVERSATION_EXTRACTOR_MODE ?? 'legacy') !== extractorMode) fail('conversation_session_runtime_config_invalid');
   if (typeof rootPath !== 'string' || !path.isAbsolute(rootPath) || (!legacyReader && mode === 'shadow')) fail('conversation_session_runtime_config_invalid');
   const sqlitePath = config.AMF_CONVERSATION_ARCHIVE_SQLITE_PATH;
   const postgresUrl = config.AMF_CONVERSATION_ARCHIVE_POSTGRES_URL;
   if ((requiredString(sqlitePath) ? 1 : 0) + (requiredString(postgresUrl) ? 1 : 0) !== 1) fail('conversation_session_runtime_config_invalid');
-  const key = cursorKey(config.AMF_CONVERSATION_READER_CURSOR_KEY_PATH, rootPath); const limit = scanLimit(config.AMF_CONVERSATION_READER_SCAN_LIMIT);
-  let db; let pool; let reader; let sqliteAnchor;
+  let publicKey; let extractorCursorKey; let aliasKey; let identityResolver;
+  try {
+    if (mode !== 'disabled') publicKey = cursorKey(config.AMF_CONVERSATION_READER_CURSOR_KEY_PATH, rootPath);
+    if (extractorMode === 'v3') {
+      extractorCursorKey = cursorKey(config.AMF_CONVERSATION_EXTRACTOR_CURSOR_KEY_PATH, rootPath);
+      aliasKey = cursorKey(config.AMF_CONVERSATION_EXTRACTOR_ALIAS_KEY_PATH, rootPath);
+      if ([publicKey, extractorCursorKey, aliasKey].filter(Boolean).some((value, index, values) => values.slice(index + 1).some(other => value.equals(other)))) fail('conversation_session_runtime_config_invalid');
+      let manifest; try { manifest = JSON.parse(readAnchoredText(config.AMF_CONVERSATION_EXTRACTOR_ALIAS_PATH, rootPath, 32 * 1024 * 1024)); }
+      catch { fail('conversation_session_runtime_config_invalid'); }
+      identityResolver = (dependencies.createM4ConversationExtractorIdentityResolver ?? createM4ConversationExtractorIdentityResolver)(manifest, aliasKey);
+    }
+  } catch (error) {
+    publicKey?.fill(0); extractorCursorKey?.fill(0); aliasKey?.fill(0);
+    if (error?.code === 'conversation_session_runtime_config_invalid') throw error;
+    fail('conversation_session_runtime_config_invalid');
+  }
+  const scan = scanLimit(config.AMF_CONVERSATION_READER_SCAN_LIMIT);
+  let db; let pool; let archiveReader; let extractorReader; let sqliteAnchor;
   try {
     if (sqlitePath) {
       sqliteAnchor = openAnchoredRegularFile(sqlitePath, rootPath);
       const BetterSqlite3 = dependencies.BetterSqlite3 ?? (await import('better-sqlite3')).default;
       db = new BetterSqlite3(descriptorPath(sqliteAnchor), { readonly: true, fileMustExist: true });
       requireAnchorPath(sqliteAnchor);
-      reader = new (dependencies.SqliteConversationSessionView ?? SqliteConversationSessionView)({ db, cursorKey: key, scanLimit: limit });
-      for (const operation of ['get', 'transcript', 'search']) {
-        const method = reader[operation].bind(reader);
-        reader[operation] = async args => { requireAnchorPath(sqliteAnchor); return method(args); };
+      if (mode !== 'disabled') archiveReader = new (dependencies.SqliteConversationSessionView ?? SqliteConversationSessionView)({ db, cursorKey: publicKey, scanLimit: scan });
+      if (extractorMode === 'v3') extractorReader = new (dependencies.SqliteM4V3ExtractorReader ?? SqliteM4V3ExtractorReader)({ db, cursorKey: extractorCursorKey, identityResolver });
+      for (const target of [archiveReader, extractorReader].filter(Boolean)) for (const operation of ['get', 'transcript', 'search']) {
+        const method = target[operation].bind(target); target[operation] = async args => { requireAnchorPath(sqliteAnchor); return method(args); };
       }
     } else {
       let url; try { url = new URL(postgresUrl); } catch { fail('conversation_session_runtime_config_invalid'); }
@@ -156,24 +178,37 @@ export async function createConversationSessionRuntimeFromEnv({ env = process.en
       if (typeof Pool !== 'function') fail('conversation_session_runtime_unavailable');
       pool = new Pool({ connectionString: postgresUrl, max: 4, idleTimeoutMillis: 10_000, connectionTimeoutMillis: 5_000,
         statement_timeout: 5_000, query_timeout: 5_000, options: '-c default_transaction_read_only=on', ssl });
-      reader = new (dependencies.PostgresConversationSessionView ?? PostgresConversationSessionView)({ pool, cursorKey: key, scanLimit: limit });
+      if (mode !== 'disabled') archiveReader = new (dependencies.PostgresConversationSessionView ?? PostgresConversationSessionView)({ pool, cursorKey: publicKey, scanLimit: scan });
+      if (extractorMode === 'v3') extractorReader = new (dependencies.PostgresM4V3ExtractorReader ?? PostgresM4V3ExtractorReader)({ pool, cursorKey: extractorCursorKey, identityResolver });
     }
-  } catch (error) { key.fill(0); try { db?.close?.(); await pool?.end?.(); if (sqliteAnchor) fs.closeSync(sqliteAnchor.fd); } catch {} if (error?.code === 'conversation_session_runtime_config_invalid') throw error; fail('conversation_session_runtime_unavailable'); }
-  key.fill(0);
+  } catch (error) {
+    publicKey?.fill(0); extractorCursorKey?.fill(0); aliasKey?.fill(0);
+    try { db?.close?.(); } catch {} try { await pool?.end?.(); } catch {} try { if (sqliteAnchor) fs.closeSync(sqliteAnchor.fd); } catch {}
+    if (error?.code === 'conversation_session_runtime_config_invalid') throw error;
+    fail('conversation_session_runtime_unavailable');
+  }
+  publicKey?.fill(0); extractorCursorKey?.fill(0); aliasKey?.fill(0);
   const counters = { pending: 0, compared: 0, matched: 0, mismatched: 0, unavailable: 0, inconclusive: 0, skipped: 0 };
   let closed = false; const status = () => structuredClone(statusSnapshot(mode, counters));
   const ready = async () => {
-    try { if (db) { requireAnchorPath(sqliteAnchor); const rows = db.prepare('PRAGMA table_info(conversation_archive_events_v1)').all(); const required = ['event_id','conversation_id','source_instance_id','state','source_occurred_at','source_time_key','source_sequence','event_json','expired']; if (!required.every(name => rows.some(row => row.name === name))) throw new Error(); requireAnchorPath(sqliteAnchor); } else await pool.query('SELECT event_id,conversation_id,source_instance_id,state,source_occurred_at,source_time_key,source_sequence,event_json,expired FROM agent_memory_fabric.conversation_archive_events_v1 WHERE false'); }
+    try { if (db) { requireAnchorPath(sqliteAnchor); const rows = db.prepare('PRAGMA table_info(conversation_archive_events_v1)').all(); const required = ['event_id','conversation_id','source_instance_id','state','source_occurred_at','source_time_key','source_sequence','event_json','expired']; if (!required.every(name => rows.some(row => row.name === name))) throw new Error(); requireAnchorPath(sqliteAnchor); } else await pool.query('SELECT event_id,conversation_id,source_instance_id,state,source_occurred_at,source_time_key,source_sequence,event_json,expired FROM agent_memory_fabric.conversation_archive_events_v1 WHERE false'); await extractorReader?.verifyCoverage?.(); }
     catch { await close(); fail('conversation_session_runtime_unavailable'); }
   };
-  const close = async () => { if (closed) return; closed = true; try { db?.close?.(); await pool?.end?.(); if (sqliteAnchor) fs.closeSync(sqliteAnchor.fd); } catch { fail('conversation_session_runtime_unavailable'); } };
-  if (mode === 'active') { Object.defineProperty(reader, 'runtimeStatus', { value: status }); return { reader, ready, close, status }; }
+  const close = async () => {
+    if (closed) return; closed = true; let failed = false;
+    try { db?.close?.(); } catch { failed = true; }
+    try { await pool?.end?.(); } catch { failed = true; }
+    try { if (sqliteAnchor) fs.closeSync(sqliteAnchor.fd); } catch { failed = true; }
+    if (failed) fail('conversation_session_runtime_unavailable');
+  };
+  if (mode === 'active') { Object.defineProperty(archiveReader, 'runtimeStatus', { value: status }); return { reader: archiveReader, extractorReader, ready, close, status }; }
+  if (mode === 'disabled') return { reader: null, extractorReader, ready, close, status };
   const schedule = (operation, args, primary) => {
     if (closed || counters.pending >= 4) { counters.skipped += 1; return; }
     counters.pending += 1; queueMicrotask(async () => {
       try {
         const id = args?.id; const mapped = id && /^ses_[a-f0-9]{64}$/.test(id) ? { ...args, id: deriveM4V3ConversationIdFromLegacySessionId(id) } : args;
-        const right = await reader[operation](mapped);
+        const right = await archiveReader[operation](mapped);
         if ((operation === 'transcript' || operation === 'search') && (primary.nextCursor !== null || right.nextCursor !== null)) { counters.inconclusive += 1; return; }
         const leftComparable = comparable(operation, primary, true); const rightComparable = comparable(operation, right, false);
         counters.compared += 1; if (stable(leftComparable) === stable(rightComparable)) counters.matched += 1; else counters.mismatched += 1;
@@ -189,5 +224,5 @@ export async function createConversationSessionRuntimeFromEnv({ env = process.en
     return value;
   };
   Object.defineProperty(served, 'runtimeStatus', { value: status });
-  return { reader: served, ready, close, status };
+  return { reader: served, extractorReader, ready, close, status };
 }

@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, normalizeState, proposalIdempotencyKey, reserveModelBudget, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
-import { buildBoundedModelInput, evaluatePlanUsage } from './amf-raw-memory-extractor.mjs';
+import { buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, migrateExtractorStateToConversationV3, normalizeConversationExtractorState, normalizeState, proposalIdempotencyKey, reserveModelBudget, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
+import { buildBoundedModelInput, evaluatePlanUsage, loadExtractorState } from './amf-raw-memory-extractor.mjs';
 
 const durable = [{ role: 'user', text: 'We decided to keep the extractor slow and cost bounded.' }, { role: 'assistant', text: 'Agreed: one conversation per tick and a daily ceiling.' }];
 
@@ -62,6 +62,56 @@ test('claims exclude operational material and records use shared global plus det
   const record = buildMemoryRecord({ sessionId: 'ses_123', transcript: 'decrypted transcript', claim, now: '2026-07-20T12:00:00Z' });
   assert.equal(record.scope.id, 'shared:global'); assert.equal(record.visibility, 'shared');
   assert.equal(proposalIdempotencyKey({ sessionId: 'ses_123', claim: claim.claim }), proposalIdempotencyKey({ sessionId: 'ses_123', claim: claim.claim }));
+});
+
+test('conversation reader state migrates only at a legacy cycle boundary without mutating rollback state', () => {
+  const legacy = createExtractorState();
+  legacy.days['2026-07-20'] = { reservedInputTokens: 0, reservedOutputTokens: 0, usedInputTokens: 12, usedOutputTokens: 3 };
+  legacy.planUsage = { checkedAt: '2026-07-20T12:00:00Z', constrained: false };
+  const before = structuredClone(legacy);
+  const migrated = migrateExtractorStateToConversationV3(legacy);
+  assert.deepEqual(legacy, before);
+  assert.equal(migrated.schema, 'amf.raw-memory-extractor-state/v2');
+  assert.equal(migrated.readerGeneration, 'conversation-v3');
+  assert.deepEqual(migrated.days, legacy.days);
+  assert.deepEqual(migrated.planUsage, legacy.planUsage);
+  assert.match(migrated.legacyBoundary.stateDigest, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(normalizeConversationExtractorState(migrated), migrated);
+  for (const field of ['cursor', 'inFlight']) {
+    const unsafe = structuredClone(legacy);
+    unsafe[field] = field === 'cursor' ? 'legacy-cursor' : { stage: 'model_done' };
+    assert.throws(() => migrateExtractorStateToConversationV3(unsafe), /extractor_state_migration_not_at_boundary/);
+  }
+});
+
+test('conversation reader state loader preserves the legacy file and resumes the new state independently', async t => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-extractor-state-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const legacyStateFile = path.join(directory, 'legacy.json');
+  const stateFile = path.join(directory, 'conversation-v3.json');
+  const legacy = createExtractorState();
+  fs.writeFileSync(legacyStateFile, JSON.stringify(legacy));
+  const config = { readerGeneration: 'conversation-v3', legacyStateFile, stateFile };
+  const migrated = loadExtractorState(config);
+  assert.deepEqual(JSON.parse(fs.readFileSync(legacyStateFile, 'utf8')), legacy);
+  assert.equal(JSON.parse(fs.readFileSync(stateFile, 'utf8')).readerGeneration, 'conversation-v3');
+  migrated.cursor = 'v3-cursor';
+  fs.writeFileSync(stateFile, JSON.stringify(migrated));
+  assert.equal(loadExtractorState(config).cursor, 'v3-cursor');
+  assert.equal(loadExtractorState(config, { dryRun: true }).cursor, null);
+});
+
+test('v3 route identity preserves legacy proposal and provenance identity', () => {
+  const claim = { claimType: 'decision', claim: 'Keep the extractor transition identity stable.', confidence: 0.9 };
+  const legacyId = `ses_${'a'.repeat(64)}`;
+  const legacy = buildMemoryRecord({ sessionId: legacyId, transcript: 'redacted', claim, now: '2026-07-20T12:00:00Z' });
+  const v3 = buildMemoryRecord({ sessionId: 'ccon_example123', extractionIdentity: legacyId, transcript: 'redacted', claim, now: '2026-07-20T12:00:00Z' });
+  assert.deepEqual(v3, legacy);
+  assert.equal(proposalIdempotencyKey({ sessionId: legacyId, claim: claim.claim }),
+    proposalIdempotencyKey({ sessionId: 'ccon_example123', extractionIdentity: legacyId, claim: claim.claim }));
 });
 
 test('shared global extraction drops explicitly project-scoped claims', () => {
