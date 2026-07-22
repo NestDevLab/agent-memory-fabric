@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
+import path from 'node:path';
 import pg from 'pg';
 
 import { createM4PostgresReconciliationCollector,
@@ -59,32 +60,75 @@ function once(close, errorCode) {
   };
 }
 
-function sqlite(config, dependencies, errorCode) {
-  const identity = privateFileIdentity(config.databasePath, {
-    code: errorCode,
-    minBytes: 1,
-    maxBytes: SQLITE_MAX_BYTES,
-  });
-  let db;
+function sqliteDirectoryStat(stat, final) {
+  if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
+  if (final) return stat.uid === process.getuid() && (stat.mode & 0o077) === 0;
+  return (stat.mode & 0o022) === 0 || (stat.uid === 0 && (stat.mode & 0o1000) !== 0);
+}
+
+function openPrivateSqliteDirectory(databasePath, errorCode) {
+  const directory = path.dirname(databasePath); const parsed = path.parse(directory);
+  let current = parsed.root;
   try {
+    for (const component of directory.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+      current = path.join(current, component); const stat = fs.lstatSync(current);
+      if (!sqliteDirectoryStat(stat, current === directory)) fail(errorCode);
+    }
+    if (fs.realpathSync(directory) !== directory) fail(errorCode);
+    const expected = fs.lstatSync(directory); let descriptor;
+    try {
+      descriptor = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      const actual = fs.fstatSync(descriptor);
+      if (!sqliteDirectoryStat(actual, true) || actual.dev !== expected.dev || actual.ino !== expected.ino) fail(errorCode);
+      return { directory, descriptor, dev: actual.dev, ino: actual.ino };
+    } catch (error) {
+      if (descriptor !== undefined) try { fs.closeSync(descriptor); } catch {}
+      throw error;
+    }
+  } catch (error) { if (error?.code === errorCode) throw error; fail(errorCode); }
+}
+
+function assertPrivateSqliteDirectory(identity, errorCode) {
+  try {
+    const held = fs.fstatSync(identity.descriptor); const current = fs.lstatSync(identity.directory);
+    if (!sqliteDirectoryStat(held, true) || !sqliteDirectoryStat(current, true)
+      || held.dev !== identity.dev || held.ino !== identity.ino
+      || current.dev !== identity.dev || current.ino !== identity.ino
+      || fs.realpathSync(identity.directory) !== identity.directory) fail(errorCode);
+  } catch (error) { if (error?.code === errorCode) throw error; fail(errorCode); }
+}
+
+function sqlite(config, dependencies, errorCode) {
+  const directory = openPrivateSqliteDirectory(config.databasePath, errorCode); let identity; let db; let collector;
+  try {
+    identity = privateFileIdentity(config.databasePath, {
+      code: errorCode,
+      minBytes: 1,
+      maxBytes: SQLITE_MAX_BYTES,
+    });
     db = new dependencies.Database(`/proc/self/fd/${identity.descriptor}`, {
       readonly: true,
       fileMustExist: true,
     });
+    assertPrivateSqliteDirectory(directory, errorCode);
     assertPrivateFileIdentity(identity, errorCode);
+    collector = createM4SqliteReconciliationCollector({ db, pageSize: config.pageSize });
   } catch (error) {
     try { db?.close?.(); } catch {}
-    try { fs.closeSync(identity.descriptor); } catch {}
+    try { if (identity) fs.closeSync(identity.descriptor); } catch {}
+    try { fs.closeSync(directory.descriptor); } catch {}
     if (error?.code === errorCode) throw error;
     fail(errorCode);
   }
-  const collector = createM4SqliteReconciliationCollector({ db, pageSize: config.pageSize });
   return { revisionSource: collector.revisionSource, events: collector.events,
     close: once(async () => {
       try { await collector.close(); }
       finally {
         try { db.close(); }
-        finally { try { fs.closeSync(identity.descriptor); } catch {} }
+        finally {
+          try { fs.closeSync(identity.descriptor); } catch {}
+          try { fs.closeSync(directory.descriptor); } catch {}
+        }
       }
     }, errorCode) };
 }

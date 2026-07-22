@@ -50,6 +50,22 @@ test('SQLite fails closed when the validated pathname is replaced during open', 
   }), { code: 'm4_v3_reconciliation_source_adapter_invalid' });
 });
 
+test('SQLite accepts private WAL state and rejects a writable database directory', async t => {
+  const target = path.join(temporary(t), 'wal-source.db'); const writer = new Database(target);
+  writer.pragma('journal_mode = WAL'); writer.pragma('wal_autocheckpoint = 0');
+  writer.exec('CREATE TABLE conversation_archive_events_v1 (event_id TEXT, state TEXT, logical_digest TEXT, payload_digest TEXT, source_occurred_at TEXT, event_json TEXT)');
+  writer.prepare('INSERT INTO conversation_archive_events_v1 VALUES (@event_id,@state,@logical_digest,@payload_digest,@source_occurred_at,@event_json)').run(row);
+  fs.chmodSync(target, 0o600);
+  const source = createM4V3ReconciliationSource(input(sourceConfig(target)));
+  await source.revisionSource(); const events = [];
+  for await (const event of source.events) events.push(event);
+  await source.close(); assert.deepEqual(events.map(event => event.eventId), [row.event_id]); writer.close();
+  fs.chmodSync(path.dirname(target), 0o755);
+  assert.throws(() => createM4V3ReconciliationSource(input(sourceConfig(target))), {
+    code: 'm4_v3_reconciliation_source_adapter_invalid',
+  });
+});
+
 test('SQLite rejects unsafe, missing, and symlink database paths without exposing paths', t => {
   const target = databaseFile(t); fs.chmodSync(target, 0o644);
   assert.throws(() => createM4V3ReconciliationSource(input(sourceConfig(target))), { code: 'm4_v3_reconciliation_source_adapter_invalid' });
