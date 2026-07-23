@@ -251,17 +251,15 @@ test('PostgresCatalog uses one repeatable-read client transaction and normalizes
   const client = {
     async query(request) {
       queries.push(request.text);
-      if (request.text.includes('logical_messages_v2')) return { rows: [
-        {
-          logical_message_id: groups[0].logical.logicalMessageId,
-          preferred_observation_id: groups[0].logical.preferredObservationId,
-          payload_conflict: false,
-          tombstoned: false,
-          selection_version: 'amf-observation-selection/v1',
-          event_ids: groups[0].logical.eventIds,
-        },
-      ] };
-      if (request.text.includes('raw_events_v2')) return { rows: groups[0].observations.map(row => ({
+      if (request.text.includes('logical_messages_v2')) return { rows: groups.slice(0, 2).map(group => ({
+        logical_message_id: group.logical.logicalMessageId,
+        preferred_observation_id: group.logical.preferredObservationId,
+        payload_conflict: group.logical.payloadConflict,
+        tombstoned: group.logical.tombstoned,
+        selection_version: group.logical.selectionVersion,
+        event_ids: group.logical.eventIds,
+      })) };
+      if (request.text.includes('raw_events_v2')) return { rows: groups.slice(0, 2).flatMap(group => group.observations).map(row => ({
         event_id: row.eventId, session_id: row.sessionId, logical_message_id: row.logicalMessageId,
         content_id: row.contentId, payload_digest: row.payloadDigest, projection_json: row.projection,
         owner_tag: row.ownerTag, source_tag: row.sourceTag, created_at: row.createdAt,
@@ -273,16 +271,19 @@ test('PostgresCatalog uses one repeatable-read client transaction and normalizes
   const pool = { connect: async () => client, on() {} };
   const catalog = new PostgresCatalog({ pool });
   catalog.ready = async () => {};
-  const result = await catalog.listM4V2LogicalGroups({ limit: 1 });
-  assert.equal(result.items.length, 1);
+  const result = await catalog.listM4V2LogicalGroups({ limit: 2 });
+  assert.deepEqual(result.items, groups.slice(0, 2));
   assert.equal(queries[0], 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
   assert.equal(queries.includes('COMMIT'), true);
   assert.equal(released, 1);
   assert.equal(queries.some(sql => sql.includes('raw_events_v2')), true);
+  assert.equal(queries.filter(sql => sql.includes('raw_events_v2')).length, 1);
   assert.equal(queries.some(sql => sql.includes('logical_messages_v2')), true);
   assert.equal(queries.some(sql => /raw_sessions_v1|searchSessions|session compatibility/i.test(sql)), false);
   const logicalQuery = queries.find(sql => sql.includes('logical_messages_v2'));
   assert.match(logicalQuery, /LIMIT \$2/);
+  const rawRequest = queries.find(sql => sql.includes('raw_events_v2'));
+  assert.match(rawRequest, /logical_message_id=ANY\(\$1::text\[\]\)/);
 
   const failedQueries = [];
   let rollbackFailureReleaseReason = null;
@@ -364,6 +365,6 @@ test('PostgresCatalog reads a production-shaped 4114-observation group without a
   const result = await catalog.listM4V2LogicalGroups({ limit: 1 });
   assert.equal(result.items[0].observations.length, 4_114);
   const rawRequest = requests.find(request => request.text.includes('raw_events_v2'));
-  assert.deepEqual(rawRequest.values, [logicalMessageId]);
-  assert.equal(rawRequest.text.includes('ANY('), false);
+  assert.deepEqual(rawRequest.values, [[logicalMessageId]]);
+  assert.equal(rawRequest.text.includes('ANY('), true);
 });

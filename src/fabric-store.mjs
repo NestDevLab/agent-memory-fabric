@@ -1939,8 +1939,24 @@ export class PostgresCatalog {
         LIMIT $2
       `, [request.after, request.limit + 1]);
       const selected = logicalRows.rows.slice(0, request.limit);
-      const items = [];
-      for (const row of selected) {
+      const selectedIds = selected.map(row => row.logical_message_id);
+      const observationRows = selectedIds.length === 0 ? [] : (await this._query(client, `
+        SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at
+        FROM ${POSTGRES_SCHEMA}.raw_events_v2
+        WHERE logical_message_id=ANY($1::text[])
+        ORDER BY logical_message_id ASC,event_id ASC
+      `, [selectedIds])).rows;
+      const selectedIdSet = new Set(selectedIds);
+      const observationsByLogicalId = new Map(selectedIds.map(id => [id, []]));
+      for (const observation of observationRows) {
+        if (!selectedIdSet.has(observation.logical_message_id)) {
+          const malformed = new Error('m4_v2_catalog_group_invalid');
+          malformed.code = 'm4_v2_catalog_group_invalid';
+          throw malformed;
+        }
+        observationsByLogicalId.get(observation.logical_message_id).push(mapPostgresRawEvent(observation));
+      }
+      const items = selected.map(row => {
         const logical = {
           logicalMessageId: row.logical_message_id,
           preferredObservationId: row.preferred_observation_id,
@@ -1956,14 +1972,8 @@ export class PostgresCatalog {
             }
           })(),
         };
-        const observations = await this._query(client, `
-          SELECT event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at
-          FROM ${POSTGRES_SCHEMA}.raw_events_v2
-          WHERE logical_message_id=$1
-          ORDER BY event_id ASC
-        `, [row.logical_message_id]);
-        items.push(buildM4V2LogicalGroup(logical, observations.rows.map(mapPostgresRawEvent)));
-      }
+        return buildM4V2LogicalGroup(logical, observationsByLogicalId.get(row.logical_message_id));
+      });
       result = structuredClone({
         items,
         next: logicalRows.rows.length > request.limit ? selected.at(-1).logical_message_id : null,
