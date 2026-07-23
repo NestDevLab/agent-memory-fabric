@@ -25,13 +25,14 @@ import {
   unlinkSync,
   writeSync
 } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const MANIFEST_NAME = '.amf-release-manifest.json';
-const MANIFEST_SCHEMA = 'amf.release_manifest/v1';
+const MANIFEST_SCHEMA = 'amf.release_manifest/v2';
+const LEGACY_MANIFEST_SCHEMA = 'amf.release_manifest/v1';
 const PROTECTED_ROOTS = new Set(['.env', '.env.runtime', MANIFEST_NAME, 'runtime', 'var']);
 const REQUIRED_RELEASE_FILES = [
   'Dockerfile',
@@ -80,6 +81,26 @@ function validateRelativeCodePath(entry) {
   const normalized = normalizedEntry(entry);
   if (!normalized) throw failure('release_manifest_path_invalid');
   return normalized;
+}
+
+function manifestRecord(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).length !== 2 || typeof value.path !== 'string'
+    || typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.sha256)) {
+    throw failure('release_manifest_invalid');
+  }
+  const path = validateRelativeCodePath(value.path);
+  if (value.path !== path) throw failure('release_manifest_invalid');
+  return { path, sha256: value.sha256 };
+}
+
+function fileSha256(path) {
+  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const hash = createHash('sha256'); const buffer = Buffer.allocUnsafe(64 * 1024);
+  try {
+    while (true) { const count = readSync(descriptor, buffer, 0, buffer.length, null); if (count === 0) break; hash.update(buffer.subarray(0, count)); }
+    return hash.digest('hex');
+  } finally { closeSync(descriptor); }
 }
 
 function ordinaryFile(path, code) {
@@ -140,10 +161,16 @@ function readPreviousManifest(releaseRoot) {
   } catch {
     throw failure('release_manifest_invalid');
   }
-  if (parsed?.schema !== MANIFEST_SCHEMA || !Array.isArray(parsed.files)) {
+  if (!Array.isArray(parsed?.files) || ![MANIFEST_SCHEMA, LEGACY_MANIFEST_SCHEMA].includes(parsed.schema)) {
     throw failure('release_manifest_invalid');
   }
-  return parsed.files.map(validateRelativeCodePath);
+  const files = parsed.schema === LEGACY_MANIFEST_SCHEMA
+    ? parsed.files.map(validateRelativeCodePath)
+    : parsed.files.map(manifestRecord).map(record => record.path);
+  if (new Set(files).size !== files.length || files.some((entry, index) => index > 0 && files[index - 1] >= entry)) {
+    throw failure('release_manifest_invalid');
+  }
+  return files;
 }
 
 function writeFromStdin(target) {
@@ -423,13 +450,16 @@ function installReleaseUnlocked({
     }
 
     const archiveEntries = run('tar', ['-tf', stagedArchive], 'release_archive_list_failed').split('\n').filter(Boolean);
-    for (const entry of archiveEntries) normalizedEntry(entry);
+    const normalizedArchiveEntries = archiveEntries.map(normalizedEntry).filter(Boolean);
+    if (new Set(normalizedArchiveEntries).size !== normalizedArchiveEntries.length) throw failure('release_archive_path_duplicate');
 
     const extracted = join(stage, 'extracted');
     mkdirSync(extracted, { mode: 0o700 });
     run('tar', ['--no-same-owner', '--no-same-permissions', '-xf', stagedArchive, '-C', extracted], 'release_archive_extract_failed');
     const tree = inspectReleaseTree(extracted);
     const currentFiles = tree.files.sort().map(validateRelativeCodePath);
+    if (new Set(currentFiles).size !== currentFiles.length) throw failure('release_manifest_invalid');
+    const manifestFiles = currentFiles.map(entry => ({ path: entry, sha256: fileSha256(join(extracted, entry)) }));
     const currentDirectories = tree.directories.sort().map(validateRelativeCodePath);
     for (const required of REQUIRED_RELEASE_FILES) {
       if (!currentFiles.includes(required)) throw failure('release_archive_incomplete');
@@ -483,7 +513,7 @@ function installReleaseUnlocked({
         schema: MANIFEST_SCHEMA,
         revision,
         installedAt: clock().toISOString(),
-        files: currentFiles
+        files: manifestFiles
       }, null, 2)}\n`;
       writeAll(descriptor, manifest);
     } finally {

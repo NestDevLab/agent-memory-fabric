@@ -16,6 +16,7 @@ import {
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 import { formatInstallError, installRelease } from '../deploy/amf-install-release.mjs';
 
@@ -62,6 +63,8 @@ function inode(path) {
   return `${stat.dev}:${stat.ino}`;
 }
 
+function sha256(path) { return createHash('sha256').update(readFileSync(path)).digest('hex'); }
+
 test('installs code in place while preserving runtime configuration and raw data', () => {
   const item = fixture();
   try {
@@ -97,9 +100,26 @@ test('installs code in place while preserving runtime configuration and raw data
     assert.equal(existsSync(join(result.backupPath, '.env.runtime')), true);
     assert.equal(existsSync(join(result.backupPath, 'runtime/secrets/key')), true);
     assert.equal(existsSync(join(result.backupPath, 'var')), false);
+    const manifest = JSON.parse(readFileSync(join(item.releaseRoot, '.amf-release-manifest.json'), 'utf8'));
+    assert.equal(manifest.schema, 'amf.release_manifest/v2');
+    assert.deepEqual(manifest.files.map(item => item.path), [...manifest.files.map(item => item.path)].sort());
+    assert.deepEqual(manifest.files.find(item => item.path === 'src/current.mjs'), { path: 'src/current.mjs', sha256: sha256(join(item.releaseRoot, 'src/current.mjs')) });
   } finally {
     rmSync(item.root, { recursive: true, force: true });
   }
+});
+
+test('v2 manifest digests are deterministic and reveal published-file tampering', () => {
+  const item = fixture();
+  try {
+    installRelease({ ...item, revision: 'digest-release', expectedUid: process.getuid(), expectedGid: process.getgid(), clock: () => new Date('2026-07-20T13:00:00.000Z') });
+    const manifestPath = join(item.releaseRoot, '.amf-release-manifest.json');
+    const first = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    const current = first.files.find(item => item.path === 'src/current.mjs');
+    assert.equal(current.sha256, sha256(join(item.releaseRoot, current.path)));
+    writeFileSync(join(item.releaseRoot, current.path), 'tampered\n');
+    assert.notEqual(current.sha256, sha256(join(item.releaseRoot, current.path)));
+  } finally { rmSync(item.root, { recursive: true, force: true }); }
 });
 
 test('rejects an archive that contains a persistent path', () => {
