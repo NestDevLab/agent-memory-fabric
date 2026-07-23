@@ -313,7 +313,7 @@ test('strips ineligible observations and rejects wrapper, logical, cross-binding
     logical: logical([accepted, duplicateSequence]), observations: [accepted, duplicateSequence], integrityFor: integrityRecorder().integrityFor,
   }), { code: 'm4_v2_projector_observation_invalid' });
   await assert.rejects(() => projectM4V2LogicalGroup({
-    logical: logical([accepted]), observations: [{ ...accepted, visibleText: 'x'.repeat(65_537) }], integrityFor: integrityRecorder().integrityFor,
+    logical: logical([accepted]), observations: [{ ...accepted, visibleText: 'x'.repeat(131_073) }], integrityFor: integrityRecorder().integrityFor,
   }), { code: 'm4_v2_projector_observation_invalid' });
   await assert.rejects(() => projectM4V2LogicalGroup({
     logical: logical([accepted, { ...accepted, migrationSequence: 3 }]),

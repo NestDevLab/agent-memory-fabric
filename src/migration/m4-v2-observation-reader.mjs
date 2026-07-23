@@ -18,8 +18,9 @@ const LOGICAL_ID = /^lmsg_[a-f0-9]{64}$/;
 const CONTENT_ID = /^[a-f0-9]{64}$/;
 const PAYLOAD_DIGEST = /^hmac-sha256:v1:[a-f0-9]{64}$/;
 const CATALOG_TAG = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}:[a-f0-9]{64}$/;
-const MAX_VISIBLE_TEXT_CODE_POINTS = 65_536;
+const MAX_VISIBLE_TEXT_CODE_POINTS = 131_072;
 const MAX_VISIBLE_TEXT_BYTES = 262_144;
+const MAX_VISIBLE_TEXT_PARTS = 256;
 
 function fail(code) {
   const error = new Error(code);
@@ -122,7 +123,7 @@ function verifyNormalizedText(normalized, projection) {
   }
   if (!Array.isArray(normalized.value)
     || normalized.value.length < 1
-    || normalized.value.length > 100
+    || normalized.value.length > MAX_VISIBLE_TEXT_PARTS
     || projection.contentParts !== normalized.value.length) {
     fail('m4_v2_reader_normalized_invalid');
   }
@@ -162,6 +163,19 @@ function isClaudeThinkingOnly(normalized, projection) {
     && typeof normalized.value[0].thinking === 'string';
 }
 
+function isClaudeIneligibleArray(normalized, projection) {
+  return projection.sourceKind === 'claude'
+    && ['user', 'assistant'].includes(projection.role)
+    && projection.contentType === 'text'
+    && hasExactKeys(normalized, ['role', 'contentType', 'value'])
+    && normalized.role === projection.role
+    && normalized.contentType === projection.contentType
+    && Array.isArray(normalized.value)
+    && normalized.value.some(part => !hasExactKeys(part, ['text', 'type'])
+      || part.type !== 'text'
+      || typeof part.text !== 'string');
+}
+
 function boundedVisibleText(value) {
   if (typeof value !== 'string'
     || !/\S/u.test(value)
@@ -182,6 +196,7 @@ function visibleTextFromDecrypted(item, projection) {
     return null;
   }
   if (isClaudeThinkingOnly(item?.event?.normalized, projection)) return null;
+  if (isClaudeIneligibleArray(item?.event?.normalized, projection)) return null;
   return boundedVisibleText(verifyNormalizedText(item?.event?.normalized, projection));
 }
 

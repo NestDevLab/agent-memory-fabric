@@ -15,7 +15,7 @@ const SCHEMA = 'amf.m4-v2-conversation-projection/v1';
 const LOGICAL_ID = /^lmsg_[a-f0-9]{64}$/;
 const V2_EVENT_ID = /^evt_[a-f0-9]{64}$/;
 const V2_SESSION_ID = /^ses_[a-f0-9]{64}$/;
-const V3_TEXT_MAX = 65_536;
+const V3_TEXT_MAX = 131_072;
 const SOURCE_TAG = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}:[a-f0-9]{64}$/;
 const EXCLUSION_REASONS = new Set([
   'preferred_ineligible',
