@@ -602,3 +602,35 @@ test('all-text arrays obey the safe part contract and fixture remains public-saf
     auditDecrypt: async input => ({ recorded: true, eventId: input.eventId, contentId: input.contentId }),
   }), 'm4_v2_reader_visible_text_invalid');
 });
+
+test('OpenClaw signed visible text parts retain only text and fail closed on shape drift', async () => {
+  const value = [{
+    type: 'text',
+    text: 'synthetic signed visible text',
+    textSignature: 'synthetic-text-signature',
+  }];
+  const result = await read({
+    sourceKind: 'openclaw',
+    role: 'assistant',
+    direction: 'outbound',
+    value,
+    suffix: 'openclaw-signed-text',
+  });
+  assert.equal(result.result.visibleText, 'synthetic signed visible text');
+  assert.equal(JSON.stringify(result.result).includes('synthetic-text-signature'), false);
+
+  for (const [sourceKind, part] of [
+    ['codex', value[0]],
+    ['openclaw', { ...value[0], textSignature: '' }],
+    ['openclaw', { ...value[0], textSignature: 7 }],
+    ['openclaw', { ...value[0], extra: true }],
+  ]) {
+    await assertCode(() => read({
+      sourceKind,
+      role: 'assistant',
+      direction: 'outbound',
+      value: [part],
+      suffix: crypto.randomUUID(),
+    }), 'm4_v2_reader_normalized_invalid');
+  }
+});
