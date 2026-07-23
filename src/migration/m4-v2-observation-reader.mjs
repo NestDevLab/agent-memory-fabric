@@ -127,9 +127,16 @@ function verifyNormalizedText(normalized, projection) {
     fail('m4_v2_reader_normalized_invalid');
   }
   const parts = normalized.value.map(part => {
-    if (!hasExactKeys(part, ['type', 'text'])
-      || !['text', 'input_text', 'output_text'].includes(part.type)
-      || typeof part.text !== 'string') {
+    const canonicalText = hasExactKeys(part, ['type', 'text'])
+      && ['text', 'input_text', 'output_text'].includes(part.type)
+      && typeof part.text === 'string';
+    const openClawSignedText = projection.sourceKind === 'openclaw'
+      && hasExactKeys(part, ['text', 'textSignature', 'type'])
+      && part.type === 'text'
+      && typeof part.text === 'string'
+      && typeof part.textSignature === 'string'
+      && part.textSignature.length > 0;
+    if (!canonicalText && !openClawSignedText) {
       fail('m4_v2_reader_normalized_invalid');
     }
     return part.text;
