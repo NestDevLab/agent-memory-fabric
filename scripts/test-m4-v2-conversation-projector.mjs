@@ -239,6 +239,68 @@ test('maps authoritative contentType none deletion from its eligible predecessor
   assert.equal(tombstone.tombstonesEventId, result.events[1].eventId);
 });
 
+test('uses native revision when a deletion carries an earlier editedAt sentinel at the original timestamp', async () => {
+  const occurredAt = '2026-07-13T06:58:00.369Z';
+  const predecessor = observation('b', {
+    sourceKind: 'hermes',
+    occurredAt,
+    nativeRevision: 1,
+    migrationSequence: 2,
+  });
+  const deletion = observation('a', {
+    sourceKind: 'hermes',
+    occurredAt,
+    editedAt: '1970-01-01T00:00:00.000Z',
+    nativeRevision: 2,
+    migrationSequence: 1,
+    authoritativeDeletion: true,
+  });
+  const { result } = await project([deletion, predecessor]);
+  assert.deepEqual(result.events.map(event => event.state), ['active', 'tombstone']);
+  assert.equal(result.events.at(-1).sourceOccurredAt, occurredAt);
+  assert.equal(result.events.at(-1).tombstonesEventId, result.events[0].eventId);
+});
+
+test('projects a colliding logical identity independently for each signed legacy session', async () => {
+  const first = observation('c', {
+    sourceKind: 'hermes',
+    sessionId: sessionId('1'),
+    occurredAt: '2026-07-09T10:27:08.123Z',
+    migrationSequence: 1,
+  });
+  const second = observation('d', {
+    sourceKind: 'hermes',
+    sessionId: sessionId('2'),
+    occurredAt: '2026-07-12T15:34:11.059Z',
+    migrationSequence: 2,
+  });
+  const blocks = [];
+  const { result } = await project([first, second], {
+    identityCollector: { async accept(block) { blocks.push(block); } },
+  });
+  assert.deepEqual(result.events.map(event => event.state), ['active', 'active']);
+  assert.equal(new Set(result.events.map(event => event.conversationId)).size, 2);
+  assert.deepEqual(result.evidence, {
+    inputCount: 2,
+    eligibleCount: 2,
+    outputCount: 2,
+    deduplicatedCount: 0,
+    excludedCount: 0,
+    states: {
+      active: 2,
+      edited: 0,
+      replacement: 0,
+      tombstone: 0,
+      conflict: 0,
+    },
+  });
+  assert.equal(blocks.length, 2);
+  assert.deepEqual(blocks.map(block => block.session.legacySessionId).sort(), [
+    first.sessionId,
+    second.sessionId,
+  ].sort());
+});
+
 test('fails closed for deletion over conflicts and excludes preferred ineligible groups', async () => {
   const left = observation('b', { sourceKind: 'codex', sequence: 1, migrationSequence: 1 });
   const right = observation('c', { sourceKind: 'claude', sequence: 2, migrationSequence: 2 });
