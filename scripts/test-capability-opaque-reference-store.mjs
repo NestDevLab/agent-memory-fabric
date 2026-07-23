@@ -110,7 +110,8 @@ test('spoofed backend codes and messages are always normalized', async () => {
   await assert.rejects(new SpoofedStore().issueResource(resource), failure => failure.code === 'capability_opaque_reference_unavailable' && !failure.message.includes('private-backend-secret'));
 });
 
-test('memory rows corrupt fail closed and poolFactory receives only connectionString', async () => {
+test('memory rows corrupt fail closed and poolFactory receives only connectionString and TLS options', async () => {
   const store = new MemoryOpaqueReferenceStore(); const id = await store.issueResource(resource); store.resources.get(id).payload = { unexpected: true }; await assert.rejects(store.resolveResource({ id, grantBinding: BINDING }), { code: 'capability_resource_not_found' });
-  let options; new PostgresOpaqueReferenceStore({ connectionString: 'postgres://synthetic/opaque', poolFactory(value) { options = value; return { async query() { return { rows: [] }; } }; } }); assert.deepEqual(options, { connectionString: 'postgres://synthetic/opaque' });
+  let options; new PostgresOpaqueReferenceStore({ connectionString: 'postgres://synthetic/opaque', ssl: { rejectUnauthorized: false }, poolFactory(value) { options = value; return { async query() { return { rows: [] }; } }; } }); assert.deepEqual(options, { connectionString: 'postgres://synthetic/opaque', ssl: { rejectUnauthorized: false } });
+  assert.throws(() => new PostgresOpaqueReferenceStore({ pool: new FakePool(), ssl: { rejectUnauthorized: false, ca: 'invalid' } }), { code: 'capability_opaque_reference_invalid' });
 });
