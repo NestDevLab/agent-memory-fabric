@@ -21,7 +21,7 @@ import {
   opaqueContextTag,
 } from '../src/ingest/raw-projection-v2.mjs';
 import { projectM4V2LogicalGroup } from '../src/migration/m4-v2-conversation-projector.mjs';
-import { readM4V2Observation } from '../src/migration/m4-v2-observation-reader.mjs';
+import { readM4V2CatalogObservation, readM4V2Observation } from '../src/migration/m4-v2-observation-reader.mjs';
 
 const INGEST_KEY = Buffer.alloc(32, 7).toString('base64');
 const LOGICAL_KEY = Buffer.alloc(32, 8).toString('base64');
@@ -58,6 +58,7 @@ function createItem({
   authoritativeDeletion = false,
   contentParts = null,
   logicalKeys = KEY_RING.logicalMessageKeys,
+  sourceKind = 'codex',
 } = {}) {
   const senderTag = tag('sender', 'synthetic-sender');
   const conversationTag = tag('conversation', 'synthetic-conversation');
@@ -73,11 +74,11 @@ function createItem({
   const derivedLogical = deriveLogicalMessageIds(logical, logicalKeys);
   const rawBytes = Buffer.from(`synthetic-raw-${suffix}`, 'utf8');
   const eventId = deriveEventIdV2({
-    sourceKind: 'codex',
+    sourceKind,
     observationClass: 'native',
     rawBytes,
   });
-  const sessionId = deriveSessionIdV2({ sourceKind: 'codex', conversationTag });
+  const sessionId = deriveSessionIdV2({ sourceKind, conversationTag });
   const normalized = {
     role,
     contentType,
@@ -88,7 +89,7 @@ function createItem({
     eventId,
     sessionId,
     occurredAt: '2026-07-21T12:00:00.123456789Z',
-    source: { runtime: 'codex', subtype: authoritativeDeletion ? 'message.deleted' : 'message' },
+    source: { runtime: sourceKind, subtype: authoritativeDeletion ? 'message.deleted' : 'message' },
     logical,
     normalized,
     raw: { encoding: 'base64', line: rawBytes.toString('base64'), lineEnding: 'lf' },
@@ -102,7 +103,7 @@ function createItem({
     logicalMessageAliases: derivedLogical.aliases,
     derivationVersion: 'amf-logical-message/v1',
     keyVersion: derivedLogical.keyVersion,
-    sourceKind: 'codex',
+    sourceKind,
     observationClass: 'native',
     direction,
     conversationKind,
@@ -249,6 +250,61 @@ test('assistant, authoritative deletion, and non-conversation rows are determini
   assert.equal((await read({ authoritativeDeletion: true, contentType: 'none', suffix: 'deletion' })).result.visibleText, null);
   assert.equal((await read({ role: 'tool', contentType: 'tool', value: { structured: true }, suffix: 'tool' })).result.visibleText, null);
   assert.equal((await read({ role: 'system', contentType: 'structured', value: { structured: true }, suffix: 'system' })).result.visibleText, null);
+});
+
+test('Claude thinking-only assistant content is private reasoning and never becomes visible text', async () => {
+  const thinking = [{
+    signature: 'synthetic-signature',
+    thinking: 'SYNTHETIC_PRIVATE_REASONING',
+    type: 'thinking',
+  }];
+  const result = await read({
+    sourceKind: 'claude',
+    role: 'assistant',
+    direction: 'outbound',
+    value: thinking,
+    suffix: 'claude-thinking',
+  });
+  assert.equal(result.result.visibleText, null);
+  assert.equal(JSON.stringify(result.result).includes('SYNTHETIC_PRIVATE_REASONING'), false);
+
+  for (const value of [
+    [{ type: 'thinking', thinking: 'private', signature: 'signature', extra: true }],
+    [{ type: 'thinking', thinking: 'private' }],
+    [{ type: 'text', thinking: 'private', signature: 'signature' }],
+  ]) {
+    await assertCode(() => read({
+      sourceKind: 'claude',
+      role: 'assistant',
+      direction: 'outbound',
+      value,
+      suffix: crypto.randomUUID(),
+    }), 'm4_v2_reader_normalized_invalid');
+  }
+});
+
+test('catalog-only observations accept metadata but require decrypt for potential conversation rows', async () => {
+  const metadata = createItem({
+    role: 'system',
+    direction: 'internal',
+    contentType: 'structured',
+    value: { ignored: true },
+    suffix: 'catalog-metadata',
+  });
+  const metadataEnvelope = encrypt(metadata);
+  const observation = readM4V2CatalogObservation({
+    catalogRow: rowFor(metadata, metadataEnvelope),
+    migrationSequence: 3,
+  });
+  assert.equal(observation.visibleText, null);
+  assert.equal(observation.migrationSequence, 3);
+
+  const conversation = createItem({ suffix: 'catalog-conversation' });
+  const conversationEnvelope = encrypt(conversation);
+  assert.throws(() => readM4V2CatalogObservation({
+    catalogRow: rowFor(conversation, conversationEnvelope),
+    migrationSequence: 4,
+  }), { code: 'm4_v2_reader_decrypt_required' });
 });
 
 test('preflight rejects malformed envelopes before callbacks and valid output is mutation isolated', async () => {

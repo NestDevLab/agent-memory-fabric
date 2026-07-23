@@ -8,6 +8,7 @@ import {
 } from '../ingest/raw-event-contract.mjs';
 import { validateProjectionV2 } from '../ingest/raw-projection-v2.mjs';
 import { strictIsoTimestamp } from '../ingest/transcripts/canonical.mjs';
+import { isPotentialM4ConversationProjection } from './m4-v2-conversation-eligibility.mjs';
 
 export const M4_V2_READER_MIN_CIPHERTEXT_BYTES = 1_024;
 
@@ -136,6 +137,24 @@ function verifyNormalizedText(normalized, projection) {
   return parts.join('\n');
 }
 
+function isClaudeThinkingOnly(normalized, projection) {
+  return projection.sourceKind === 'claude'
+    && projection.role === 'assistant'
+    && projection.direction === 'outbound'
+    && projection.contentType === 'text'
+    && projection.contentParts === 1
+    && projection.hasContent === true
+    && hasExactKeys(normalized, ['role', 'contentType', 'value'])
+    && normalized.role === projection.role
+    && normalized.contentType === projection.contentType
+    && Array.isArray(normalized.value)
+    && normalized.value.length === 1
+    && hasExactKeys(normalized.value[0], ['signature', 'thinking', 'type'])
+    && normalized.value[0].type === 'thinking'
+    && typeof normalized.value[0].signature === 'string'
+    && typeof normalized.value[0].thinking === 'string';
+}
+
 function boundedVisibleText(value) {
   if (typeof value !== 'string'
     || !/\S/u.test(value)
@@ -155,6 +174,7 @@ function visibleTextFromDecrypted(item, projection) {
     || projection.contentType !== 'text') {
     return null;
   }
+  if (isClaudeThinkingOnly(item?.event?.normalized, projection)) return null;
   return boundedVisibleText(verifyNormalizedText(item?.event?.normalized, projection));
 }
 
@@ -239,6 +259,39 @@ async function recordDecryptAudit(auditDecrypt, row, size) {
   }
 }
 
+function validateMigrationSequence(value) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    fail('m4_v2_reader_request_invalid');
+  }
+  return value;
+}
+
+function projectorObservation(row, migrationSequence, visibleText) {
+  return {
+    eventId: row.eventId,
+    sessionId: row.sessionId,
+    sourceTag: row.sourceTag,
+    migrationSequence,
+    projection: canonicalizeProjectorProjection(
+      row.transportProjection,
+      row.logicalMessageId,
+    ),
+    visibleText,
+  };
+}
+
+export function readM4V2CatalogObservation({
+  catalogRow,
+  migrationSequence,
+} = {}) {
+  const row = copyCatalogRow(catalogRow);
+  const sequence = validateMigrationSequence(migrationSequence);
+  if (isPotentialM4ConversationProjection(row.transportProjection)) {
+    fail('m4_v2_reader_decrypt_required');
+  }
+  return projectorObservation(row, sequence, null);
+}
+
 export async function readM4V2Observation({
   catalogRow,
   envelope,
@@ -249,9 +302,7 @@ export async function readM4V2Observation({
   maxCiphertextBytes = RAW_EVENT_HTTP_MAX_BODY_BYTES,
 } = {}) {
   const row = copyCatalogRow(catalogRow);
-  if (!Number.isSafeInteger(migrationSequence) || migrationSequence < 0) {
-    fail('m4_v2_reader_request_invalid');
-  }
+  const sequence = validateMigrationSequence(migrationSequence);
   const maxBytes = validateMaxCiphertextBytes(maxCiphertextBytes);
   const size = ciphertextBytes(envelope, maxBytes);
   const normalizedKeys = preflightEnvelope(envelope, row, ingestKeys);
@@ -281,16 +332,5 @@ export async function readM4V2Observation({
     fail('m4_v2_reader_decrypt_invalid');
   }
   const visibleText = visibleTextFromDecrypted(decrypted, row.transportProjection);
-  const projectorProjection = canonicalizeProjectorProjection(
-    row.transportProjection,
-    row.logicalMessageId,
-  );
-  return {
-    eventId: row.eventId,
-    sessionId: row.sessionId,
-    sourceTag: row.sourceTag,
-    migrationSequence,
-    projection: projectorProjection,
-    visibleText,
-  };
+  return projectorObservation(row, sequence, visibleText);
 }

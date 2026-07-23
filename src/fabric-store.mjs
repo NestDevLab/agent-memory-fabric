@@ -311,6 +311,7 @@ export class MemoryRawStore extends RawStoreBase {
     if (!envelope) throw createError('raw_object_not_found', 404);
     return structuredClone(envelope);
   }
+  async removeClientCiphertext(contentId) { this.clientBlobs.delete(contentId); }
 }
 
 export class FileRawStore extends RawStoreBase {
@@ -405,6 +406,20 @@ export class FileRawStore extends RawStoreBase {
     }
     catch (error) { if (error?.code === 'ENOENT') throw createError('raw_object_not_found', 404); throw error; }
     finally { if (directoryFd !== undefined) fs.closeSync(directoryFd); fs.closeSync(rootFd); }
+  }
+  async removeClientCiphertext(contentId) {
+    this.clientBlobPath(contentId);
+    const rootFd = openSecureAbsoluteDirectory(this.rootPath);
+    let directoryFd;
+    try {
+      directoryFd = openSecureSubdirectory(rootFd, ['client-events', contentId.slice(0, 2)]);
+      secureRemoveFile(directoryFd, `${contentId}.enc.json`);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    } finally {
+      if (directoryFd !== undefined) fs.closeSync(directoryFd);
+      fs.closeSync(rootFd);
+    }
   }
 }
 
@@ -575,6 +590,28 @@ export class MemoryCatalog {
     this.rawSessions.set(record.sessionId, session);
     this.auditEvents.push({ ...auditEvent, outcome: 'stored' });
     return { record: stored, duplicate: false, logical: structuredClone(logical) };
+  }
+  recoverRawEventV2({ eventId, expectedContentId }, rawRecord, auditEvent) {
+    const existing = this.rawEventsV2.get(eventId);
+    if (!existing || existing.contentId !== expectedContentId
+      || rawRecord.contentId === expectedContentId) {
+      throw createError('raw_event_recovery_conflict', 409);
+    }
+    this.rawObjects.set(rawRecord.contentId, { ...rawRecord });
+    const recovered = structuredClone({ ...existing, contentId: rawRecord.contentId });
+    this.rawEventsV2.set(eventId, recovered);
+    this.auditEvents.push({ ...auditEvent, outcome: 'recovered' });
+    const referenced = [...this.rawEvents.values(), ...this.rawEventsV2.values()]
+      .some(row => row.contentId === expectedContentId)
+      || [...this.proposals.values()].some(row => row.contentId === expectedContentId)
+      || this.identityEvents.some(row => row.evidenceContentId === expectedContentId)
+      || this.retention.has(expectedContentId);
+    if (!referenced) this.rawObjects.delete(expectedContentId);
+    return {
+      record: structuredClone(recovered),
+      recovered: true,
+      retiredContentId: referenced ? null : expectedContentId,
+    };
   }
   listM4V2LogicalGroups(input = {}) {
     let request;
@@ -1014,6 +1051,39 @@ export class SqliteCatalog {
       this.db.prepare('INSERT INTO audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES (?,?,?,?,?,?,?,?,?)').run(auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, 'stored', auditEvent.requestId || null, auditEvent.targetId, null, JSON.stringify(auditEvent.details || {}));
       return { record: { ...record, logicalMessageId: canonicalId }, duplicate: false, logical };
     });
+    this.recoverRawEventV2Transaction = this.db.transaction(({ eventId, expectedContentId }, raw, auditEvent) => {
+      const existing = this.db.prepare('SELECT * FROM raw_events_v2 WHERE event_id=?').get(eventId);
+      if (!existing || existing.content_id !== expectedContentId || raw.contentId === expectedContentId) {
+        throw createError('raw_event_recovery_conflict', 409);
+      }
+      this.db.prepare('INSERT OR IGNORE INTO raw_objects_v2(content_id,media_type,byte_length,storage_ref,created_at) VALUES (@contentId,@mediaType,@byteLength,@storageRef,@createdAt)').run(raw);
+      const replacement = this.db.prepare('SELECT * FROM raw_objects_v2 WHERE content_id=?').get(raw.contentId);
+      if (!replacement
+        || replacement.media_type !== raw.mediaType
+        || replacement.byte_length !== raw.byteLength
+        || replacement.storage_ref !== raw.storageRef) {
+        throw createError('raw_object_conflict', 409);
+      }
+      const changed = this.db.prepare('UPDATE raw_events_v2 SET content_id=? WHERE event_id=? AND content_id=?')
+        .run(raw.contentId, eventId, expectedContentId);
+      if (changed.changes !== 1) throw createError('raw_event_recovery_conflict', 409);
+      this.db.prepare('INSERT INTO audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES (?,?,?,?,?,?,?,?,?)')
+        .run(auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, 'recovered', auditEvent.requestId || null, auditEvent.targetId, null, JSON.stringify(auditEvent.details || {}));
+      const references = this.db.prepare(`
+        SELECT 1 FROM raw_events_v1 WHERE content_id=?
+        UNION ALL SELECT 1 FROM raw_events_v2 WHERE content_id=?
+        UNION ALL SELECT 1 FROM fabric_proposals WHERE content_id=?
+        UNION ALL SELECT 1 FROM identity_events_v2 WHERE evidence_content_id=?
+        UNION ALL SELECT 1 FROM raw_retention_v2 WHERE content_id=?
+        LIMIT 1
+      `).get(expectedContentId, expectedContentId, expectedContentId, expectedContentId, expectedContentId);
+      if (!references) this.db.prepare('DELETE FROM raw_objects_v2 WHERE content_id=?').run(expectedContentId);
+      return {
+        record: this.mapRawEvent(this.db.prepare('SELECT * FROM raw_events_v2 WHERE event_id=?').get(eventId)),
+        recovered: true,
+        retiredContentId: references ? null : expectedContentId,
+      };
+    });
     this.selectIdentity = this.db.prepare('SELECT * FROM identity_records_v2 WHERE id = ?');
     this.selectIdentityEventByIdempotency = this.db.prepare('SELECT * FROM identity_events_v2 WHERE idempotency_tag = ?');
     this.createIdentityTransaction = this.db.transaction((record, event, raw) => {
@@ -1130,6 +1200,7 @@ export class SqliteCatalog {
   mapRawEvent(row) { return row ? { eventId: row.event_id, sessionId: row.session_id, logicalMessageId: row.logical_message_id || null, contentId: row.content_id, payloadDigest: row.payload_digest, projection: JSON.parse(row.projection_json), ownerTag: row.owner_tag, sourceTag: row.source_tag, createdAt: row.created_at } : null; }
   ingestRawEvent(record, rawRecord, auditEvent) { return this.insertRawEvent(record, rawRecord, auditEvent); }
   ingestRawEventV2(record, rawRecord, auditEvent) { return this.insertRawEventV2(record, rawRecord, auditEvent); }
+  recoverRawEventV2(input, rawRecord, auditEvent) { return this.recoverRawEventV2Transaction(input, rawRecord, auditEvent); }
   findLogicalMessage(ids) {
     for (const id of ids) {
       const alias = this.db.prepare('SELECT logical_message_id FROM logical_message_aliases_v2 WHERE alias_id=?').get(id);
@@ -1954,6 +2025,80 @@ export class PostgresCatalog {
       throw error;
     } finally { client.release(destroyClient ? new Error('catalog_client_discarded') : undefined); }
   }
+  async recoverRawEventV2({ eventId, expectedContentId }, rawRecord, auditEvent) {
+    await this.ready();
+    const client = await this._connect();
+    let destroyClient = false;
+    let commitAttempted = false;
+    let primaryError = null;
+    try {
+      await this._begin(client);
+      const selected = await this._query(client,
+        `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE event_id=$1 FOR UPDATE`,
+        [eventId]);
+      const existing = selected.rows[0];
+      if (!existing || existing.content_id !== expectedContentId || rawRecord.contentId === expectedContentId) {
+        throw createError('raw_event_recovery_conflict', 409);
+      }
+      await this._query(client,
+        `INSERT INTO ${POSTGRES_SCHEMA}.raw_objects_v2(content_id,media_type,byte_length,storage_ref,created_at)
+         VALUES ($1,$2,$3,$4,$5) ON CONFLICT(content_id) DO NOTHING`,
+        [rawRecord.contentId, rawRecord.mediaType, rawRecord.byteLength, rawRecord.storageRef, rawRecord.createdAt]);
+      const replacement = (await this._query(client,
+        `SELECT * FROM ${POSTGRES_SCHEMA}.raw_objects_v2 WHERE content_id=$1`,
+        [rawRecord.contentId])).rows[0];
+      if (!replacement
+        || replacement.media_type !== rawRecord.mediaType
+        || Number(replacement.byte_length) !== rawRecord.byteLength
+        || replacement.storage_ref !== rawRecord.storageRef) {
+        throw createError('raw_object_conflict', 409);
+      }
+      const changed = await this._query(client,
+        `UPDATE ${POSTGRES_SCHEMA}.raw_events_v2 SET content_id=$1
+         WHERE event_id=$2 AND content_id=$3 RETURNING *`,
+        [rawRecord.contentId, eventId, expectedContentId]);
+      if (!changed.rows[0]) throw createError('raw_event_recovery_conflict', 409);
+      await this._query(client,
+        `INSERT INTO ${POSTGRES_SCHEMA}.audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json)
+         VALUES ($1,$2,$3,$4,'recovered',$5,$6,NULL,$7::jsonb)`,
+        [auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action,
+          auditEvent.requestId || null, auditEvent.targetId, JSON.stringify(auditEvent.details || {})]);
+      const retired = await this._query(client, `
+        DELETE FROM ${POSTGRES_SCHEMA}.raw_objects_v2 object
+        WHERE object.content_id=$1
+          AND NOT EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE content_id=$1)
+          AND NOT EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE content_id=$1)
+          AND NOT EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.fabric_proposals WHERE content_id=$1)
+          AND NOT EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.identity_events_v2 WHERE evidence_content_id=$1)
+          AND NOT EXISTS (SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_retention_v2 WHERE content_id=$1)
+        RETURNING content_id
+      `, [expectedContentId]);
+      commitAttempted = true;
+      await this._query(client, 'COMMIT');
+      return {
+        record: mapPostgresRawEvent(changed.rows[0]),
+        recovered: true,
+        retiredContentId: retired.rows[0] ? expectedContentId : null,
+      };
+    } catch (error) {
+      primaryError = error;
+      if (commitAttempted) {
+        destroyClient = true;
+      } else {
+        try { await this._query(client, 'ROLLBACK'); }
+        catch { destroyClient = true; }
+      }
+    } finally {
+      client.release(destroyClient ? new Error('catalog_client_discarded') : undefined);
+    }
+    if (commitAttempted) {
+      const reconciled = await this.getRawEvent(eventId);
+      if (reconciled?.contentId === rawRecord.contentId) {
+        return { record: reconciled, recovered: true, retiredContentId: null };
+      }
+    }
+    throw primaryError;
+  }
   async getRawEvent(id) {
     await this.ready();
     const v2 = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE event_id=$1`, [id]);
@@ -2596,6 +2741,52 @@ export class FabricStore {
       }
       if (existing.payloadDigest !== payloadDigest) throw createError('raw_event_conflict', 409);
       if (canonicalJson(existing.projection) !== canonicalJson(projection)) throw createError('raw_event_conflict', 409);
+      if (projectionV2) {
+        let missingCiphertext = false;
+        try {
+          await this.rawStore.getClientCiphertext(existing.contentId);
+        } catch (error) {
+          if (error?.message !== 'raw_object_not_found') throw error;
+          missingCiphertext = true;
+        }
+        if (missingCiphertext) {
+          if (typeof this.catalog.recoverRawEventV2 !== 'function') {
+            throw createError('raw_event_recovery_unavailable', 503);
+          }
+          if (contentId === existing.contentId) throw createError('raw_event_recovery_conflict', 409);
+          const createdAt = this.clock().toISOString();
+          const raw = await this.rawStore.commitClientCiphertext(contentId, envelope);
+          const recoveryAudit = {
+            ...auditEvent,
+            action: 'raw_event_recovery',
+            details: {
+              previousContentId: existing.contentId,
+              replacementContentId: contentId,
+              reason: 'catalog_referenced_ciphertext_missing',
+            },
+          };
+          const recovered = await this._catalogOperation(() => this.catalog.recoverRawEventV2(
+            { eventId: existing.eventId, expectedContentId: existing.contentId },
+            {
+              contentId,
+              mediaType: 'application/vnd.agent-memory-fabric.raw-event-ciphertext+json',
+              byteLength: raw.byteLength,
+              storageRef: raw.storageRef,
+              createdAt,
+            },
+            recoveryAudit,
+          ));
+          return {
+            status: 'duplicate',
+            duplicate: true,
+            recovered: true,
+            eventId: projection.eventId,
+            sessionId: projection.sessionId,
+            contentId: recovered.record.contentId,
+            logicalMessageId: recovered.record.logicalMessageId,
+          };
+        }
+      }
       const duplicateWrite = projectionV2 ? this.catalog.ingestRawEventV2?.bind(this.catalog) : this.catalog.ingestRawEvent.bind(this.catalog);
       if (!duplicateWrite) throw createError('raw_projection_v2_storage_unavailable', 503);
       await this._catalogOperation(() => duplicateWrite(existing, null, auditEvent));
