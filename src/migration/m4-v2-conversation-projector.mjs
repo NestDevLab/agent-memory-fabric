@@ -8,6 +8,8 @@ import {
   validateProjectionV2,
 } from '../ingest/raw-projection-v2.mjs';
 import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
+import { M4_V2_LOGICAL_GROUP_MAX_OBSERVATIONS } from './m4-v2-catalog-groups.mjs';
+import { isPotentialM4ConversationProjection } from './m4-v2-conversation-eligibility.mjs';
 
 const SCHEMA = 'amf.m4-v2-conversation-projection/v1';
 const LOGICAL_ID = /^lmsg_[a-f0-9]{64}$/;
@@ -80,7 +82,8 @@ function copyLogical(value) {
     || typeof value.payloadConflict !== 'boolean'
     || typeof value.tombstoned !== 'boolean'
     || value.selectionVersion !== 'amf-observation-selection/v1'
-    || !Array.isArray(value.eventIds) || value.eventIds.length < 1 || value.eventIds.length > 1_000
+    || !Array.isArray(value.eventIds) || value.eventIds.length < 1
+    || value.eventIds.length > M4_V2_LOGICAL_GROUP_MAX_OBSERVATIONS
     || value.eventIds.some(id => typeof id !== 'string' || !V2_EVENT_ID.test(id))
     || new Set(value.eventIds).size !== value.eventIds.length) {
     fail('m4_v2_projector_logical_invalid');
@@ -143,7 +146,7 @@ function copyObservation(value) {
     migrationSequence: value.migrationSequence,
     projection,
     visibleText: value.visibleText,
-    sourceOccurredAt: normalizeUtcTimestamp(projection.editedAt ?? projection.occurredAt),
+    sourceOccurredAt: projection.editedAt ?? projection.occurredAt,
   };
 }
 
@@ -155,19 +158,11 @@ function compareTemporal(left, right) {
 
 function isConversationObservation(observation) {
   const projection = observation.projection;
+  if (!isPotentialM4ConversationProjection(projection)) return false;
   if (projection.authoritativeDeletion) {
-    return projection.contentType === 'none'
-      && projection.hasContent === false
-      && observation.visibleText === null;
+    return observation.visibleText === null;
   }
-  if (!['user', 'assistant'].includes(projection.role)
-    || !['inbound', 'outbound'].includes(projection.direction)
-    || !['dm', 'group', 'channel', 'thread', 'session'].includes(projection.conversationKind)
-    || (projection.role === 'user' && projection.direction !== 'inbound')
-    || (projection.role === 'assistant' && projection.direction !== 'outbound')) {
-    return false;
-  }
-  return projection.contentType === 'text' && validVisibleText(observation.visibleText);
+  return validVisibleText(observation.visibleText);
 }
 
 function evidence(inputCount, eligibleCount, outputCount, deduplicatedCount, excludedCount, states) {
@@ -397,7 +392,8 @@ function projectorIdentityBlock({ sessionId, conversationId, sourceTags, selecte
 }
 
 export async function projectM4V2LogicalGroup({ logical, observations, integrityFor, identityCollector: collectorInput = null } = {}) {
-  if (typeof integrityFor !== 'function' || !Array.isArray(observations) || observations.length < 1 || observations.length > 1_000) {
+  if (typeof integrityFor !== 'function' || !Array.isArray(observations) || observations.length < 1
+    || observations.length > M4_V2_LOGICAL_GROUP_MAX_OBSERVATIONS) {
     fail('m4_v2_projector_request_invalid');
   }
   const safeLogical = copyLogical(logical);
@@ -416,6 +412,10 @@ export async function projectM4V2LogicalGroup({ logical, observations, integrity
     return excluded('preferred_ineligible', safeObservations.length, 0, safeObservations.length);
   }
   const eligible = safeObservations.filter(isConversationObservation);
+  if (eligible.some(item => item.sourceOccurredAt === null)) {
+    fail('m4_v2_projector_observation_invalid');
+  }
+  for (const item of eligible) item.sourceOccurredAt = normalizeUtcTimestamp(item.sourceOccurredAt);
   const nonDeletion = eligible.filter(item => !item.projection.authoritativeDeletion);
   const deletion = preferred.projection.authoritativeDeletion ? preferred : null;
   const deletions = safeObservations.filter(item => item.projection.authoritativeDeletion);

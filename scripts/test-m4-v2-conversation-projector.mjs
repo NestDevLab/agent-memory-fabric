@@ -42,7 +42,9 @@ function projection(char, options = {}) {
       sender: [opaque('d')], conversation: [opaque('e')], actor: [opaque('f')],
     },
     subtype: deletion ? 'message.deleted' : 'message',
-    occurredAt: options.occurredAt ?? `2026-01-01T00:00:0${options.sequence ?? 1}Z`,
+    occurredAt: Object.hasOwn(options, 'occurredAt')
+      ? options.occurredAt
+      : `2026-01-01T00:00:0${options.sequence ?? 1}Z`,
     editedAt: options.editedAt ?? null,
     nativeRevision: Object.hasOwn(options, 'nativeRevision') ? options.nativeRevision : 1,
     sourceSequence: options.sourceSequence ?? options.sequence ?? 1,
@@ -139,6 +141,23 @@ test('normalizes offset timestamps to canonical UTC without losing nine-digit fr
   assert.equal(earlyResult.result.events[0].sourceOccurredAt, '0099-01-01T00:00:00.000000001Z');
 });
 
+test('excludes untimed non-conversation metadata before temporal normalization', async () => {
+  const metadata = observation('c', {
+    role: 'unknown',
+    direction: 'unknown',
+    contentType: 'none',
+    contentParts: 0,
+    hasContent: false,
+    occurredAt: null,
+    visibleText: null,
+  });
+  const { result, recorder } = await project([metadata]);
+  assert.equal(result.outcome, 'excluded');
+  assert.equal(result.reason, 'preferred_ineligible');
+  assert.equal(result.evidence.excludedCount, 1);
+  assert.equal(recorder.calls.length, 0);
+});
+
 test('deduplicates delivery handoffs and retains the deterministic native representative', async () => {
   const native = observation('2', { normalizedPayloadDigest: normalizedDigest('a'), migrationSequence: 2 });
   const handoff = observation('3', {
@@ -150,6 +169,25 @@ test('deduplicates delivery handoffs and retains the deterministic native repres
   assert.equal(result.evidence.deduplicatedCount, 1);
   assert.equal(result.events[0].eventId.includes(native.eventId), false);
   assert.equal(recorder.calls[0].legacyEventId, native.eventId);
+});
+
+test('deduplicates a production-shaped 4114-observation logical group within the bounded input', async () => {
+  const observations = Array.from({ length: 4_114 }, (_, index) => {
+    const eventId = `evt_${(index + 1).toString(16).padStart(64, '0')}`;
+    const item = observation('1', {
+      eventId,
+      migrationSequence: index + 1,
+      sourceSequence: index + 1,
+      normalizedPayloadDigest: normalizedDigest('1'),
+      visibleText: 'stable synthetic text',
+    });
+    return item;
+  });
+  const { result, recorder } = await project(observations);
+  assert.equal(result.outcome, 'projected');
+  assert.equal(result.events.length, 1);
+  assert.equal(result.evidence.deduplicatedCount, 4_113);
+  assert.equal(recorder.calls.length, 1);
 });
 
 test('maps native revisions into edits and ambiguous variants into conflicts', async () => {
