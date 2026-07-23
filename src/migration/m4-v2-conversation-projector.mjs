@@ -120,6 +120,13 @@ function utcOrderKey(value) {
   return `${match[1]}.${(match[2] ?? '').padEnd(9, '0')}`;
 }
 
+function effectiveSourceOccurredAt(projection) {
+  if (projection.editedAt === null) return projection.occurredAt;
+  return Date.parse(projection.editedAt) < Date.parse(projection.occurredAt)
+    ? projection.occurredAt
+    : projection.editedAt;
+}
+
 function copyObservation(value) {
   const keys = ['eventId', 'sessionId', 'sourceTag', 'migrationSequence', 'projection', 'visibleText'];
   if (!hasExactKeys(value, keys)
@@ -146,7 +153,7 @@ function copyObservation(value) {
     migrationSequence: value.migrationSequence,
     projection,
     visibleText: value.visibleText,
-    sourceOccurredAt: projection.editedAt ?? projection.occurredAt,
+    sourceOccurredAt: effectiveSourceOccurredAt(projection),
   };
 }
 
@@ -154,6 +161,19 @@ function compareTemporal(left, right) {
   return utcOrderKey(left.sourceOccurredAt).localeCompare(utcOrderKey(right.sourceOccurredAt))
     || left.migrationSequence - right.migrationSequence
     || left.eventId.localeCompare(right.eventId);
+}
+
+function deletionOrdering(predecessor, deletion) {
+  const temporal = utcOrderKey(predecessor.sourceOccurredAt)
+    .localeCompare(utcOrderKey(deletion.sourceOccurredAt));
+  if (temporal < 0) return deletion.migrationSequence;
+  if (temporal > 0) return null;
+  const revisionOrdered = Number.isSafeInteger(predecessor.projection.nativeRevision)
+    && Number.isSafeInteger(deletion.projection.nativeRevision)
+    && deletion.projection.nativeRevision > predecessor.projection.nativeRevision;
+  return revisionOrdered
+    ? Math.max(predecessor.migrationSequence, deletion.migrationSequence) + 1
+    : null;
 }
 
 function isConversationObservation(observation) {
@@ -193,6 +213,42 @@ function excluded(reason, inputCount, eligibleCount, excludedCount) {
     }),
     events: [],
   };
+}
+
+function mergeSessionPartitions(results) {
+  const events = results.flatMap(result => result.events).sort(compareConversationEvents);
+  const reasons = new Set(results.map(result => result.reason).filter(reason => reason !== null));
+  const sum = key => results.reduce((total, result) => total + result.evidence[key], 0);
+  const state = key => results.reduce((total, result) => total + result.evidence.states[key], 0);
+  return {
+    schema: SCHEMA,
+    outcome: events.length > 0 ? 'projected' : 'excluded',
+    reason: events.length > 0
+      ? null
+      : reasons.size === 1 ? [...reasons][0] : 'no_eligible_observations',
+    evidence: evidence(
+      sum('inputCount'),
+      sum('eligibleCount'),
+      events.length,
+      sum('deduplicatedCount'),
+      sum('excludedCount'),
+      {
+        active: state('active'),
+        edited: state('edited'),
+        tombstone: state('tombstone'),
+        conflict: state('conflict'),
+      },
+    ),
+    events,
+  };
+}
+
+function isHermesFirstRevisionSessionCollision(sessions) {
+  return [...sessions.values()].every(items => items.length === 1)
+    && [...sessions.values()].flat().every(item => item.projection.sourceKind === 'hermes'
+      && item.projection.observationClass === 'native'
+      && item.projection.nativeRevision === 1
+      && item.projection.authoritativeDeletion === false);
 }
 
 function recomputeLogical(logical, observations) {
@@ -290,6 +346,7 @@ async function createProjectedEvent({
   previousId,
   conflicts,
   integrityFor,
+  orderingSequence = observation.migrationSequence,
 }) {
   const sourceOccurredAt = observation.sourceOccurredAt;
   const integrityInput = { legacyEventId: observation.eventId, eventId, state, revision };
@@ -306,7 +363,7 @@ async function createProjectedEvent({
     role: semanticObservation.projection.role,
     sourceOccurredAt,
     occurredAt: sourceOccurredAt,
-    ordering: { sourceSequence: observation.migrationSequence },
+    ordering: { sourceSequence: orderingSequence },
     direction: semanticObservation.projection.direction,
     conversationKind: semanticObservation.projection.conversationKind,
     authorizationContextTags: structuredClone(semanticObservation.projection.contextTags),
@@ -401,11 +458,34 @@ export async function projectM4V2LogicalGroup({ logical, observations, integrity
   const safeObservations = observations.map(copyObservation);
   if (new Set(safeObservations.map(item => item.eventId)).size !== safeObservations.length
     || new Set(safeObservations.map(item => item.migrationSequence)).size !== safeObservations.length
-    || new Set(safeObservations.map(item => item.sessionId)).size !== 1
     || safeObservations.some(item => item.projection.logicalMessageId !== safeLogical.logicalMessageId)) {
     fail('m4_v2_projector_observation_invalid');
   }
   recomputeLogical(safeLogical, safeObservations);
+  const sessions = Map.groupBy(safeObservations, item => item.sessionId);
+  if (sessions.size > 1) {
+    if (!isHermesFirstRevisionSessionCollision(sessions)) {
+      fail('m4_v2_projector_observation_invalid');
+    }
+    const results = [];
+    for (const sessionObservations of [...sessions.values()]
+      .sort((left, right) => left[0].sessionId.localeCompare(right[0].sessionId))) {
+      const selection = selectLogicalMessage(sessionObservations.map(item => ({
+        eventId: item.eventId,
+        projection: item.projection,
+      })));
+      results.push(await projectM4V2LogicalGroup({
+        logical: {
+          ...selection,
+          eventIds: sessionObservations.map(item => item.eventId).sort(),
+        },
+        observations: sessionObservations.map(({ sourceOccurredAt, ...item }) => item),
+        integrityFor,
+        identityCollector: identitySink,
+      }));
+    }
+    return mergeSessionPartitions(results);
+  }
 
   const preferred = safeObservations.find(item => item.eventId === safeLogical.preferredObservationId);
   if (!isConversationObservation(preferred)) {
@@ -420,6 +500,7 @@ export async function projectM4V2LogicalGroup({ logical, observations, integrity
   const deletion = preferred.projection.authoritativeDeletion ? preferred : null;
   const deletions = safeObservations.filter(item => item.projection.authoritativeDeletion);
   const deletionCandidates = deletions.filter(isConversationObservation);
+  let deletionOrderingSequence = null;
   if (nonDeletion.length === 0) {
     return excluded('deletion_without_history', safeObservations.length, eligible.length, safeObservations.length);
   }
@@ -444,7 +525,8 @@ export async function projectM4V2LogicalGroup({ logical, observations, integrity
       || canonicalJson(deletion.projection.contextTags) !== canonicalJson(predecessor.projection.contextTags)) {
       fail('m4_v2_projector_deletion_binding_invalid');
     }
-    if (compareTemporal(predecessor, deletion) >= 0) {
+    deletionOrderingSequence = deletionOrdering(predecessor, deletion);
+    if (deletionOrderingSequence === null) {
       fail('m4_v2_projector_deletion_order_invalid');
     }
   }
@@ -487,6 +569,7 @@ export async function projectM4V2LogicalGroup({ logical, observations, integrity
       previousId: events.at(-1).eventId,
       conflicts: [],
       integrityFor,
+      orderingSequence: deletionOrderingSequence,
     });
     events.push(event);
     states.tombstone += 1;
