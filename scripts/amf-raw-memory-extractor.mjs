@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-import { buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, migrateExtractorStateToConversationV3, normalizeConversationExtractorState, normalizeState, proposalIdempotencyKey, reserveModelBudget, resumeExtractorInFlight, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
+import { assertExtractorStateRunnable, buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, migrateExtractorStateToConversationV3, normalizeConversationExtractorState, normalizeState, proposalIdempotencyKey, reserveModelBudget, resumeExtractorInFlight, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
 
 function fail(code) { throw new Error(code); }
 
@@ -185,7 +185,9 @@ async function extractWithCodex(text, config) {
 async function tick(config, { dryRun, sessionId = null }) {
   if (sessionId && !dryRun) fail('extractor_session_selector_requires_dry_run');
   fs.mkdirSync(config.codexWorkDir, { recursive: true, mode: 0o700 });
-  const token = privateToken(config.tokenFile); const state = loadExtractorState(config, { dryRun });
+  const state = loadExtractorState(config, { dryRun });
+  if (!dryRun) assertExtractorStateRunnable(state);
+  const token = privateToken(config.tokenFile);
   const query = new URL('/v2/internal/extractor/sessions', config.baseUrl);
   query.searchParams.set('limit', '1'); if (state.cursor) query.searchParams.set('cursor', state.cursor);
   const page = sessionId ? { nextCursor: null } : await requestJson({ url: query, token });

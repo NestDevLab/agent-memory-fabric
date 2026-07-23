@@ -75,7 +75,8 @@ export function normalizeConversationExtractorState(value) {
       || value.version !== 2 || value.stream !== 'shared:global' || value.phase !== 'newest-first'
       || value.readerGeneration !== 'conversation-v3' || (value.cursor !== null && typeof value.cursor !== 'string')
       || (value.inFlight !== null && !validConversationInFlight(value.inFlight)) || !value.days || typeof value.days !== 'object'
-      || Array.isArray(value.days) || (value.legacyBoundary !== null && (!value.legacyBoundary
+      || Array.isArray(value.days) || (value.inFlight?.stage === 'model_pending' && !validReservationBacking(value.inFlight.reservation, value.days))
+      || (value.legacyBoundary !== null && (!value.legacyBoundary
         || typeof value.legacyBoundary !== 'object' || Array.isArray(value.legacyBoundary)
         || Object.keys(value.legacyBoundary).sort().join('\0') !== 'schema\0stateDigest'
         || value.legacyBoundary.schema !== RAW_MEMORY_EXTRACTOR_STATE_SCHEMA
@@ -88,7 +89,30 @@ function validConversationInFlight(value) {
     && CONVERSATION_ID.test(value.sessionId) && EXTRACTION_IDENTITY.test(value.extractionIdentity)
     && VISIBLE_REVISION_DIGEST.test(value.visibleRevisionDigest)
     && ['model_pending', 'model_done', 'proposing'].includes(value.stage)
+    && (value.stage !== 'model_pending' || validModelReservation(value.reservation))
     && (value.stage !== 'proposing' || (Array.isArray(value.proposalKeys) && Array.isArray(value.proposalRecords)));
+}
+
+function validModelReservation(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).sort().join('\0') === 'day\0inputTokens\0outputTokens\0reserved'
+    && value.reserved === true && validUtcDay(value.day)
+    && Number.isSafeInteger(value.inputTokens) && value.inputTokens > 0
+    && Number.isSafeInteger(value.outputTokens) && value.outputTokens > 0;
+}
+
+function validUtcDay(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function validReservationBacking(reservation, days) {
+  if (!validModelReservation(reservation)) return false;
+  const current = days[reservation.day];
+  return current !== null && typeof current === 'object' && !Array.isArray(current)
+    && Number.isSafeInteger(current.reservedInputTokens) && current.reservedInputTokens >= reservation.inputTokens
+    && Number.isSafeInteger(current.reservedOutputTokens) && current.reservedOutputTokens >= reservation.outputTokens;
 }
 
 export function migrateExtractorStateToConversationV3(value) {
@@ -157,13 +181,24 @@ export function sharedDurableClaim(claim) {
   return !PROJECT_SCOPED.test(String(claim || ''));
 }
 
+export function assertExtractorStateRunnable(state) {
+  const inFlight = state?.inFlight;
+  if (inFlight?.stage !== 'model_pending') return;
+  if (!validModelReservation(inFlight.reservation)) throw new Error('extractor_inflight_invalid');
+  throw new Error('extractor_model_pending_recovery_required');
+}
+
 export function resumeExtractorInFlight({ inFlight, sessionId, extractionIdentity, visibleRevisionDigest = undefined, readerGeneration = 'legacy-v2', maxClaims = 2 }) {
   if (!inFlight || typeof inFlight !== 'object' || Array.isArray(inFlight) || !['legacy-v2', 'conversation-v3'].includes(readerGeneration)) return null;
+  // A pending reservation records an uncertain external model side effect. It
+  // blocks every automatic path, even when the fetched session or revision has
+  // since changed, so callers cannot overwrite it and reserve the budget again.
+  assertExtractorStateRunnable({ inFlight });
   const inFlightIdentity = inFlight.extractionIdentity ?? (readerGeneration === 'legacy-v2' ? inFlight.sessionId : null);
   const matchingRevision = readerGeneration === 'legacy-v2' || (VISIBLE_REVISION_DIGEST.test(visibleRevisionDigest)
     && inFlight.visibleRevisionDigest === visibleRevisionDigest);
-  if (inFlight.sessionId !== sessionId || inFlightIdentity !== extractionIdentity || !matchingRevision
-      || !['model_done', 'proposing'].includes(inFlight.stage)) return null;
+  if (inFlight.sessionId !== sessionId || inFlightIdentity !== extractionIdentity || !matchingRevision) return null;
+  if (!['model_done', 'proposing'].includes(inFlight.stage)) return null;
   const claims = validateClaims(inFlight.claims, { maxClaims });
   if (inFlight.stage !== 'proposing') return { stage: inFlight.stage, claims, usage: inFlight.usage, inputTokenUpperBound: inFlight.inputTokenUpperBound };
   const proposalRecords = validatePersistedProposalRecords({ records: inFlight.proposalRecords, proposalKeys: inFlight.proposalKeys,
