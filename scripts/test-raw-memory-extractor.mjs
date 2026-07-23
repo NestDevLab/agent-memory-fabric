@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, migrateExtractorStateToConversationV3, normalizeConversationExtractorState, normalizeState, proposalIdempotencyKey, reserveModelBudget, resumeExtractorInFlight, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
+import { assertExtractorStateRunnable, buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, migrateExtractorStateToConversationV3, normalizeConversationExtractorState, normalizeState, proposalIdempotencyKey, reserveModelBudget, resumeExtractorInFlight, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
 import { buildBoundedModelInput, evaluatePlanUsage, loadExtractorState } from './amf-raw-memory-extractor.mjs';
 
 const durable = [{ role: 'user', text: 'We decided to keep the extractor slow and cost bounded.' }, { role: 'assistant', text: 'Agreed: one conversation per tick and a daily ceiling.' }];
@@ -138,6 +138,29 @@ test('conversation-v3 in-flight state fails closed when its visible revision dig
     else invalid.inFlight.visibleRevisionDigest = visibleRevisionDigest;
     assert.throws(() => normalizeConversationExtractorState(invalid), /extractor_state_invalid/);
   }
+});
+
+test('matching model_pending reservations require explicit recovery and never retry automatically', () => {
+  const sessionId = 'ccon_revisionexample1'; const extractionIdentity = `ses_${'c'.repeat(64)}`; const visibleRevisionDigest = `sha256:${'a'.repeat(64)}`;
+  const inFlight = { sessionId, extractionIdentity, visibleRevisionDigest, stage: 'model_pending', reservation: { reserved: true, day: '2026-07-23', inputTokens: 12, outputTokens: 3 } };
+  const state = createExtractorState({ readerGeneration: 'conversation-v3' }); state.inFlight = inFlight;
+  state.days['2026-07-23'] = { reservedInputTokens: 12, reservedOutputTokens: 3, usedInputTokens: 0, usedOutputTokens: 0 };
+  assert.equal(normalizeConversationExtractorState(state), state);
+  assert.throws(() => assertExtractorStateRunnable(state), /extractor_model_pending_recovery_required/);
+  assert.doesNotThrow(() => assertExtractorStateRunnable({ ...state, inFlight: { ...inFlight, stage: 'model_done' } }));
+  assert.throws(() => resumeExtractorInFlight({ inFlight, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3' }), /extractor_model_pending_recovery_required/);
+  assert.throws(() => resumeExtractorInFlight({ inFlight, sessionId, extractionIdentity, visibleRevisionDigest: `sha256:${'b'.repeat(64)}`, readerGeneration: 'conversation-v3' }), /extractor_model_pending_recovery_required/);
+  assert.throws(() => resumeExtractorInFlight({ inFlight, sessionId: 'ccon_otherexample1', extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3' }), /extractor_model_pending_recovery_required/);
+  const incomplete = { ...inFlight, reservation: { reserved: true, day: '2026-07-23', inputTokens: 12 } };
+  const invalid = createExtractorState({ readerGeneration: 'conversation-v3' }); invalid.inFlight = incomplete;
+  assert.throws(() => normalizeConversationExtractorState(invalid), /extractor_state_invalid/);
+  assert.throws(() => resumeExtractorInFlight({ inFlight: incomplete, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3' }), /extractor_inflight_invalid/);
+  for (const day of ['2026-02-30', '2026-13-01']) {
+    const impossible = { ...inFlight, reservation: { ...inFlight.reservation, day } };
+    assert.throws(() => resumeExtractorInFlight({ inFlight: impossible, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3' }), /extractor_inflight_invalid/);
+  }
+  const unbacked = structuredClone(state); unbacked.days['2026-07-23'].reservedInputTokens = 11;
+  assert.throws(() => normalizeConversationExtractorState(unbacked), /extractor_state_invalid/);
 });
 
 test('matching proposing state replays persisted records and keys byte-for-byte without model work', () => {
