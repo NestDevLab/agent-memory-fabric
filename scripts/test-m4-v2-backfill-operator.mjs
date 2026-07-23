@@ -125,6 +125,27 @@ test('catalog revision attestation traverses a non-empty catalog deterministical
         },
       };
       await assert.rejects(() => attestM4V2CatalogRevision({ catalog: missingTimestamp, keyDocument: catalogKey, pageLimit: 1 }), { code: 'm4_v2_catalog_attestation_observation_timestamp_missing' });
+      const untimedMetadata = {
+        async listM4V2LogicalGroups(request) {
+          const copy = structuredClone(store.catalog.listM4V2LogicalGroups(request));
+          if (copy.items.length > 0) {
+            const projection = copy.items[0].observations[0].projection;
+            projection.occurredAt = null;
+            projection.editedAt = null;
+            projection.role = 'unknown';
+            projection.direction = 'unknown';
+            projection.contentType = 'none';
+            projection.contentParts = 0;
+            projection.hasContent = false;
+          }
+          return copy;
+        },
+      };
+      const metadataAttestation = await attestM4V2CatalogRevision({
+        catalog: untimedMetadata, keyDocument: catalogKey, pageLimit: 1,
+      });
+      assert.equal(metadataAttestation.traversal.observationCount, 3);
+      assert.equal(metadataAttestation.traversal.coveredThrough, null);
     } finally { await store.close(); }
   } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
 });

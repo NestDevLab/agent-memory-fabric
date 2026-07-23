@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test from 'node:test';
 
-import { attestM4V2CatalogRevision, verifyM4V2CatalogRevisionAttestation } from '../src/migration/m4-v2-catalog-revision-attestation.mjs';
+import {
+  attestM4V2CatalogRevision,
+  createM4V2CatalogRevisionAccumulator,
+  verifyM4V2CatalogRevisionAttestation,
+} from '../src/migration/m4-v2-catalog-revision-attestation.mjs';
 import { canonicalJson } from '../src/ingest/transcripts/canonical.mjs';
 
 const key = { schema: 'amf.migration-signing-key/v1', keyId: 'catalog-attestation-k1', key: Buffer.alloc(32, 7).toString('base64') };
@@ -35,6 +39,29 @@ test('signs bounded content-free empty traversal deterministically and rejects t
   assert.throws(() => verifyM4V2CatalogRevisionAttestation(v1DomainSignature, key), { code: 'm4_v2_catalog_attestation_signature_mismatch' });
   for (const nonCanonical of ['2026-07-22T12:00:00+00:00', '2026-07-22T12:00:00.1200Z']) assert.throws(() => verifyM4V2CatalogRevisionAttestation(signedV2WithCoveredThrough({ ...first, traversal: { ...first.traversal, groupCount: 1, observationCount: 1, coveredThrough: '2026-07-22T12:00:00Z' } }, nonCanonical), key), { code: 'm4_v2_catalog_attestation_invalid' });
   assert.throws(() => verifyM4V2CatalogRevisionAttestation(first, { ...key, keyId: 'other-key' }), { code: 'm4_v2_catalog_attestation_key_mismatch' });
+});
+
+test('untimed non-conversation metadata remains chain-bound without inventing a time bound', () => {
+  const accumulator = createM4V2CatalogRevisionAccumulator();
+  accumulator.append({
+    logical: { logicalMessageId: `lmsg_${'a'.repeat(64)}` },
+    observations: [{
+      projection: {
+        authoritativeDeletion: false,
+        role: 'unknown',
+        direction: 'unknown',
+        conversationKind: 'session',
+        contentType: 'none',
+        hasContent: false,
+        occurredAt: null,
+        editedAt: null,
+      },
+    }],
+  });
+  const traversal = accumulator.traversal(50);
+  assert.equal(traversal.groupCount, 1);
+  assert.equal(traversal.observationCount, 1);
+  assert.equal(traversal.coveredThrough, null);
 });
 
 test('fails closed on invalid catalog pagination before signing', async () => {

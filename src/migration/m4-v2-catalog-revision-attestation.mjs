@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 
 import { canonicalJson, strictIsoTimestamp } from '../ingest/transcripts/canonical.mjs';
 import { buildM4V2LogicalGroup } from './m4-v2-catalog-groups.mjs';
+import { isPotentialM4ConversationProjection } from './m4-v2-conversation-eligibility.mjs';
 
 export const M4_V2_CATALOG_REVISION_ATTESTATION_SCHEMA = 'amf.m4-v2-catalog-revision-attestation/v2';
 const M4_V2_CATALOG_REVISION_ATTESTATION_V1_SCHEMA = 'amf.m4-v2-catalog-revision-attestation/v1';
@@ -57,7 +58,10 @@ export function createM4V2CatalogRevisionAccumulator() {
       if (groups>MAX_GROUPS || observations>MAX_OBSERVATIONS) fail('m4_v2_catalog_attestation_bounds_exceeded');
       for (const observation of group.observations) {
         const timestamp=observation.projection.editedAt??observation.projection.occurredAt;
-        if (timestamp===null) fail('m4_v2_catalog_attestation_observation_timestamp_missing');
+        if (timestamp===null) {
+          if (isPotentialM4ConversationProjection(observation.projection)) fail('m4_v2_catalog_attestation_observation_timestamp_missing');
+          continue;
+        }
         const effective=utcTimestamp(timestamp,'m4_v2_catalog_attestation_catalog_invalid');
         if (coveredThrough===null||timestampKey(effective)>timestampKey(coveredThrough)) coveredThrough=effective;
       }
@@ -77,7 +81,7 @@ function traversal(value, schema, code) {
     || !Number.isSafeInteger(value.observationCount) || value.observationCount < 0 || value.observationCount > MAX_OBSERVATIONS
     || ![value.finalChain, value.catalogRevisionDigest].every(item => typeof item === 'string' && DIGEST.test(item))
     || (!v1 && (value.coveredThrough !== null && strictIsoTimestamp(value.coveredThrough) !== value.coveredThrough
-      || (value.observationCount === 0) !== (value.coveredThrough === null)))) fail(code);
+      || (value.observationCount === 0 && value.coveredThrough !== null)))) fail(code);
   const safe = clone(value, code);
   if (!v1 && safe.coveredThrough !== null && utcTimestamp(safe.coveredThrough, code) !== safe.coveredThrough) fail(code);
   const revision = v1

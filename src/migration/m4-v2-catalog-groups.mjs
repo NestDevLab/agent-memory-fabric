@@ -7,6 +7,7 @@ const SESSION_ID = /^ses_[a-f0-9]{64}$/;
 const CONTENT_ID = /^[a-f0-9]{64}$/;
 const PAYLOAD_DIGEST = /^hmac-sha256:v1:[a-f0-9]{64}$/;
 const CATALOG_TAG = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}:[a-f0-9]{64}$/;
+export const M4_V2_LOGICAL_GROUP_MAX_OBSERVATIONS = 8_192;
 
 function fail(code) {
   const error = new Error(code);
@@ -49,7 +50,8 @@ function copyLogical(value) {
     || typeof value.tombstoned !== 'boolean'
     || value.selectionVersion !== 'amf-observation-selection/v1'
     || !Array.isArray(value.eventIds)
-    || value.eventIds.length < 1 || value.eventIds.length > 1_000
+    || value.eventIds.length < 1
+    || value.eventIds.length > M4_V2_LOGICAL_GROUP_MAX_OBSERVATIONS
     || value.eventIds.some(eventId => typeof eventId !== 'string' || !EVENT_ID.test(eventId))
     || new Set(value.eventIds).size !== value.eventIds.length
     || !value.eventIds.includes(value.preferredObservationId)) {

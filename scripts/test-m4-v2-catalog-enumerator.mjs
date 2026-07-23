@@ -326,9 +326,9 @@ test('PostgresCatalog uses one repeatable-read client transaction and normalizes
   assert.equal(connects, 0);
 });
 
-test('PostgresCatalog reads a 1000-observation group without an event-ID parameter list', async () => {
+test('PostgresCatalog reads a production-shaped 4114-observation group without an event-ID parameter list', async () => {
   const logicalMessageId = id('lmsg', 'a');
-  const observations = Array.from({ length: 1_000 }, (_, index) => {
+  const observations = Array.from({ length: 4_114 }, (_, index) => {
     const eventId = indexedId('evt', index + 1);
     const row = observation('1', 'a');
     row.eventId = eventId;
@@ -362,7 +362,7 @@ test('PostgresCatalog reads a 1000-observation group without an event-ID paramet
   const catalog = new PostgresCatalog({ pool: { connect: async () => client, on() {} } });
   catalog.ready = async () => {};
   const result = await catalog.listM4V2LogicalGroups({ limit: 1 });
-  assert.equal(result.items[0].observations.length, 1_000);
+  assert.equal(result.items[0].observations.length, 4_114);
   const rawRequest = requests.find(request => request.text.includes('raw_events_v2'));
   assert.deepEqual(rawRequest.values, [logicalMessageId]);
   assert.equal(rawRequest.text.includes('ANY('), false);
