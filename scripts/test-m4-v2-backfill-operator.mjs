@@ -151,7 +151,7 @@ test('catalog revision attestation traverses a non-empty catalog deterministical
 });
 
 test('plan is resource-free and returns only redacted confirmation material', async () => {
-  const item = setup(); try { const plan = await planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1 }); assert.deepEqual(Object.keys(plan).sort(), ['confirmationDigest', 'operation', 'phase', 'runId', 'schema']); assert.match(plan.confirmationDigest, /^sha256:/); assert.equal(fs.existsSync(path.join(item.root, 'fabric')), false); assert.equal(fs.existsSync(path.join(item.root, 'archive.sqlite')), false); } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
+  const item = setup(); try { const plan = await planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 10_000 }); assert.deepEqual(Object.keys(plan).sort(), ['confirmationDigest', 'operation', 'phase', 'runId', 'schema']); assert.match(plan.confirmationDigest, /^sha256:/); assert.equal(fs.existsSync(path.join(item.root, 'fabric')), false); assert.equal(fs.existsSync(path.join(item.root, 'archive.sqlite')), false); } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
 });
 
 test('wrong confirmation and referenced-file drift construct zero delayed resources', async () => {
@@ -167,7 +167,7 @@ test('run validates hostile input and bounds before it reads private configurati
   try {
     const hostile = {}; Object.defineProperty(hostile, 'configPath', { enumerable: true, get() { throw new Error('private'); } });
     await assert.rejects(() => runM4V2BackfillOperator(hostile), { code: 'm4_operator_run_input_invalid' });
-    await assert.rejects(() => runM4V2BackfillOperator({ configPath: '/absolute/private.json', maxEvents: 1001, confirmedPlanDigest: digest('a') }), { code: 'm4_operator_run_input_invalid' });
+    await assert.rejects(() => runM4V2BackfillOperator({ configPath: '/absolute/private.json', maxEvents: 10001, confirmedPlanDigest: digest('a') }), { code: 'm4_operator_run_input_invalid' });
     assert.equal(reads, 0);
   } finally { fs.readFileSync = original; }
 });
@@ -270,7 +270,7 @@ test('CLI emits compact JSON and rejects malformed argv before private reads', a
     const script = path.resolve('scripts/amf-m4-v2-backfill.mjs'); const invoke = args => spawnSync(process.execPath, [script, ...args], { encoding: 'utf8' });
     const planned = invoke(['plan', '--config', item.files.config, '--max-events', '1']); assert.equal(planned.status, 0); assert.deepEqual(Object.keys(JSON.parse(planned.stdout)).sort(), ['confirmationDigest', 'ok', 'operation', 'phase', 'runId', 'schema']);
     for (const literal of [item.root, 'delivery-k1', 'synthetic-', 'visible ', 'sqlite']) assert.equal(`${planned.stdout}${planned.stderr}`.includes(literal), false);
-    for (const args of [['plan', '--config', 'relative.json', '--max-events', '1'], ['plan', '--config', item.files.config, '--max-events', '1001'], ['plan', '--config', item.files.config, '--max-events', '1', '--max-events', '1'], ['plan', '--unknown', 'x', '--config', item.files.config, '--max-events', '1'], ['plan', '--config', item.files.config, '--max-events'], ['run', '--config', item.files.config, '--max-events', '1', '--confirmed-plan-digest', 'bad']]) { const result = invoke(args); assert.equal(result.status, 78); assert.deepEqual(JSON.parse(result.stderr), { ok: false, error: 'm4_operator_argument_invalid' }); }
+    for (const args of [['plan', '--config', 'relative.json', '--max-events', '1'], ['plan', '--config', item.files.config, '--max-events', '10001'], ['plan', '--config', item.files.config, '--max-events', '1', '--max-events', '1'], ['plan', '--unknown', 'x', '--config', item.files.config, '--max-events', '1'], ['plan', '--config', item.files.config, '--max-events'], ['run', '--config', item.files.config, '--max-events', '1', '--confirmed-plan-digest', 'bad']]) { const result = invoke(args); assert.equal(result.status, 78); assert.deepEqual(JSON.parse(result.stderr), { ok: false, error: 'm4_operator_argument_invalid' }); }
     const wrong = invoke(['run', '--config', item.files.config, '--max-events', '1', '--confirmed-plan-digest', digest('f')]); assert.equal(wrong.status, 78); assert.deepEqual(JSON.parse(wrong.stderr), { ok: false, error: 'm4_operator_confirmation_invalid' }); assert.equal(fs.existsSync(path.join(item.root, 'fabric')), false); assert.equal(fs.existsSync(path.join(item.root, 'archive.sqlite')), false);
   } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
 });

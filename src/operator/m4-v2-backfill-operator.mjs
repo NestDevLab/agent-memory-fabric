@@ -8,6 +8,7 @@ import { ConversationEventPlaintextOutbox } from '../ingest/conversation-event-v
 import { BackfillLease } from '../ingest/transcripts/backfill.mjs';
 import { normalizeIngestKeyRing } from '../ingest/raw-event-contract.mjs';
 import { M4ProgressStore } from '../migration/m4-progress-store.mjs';
+import { M4_BACKFILL_MAX_EVENTS } from '../migration/m4-backfill-coordinator.mjs';
 import { createM4V2ArchiveSource } from '../migration/m4-v2-archive-source.mjs';
 import { attestM4V2CatalogRevision, verifyM4V2CatalogRevisionAttestation } from '../migration/m4-v2-catalog-revision-attestation.mjs';
 import { createM4V2ArchiveBackfillCompletion } from '../migration/m4-v2-backfill-completion.mjs';
@@ -145,7 +146,8 @@ function independentCompletionKeys(catalogDocument, completionDocument) {
 }
 
 async function preparedInput({ configPath, maxEvents }) {
-  if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 1000) fail('m4_operator_plan_input_invalid');
+  if (!Number.isSafeInteger(maxEvents) || maxEvents < 1
+    || maxEvents > M4_BACKFILL_MAX_EVENTS) fail('m4_operator_plan_input_invalid');
   const configLoaded = privateJson(configPath, 'm4_operator_config_invalid'); const config = configShape(configLoaded.value); const references = [['config', configLoaded.fileDigest]];
   const fabricLoaded = privateJson(config.fabricConfigPath, 'm4_operator_reference_invalid'); const fabric = normalizeFabricFiles(fabricShape(fabricLoaded.value), references); references.push(['fabric', fabricLoaded.fileDigest]);
   const deliveryLoaded = privateJson(config.deliveryKeyRingPath, 'm4_operator_reference_invalid'); const delivery = deliveryShape(deliveryLoaded.value); references.push(['delivery', deliveryLoaded.fileDigest]);
@@ -211,13 +213,13 @@ function operatorResult(result, completion = null) {
 }
 
 export async function planM4V2BackfillOperator(input = {}) {
-  const request = validated('m4_operator_plan_input_invalid', () => { if (!exact(input, ['configPath', 'maxEvents'])) fail('m4_operator_plan_input_invalid'); const snapshot = { configPath: input.configPath, maxEvents: input.maxEvents }; if (!Number.isSafeInteger(snapshot.maxEvents) || snapshot.maxEvents < 1 || snapshot.maxEvents > 1000) fail('m4_operator_plan_input_invalid'); return snapshot; });
+  const request = validated('m4_operator_plan_input_invalid', () => { if (!exact(input, ['configPath', 'maxEvents'])) fail('m4_operator_plan_input_invalid'); const snapshot = { configPath: input.configPath, maxEvents: input.maxEvents }; if (!Number.isSafeInteger(snapshot.maxEvents) || snapshot.maxEvents < 1 || snapshot.maxEvents > M4_BACKFILL_MAX_EVENTS) fail('m4_operator_plan_input_invalid'); return snapshot; });
   let prepared; try { prepared = await preparedInput(request); } catch (error) { if (error?.code?.startsWith?.('m4_operator_')) throw error; fail('m4_operator_prepare_failed'); }
   return { schema: 'amf.m4-v2-backfill-operator-plan/v1', operation: 'plan', runId: safeRunId(prepared.gate), phase: 'v2-archive', confirmationDigest: prepared.confirmationDigest };
 }
 
 export async function runM4V2BackfillOperator(input = {}, options = {}) {
-  const request = validated('m4_operator_run_input_invalid', () => { if (!exact(input, ['configPath', 'maxEvents', 'confirmedPlanDigest'])) fail('m4_operator_run_input_invalid'); const snapshot = { configPath: input.configPath, maxEvents: input.maxEvents, confirmedPlanDigest: input.confirmedPlanDigest }; if (!Number.isSafeInteger(snapshot.maxEvents) || snapshot.maxEvents < 1 || snapshot.maxEvents > 1000 || typeof snapshot.confirmedPlanDigest !== 'string' || !DIGEST.test(snapshot.confirmedPlanDigest)) fail('m4_operator_run_input_invalid'); return snapshot; });
+  const request = validated('m4_operator_run_input_invalid', () => { if (!exact(input, ['configPath', 'maxEvents', 'confirmedPlanDigest'])) fail('m4_operator_run_input_invalid'); const snapshot = { configPath: input.configPath, maxEvents: input.maxEvents, confirmedPlanDigest: input.confirmedPlanDigest }; if (!Number.isSafeInteger(snapshot.maxEvents) || snapshot.maxEvents < 1 || snapshot.maxEvents > M4_BACKFILL_MAX_EVENTS || typeof snapshot.confirmedPlanDigest !== 'string' || !DIGEST.test(snapshot.confirmedPlanDigest)) fail('m4_operator_run_input_invalid'); return snapshot; });
   let prepared; try { prepared = await preparedInput(request); } catch (error) { if (error?.code?.startsWith?.('m4_operator_')) throw error; fail('m4_operator_prepare_failed'); }
   if (prepared.confirmationDigest !== request.confirmedPlanDigest) fail('m4_operator_confirmation_invalid');
   revalidate(prepared);
