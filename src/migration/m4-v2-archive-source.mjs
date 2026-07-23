@@ -3,7 +3,8 @@ import crypto from 'node:crypto';
 import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
 import { RAW_EVENT_HTTP_MAX_BODY_BYTES, normalizeIngestKeyRing } from '../ingest/raw-event-contract.mjs';
 import { buildM4V2LogicalGroup } from './m4-v2-catalog-groups.mjs';
-import { readM4V2Observation } from './m4-v2-observation-reader.mjs';
+import { isPotentialM4ConversationProjection } from './m4-v2-conversation-eligibility.mjs';
+import { readM4V2CatalogObservation, readM4V2Observation } from './m4-v2-observation-reader.mjs';
 import { projectM4V2LogicalGroup } from './m4-v2-conversation-projector.mjs';
 
 const CHECKPOINT_ID = /^m4v2-([a-f0-9]{64})$/;
@@ -111,6 +112,15 @@ export function createM4V2ArchiveSource(input = {}) {
             if (resume && group?.logical?.logicalMessageId !== resume.logicalMessageId) fail('m4_v2_source_checkpoint_drift');
             const observations = [];
             for (const [index, catalogRow] of group.observations.entries()) {
+              if (!isPotentialM4ConversationProjection(catalogRow.projection)) {
+                try {
+                  observations.push(readM4V2CatalogObservation({
+                    catalogRow,
+                    migrationSequence: index + 1,
+                  }));
+                } catch { fail('m4_v2_source_read_failed'); }
+                continue;
+              }
               let envelope;
               try { envelope = await dependencies.rawStore.getClientCiphertext(catalogRow.contentId); }
               catch { fail('m4_v2_source_envelope_unavailable'); }

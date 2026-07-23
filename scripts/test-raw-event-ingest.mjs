@@ -7,24 +7,96 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { FabricStore, FileRawStore, MemoryCatalog, MemoryRawStore, SqliteCatalog } from '../src/fabric-store.mjs';
-import { RAW_EVENT_HTTP_MAX_BODY_BYTES, ciphertextContentId } from '../src/ingest/raw-event-contract.mjs';
+import {
+  RAW_EVENT_HTTP_MAX_BODY_BYTES,
+  ciphertextContentId,
+  normalizeIngestKeyRing,
+  normalizedObservationDigest,
+} from '../src/ingest/raw-event-contract.mjs';
 import { HttpRawEventSink } from '../src/ingest/http-raw-event-sink.mjs';
 import { EncryptedOutbox } from '../src/ingest/outbox.mjs';
+import {
+  deriveEventIdV2,
+  deriveLogicalMessageIds,
+  deriveSessionIdV2,
+  opaqueContextTag,
+} from '../src/ingest/raw-projection-v2.mjs';
 import { parseClaudeRecord } from '../src/ingest/transcripts/claude.mjs';
 import { MAX_TRANSCRIPT_JSONL_LINE_BYTES } from '../src/ingest/transcripts/jsonl-tail.mjs';
 import { createAgentMemoryFabricServer } from '../src/server.mjs';
 
 const KEY = crypto.createHash('sha256').update('synthetic-ingest-key').digest('hex');
 const KEY2 = crypto.createHash('sha256').update('synthetic-ingest-key-rotated').digest('hex');
+const LOGICAL_KEY = crypto.createHash('sha256').update('synthetic-logical-key').digest('base64');
+const TAG_KEY = crypto.createHash('sha256').update('synthetic-tag-key').digest('base64');
 const KEY_RING = { keys: { 'client-v1': KEY, 'client-v2': KEY2 }, digestKey: KEY, authorizations: {
   'client-v1': { actors: ['raw-owner'], sourceInstances: ['synthetic-host', 'other-host'] },
   'client-v2': { actors: ['raw-owner'], sourceInstances: ['synthetic-host'] }
-} };
+}, logicalMessageKeys: { currentKeyVersion: 'logical-k1', keys: { 'logical-k1': LOGICAL_KEY } } };
 const RAW_OUTBOX = { encryptionKey: KEY, digestKey: KEY, sourceInstanceId: 'synthetic-host', actorId: 'raw-owner', keyId: 'client-v1' };
 
 function syntheticItem(secret = 'SYNTHETIC_RAW_PRIVATE_TEXT') {
   const value = { type: 'user', uuid: 'raw-http-event', sessionId: 'raw-http-session', timestamp: '2026-07-12T00:00:00Z', message: { role: 'user', content: secret } };
   return parseClaudeRecord({ value, rawBytes: Buffer.from(JSON.stringify(value)), lineEnding: 'lf' });
+}
+
+function syntheticItemV2(secret = 'SYNTHETIC_V2_RAW_PRIVATE_TEXT') {
+  const rawBytes = Buffer.from(JSON.stringify({ secret }), 'utf8');
+  const conversationTag = opaqueContextTag('conversation', 'synthetic-conversation-v2', TAG_KEY, 'routing-k1');
+  const senderTag = opaqueContextTag('sender', 'synthetic-sender-v2', TAG_KEY, 'routing-k1');
+  const logical = {
+    canonicalSenderIdentity: 'synthetic-sender-v2',
+    senderTag,
+    conversationTag,
+    direction: 'inbound',
+    nativePlatform: 'synthetic-platform',
+    nativeConversationId: 'synthetic-conversation-v2',
+    nativeMessageId: 'synthetic-message-v2',
+  };
+  const derived = deriveLogicalMessageIds(logical, KEY_RING.logicalMessageKeys);
+  const eventId = deriveEventIdV2({ sourceKind: 'codex', observationClass: 'native', rawBytes });
+  const sessionId = deriveSessionIdV2({ sourceKind: 'codex', conversationTag });
+  const event = {
+    schema: 'amf.raw-event/v2',
+    eventId,
+    sessionId,
+    occurredAt: '2026-07-23T12:00:00.000000000Z',
+    source: { runtime: 'codex', subtype: 'message' },
+    logical,
+    normalized: { role: 'user', contentType: 'text', value: secret },
+    raw: { encoding: 'base64', line: rawBytes.toString('base64'), lineEnding: 'lf' },
+  };
+  const projection = {
+    schema: 'amf.raw-event-projection/v2',
+    eventId,
+    sessionId,
+    logicalMessageId: derived.logicalMessageId,
+    logicalMessageAliases: derived.aliases,
+    derivationVersion: 'amf-logical-message/v1',
+    keyVersion: derived.keyVersion,
+    sourceKind: 'codex',
+    observationClass: 'native',
+    direction: 'inbound',
+    conversationKind: 'session',
+    contextTags: {
+      actor: [opaqueContextTag('actor', 'raw-owner', TAG_KEY, 'routing-k1')],
+      sender: [senderTag],
+      conversation: [conversationTag],
+    },
+    subtype: 'message',
+    occurredAt: event.occurredAt,
+    editedAt: null,
+    nativeRevision: 1,
+    sourceSequence: 1,
+    authoritativeDeletion: false,
+    role: 'user',
+    contentType: 'text',
+    contentParts: 1,
+    hasContent: true,
+    normalizationVersion: 'amf-observation-normalization/v1',
+    normalizedPayloadDigest: normalizedObservationDigest({ event }, normalizeIngestKeyRing(KEY_RING).digestKey),
+  };
+  return { event, projection };
 }
 
 async function withRawServer(run, { bodyReadTimeoutMs, rawIngestBodyBytes } = {}) {
@@ -81,6 +153,83 @@ test('HTTP ciphertext sink stores idempotently without sending RAW plaintext', a
     const rotationDuplicate = await api('/v2/ingest/raw-events', { method: 'POST', body: JSON.stringify({ ...body, envelope: rotated.encrypt(item) }) });
     assert.equal(rotationDuplicate.body.data.status, 'duplicate', 'stable digest survives encryption-key rotation');
   });
+});
+
+test('exact v2 replay atomically repairs a missing ciphertext reference', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-raw-recovery-'));
+  const catalogs = [
+    new MemoryCatalog(),
+    new SqliteCatalog({ databasePath: path.join(root, 'catalog.sqlite') }),
+  ];
+  try {
+    for (const catalog of catalogs) {
+      const rawStore = new MemoryRawStore();
+      const store = new FabricStore({ rawStore, catalog, ingestKeyRing: KEY_RING });
+      const item = syntheticItemV2();
+      const firstOutbox = new EncryptedOutbox({
+        rootPath: path.join(root, `first-${catalog.constructor.name}`),
+        ...RAW_OUTBOX,
+      });
+      const firstEnvelope = firstOutbox.encrypt(item);
+      const stored = await store.ingestRawEvent({
+        actor: 'raw-owner',
+        sourceInstanceId: 'synthetic-host',
+        projection: item.projection,
+        envelope: firstEnvelope,
+      });
+      const oldContentId = stored.contentId;
+      await rawStore.removeClientCiphertext(oldContentId);
+
+      const replayOutbox = new EncryptedOutbox({
+        rootPath: path.join(root, `replay-${catalog.constructor.name}`),
+        ...RAW_OUTBOX,
+      });
+      const replayEnvelope = replayOutbox.encrypt(item);
+      const replacementContentId = ciphertextContentId(replayEnvelope);
+      assert.notEqual(replacementContentId, oldContentId);
+      const recovered = await store.ingestRawEvent({
+        actor: 'raw-owner',
+        sourceInstanceId: 'synthetic-host',
+        projection: item.projection,
+        envelope: replayEnvelope,
+      });
+      assert.deepEqual({
+        status: recovered.status,
+        duplicate: recovered.duplicate,
+        recovered: recovered.recovered,
+        contentId: recovered.contentId,
+      }, {
+        status: 'duplicate',
+        duplicate: true,
+        recovered: true,
+        contentId: replacementContentId,
+      });
+      assert.equal((await rawStore.getClientCiphertext(replacementContentId)).payloadDigest, replayEnvelope.payloadDigest);
+      assert.equal((await catalog.getRawEvent(item.event.eventId)).contentId, replacementContentId);
+      if (catalog instanceof MemoryCatalog) {
+        assert.equal(catalog.rawObjects.has(oldContentId), false);
+        assert.equal(catalog.rawObjects.has(replacementContentId), true);
+        assert.ok(catalog.auditEvents.some(event => event.action === 'raw_event_recovery' && event.outcome === 'recovered'));
+      } else {
+        assert.equal(catalog.db.prepare('SELECT count(*) AS count FROM raw_objects_v2 WHERE content_id=?').get(oldContentId).count, 0);
+        assert.equal(catalog.db.prepare('SELECT count(*) AS count FROM raw_objects_v2 WHERE content_id=?').get(replacementContentId).count, 1);
+        assert.equal(catalog.db.prepare("SELECT count(*) AS count FROM audit_events_v2 WHERE action='raw_event_recovery' AND outcome='recovered'").get().count, 1);
+      }
+
+      const ordinaryReplay = replayOutbox.encrypt(item);
+      const duplicate = await store.ingestRawEvent({
+        actor: 'raw-owner',
+        sourceInstanceId: 'synthetic-host',
+        projection: item.projection,
+        envelope: ordinaryReplay,
+      });
+      assert.equal(duplicate.recovered, undefined);
+      assert.equal(duplicate.contentId, replacementContentId);
+    }
+  } finally {
+    catalogs[1].close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('RAW ingest accepts a maximum native JSONL record under the shared 8 MiB HTTP contract', async () => {

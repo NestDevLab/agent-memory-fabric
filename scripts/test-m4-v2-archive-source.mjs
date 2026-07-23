@@ -148,9 +148,9 @@ test('real v2 catalog, client ciphertext, reader and projector produce only conv
   const env = await fixture(); const output = await rows(env.source);
   assert.deepEqual(output.map(row => row.event.state).sort(), ['active', 'active', 'active', 'active', 'active', 'conflict', 'edited', 'tombstone']);
   assert.equal(output.length, 8);
-  assert.equal(env.calls.raw.length, 10);
-  assert.equal(env.calls.binding.length, 10);
-  assert.equal(env.calls.audit.length, 10);
+  assert.equal(env.calls.raw.length, 9);
+  assert.equal(env.calls.binding.length, 9);
+  assert.equal(env.calls.audit.length, 9);
   assert.ok(env.calls.pages >= 3);
   assert.equal(env.calls.v1, 0);
   const rotatedNew = env.values.find(value => value.event.raw.line === Buffer.from('native-raw-rotated-new').toString('base64'));
@@ -165,6 +165,19 @@ test('real v2 catalog, client ciphertext, reader and projector produce only conv
   for (const input of [...env.calls.binding, ...env.calls.audit]) assert.equal(JSON.stringify(input).includes('visible '), false);
   output[0].event.visibleText = 'mutated output';
   assert.equal((await rows(env.source)).some(row => row.event.visibleText === 'mutated output'), false);
+});
+
+test('missing RAW is tolerated only for catalog-proven non-conversation metadata', async () => {
+  const metadataEnv = await fixture();
+  const metadata = metadataEnv.values.find(value => value.projection.role === 'system');
+  metadataEnv.envelopes.delete(metadataEnv.catalog.rawEventsV2.get(metadata.event.eventId).contentId);
+  assert.equal((await rows(metadataEnv.source)).length, 8);
+  assert.equal(metadataEnv.calls.raw.length, 9);
+
+  const conversationEnv = await fixture();
+  const conversation = conversationEnv.values.find(value => value.projection.role === 'user');
+  conversationEnv.envelopes.delete(conversationEnv.catalog.rawEventsV2.get(conversation.event.eventId).contentId);
+  await exactError(async () => { await rows(conversationEnv.source); }, 'm4_v2_source_read_failed');
 });
 
 test('forwards the projector-only identity collector without placing identity data in rows', async () => {
