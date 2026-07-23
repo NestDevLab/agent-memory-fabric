@@ -25,6 +25,10 @@ function loadPolicy(filePath) {
     return null;
   }
 }
+function aliases(value) {
+  if (value === undefined) return undefined;
+  try { if (typeof value !== 'string' || value.length < 2 || value.length > 16384 || value.includes('\0')) return null; const parsed = JSON.parse(value); if (!plain(parsed) || Object.keys(parsed).length > 16) return null; const out = {}; for (const [name, target] of Object.entries(parsed)) { if (!/^[a-z][a-z0-9_-]{2,63}$/.test(name) || ['search', 'read', 'propose', 'proposal_status', 'status'].includes(name) || !['search', 'read', 'propose', 'proposal_status', 'status'].includes(target)) return null; Object.defineProperty(out, name, { value: target, enumerable: true }); } return Object.freeze(out); } catch { return null; }
+}
 async function closeResource(value) {
   try { await value?.close?.(); } catch { /* best-effort cleanup */ }
 }
@@ -64,6 +68,8 @@ export function createCapabilityMcpServerRuntime({ env = process.env, dependenci
   };
   if (Object.values(options).some(value => value === null)
     || options.maxConnectionsPerActor > options.maxConnections) fail();
+  const configuredAliases = aliases(env.AMF_CAPABILITY_MCP_ALIASES_JSON);
+  if (env.AMF_CAPABILITY_MCP_ALIASES_JSON !== undefined && !configuredAliases) fail();
 
   let resources = [];
   let server = null;
@@ -149,7 +155,7 @@ export function createCapabilityMcpServerRuntime({ env = process.env, dependenci
             policies, validateContextActorBinding: dependencies.validateContextActorBinding });
           return dependencies.createComposition({ canonicalStore, documentStore, conversationReader, fabricStore,
             resolveGrant: bridge.resolveGrant, authorize: bridge.authorize, opaqueReferenceStore,
-            cursorTtlMs: options.cursorTtlMs });
+            cursorTtlMs: options.cursorTtlMs, ...(configuredAliases === undefined ? {} : { aliases: configuredAliases }) });
         }
       });
       if (!candidate || typeof candidate.listen !== 'function' || typeof candidate.close !== 'function'
