@@ -94,14 +94,7 @@ visible conflict is limited to the event ID and the three contract digests.
 
 `npm run test:conversation-archive` always executes the shared scenarios against
 SQLite. It reports PostgreSQL as skipped unless a real disposable PostgreSQL
-database is supplied explicitly:
-
-```sh
-AMF_ARCHIVE_POSTGRES_TEST_URL=postgresql://user:password@127.0.0.1:5432/archive_test npm run test:conversation-archive
-```
-
-The test uses fixed archive-only schema tables and truncates those tables before
-the PostgreSQL scenario run. Use an isolated test database only.
+database is supplied explicitly.
 
 PostgreSQL writes serialize stable event and idempotency keys with transaction
 advisory locks. If a commit acknowledgement is ambiguous, the adapter re-reads
@@ -109,3 +102,23 @@ the idempotency record: a durably recorded exact write returns `duplicate`, and
 a durably recorded changed-payload write returns its content-free
 `conflict_visible` projection. It never retries a changed payload as a new
 write.
+
+SQLite is the default local conformance adapter and creates only disposable test
+state selected by the test runner:
+
+```sh
+npm run test:conversation-archive
+```
+
+PostgreSQL conformance is opt-in and must use a disposable database with
+synthetic credentials and a loopback endpoint:
+
+```sh
+AMF_ARCHIVE_POSTGRES_TEST_URL='postgresql://archive_test:archive_test@127.0.0.1:5432/archive_test' \
+  npm run test:conversation-archive
+```
+
+Never point either example at a shared, recovered, or production archive. The
+PostgreSQL test truncates its fixed archive-only schema tables before the
+scenario run. The two adapters are alternatives: successful conformance does
+not authorize a dual-write, migration, or deployment.

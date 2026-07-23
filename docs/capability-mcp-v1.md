@@ -58,3 +58,17 @@ through its assigned provider.
 Migration aliases may be accepted only as unadvertised routing aliases. They
 must preserve the target tool's complete authorization rule and cannot widen
 permissions, purpose, or scope.
+
+## Runtime and transport
+
+The capability runtime is source-ready and opt-in. It listens only on a
+configured loopback endpoint after policy, authorization, composition, and
+readiness checks succeed; this documentation does not claim that it is deployed.
+Streamable HTTP at `/mcp` is the primary transport. SSE remains a compatibility
+transport for clients that require it. Both transports authenticate each request
+and expose the same canonical public tools.
+
+`fabric:*` permissions are strict: each tool requires its matching permission,
+and non-status operations also require the exact declared purpose. Optional
+aliases are routing-only compatibility names, remain unadvertised in
+`tools/list`, and inherit the target tool's full authorization boundary.

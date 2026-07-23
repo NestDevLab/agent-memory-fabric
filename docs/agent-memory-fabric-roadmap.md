@@ -1,6 +1,6 @@
 # Agent Memory Fabric Roadmap and Implementation Plan
 
-Status: active; M3 accepted, M4 next
+Status: active; M6 source and M7 documentation accepted, M4-M5 live acceptance pending
 Audience: maintainers, contributors, and operators
 Maintenance rule: update this checklist in the same change that completes a roadmap item.
 
@@ -297,30 +297,30 @@ canonical writes outside the curator/applicator path.
 
 ### M6 — Deliver the unified capability MCP
 
-- [ ] Implement one provider registry with one authoritative provider per capability.
-- [ ] Fail startup for missing or ambiguous enabled providers.
-- [ ] Implement typed `search` with memory and document defaults.
-- [ ] Require explicit kind, purpose, and authorization for conversation search.
-- [ ] Implement provider-neutral `read`, `propose`, `proposal_status`, and `status`.
-- [ ] Keep administrative tools on a separate operator-only surface.
-- [ ] Add unadvertised compatibility aliases for migrated clients.
-- [ ] Run every public MCP contract fixture against each supported transport.
-- [ ] Add authorization tests proving no tool widens scope through another provider.
-- [ ] Compare equivalent search queries across implementations with declared tolerances.
+- [x] Implement one provider registry with one authoritative provider per capability.
+- [x] Fail startup for missing or ambiguous enabled providers.
+- [x] Implement typed `search` with memory and document defaults.
+- [x] Require explicit kind, purpose, and authorization for conversation search.
+- [x] Implement provider-neutral `read`, `propose`, `proposal_status`, and `status`.
+- [x] Keep administrative tools on a separate operator-only surface.
+- [x] Add unadvertised compatibility aliases for migrated clients.
+- [x] Run every public MCP contract fixture against Streamable HTTP and SSE.
+- [x] Add authorization tests proving no tool widens scope through another provider.
+- [x] Compare equivalent search queries across independent compositions with declared tolerances.
 
 Acceptance: agents need one MCP configuration, enabled tools are complete and
 provider-neutral, and contract fixtures cover every advertised tool and error shape.
 
 ### M7 — Update public documentation and operate the release
 
-- [ ] Replace the README architecture section with the target vertical diagram.
-- [ ] Keep the current and target diagrams in this roadmap until cutover completes.
-- [ ] Explain clearly that native transcripts remain and only broad central duplication is retired.
-- [ ] Document v3 schemas, storage selection, content policy, MCP tools, and compatibility behavior.
-- [ ] Add public-safe local examples for PostgreSQL and SQLite.
-- [ ] Add migration, rollback, recovery, and cleanup procedures without environment-specific values.
-- [ ] Add a release checklist and update this roadmap after each accepted milestone.
-- [ ] Scan all changed documentation for private identifiers before publication.
+- [x] Replace the README architecture section with vertical baseline and target diagrams.
+- [x] Keep the current and target diagrams in this roadmap until cutover completes.
+- [x] Explain clearly that native transcripts remain and only broad central duplication is retired.
+- [x] Document v3 schemas, storage selection, content policy, MCP tools, and compatibility behavior.
+- [x] Add public-safe local examples for PostgreSQL and SQLite.
+- [x] Add migration, rollback, recovery, and cleanup procedures without environment-specific values.
+- [x] Add a release checklist and update this roadmap after each accepted milestone.
+- [x] Scan all changed documentation for private identifiers before publication.
 
 Acceptance: a new contributor can understand the complete system from the
 README, render every Mermaid diagram on GitHub, run local fixtures, and identify
