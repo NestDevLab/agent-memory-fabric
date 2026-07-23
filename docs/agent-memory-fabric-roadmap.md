@@ -275,6 +275,7 @@ adapters, excluded content never crosses the filter, and recovery tests pass.
 - [ ] Take and restore-test one recovery copy of the old archive and one of the new archive.
 - [ ] Switch session reads and extraction to the v3 archive.
 - [ ] Observe a bounded canary period with queue, latency, and error thresholds.
+- [ ] Require the release adapter to bind the current route execution and an independent observation authority before rollback.
 - [ ] Close plaintext migration reads for encrypted selectors only after reconciliation succeeds.
 - [ ] Remove only legacy transcript rows and blobs proven unreferenced by the catalog.
 - [ ] Preserve proposal, canonical-memory, and document data that shares storage.
