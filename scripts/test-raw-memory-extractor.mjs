@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, migrateExtractorStateToConversationV3, normalizeConversationExtractorState, normalizeState, proposalIdempotencyKey, reserveModelBudget, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
+import { buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, migrateExtractorStateToConversationV3, normalizeConversationExtractorState, normalizeState, proposalIdempotencyKey, reserveModelBudget, resumeExtractorInFlight, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
 import { buildBoundedModelInput, evaluatePlanUsage, loadExtractorState } from './amf-raw-memory-extractor.mjs';
 
 const durable = [{ role: 'user', text: 'We decided to keep the extractor slow and cost bounded.' }, { role: 'assistant', text: 'Agreed: one conversation per tick and a daily ceiling.' }];
@@ -112,6 +112,48 @@ test('v3 route identity preserves legacy proposal and provenance identity', () =
   assert.deepEqual(v3, legacy);
   assert.equal(proposalIdempotencyKey({ sessionId: legacyId, claim: claim.claim }),
     proposalIdempotencyKey({ sessionId: 'ccon_example123', extractionIdentity: legacyId, claim: claim.claim }));
+});
+
+test('v3 visible revision digest makes proposal and record identity revision-aware without changing legacy keys', () => {
+  const claim = { claimType: 'decision', claim: 'Keep the visible conversation revision in the proposal identity.', confidence: 0.9 };
+  const sessionId = 'ccon_revisionexample1'; const extractionIdentity = `ses_${'c'.repeat(64)}`;
+  const firstDigest = `sha256:${'a'.repeat(64)}`; const revisedDigest = `sha256:${'b'.repeat(64)}`;
+  const stableFirst = proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest: firstDigest, claim: claim.claim });
+  assert.equal(stableFirst, proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest: firstDigest, claim: claim.claim }));
+  assert.notEqual(stableFirst, proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest: revisedDigest, claim: claim.claim }));
+  const firstRecord = buildMemoryRecord({ sessionId, extractionIdentity, visibleRevisionDigest: firstDigest, transcript: 'redacted', claim, now: '2026-07-20T12:00:00Z' });
+  const revisedRecord = buildMemoryRecord({ sessionId, extractionIdentity, visibleRevisionDigest: revisedDigest, transcript: 'redacted', claim, now: '2026-07-20T12:00:00Z' });
+  assert.notEqual(firstRecord.id, revisedRecord.id);
+  assert.equal(firstRecord.provenance[0].sourceId, extractionIdentity, 'revision only affects record and proposal identity');
+  assert.throws(() => proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest: 'not-a-digest', claim: claim.claim }), /extractor_visible_revision_invalid/);
+});
+
+test('conversation-v3 in-flight state fails closed when its visible revision digest is absent or invalid', () => {
+  const state = createExtractorState({ readerGeneration: 'conversation-v3' });
+  state.inFlight = { sessionId: 'ccon_revisionexample1', extractionIdentity: `ses_${'c'.repeat(64)}`, visibleRevisionDigest: `sha256:${'a'.repeat(64)}`, stage: 'model_done' };
+  assert.equal(normalizeConversationExtractorState(state), state);
+  for (const visibleRevisionDigest of [undefined, 'sha256:not-valid']) {
+    const invalid = structuredClone(state);
+    if (visibleRevisionDigest === undefined) delete invalid.inFlight.visibleRevisionDigest;
+    else invalid.inFlight.visibleRevisionDigest = visibleRevisionDigest;
+    assert.throws(() => normalizeConversationExtractorState(invalid), /extractor_state_invalid/);
+  }
+});
+
+test('matching proposing state replays persisted records and keys byte-for-byte without model work', () => {
+  const [claim] = validateClaims([{ claimType: 'decision', claim: 'Persist an exact proposal body before retrying delivery.', confidence: 0.8 }]);
+  const sessionId = 'ccon_revisionexample1'; const extractionIdentity = `ses_${'c'.repeat(64)}`; const visibleRevisionDigest = `sha256:${'a'.repeat(64)}`;
+  const record = buildMemoryRecord({ sessionId, extractionIdentity, visibleRevisionDigest, transcript: 'redacted transcript', claim, now: '2026-07-20T12:00:00Z' });
+  const proposalKey = proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest, claim: claim.claim });
+  const inFlight = { sessionId, extractionIdentity, visibleRevisionDigest, stage: 'proposing', claims: [claim], usage: { inputTokens: 12, outputTokens: 3 }, proposalKeys: [proposalKey], proposalRecords: [record] };
+  const resumed = resumeExtractorInFlight({ inFlight, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3' });
+  assert.equal(resumed.stage, 'proposing'); assert.deepEqual(resumed.proposalKeys, [proposalKey]); assert.deepEqual(resumed.proposalRecords, [record]);
+  const body = value => ({ record: value, rationale: `Conversation extractor durable claim from ${sessionId}; automatic curator and receipt applicator perform canonical plaintext deduplication.` });
+  assert.equal(JSON.stringify(body(resumed.proposalRecords[0])), JSON.stringify(body(record)), 'retry body is exactly the staged body');
+  assert.equal(resumeExtractorInFlight({ inFlight, sessionId, extractionIdentity, visibleRevisionDigest: `sha256:${'b'.repeat(64)}`, readerGeneration: 'conversation-v3' }), null);
+  assert.equal(resumeExtractorInFlight({ inFlight: { ...inFlight, stage: 'model_done' }, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3' }).stage, 'model_done');
+  assert.throws(() => resumeExtractorInFlight({ inFlight: { ...inFlight, proposalRecords: [{ ...record, id: 'mem_extract_invalid' }] }, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3' }), /extractor_inflight_invalid/);
+  assert.throws(() => resumeExtractorInFlight({ inFlight: { ...inFlight, proposalRecords: [{ ...record, scope: { type: 'agent', id: 'agent:mutated-scope' } }] }, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3' }), /extractor_inflight_invalid/);
 });
 
 test('shared global extraction drops explicitly project-scoped claims', () => {

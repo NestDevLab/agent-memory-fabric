@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { validateAmfMemoryRecord } from './amf-memory-record-validator.mjs';
 import { canonicalJson } from './ingest/transcripts/canonical.mjs';
 
 export const RAW_MEMORY_EXTRACTOR_STATE_SCHEMA = 'amf.raw-memory-extractor-state/v1';
@@ -9,6 +10,9 @@ const ELIGIBLE_TYPES = new Set(['decision', 'preference', 'instruction', 'summar
 const OPERATIONAL = /\b(?:error|exception|failed?|failure|incident|outage|alert|metric|counter|latency|throughput|deploy(?:ment)?|restart(?:ed)?|health ?check|ticket|log|trace|cpu|memory usage)\b/i;
 const DURABLE = /\b(?:decid(?:e|ed|ing|iamo|iamo di)|prefer(?:s|red|enza)?|always|never|must|should|will|commit(?:ted|ment)?|agreed|conclusion|policy|standard|regola|preferisc|decidiamo|mai|sempre|dobbiamo|impegno)\b/i;
 const PROJECT_SCOPED = /\b(?:project-specific|this project|the project)\b/i;
+const CONVERSATION_ID = /^ccon_[a-z0-9][a-z0-9_-]{7,127}$/;
+const EXTRACTION_IDENTITY = /^(?:ses_[a-f0-9]{64}|ccon_[a-z0-9][a-z0-9_-]{7,127})$/;
+const VISIBLE_REVISION_DIGEST = /^sha256:[a-f0-9]{64}$/;
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
@@ -70,13 +74,21 @@ export function normalizeConversationExtractorState(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.schema !== CONVERSATION_MEMORY_EXTRACTOR_STATE_SCHEMA
       || value.version !== 2 || value.stream !== 'shared:global' || value.phase !== 'newest-first'
       || value.readerGeneration !== 'conversation-v3' || (value.cursor !== null && typeof value.cursor !== 'string')
-      || (value.inFlight !== null && typeof value.inFlight !== 'object') || !value.days || typeof value.days !== 'object'
+      || (value.inFlight !== null && !validConversationInFlight(value.inFlight)) || !value.days || typeof value.days !== 'object'
       || Array.isArray(value.days) || (value.legacyBoundary !== null && (!value.legacyBoundary
         || typeof value.legacyBoundary !== 'object' || Array.isArray(value.legacyBoundary)
         || Object.keys(value.legacyBoundary).sort().join('\0') !== 'schema\0stateDigest'
         || value.legacyBoundary.schema !== RAW_MEMORY_EXTRACTOR_STATE_SCHEMA
         || !/^sha256:[a-f0-9]{64}$/.test(value.legacyBoundary.stateDigest)))) throw new Error('extractor_state_invalid');
   return value;
+}
+
+function validConversationInFlight(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && CONVERSATION_ID.test(value.sessionId) && EXTRACTION_IDENTITY.test(value.extractionIdentity)
+    && VISIBLE_REVISION_DIGEST.test(value.visibleRevisionDigest)
+    && ['model_pending', 'model_done', 'proposing'].includes(value.stage)
+    && (value.stage !== 'proposing' || (Array.isArray(value.proposalKeys) && Array.isArray(value.proposalRecords)));
 }
 
 export function migrateExtractorStateToConversationV3(value) {
@@ -145,12 +157,60 @@ export function sharedDurableClaim(claim) {
   return !PROJECT_SCOPED.test(String(claim || ''));
 }
 
-export function extractionFingerprint({ sessionId, extractionIdentity = sessionId, claim }) {
-  return sha256(`${RAW_MEMORY_EXTRACTOR_VERSION}\0${String(extractionIdentity)}\0${normalizeClaimText(claim)}`);
+export function resumeExtractorInFlight({ inFlight, sessionId, extractionIdentity, visibleRevisionDigest = undefined, readerGeneration = 'legacy-v2', maxClaims = 2 }) {
+  if (!inFlight || typeof inFlight !== 'object' || Array.isArray(inFlight) || !['legacy-v2', 'conversation-v3'].includes(readerGeneration)) return null;
+  const inFlightIdentity = inFlight.extractionIdentity ?? (readerGeneration === 'legacy-v2' ? inFlight.sessionId : null);
+  const matchingRevision = readerGeneration === 'legacy-v2' || (VISIBLE_REVISION_DIGEST.test(visibleRevisionDigest)
+    && inFlight.visibleRevisionDigest === visibleRevisionDigest);
+  if (inFlight.sessionId !== sessionId || inFlightIdentity !== extractionIdentity || !matchingRevision
+      || !['model_done', 'proposing'].includes(inFlight.stage)) return null;
+  const claims = validateClaims(inFlight.claims, { maxClaims });
+  if (inFlight.stage !== 'proposing') return { stage: inFlight.stage, claims, usage: inFlight.usage, inputTokenUpperBound: inFlight.inputTokenUpperBound };
+  const proposalRecords = validatePersistedProposalRecords({ records: inFlight.proposalRecords, proposalKeys: inFlight.proposalKeys,
+    claims, sessionId, extractionIdentity, visibleRevisionDigest });
+  return { stage: inFlight.stage, claims, usage: inFlight.usage, inputTokenUpperBound: inFlight.inputTokenUpperBound,
+    proposalKeys: [...inFlight.proposalKeys], proposalRecords };
 }
 
-export function buildMemoryRecord({ sessionId, extractionIdentity = sessionId, transcript, claim, now }) {
-  const fingerprint = extractionFingerprint({ extractionIdentity, claim: claim.claim });
+function validatePersistedProposalRecords({ records, proposalKeys, claims, sessionId, extractionIdentity, visibleRevisionDigest }) {
+  if (!Array.isArray(records) || !Array.isArray(proposalKeys) || records.length !== proposalKeys.length
+      || new Set(proposalKeys).size !== proposalKeys.length) throw new Error('extractor_inflight_invalid');
+  const byClaim = new Map(claims.map(claim => [claim.claim, claim]));
+  return records.map((record, index) => {
+    const claim = byClaim.get(record?.claim?.text);
+    const key = proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest, claim: record?.claim?.text });
+    const timestamp = record?.createdAt; const provenance = record?.provenance?.[0];
+    if (!claim || proposalKeys[index] !== key || !validateAmfMemoryRecord(record).ok || record.schema !== 'amf-memory/v1'
+      || record.id !== `mem_extract_${key.slice('raw-extractor:'.length, 'raw-extractor:'.length + 40)}`
+      || record.claimType !== claim.claimType || record.claim?.encoding !== 'plain' || record.claim?.text !== claim.claim
+      || record.scope?.type !== 'shared' || record.scope?.id !== 'shared:global' || record.visibility !== 'shared'
+      || JSON.stringify(record.subjects) !== JSON.stringify([{ identityId: 'agent:raw-extractor', role: 'owner' }])
+      || record.confidence?.score !== claim.confidence || record.confidence?.basis !== 'inferred' || record.confidence?.assessedAt !== timestamp
+      || record.lifecycle?.status !== 'active' || record.lifecycle?.validFrom !== timestamp || record.lifecycle?.validTo !== null
+      || !Array.isArray(record.lifecycle?.supersedes) || record.lifecycle.supersedes.length !== 0
+      || record.lifecycle?.revokedAt !== null || record.lifecycle?.revocationReason !== null
+      || !Array.isArray(record.provenance) || record.provenance.length !== 1 || provenance?.sourceType !== 'raw-conversation'
+      || provenance?.sourceId !== String(extractionIdentity) || provenance?.eventId !== `session-${sha256(String(extractionIdentity)).slice(0, 32)}`
+      || !/^[a-f0-9]{64}$/.test(provenance?.contentSha256) || provenance?.capturedAt !== timestamp
+      || record.updatedAt !== timestamp) {
+      throw new Error('extractor_inflight_invalid');
+    }
+    return record;
+  });
+}
+
+export function extractionFingerprint({ sessionId, extractionIdentity = sessionId, visibleRevisionDigest = undefined, claim }) {
+  // Keep existing v2 keys byte-for-byte stable. A v3 revision becomes part of
+  // the identity only when the caller supplies a validated, content-free digest.
+  const identity = visibleRevisionDigest === undefined ? String(extractionIdentity) : (() => {
+    if (!VISIBLE_REVISION_DIGEST.test(visibleRevisionDigest)) throw new Error('extractor_visible_revision_invalid');
+    return `${String(extractionIdentity)}\0${visibleRevisionDigest}`;
+  })();
+  return sha256(`${RAW_MEMORY_EXTRACTOR_VERSION}\0${identity}\0${normalizeClaimText(claim)}`);
+}
+
+export function buildMemoryRecord({ sessionId, extractionIdentity = sessionId, visibleRevisionDigest = undefined, transcript, claim, now }) {
+  const fingerprint = extractionFingerprint({ extractionIdentity, visibleRevisionDigest, claim: claim.claim });
   const timestamp = new Date(now).toISOString().replace('.000Z', 'Z');
   return {
     schema: 'amf-memory/v1', id: `mem_extract_${fingerprint.slice(0, 40)}`, revision: 1,
@@ -163,6 +223,6 @@ export function buildMemoryRecord({ sessionId, extractionIdentity = sessionId, t
   };
 }
 
-export function proposalIdempotencyKey({ sessionId, extractionIdentity = sessionId, claim }) {
-  return `raw-extractor:${extractionFingerprint({ extractionIdentity, claim })}`;
+export function proposalIdempotencyKey({ sessionId, extractionIdentity = sessionId, visibleRevisionDigest = undefined, claim }) {
+  return `raw-extractor:${extractionFingerprint({ extractionIdentity, visibleRevisionDigest, claim })}`;
 }

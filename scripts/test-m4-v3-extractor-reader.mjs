@@ -52,6 +52,8 @@ test('SQLite reader is newest-first, resumable, redacted, and applies archive vi
   const all = [first.items[0], second.items[0], ...(await reader.search({ limit: 10, cursor: second.nextCursor })).items];
   assert.deepEqual(all.map(item => item.id), [newer, replaced, legacy]);
   assert.equal(all.find(item => item.id === legacy).extractionIdentity, `ses_${'b'.repeat(64)}`);
+  for (const item of all) assert.match(item.visibleRevisionDigest, /^sha256:[a-f0-9]{64}$/);
+  assert.deepEqual(Object.keys(all.find(item => item.id === legacy)).sort(), ['contextTags', 'conversationKind', 'eventCount', 'extractionIdentity', 'firstOccurredAt', 'id', 'lastOccurredAt', 'visibleRevisionDigest']);
   assert.equal(all.some(item => [tombstoned, expired].includes(item.id)), false);
 
   const transcript = await reader.transcript({ id: legacy, view: 'redacted', newest: true, limit: 1 });
@@ -62,22 +64,51 @@ test('SQLite reader is newest-first, resumable, redacted, and applies archive vi
   await assert.rejects(() => reader.transcript({ id: newer, view: 'redacted', newest: true, cursor: transcript.nextCursor }), /m4_v3_extractor_cursor_invalid/);
   const tampered = `${first.nextCursor.slice(0, -1)}${first.nextCursor.endsWith('A') ? 'B' : 'A'}`;
   await assert.rejects(() => reader.search({ cursor: tampered }), /m4_v3_extractor_cursor_invalid/);
+
+  const replacedBeforeRevision = await reader.get({ id: replaced });
+  const revised = event({ eventId: 'cevt_extractreplace3', conversationId: replaced, sequence: 3, second: 8, text: 'revised visible event', state: 'replacement', replacesEventId: current.eventId });
+  await append(archive, revised);
+  const replacedAfterRevision = await reader.get({ id: replaced });
+  assert.notEqual(replacedAfterRevision.visibleRevisionDigest, replacedBeforeRevision.visibleRevisionDigest);
+  assert.equal(replacedAfterRevision.eventCount, replacedBeforeRevision.eventCount);
+  assert.doesNotMatch(replacedAfterRevision.visibleRevisionDigest, /revised|visible|event/);
+
+  const interior = 'ccon_extractinterior1';
+  const interiorFirst = event({ eventId: 'cevt_extractinterior1', conversationId: interior, sequence: 1, second: 1, text: 'first visible event' });
+  const interiorMiddle = event({ eventId: 'cevt_extractinterior2', conversationId: interior, sequence: 2, second: 2, text: 'middle visible event' });
+  const interiorLast = event({ eventId: 'cevt_extractinterior3', conversationId: interior, sequence: 3, second: 3, text: 'last visible event' });
+  await append(archive, interiorFirst); await append(archive, interiorMiddle); await append(archive, interiorLast);
+  const interiorBeforeRevision = await reader.get({ id: interior });
+  await append(archive, event({ eventId: 'cevt_extractinterior4', conversationId: interior, sequence: 2, second: 2, text: 'revised middle event', state: 'replacement', replacesEventId: interiorMiddle.eventId }));
+  const interiorAfterRevision = await reader.get({ id: interior });
+  assert.equal(interiorAfterRevision.eventCount, interiorBeforeRevision.eventCount, 'interior replacement preserves visible count');
+  assert.equal(interiorAfterRevision.firstOccurredAt, interiorBeforeRevision.firstOccurredAt);
+  assert.equal(interiorAfterRevision.lastOccurredAt, interiorBeforeRevision.lastOccurredAt);
+  assert.notEqual(interiorAfterRevision.visibleRevisionDigest, interiorBeforeRevision.visibleRevisionDigest, 'full ordered visible identity binds an interior revision');
 });
 
 test('PostgreSQL reader uses grouped newest keysets and bounded transcript queries', async () => {
-  const id = 'ccon_extractpostgres1'; const eventId = 'cevt_extractpostgres1'; const calls = [];
-  const metadata = { conversation_id: id, event_count: '1', source_count: '1', kind_count: '1', context_count: '1',
-    conversation_kind: 'session', context_tags: JSON.stringify({ conversation: [TAG] }), first_occurred_at: '2026-07-22T10:00:00Z', last_occurred_at: '2026-07-22T10:00:00Z' };
+  const id = 'ccon_extractpostgres1'; const eventId = 'cevt_extractpostgres1'; const lastEventId = 'cevt_extractpostgres2'; const calls = [];
+  const firstKey = '2026-07-22T10:00:00.000000000'; const lastKey = '2026-07-22T10:00:01.000000000';
+  const metadata = { conversation_id: id, event_count: '2', source_count: '1', kind_count: '1', context_count: '1',
+    conversation_kind: 'session', context_tags: JSON.stringify({ conversation: [TAG] }), first_occurred_at: '2026-07-22T10:00:00Z', last_occurred_at: '2026-07-22T10:00:00Z',
+    first_time_key: firstKey, first_sequence: '1', first_event_id: eventId,
+    last_time_key: lastKey, last_sequence: '2', last_event_id: lastEventId,
+    visible_event_identities: `${firstKey}\u001f1\u001f${eventId}\u001e${lastKey}\u001f2\u001f${lastEventId}` };
   const pool = { async query(sql, values) {
     calls.push({ sql, values });
-    if (sql.startsWith('WITH visible_events')) return { rows: [{ conversation_id: id, last_time_key: '2026-07-22T10:00:00.000000000', last_sequence: '1', last_event_id: eventId }] };
-    if (sql.startsWith('SELECT e.conversation_id')) return { rows: [metadata] };
+    if (sql.includes('ROW_NUMBER() OVER')) return { rows: [{ conversation_id: id, last_time_key: lastKey, last_sequence: '2', last_event_id: lastEventId }] };
+    if (sql.includes('COUNT(DISTINCT e.source_instance_id)')) return { rows: [metadata] };
     return { rows: [{ event_id: eventId, occurred_at: '2026-07-22T10:00:00Z', source_time_key: '2026-07-22T10:00:00.000000000', source_sequence: '1', role: 'assistant', visible_text: 'redacted result' }] };
   } };
   const reader = new PostgresM4V3ExtractorReader({ pool, cursorKey: CURSOR_KEY, identityResolver });
   assert.equal((await reader.search({ limit: 1 })).items[0].id, id);
   assert.equal((await reader.transcript({ id, view: 'redacted', newest: true, limit: 1 })).items[0].content.text, 'redacted result');
   assert.match(calls[0].sql, /ROW_NUMBER\(\) OVER \(PARTITION BY e\.conversation_id ORDER BY e\.source_time_key DESC/);
+  const metadataCall = calls.find(call => call.sql.includes('COUNT(DISTINCT e.source_instance_id)'));
+  assert.match(metadataCall.sql, /string_agg\(identity, chr\(30\) ORDER BY source_time_key,source_sequence,event_id\)/);
+  assert.match(metadataCall.sql, /LIMIT 10001/);
+  assert.deepEqual(metadataCall.values, [id]);
   assert.match(calls.at(-1).sql, /ORDER BY e\.source_time_key DESC,e\.source_sequence DESC,e\.event_id DESC LIMIT \$2/);
   assert.deepEqual(calls.at(-1).values, [id, 2]);
 });
@@ -104,8 +135,10 @@ test('SQLite and PostgreSQL startup coverage rejects a signed manifest missing a
 
 test('reader rejects unsafe dependencies, identities, limits, and archive drift', async () => {
   assert.throws(() => new SqliteM4V3ExtractorReader({ db: { prepare() {} }, cursorKey: Buffer.alloc(2), identityResolver }), /m4_v3_extractor_cursor_key_invalid/);
-  const reader = new SqliteM4V3ExtractorReader({ cursorKey: CURSOR_KEY, identityResolver: () => null, db: { prepare() { return { get() { return { conversation_id: 'ccon_extractinvalid1', event_count: 1, source_count: 1, kind_count: 1, context_count: 1, conversation_kind: 'session', context_tags: '{}', first_occurred_at: '2026-01-01T00:00:00Z', last_occurred_at: '2026-01-01T00:00:00Z' }; } }; } } });
+  const reader = new SqliteM4V3ExtractorReader({ cursorKey: CURSOR_KEY, identityResolver: () => null, db: { prepare() { return { get() { return { conversation_id: 'ccon_extractinvalid1', event_count: 1, source_count: 1, kind_count: 1, context_count: 1, conversation_kind: 'session', context_tags: '{}', first_occurred_at: '2026-01-01T00:00:00Z', last_occurred_at: '2026-01-01T00:00:00Z', first_time_key: '2026-01-01T00:00:00.000000000', first_sequence: 1, first_event_id: 'cevt_extractinvalid1', last_time_key: '2026-01-01T00:00:00.000000000', last_sequence: 1, last_event_id: 'cevt_extractinvalid1', visible_event_identities: '2026-01-01T00:00:00.000000000\u001f1\u001fcevt_extractinvalid1' }; } }; } } });
   await assert.rejects(() => reader.get({ id: 'ccon_extractinvalid1' }), /m4_v3_extractor_identity_invalid/);
   await assert.rejects(() => reader.search({ limit: 101 }), /m4_v3_extractor_request_invalid/);
   await assert.rejects(() => reader.get({ id: 'bad' }), /m4_v3_extractor_not_found/);
+  const capped = new SqliteM4V3ExtractorReader({ cursorKey: CURSOR_KEY, identityResolver, db: { prepare() { return { get() { return { conversation_id: 'ccon_extractinvalid1', event_count: 10001, source_count: 1, kind_count: 1, context_count: 1, conversation_kind: 'session', context_tags: '{}', first_occurred_at: '2026-01-01T00:00:00Z', last_occurred_at: '2026-01-01T00:00:00Z', first_time_key: '2026-01-01T00:00:00.000000000', first_sequence: 1, first_event_id: 'cevt_extractinvalid1', last_time_key: '2026-01-01T00:00:00.000000000', last_sequence: 1, last_event_id: 'cevt_extractinvalid1', visible_event_identities: '2026-01-01T00:00:00.000000000\u001f1\u001fcevt_extractinvalid1' }; } }; } } });
+  await assert.rejects(() => capped.get({ id: 'ccon_extractinvalid1' }), /m4_v3_extractor_archive_invalid/);
 });

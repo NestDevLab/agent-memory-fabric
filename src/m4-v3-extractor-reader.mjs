@@ -12,6 +12,10 @@ const ORDER_KEY = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}$/;
 const KINDS = new Set(['dm', 'group', 'channel', 'thread', 'session']);
 const MAX_CURSOR_CHARS = 1024;
 const MAX_TEXT_CODE_POINTS = 4096;
+const MAX_VISIBLE_REVISION_EVENTS = 10_000;
+const VISIBLE_REVISION_DIGEST = /^sha256:[a-f0-9]{64}$/;
+const REVISION_FIELD_SEPARATOR = '\u001f';
+const REVISION_RECORD_SEPARATOR = '\u001e';
 
 function failure(code) { const error = new Error(code); error.code = code; return error; }
 function fail(code) { throw failure(code); }
@@ -78,19 +82,50 @@ function contextTags(value) {
   try { return normalizeOpaqueTagMap(typeof value === 'string' ? JSON.parse(value) : value); }
   catch { fail('m4_v3_extractor_archive_invalid'); }
 }
+function visibleRevisionEvents(value, count) {
+  if (count > MAX_VISIBLE_REVISION_EVENTS || typeof value !== 'string' || value.length < 1
+    || value.length > MAX_VISIBLE_REVISION_EVENTS * 192) fail('m4_v3_extractor_archive_invalid');
+  const events = value.split(REVISION_RECORD_SEPARATOR);
+  if (events.length !== count) fail('m4_v3_extractor_archive_invalid');
+  let previous = null;
+  return events.map(item => {
+    const [timeKey, sequenceText, eventId, ...extra] = item.split(REVISION_FIELD_SEPARATOR);
+    const sequence = validSequence(sequenceText);
+    if (extra.length || !ORDER_KEY.test(timeKey) || !/^(?:0|[1-9]\d*)$/.test(sequenceText) || sequence === null || !EVENT_ID.test(eventId)) {
+      fail('m4_v3_extractor_archive_invalid');
+    }
+    const current = [timeKey, sequence, eventId];
+    if (previous && (previous[0] > current[0] || (previous[0] === current[0] && (previous[1] > current[1]
+      || (previous[1] === current[1] && previous[2] >= current[2]))))) fail('m4_v3_extractor_archive_invalid');
+    previous = current;
+    return { timeKey, sequence, eventId };
+  });
+}
 function metadata(row, resolveIdentity) {
   const count = Number(row?.event_count); const first = row?.first_occurred_at; const last = row?.last_occurred_at;
+  const firstSequence = validSequence(row?.first_sequence); const lastSequence = validSequence(row?.last_sequence);
   if (!row || !CONVERSATION_ID.test(row.conversation_id) || !Number.isSafeInteger(count) || count < 1
     || Number(row.source_count) !== 1 || Number(row.kind_count) !== 1 || Number(row.context_count) !== 1
-    || !KINDS.has(row.conversation_kind) || !isConversationEventUtcTimestamp(first) || !isConversationEventUtcTimestamp(last)) {
+    || !KINDS.has(row.conversation_kind) || !isConversationEventUtcTimestamp(first) || !isConversationEventUtcTimestamp(last)
+    || !ORDER_KEY.test(row.first_time_key) || firstSequence === null || !EVENT_ID.test(row.first_event_id)
+    || !ORDER_KEY.test(row.last_time_key) || lastSequence === null || !EVENT_ID.test(row.last_event_id)) {
     fail('m4_v3_extractor_not_found');
+  }
+  const visibleEvents = visibleRevisionEvents(row.visible_event_identities, count);
+  const firstEvent = visibleEvents[0]; const lastEvent = visibleEvents.at(-1);
+  if (firstEvent.timeKey !== row.first_time_key || firstEvent.sequence !== firstSequence || firstEvent.eventId !== row.first_event_id
+    || lastEvent.timeKey !== row.last_time_key || lastEvent.sequence !== lastSequence || lastEvent.eventId !== row.last_event_id) {
+    fail('m4_v3_extractor_archive_invalid');
   }
   let extractionIdentity;
   try { extractionIdentity = resolveIdentity({ conversationId: row.conversation_id, firstOccurredAt: first, lastOccurredAt: last }); }
   catch { fail('m4_v3_extractor_identity_invalid'); }
   if (typeof extractionIdentity !== 'string' || !EXTRACTION_IDENTITY.test(extractionIdentity)) fail('m4_v3_extractor_identity_invalid');
+  const visibleRevisionDigest = `sha256:${digest({ schema: 'amf.conversation-visible-revision/v1', conversationId: row.conversation_id,
+    visibleEventCount: count, visibleEvents })}`;
+  if (!VISIBLE_REVISION_DIGEST.test(visibleRevisionDigest)) fail('m4_v3_extractor_archive_invalid');
   return { id: row.conversation_id, firstOccurredAt: first, lastOccurredAt: last, eventCount: count,
-    conversationKind: row.conversation_kind, contextTags: contextTags(row.context_tags), extractionIdentity };
+    conversationKind: row.conversation_kind, contextTags: contextTags(row.context_tags), extractionIdentity, visibleRevisionDigest };
 }
 function searchKey(row) {
   const sequence = validSequence(row?.last_sequence);
@@ -166,27 +201,43 @@ const SQLITE_TABLE = 'conversation_archive_events_v1';
 const POSTGRES_TABLE = 'agent_memory_fabric.conversation_archive_events_v1';
 
 function sqliteMetadataSql() {
-  const current = visible(SQLITE_TABLE, false); const first = visible(SQLITE_TABLE, false, 'f'); const last = visible(SQLITE_TABLE, false, 'l');
-  return `SELECT e.conversation_id,COUNT(*) event_count,COUNT(DISTINCT e.source_instance_id) source_count,
+  const current = visible(SQLITE_TABLE, false);
+  return `WITH visible_events AS (SELECT e.* FROM ${SQLITE_TABLE} e WHERE ${current} AND ${field('e', 'role', false)} IN ('user','assistant') AND e.conversation_id=?)
+    SELECT e.conversation_id,COUNT(*) event_count,COUNT(DISTINCT e.source_instance_id) source_count,
       MIN(${field('e', 'conversationKind', false)}) conversation_kind,COUNT(DISTINCT ${field('e', 'conversationKind', false)}) kind_count,
       MIN(${field('e', 'authorizationContextTags', false)}) context_tags,COUNT(DISTINCT ${field('e', 'authorizationContextTags', false)}) context_count,
-      (SELECT f.source_occurred_at FROM ${SQLITE_TABLE} f WHERE ${first} AND ${field('f', 'role', false)} IN ('user','assistant') AND f.conversation_id=? ORDER BY f.source_time_key,f.source_sequence,f.event_id LIMIT 1) first_occurred_at,
-      (SELECT l.source_occurred_at FROM ${SQLITE_TABLE} l WHERE ${last} AND ${field('l', 'role', false)} IN ('user','assistant') AND l.conversation_id=? ORDER BY l.source_time_key DESC,l.source_sequence DESC,l.event_id DESC LIMIT 1) last_occurred_at
-    FROM ${SQLITE_TABLE} e WHERE ${current} AND ${field('e', 'role', false)} IN ('user','assistant') AND e.conversation_id=? GROUP BY e.conversation_id`;
+      (SELECT f.source_occurred_at FROM visible_events f WHERE f.conversation_id=e.conversation_id ORDER BY f.source_time_key,f.source_sequence,f.event_id LIMIT 1) first_occurred_at,
+      (SELECT f.source_time_key FROM visible_events f WHERE f.conversation_id=e.conversation_id ORDER BY f.source_time_key,f.source_sequence,f.event_id LIMIT 1) first_time_key,
+      (SELECT f.source_sequence FROM visible_events f WHERE f.conversation_id=e.conversation_id ORDER BY f.source_time_key,f.source_sequence,f.event_id LIMIT 1) first_sequence,
+      (SELECT f.event_id FROM visible_events f WHERE f.conversation_id=e.conversation_id ORDER BY f.source_time_key,f.source_sequence,f.event_id LIMIT 1) first_event_id,
+      (SELECT l.source_occurred_at FROM visible_events l WHERE l.conversation_id=e.conversation_id ORDER BY l.source_time_key DESC,l.source_sequence DESC,l.event_id DESC LIMIT 1) last_occurred_at,
+      (SELECT l.source_time_key FROM visible_events l WHERE l.conversation_id=e.conversation_id ORDER BY l.source_time_key DESC,l.source_sequence DESC,l.event_id DESC LIMIT 1) last_time_key,
+      (SELECT l.source_sequence FROM visible_events l WHERE l.conversation_id=e.conversation_id ORDER BY l.source_time_key DESC,l.source_sequence DESC,l.event_id DESC LIMIT 1) last_sequence,
+      (SELECT l.event_id FROM visible_events l WHERE l.conversation_id=e.conversation_id ORDER BY l.source_time_key DESC,l.source_sequence DESC,l.event_id DESC LIMIT 1) last_event_id,
+      (SELECT group_concat(identity, char(30)) FROM (SELECT f.source_time_key || char(31) || CAST(f.source_sequence AS TEXT) || char(31) || f.event_id identity FROM visible_events f WHERE f.conversation_id=e.conversation_id ORDER BY f.source_time_key,f.source_sequence,f.event_id LIMIT ${MAX_VISIBLE_REVISION_EVENTS + 1})) visible_event_identities
+    FROM visible_events e GROUP BY e.conversation_id`;
 }
 function postgresMetadataSql() {
-  const current = visible(POSTGRES_TABLE, true); const first = visible(POSTGRES_TABLE, true, 'f'); const last = visible(POSTGRES_TABLE, true, 'l');
-  return `SELECT e.conversation_id,COUNT(*) event_count,COUNT(DISTINCT e.source_instance_id) source_count,
+  const current = visible(POSTGRES_TABLE, true);
+  return `WITH visible_events AS (SELECT e.* FROM ${POSTGRES_TABLE} e WHERE ${current} AND ${field('e', 'role', true)} IN ('user','assistant') AND e.conversation_id=$1)
+    SELECT e.conversation_id,COUNT(*) event_count,COUNT(DISTINCT e.source_instance_id) source_count,
       MIN(${field('e', 'conversationKind', true)}) conversation_kind,COUNT(DISTINCT ${field('e', 'conversationKind', true)}) kind_count,
       MIN(${field('e', 'authorizationContextTags', true)}) context_tags,COUNT(DISTINCT ${field('e', 'authorizationContextTags', true)}) context_count,
-      (SELECT f.source_occurred_at FROM ${POSTGRES_TABLE} f WHERE ${first} AND ${field('f', 'role', true)} IN ('user','assistant') AND f.conversation_id=$1 ORDER BY f.source_time_key,f.source_sequence,f.event_id LIMIT 1) first_occurred_at,
-      (SELECT l.source_occurred_at FROM ${POSTGRES_TABLE} l WHERE ${last} AND ${field('l', 'role', true)} IN ('user','assistant') AND l.conversation_id=$2 ORDER BY l.source_time_key DESC,l.source_sequence DESC,l.event_id DESC LIMIT 1) last_occurred_at
-    FROM ${POSTGRES_TABLE} e WHERE ${current} AND ${field('e', 'role', true)} IN ('user','assistant') AND e.conversation_id=$3 GROUP BY e.conversation_id`;
+      (SELECT f.source_occurred_at FROM visible_events f WHERE f.conversation_id=e.conversation_id ORDER BY f.source_time_key,f.source_sequence,f.event_id LIMIT 1) first_occurred_at,
+      (SELECT f.source_time_key FROM visible_events f WHERE f.conversation_id=e.conversation_id ORDER BY f.source_time_key,f.source_sequence,f.event_id LIMIT 1) first_time_key,
+      (SELECT f.source_sequence FROM visible_events f WHERE f.conversation_id=e.conversation_id ORDER BY f.source_time_key,f.source_sequence,f.event_id LIMIT 1) first_sequence,
+      (SELECT f.event_id FROM visible_events f WHERE f.conversation_id=e.conversation_id ORDER BY f.source_time_key,f.source_sequence,f.event_id LIMIT 1) first_event_id,
+      (SELECT l.source_occurred_at FROM visible_events l WHERE l.conversation_id=e.conversation_id ORDER BY l.source_time_key DESC,l.source_sequence DESC,l.event_id DESC LIMIT 1) last_occurred_at,
+      (SELECT l.source_time_key FROM visible_events l WHERE l.conversation_id=e.conversation_id ORDER BY l.source_time_key DESC,l.source_sequence DESC,l.event_id DESC LIMIT 1) last_time_key,
+      (SELECT l.source_sequence FROM visible_events l WHERE l.conversation_id=e.conversation_id ORDER BY l.source_time_key DESC,l.source_sequence DESC,l.event_id DESC LIMIT 1) last_sequence,
+      (SELECT l.event_id FROM visible_events l WHERE l.conversation_id=e.conversation_id ORDER BY l.source_time_key DESC,l.source_sequence DESC,l.event_id DESC LIMIT 1) last_event_id,
+      (SELECT string_agg(identity, chr(30) ORDER BY source_time_key,source_sequence,event_id) FROM (SELECT f.source_time_key,f.source_sequence,f.event_id,f.source_time_key || chr(31) || f.source_sequence::text || chr(31) || f.event_id identity FROM visible_events f WHERE f.conversation_id=e.conversation_id ORDER BY f.source_time_key,f.source_sequence,f.event_id LIMIT ${MAX_VISIBLE_REVISION_EVENTS + 1}) revision_events) visible_event_identities
+    FROM visible_events e GROUP BY e.conversation_id`;
 }
 
 export class SqliteM4V3ExtractorReader extends M4V3ExtractorReader {
   constructor({ db, ...options } = {}) { super(options); if (!db?.prepare) fail('m4_v3_extractor_sqlite_invalid'); this.db = db; }
-  async _metadata(id) { return this.db.prepare(sqliteMetadataSql()).get(id, id, id); }
+  async _metadata(id) { return this.db.prepare(sqliteMetadataSql()).get(id); }
   async _coverage(cutoff, rowLimit) {
     return this.db.prepare(`SELECT e.conversation_id,MIN(e.source_time_key) first_time_key FROM ${SQLITE_TABLE} e
       WHERE ${visible(SQLITE_TABLE, false)} AND ${field('e', 'role', false)} IN ('user','assistant')
@@ -210,7 +261,7 @@ export class SqliteM4V3ExtractorReader extends M4V3ExtractorReader {
 
 export class PostgresM4V3ExtractorReader extends M4V3ExtractorReader {
   constructor({ pool, ...options } = {}) { super(options); if (!pool?.query) fail('m4_v3_extractor_postgres_invalid'); this.pool = pool; }
-  async _metadata(id) { return (await this.pool.query(postgresMetadataSql(), [id, id, id])).rows[0]; }
+  async _metadata(id) { return (await this.pool.query(postgresMetadataSql(), [id])).rows[0]; }
   async _coverage(cutoff, rowLimit) {
     return (await this.pool.query(`SELECT e.conversation_id,MIN(e.source_time_key) first_time_key FROM ${POSTGRES_TABLE} e
       WHERE ${visible(POSTGRES_TABLE, true)} AND ${field('e', 'role', true)} IN ('user','assistant')
