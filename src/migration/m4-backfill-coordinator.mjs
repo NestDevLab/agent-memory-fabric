@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
 import { isConversationEventUtcTimestamp } from '../conversation-event-v3.mjs';
 
-export const M4_BACKFILL_MAX_EVENTS = 1_000;
+export const M4_BACKFILL_MAX_EVENTS = 10_000;
 
 const GATE_SCHEMA = 'amf.m4-backfill-gate/v1';
 const PLAN_SCHEMA = 'amf.m4-backfill-plan/v1';

@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 
 import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
 import { RAW_EVENT_HTTP_MAX_BODY_BYTES, normalizeIngestKeyRing } from '../ingest/raw-event-contract.mjs';
+import { M4_BACKFILL_MAX_EVENTS } from './m4-backfill-coordinator.mjs';
 import { buildM4V2LogicalGroup } from './m4-v2-catalog-groups.mjs';
 import { isPotentialM4ConversationProjection } from './m4-v2-conversation-eligibility.mjs';
 import { readM4V2CatalogObservation, readM4V2Observation } from './m4-v2-observation-reader.mjs';
@@ -52,7 +53,8 @@ function validateOpen(value, startCheckpoint) {
   if (!exact(value, ['runId', 'phase', 'after', 'afterSequence', 'maxEvents'])
     || typeof value.runId !== 'string' || !ID.test(value.runId) || value.phase !== 'v2-archive'
     || !Number.isSafeInteger(value.afterSequence) || value.afterSequence < 0
-    || !Number.isSafeInteger(value.maxEvents) || value.maxEvents < 1 || value.maxEvents > 1000) fail('m4_v2_source_request_invalid');
+    || !Number.isSafeInteger(value.maxEvents) || value.maxEvents < 1
+    || value.maxEvents > M4_BACKFILL_MAX_EVENTS) fail('m4_v2_source_request_invalid');
   const after = checkpoint(value.after, 'm4_v2_source_request_invalid');
   if (value.afterSequence === 0 && canonicalJson(after) !== canonicalJson(startCheckpoint)) fail('m4_v2_source_checkpoint_drift');
   if (value.afterSequence > 0 && !CHECKPOINT_ID.test(after.id)) fail('m4_v2_source_checkpoint_drift');

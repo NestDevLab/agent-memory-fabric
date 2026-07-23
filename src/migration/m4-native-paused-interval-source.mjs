@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
 import { createConversationEvent, isConversationEventUtcTimestamp } from '../conversation-event-v3.mjs';
 import { normalizeContextTags } from '../ingest/raw-projection-v2.mjs';
+import { M4_BACKFILL_MAX_EVENTS } from './m4-backfill-coordinator.mjs';
 import { eligibleCodexConversationLifecyclePayload,
   eligibleClaudeConversationLifecyclePayload, eligibleOpenClawConversationLifecyclePayload,
   eligibleHermesConversationLifecyclePayload } from '../ingest/transcripts/conversation-v3.mjs';
@@ -16,7 +17,7 @@ const SIGNATURE = /^[A-Za-z0-9_-]{43,86}$/;
 const NATIVE_ID = /^\S+$/u;
 
 // Bounds excluded records and resume scans before an M4 coordinator batch can
-// observe a row. It is deliberately independent from the coordinator's 1,000
+// observe a row. It is deliberately independent from the coordinator's 10,000
 // emitted-event limit.
 export const M4_NATIVE_PAUSED_MAX_VISITED_RECORDS = 10_000;
 
@@ -86,7 +87,8 @@ function projectionBinding(value, code) {
 function request(value, initialCheckpoint) {
   const item = snapshot(value, ['runId', 'phase', 'after', 'afterSequence', 'maxEvents'], 'm4_native_paused_request_invalid');
   if (typeof item.runId !== 'string' || !ID.test(item.runId) || item.phase !== 'paused-native' || !Number.isSafeInteger(item.afterSequence)
-    || item.afterSequence < 0 || !Number.isSafeInteger(item.maxEvents) || item.maxEvents < 1 || item.maxEvents > 1000) fail('m4_native_paused_request_invalid');
+    || item.afterSequence < 0 || !Number.isSafeInteger(item.maxEvents) || item.maxEvents < 1
+    || item.maxEvents > M4_BACKFILL_MAX_EVENTS) fail('m4_native_paused_request_invalid');
   const after = checkpoint(item.after, 'm4_native_paused_request_invalid');
   if (item.afterSequence === 0 && !same(after, initialCheckpoint)) fail('m4_native_paused_checkpoint_drift');
   if (item.afterSequence > 0 && !/^m4np-[a-f0-9]{64}$/.test(after.id)) fail('m4_native_paused_checkpoint_drift');

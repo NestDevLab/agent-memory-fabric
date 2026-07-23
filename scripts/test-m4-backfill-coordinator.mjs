@@ -267,6 +267,9 @@ test('checkpoint progress is plan-bound and checkpoints must advance', async () 
   await assert.rejects(() => planM4BackfillBatch({
     gateVerifier: async () => gate(), maxEvents: M4_BACKFILL_MAX_EVENTS + 1,
   }), { code: 'm4_backfill_request_invalid' });
+  assert.equal((await planM4BackfillBatch({
+    gateVerifier: async () => gate(), maxEvents: M4_BACKFILL_MAX_EVENTS,
+  })).maxEvents, 10_000);
 });
 
 test('resume forwards the loaded sequence to a mutation-isolated source open request', async () => {
