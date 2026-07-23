@@ -42,6 +42,19 @@ startup failure.
 There is no merge, fallback, failover, or implicit selection. Provider IDs are
 operator/config-only and never occur in public tool schemas or results.
 
+Provider-conformance search comparisons are content-safe and aggregate-only.
+Authorization and non-success outcomes must match exactly. For two successful
+pages, the tolerated result-count delta is at most 2, fingerprint overlap is at
+least 0.80, and ranking agreement is at least 0.70. Comparison reports never
+contain result text, opaque IDs, locators, or provider identities.
+
+When independently composed providers share an opaque-reference store, a
+resource or proposal remains bound to the exact grant, scope set, and purpose
+used to issue it. Routing a later read or proposal-status call to another
+provider cannot widen any of those bindings; a mismatch returns the normal
+non-disclosing `not_found` result. An exact authorized binding may resolve
+through its assigned provider.
+
 Migration aliases may be accepted only as unadvertised routing aliases. They
 must preserve the target tool's complete authorization rule and cannot widen
 permissions, purpose, or scope.
