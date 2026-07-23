@@ -1,23 +1,92 @@
 # Agent Memory Fabric
 
-Shared REST/MCP boundary for scoped memory access. `mem0-gateway` remains a
-legacy product alias while clients migrate to `agent-memory-fabric`.
+Shared REST/MCP boundary for scoped memory access.
+
+## Architecture
+
+### Current baseline
+
+```mermaid
+flowchart TD
+    A["Source transcripts"] --> B["Source adapters"]
+    B --> C["Durable outbox"]
+    C --> D["Event ingest"]
+    D --> E["Broad archive and catalog"]
+    E --> F["Authorized recall and extraction"]
+    F --> G["Proposal queue"]
+    G --> H["Curator and applicator"]
+    H --> I["Canonical memory"]
+    I --> J["Search indexes"]
+    K["Document corpus"] --> J
+    F --> L["Public access surface"]
+    G --> L
+    J --> L
+    L --> M["Authorized clients"]
+```
+
+Native and RAW transcripts are authoritative at their sources. The broad central
+archive is a compatibility and recovery layer; it is not the authoritative copy
+of a native transcript.
+
+### Future target
+
+```mermaid
+flowchart TD
+    A["Source transcripts"] --> B["Adapter and visible-event filter"]
+    B --> C["Durable outbox"]
+    C --> D["v3 event ingest"]
+    D --> E["Archive interface"]
+    E --> F["SQLite adapter"]
+    E --> G["PostgreSQL adapter"]
+    E --> H["Authorized recall and extraction"]
+    H --> I["Proposal queue"]
+    I --> J["Curator and applicator"]
+    J --> K["Canonical memory"]
+    K --> L["Search indexes"]
+    M["Document corpus"] --> L
+    H --> N["Unified capability MCP"]
+    I --> N
+    L --> N
+    N --> O["Authorized clients"]
+    P["Legacy broad archive"] --> Q["Read-only compatibility and recovery"]
+    Q --> R["Approved cleanup gate"]
+```
+
+The future v3 archive contains only minimal visible conversation events, never
+full RAW. The legacy broad central archive remains read-only for compatibility
+and recovery until migration gates pass and cleanup is separately approved.
+A deployment selects either SQLite or PostgreSQL behind the archive interface;
+the diagram does not imply dual writes. The legacy branch receives no new v3
+events.
+
+## Curated specification index
+
+- [Roadmap and lifecycle](docs/agent-memory-fabric-roadmap.md)
+- [Conversation event v3 source rules](docs/conversation-event-v3-source-rules.md)
+- [Conversation archive interface](docs/conversation-archive-interface-v1.md)
+- [Content protection policy](docs/content-protection-policy-v1.md)
+- [Capability MCP v1](docs/capability-mcp-v1.md)
+- [v2 compatibility view](docs/conversation-session-v2-compatibility.md)
+- [v3 migration safety](docs/v3-migration-safety-v1.md)
+- [Recovery pair](docs/m4-recovery-pair-v1.md)
+- [Cleanup inventory](docs/m4-cleanup-inventory-v1.md)
+- [Deployment procedure](docs/deployment-procedure.md)
 
 ## Current shape
 
 - stable REST/MCP boundary with actor, scope and permission enforcement
-- Mem0 backend adapter for scoped search
-- idempotent proposal queue; public requests never write directly to Mem0
+- backend-neutral scoped-search adapter
+- idempotent proposal queue; public requests never write directly to canonical memory
 - encrypted, content-addressed RAW proposal storage and auditable catalog
 - encrypted transcript-event ingestion with a persistent outbox and session reader
-- local JSON auth registry, with optional n8n Data Table fallback
+- local authorization registry
 - legacy REST v1, MCP SSE and MCP Streamable HTTP compatibility
 - canonical PAM read/search through an internal stdio adapter; proposal queue
   status remains a separate surface
 - request-bound conversation context tokens and monotonic curator/apply receipts
 - purpose-specific authorization and exact HMAC context intersection across PAM records and v2 sessions
 - one Fabric transaction for receipt state, proposal lifecycle and durable audit
-- authoritative REST/MCP/v1 schemas and Principia fixture under `config/contracts/` and `scripts/fixtures/contracts/`
+- authoritative REST/MCP/v1 schemas and fixtures under `config/contracts/` and `scripts/fixtures/contracts/`
 
 ## Architecture and integrations
 
@@ -44,10 +113,10 @@ MEM0_AUTH_CACHE_TTL_MS=15000
     {
       "tokenSha256": "5232b8b43646788aa6ee169eadc914fc21bcdfa56c52e914413569e1f7affe81",
       "active": true,
-      "actor": "main-openclaw",
+      "actor": "actor_example",
       "mode": "allow_all",
       "allowedScopes": "*",
-      "allowedVaults": ["vault-personal"],
+      "allowedVaults": ["vault_example"],
       "permissions": "memory:search,memory:read,memory:propose,memory:add,memory:status,sessions:read,raw:decrypt,raw:ingest,documents:search,documents:read,documents:write,purpose:operator_review"
     }
   ]
@@ -58,9 +127,7 @@ MEM0_AUTH_CACHE_TTL_MS=15000
 checked with a constant-time comparison and need not be stored in the registry.
 `allowedScopes` and `permissions` accept arrays or comma-separated strings. `allowedVaults`
 is an optional array used by the document corpus; scoped actors fail closed when it is absent. The
-fabric also accepts a bare row array and the n8n-compatible `{ "data": [...] }`
-shape. When no local path is configured, n8n remains available as a compatibility
-source through `N8N_API_BASE_URL`, `N8N_AUTH_TABLE_ID`, and `N8N_API_KEY`.
+fabric also accepts a bare row array and a compatible `{ "data": [...] }` shape.
 
 ## Storage
 
@@ -108,16 +175,11 @@ changed plaintext under the same event id is a conflict. Actor, source instance,
 event, session, projection and key id are bound into AES-GCM AAD. The catalog event,
 session update and audit row commit in one transaction.
 
-Provision collector actors and per-client handoffs with the fail-closed
-[RAW collector provisioning runbook](docs/raw-collector-provisioning.md). The
-operator CLI stores only bearer digests server-side and fixes collector access
-to `memory:status` plus `raw:ingest`.
-
-Provision the independent `agent:vitae` read-only recall credential and context-signing handoff
-with the [recall consumer provisioning runbook](docs/recall-consumer-provisioning.md). This path
-does not read or create RAW collector material. Approved group/topic contexts can add bounded,
-manifest-bound canonical `room:`, `person:` and `relationship:` scopes through repeatable
-`--scope` options; wildcard and broader scope classes are rejected.
+Provision collector actors and per-client handoffs with the fail-closed operator
+CLI. It stores only bearer digests server-side and fixes collector access to
+`memory:status` plus `raw:ingest`. Recall credentials and context-signing
+handoffs are provisioned separately and cannot read or create collector key
+material.
 
 ## API v2
 
@@ -162,8 +224,7 @@ they cannot cross filters or credentials. Exact payload reads support
 `queued`, `review`, and `promoted` recovery, while rejected/revoked proposals
 return not-found before RAW decryption.
 
-The canonical index hot-reloads from
-`/srv/brain-shared/memory/amf/record-index.json`. PAM writes non-secret
+The canonical index hot-reloads from `<record-index-path>`. PAM writes non-secret
 `contextRefs`; Fabric derives opaque HMAC tags with its dedicated routing key.
 Index and routing-key files must be owner-owned regular mode-`0600` files.
 
@@ -184,7 +245,7 @@ cursor continues without a `>64` outage. Only the preferred, non-conflicted,
 non-tombstoned logical observation is eligible. Older history can be selected
 with a signed time window. Signed `canonicalScopes` are checked against the
 server registry before session access. REST GET clients send the signed context
-only in `X-AMF-Context-Token`; dedicated actors such as Vitae cannot place it in
+only in `X-AMF-Context-Token`; dedicated actors cannot place it in
 the query string. The session reader is configured automatically when the
 ingest key ring and catalog are available; otherwise MCP advertises
 `sessionReader: false` and the routes return `session_reader_unconfigured` (`503`).
@@ -204,67 +265,49 @@ v1 and both MCP transports remain compatible.
 ```bash
 npm install
 cp .env.example .env.local
-# Point AMF_POLICY_PATH at a reviewed policy, inject secrets and explicitly enable:
+# Point AMF_POLICY_PATH at a reviewed policy, inject secrets, and explicitly enable:
 export AMF_SERVER_ENABLED=true
 bash scripts/run.sh
 ```
 
-Do not commit real secrets or runtime `.env` files.
-
-Session recall also requires `AMF_SESSION_ROUTE_MANIFEST_PATH`. Create or update that signed,
-private manifest with `npm run operator:provision-session-routes -- ...`; the full root-only,
-dry-run-first procedure is in `docs/recall-consumer-provisioning.md`.
+Use only synthetic policies, credentials, and data for local fixtures. Do not
+commit secrets or runtime `.env` files. Session recall also requires a reviewed,
+signed route manifest; use the dry-run-first procedure in
+`docs/recall-consumer-provisioning.md`.
 
 ## Transcript ingestion CLI
 
-`scripts/amf-transcript-ingest.mjs` supports allowlisted Codex and Claude sources,
-durable encrypted outbox delivery, replay, deduplicated backfill and polling. A real
-run requires explicit `AMF_INGEST_ENDPOINT` (HTTPS), `AMF_INGEST_TOKEN`,
-`AMF_INGEST_ACTOR_ID`, source instance, key id, encryption key and independent digest
-key. `AMF_OUTBOX_KEY_RING_PATH` and `AMF_CURSOR_KEY_RING_PATH` retain old decrypt
-keys during rotation; `AMF_INGEST_CHECKPOINT_KEY` is independent and stable so
-existing rolling checkpoints do not change when encryption keys rotate. The local
-test sink cannot be selected outside test mode. Polling verifies
-bounded rolling checkpoints; use `--full-audit` for an explicit whole-history audit.
-Backfill uses a PID/host/nonce lease with heartbeat and only takes over a stale local
-lease after its owner is dead. Delivery failures remain queued and do not block the
-source runtime.
-The HTTP timeout covers request, headers and the complete streamed response body;
-responses are capped by `AMF_INGEST_HTTP_MAX_RESPONSE_BYTES` before JSON parsing.
-Live polling is fail-closed when its encrypted cursor is absent. Initialize a new
-poller exactly once with `--cursor-namespace realtime --bootstrap-tail`; this records
-the last complete-line boundary, retains an in-progress final line, and keeps the
-Codex native session hint encrypted. Subsequent polls use
-`--cursor-namespace realtime` without the bootstrap flag. Historical ingestion uses
-`--backfill --cursor-namespace backfill`, so it cannot consume or overwrite realtime
-cursors even when both namespaces share one cursor directory.
+`scripts/amf-transcript-ingest.mjs` supports allowlisted transcript sources,
+durable encrypted outbox delivery, replay, deduplicated backfill, and polling.
+A real run requires an explicit HTTPS endpoint, bearer token, actor, source
+instance, key identifier, encryption key, and independent digest key. Key rings
+retain old decrypt keys during rotation; the checkpoint key is independent and
+stable so existing rolling checkpoints do not change when encryption keys rotate.
+The local test sink is test-only.
 
-Native JSONL records are bounded at 4 MiB including their line ending. Double Base64
-expansion for encrypted RAW envelopes is covered by the shared 8 MiB request contract:
-server `AMF_MAX_RAW_INGEST_BODY_BYTES` and client
-`AMF_INGEST_HTTP_MAX_REQUEST_BYTES` both default to `8388608` and production values
-cannot be lower. Other API routes retain the smaller `AMF_MAX_BODY_BYTES` limit.
+Polling verifies bounded rolling checkpoints; `--full-audit` requests an
+explicit whole-history audit. Backfill uses a bounded lease and only takes over a
+stale lease after its owner is confirmed unavailable. Delivery failures remain
+queued and do not block the source runtime. The HTTP timeout covers request,
+headers, and the complete streamed response body; responses are size-capped
+before JSON parsing.
+
+Live polling fails closed when its encrypted cursor is absent. Initialize a new
+poller once with `--cursor-namespace realtime --bootstrap-tail`; later polls use
+the same namespace without bootstrap. Historical ingestion uses
+`--backfill --cursor-namespace backfill`, so it cannot overwrite realtime
+cursors. Native JSONL rows are bounded at 4 MiB including the line ending. The
+encrypted RAW request contract is 8 MiB for both client and server; other routes
+retain their smaller body limit.
 
 ## Deployment block
 
-The Mem0 backend defaults to `disabled`. The adapter is pinned to Mem0 3.0.13 and
-uses only the public `mem0ai/oss` export, loaded lazily after configuration checks.
-Typed Mem0 port/dimension/timeout/boolean settings are validated before configured
-state is accepted. Only read-side `search`/`getAll` operations may recreate and
-retry the shared Memory instance; the internal compatibility `add` hook never
-retries a failed write.
-Do not deploy with `MEM0_BACKEND_KIND=mem0-oss` until the target collection and data
-migration are explicitly reviewed. Proposal queuing/storage can be tested with Mem0
-disabled.
+The backend is disabled by default and activates only after reviewed
+configuration. Read-side operations may recreate and retry their shared client;
+proposal writes never retry a failed write. Do not enable a backend against an
+existing collection until its data migration is explicitly reviewed.
 
-`compose.agent-memory-fabric.yml` is the source overlay prepared for CT113. It
-builds the pinned Dockerfile with `npm ci`, requires an explicitly approved
-`.115` bind address, and mounts reviewed production policy, auth registry and
-key ring files. The PAM routing ring, workspace config and applicator state key
-are mounted together from `AMF_PAM_RUNTIME_PRIVATE_DIR` into a dedicated parent
-owned by the configured service UID and GID; individual mounts into root-owned
-`/run/secrets` or `/run/config` are unsupported. Run
-`npm run operator:preflight-pam-runtime` inside the container before rollout.
-No example policy is a runtime fallback. The generic service
-retains `mem0-gateway` only as a network alias.
-This change does not apply or deploy that overlay.
+The deployment overlay builds from the pinned source, requires reviewed policy,
+authorization, and key material, and does not use an example policy as a runtime
+fallback. Run the documented preflight before any rollout. This README does not
+authorize deployment; follow [the release deployment procedure](docs/deployment-procedure.md).
