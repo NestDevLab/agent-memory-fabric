@@ -7,6 +7,8 @@ import {
   createCapabilityProviderRegistry
 } from '../src/capability-provider-registry.mjs';
 
+const syntheticGrant = () => ({ actor: { id: 'actor_synthetic', scopes: ['team:trusted'] }, vault: { id: 'vault_synthetic' } });
+
 function validConfig(overrides = {}) {
   const calls = [];
   const config = {
@@ -33,11 +35,11 @@ test('routes each enabled capability to its sole assigned provider without provi
   const registry = createCapabilityProviderRegistry(value.config);
 
   assert.deepEqual(CAPABILITY_PROVIDER_REGISTRY_CAPABILITIES, ['search', 'read', 'propose', 'proposal_status', 'status']);
-  assert.deepEqual(await registry.call('search', { query: 'synthetic' }), { ok: true, request: { query: 'synthetic' } });
-  assert.deepEqual(await registry.lookup('read').call({ id: 'rid_synthetic' }), { ok: true, request: { id: 'rid_synthetic' } });
+  assert.deepEqual(await registry.call('search', { query: 'synthetic' }, syntheticGrant()), { ok: true, request: { query: 'synthetic' } });
+  assert.deepEqual(await registry.lookup('read').call({ id: 'rid_synthetic' }, syntheticGrant()), { ok: true, request: { id: 'rid_synthetic' } });
   assert.deepEqual(value.calls, [
-    ['memory', { query: 'synthetic' }, { capability: 'search' }],
-    ['memory', { id: 'rid_synthetic' }, { capability: 'read' }]
+    ['memory', { query: 'synthetic' }, { capability: 'search', grant: syntheticGrant() }],
+    ['memory', { id: 'rid_synthetic' }, { capability: 'read', grant: syntheticGrant() }]
   ]);
   assert.equal(Object.isFrozen(value.calls[0][2]), true);
   assert.equal(JSON.stringify(value.calls).includes('memory_core'), false);
@@ -136,7 +138,7 @@ test('configuration mutations and returned snapshots cannot alter routing state'
   value.config.providerAssignments[0].providerId = 'status_source';
   value.config.providers[0].handle = () => ({ changed: true });
 
-  assert.deepEqual(await registry.call('search', { stable: true }), { ok: true, request: { stable: true } });
+  assert.deepEqual(await registry.call('search', { stable: true }, syntheticGrant()), { ok: true, request: { stable: true } });
   const snapshot = registry.snapshot();
   assert.equal(Object.isFrozen(snapshot), true);
   assert.equal(Object.isFrozen(snapshot.enabledCapabilities), true);
@@ -155,7 +157,28 @@ test('does not fall back, and public errors stay provider-neutral', async () => 
     ]
   }).config);
 
-  await assert.rejects(registry.call('search', {}), error => error.code === 'capability_provider_registry_call_failed' && !error.message.includes('memory_core'));
+  await assert.rejects(registry.call('search', {}, syntheticGrant()), error => error.code === 'capability_provider_registry_call_failed' && !error.message.includes('memory_core'));
   assert.throws(() => registry.lookup('propose'), error => error.code === 'capability_provider_registry_unavailable' && !error.message.includes('memory_core'));
   await assert.rejects(registry.call('propose', {}), error => error.code === 'capability_provider_registry_unavailable');
+});
+
+test('snapshots grants for direct calls and lookup calls before providers see them', async () => {
+  const value = validConfig();
+  const registry = createCapabilityProviderRegistry(value.config);
+  const grant = syntheticGrant();
+  await registry.call('search', { query: 'synthetic' }, grant);
+  grant.actor.scopes.push('team:mutated');
+  assert.deepEqual(value.calls[0][2], { capability: 'search', grant: syntheticGrant() });
+  assert.equal(Object.isFrozen(value.calls[0][2]), true);
+  assert.equal(Object.isFrozen(value.calls[0][2].grant.actor.scopes), true);
+
+  const accessor = { actor: 'synthetic' };
+  Object.defineProperty(accessor, 'secret', { enumerable: true, get: () => 'leak' });
+  await assert.rejects(registry.call('search', {}, accessor), error => error.code === 'capability_provider_registry_call_failed' && !error.message.includes('leak'));
+  const symbol = { actor: 'synthetic' };
+  symbol[Symbol('secret')] = 'leak';
+  await assert.rejects(registry.lookup('search').call({}, symbol), { code: 'capability_provider_registry_call_failed' });
+  const hostile = new Proxy({}, { getPrototypeOf() { throw new Error('proxy grant secret'); } });
+  await assert.rejects(registry.call('search', {}, hostile), error => error.code === 'capability_provider_registry_call_failed' && !error.message.includes('proxy grant secret'));
+  assert.equal(value.calls.length, 1);
 });
