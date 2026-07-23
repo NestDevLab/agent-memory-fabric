@@ -1,5 +1,5 @@
 [Unit]
-Description=Deprecated compatibility alias for quality-gated conversation-memory extractor
+Description=Agent Memory Fabric conversation-memory extractor (quality-gated template)
 After=network-online.target
 Wants=network-online.target
 
@@ -14,7 +14,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/agent-memory-fabric/raw-extractor
+ReadWritePaths=/var/lib/agent-memory-fabric/conversation-memory-extractor
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
 RestrictSUIDSGID=true

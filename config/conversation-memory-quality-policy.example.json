@@ -1,0 +1,17 @@
+{
+  "schema": "amf.conversation-memory-quality-policy/v1",
+  "revision": "example-only-m5-policy",
+  "maxClaimsPerModel": 2,
+  "thresholds": {
+    "minRequested": 12,
+    "minScanned": 12,
+    "minModelSucceeded": 3,
+    "minPromotionBps": 2500,
+    "minTriageRejectedBps": 0,
+    "maxTriageRejectedBps": 9000,
+    "maxDuplicateBps": 5000,
+    "maxNoOpBps": 5000,
+    "maxModelFailureBps": 0,
+    "maxInvalidOrUnsafeBps": 0
+  }
+}

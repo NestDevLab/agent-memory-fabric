@@ -1,6 +1,6 @@
 [Unit]
-Description=Run slow Agent Memory Fabric RAW-to-memory extractor
-Conflicts=amf-conversation-memory-extractor.timer
+Description=Template timer for quality-gated conversation-memory extraction
+Conflicts=amf-raw-memory-extractor.timer
 
 [Timer]
 OnBootSec=4min

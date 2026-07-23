@@ -1,4 +1,9 @@
-# RAW-to-memory extractor
+# RAW-to-memory extractor (deprecated compatibility surface)
+
+Use [conversation-memory-extractor.md](conversation-memory-extractor.md) and
+the `amf-conversation-memory-extractor.mjs` CLI for new configuration and
+scheduled execution. This document and the raw-named entrypoints remain only
+for compatibility; they route through the same quality-gated CLI.
 
 ## Purpose and boundary
 
@@ -139,10 +144,11 @@ out of scope.
 
 ## Rollout
 
-Source ships with the systemd unit/template disabled.  A live `--dry-run` reads
-only a handful of newest sessions, emits redacted sample candidates and token
-usage, writes no proposal, and does not move the production cursor.  Enabling
-the credential, curation lane, service marker, or timer requires a separate
+Source ships with the systemd unit/template disabled. The deprecated
+`--dry-run` reads one bounded session but emits only a content-free outcome,
+writes no proposal, and does not move the production cursor. Use the canonical
+`--quality-eval` mode for a signed aggregate-only sample. Enabling the
+credential, curation lane, service marker, or timer requires a separate
 approval after that quality sample.
 
 The deployment-owned extractor credential is a scoped
