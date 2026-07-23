@@ -1,3 +1,5 @@
+import { snapshotPrivateGrant } from './capability-private-grant.mjs';
+
 const TOOL_NAMES = Object.freeze(['search', 'read', 'propose', 'proposal_status', 'status']);
 const TOOL_SET = new Set(TOOL_NAMES);
 const KINDS = new Set(['canonical_memory', 'document', 'conversation']);
@@ -168,11 +170,11 @@ export function createCapabilityMcpRuntime(config) {
     const authorization = deepFreeze({ capability: canonical, permission: `fabric:${canonical}`,
       purpose: canonical === 'status' ? null : argumentsValue.purpose,
       scopes: canonical === 'propose' ? [argumentsValue.scope] : (argumentsValue.scopes || []) });
-    let granted = false;
-    try { granted = await config.authorize(authorization) === true; } catch { granted = false; }
-    if (!granted) return deniedResult(canonical);
+    let grant = null;
+    try { grant = snapshotPrivateGrant(await config.authorize(authorization)); } catch { grant = null; }
+    if (!grant) return deniedResult(canonical);
     try {
-      const result = await registry.call(canonical, argumentsValue);
+      const result = await registry.call(canonical, argumentsValue, grant);
       if (!resultValidFor(canonical, result, argumentsValue)) providerInvalid();
       return cloneFrozen(result);
     } catch { providerInvalid(); }

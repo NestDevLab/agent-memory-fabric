@@ -1,3 +1,5 @@
+import { snapshotPrivateGrant } from './capability-private-grant.mjs';
+
 export const CAPABILITY_PROVIDER_REGISTRY_CAPABILITIES = Object.freeze([
   'search',
   'read',
@@ -120,11 +122,13 @@ export function createCapabilityProviderRegistry(config) {
     capabilities: enabledCapabilities.map(name => ({ name, state: 'ready' }))
   });
 
-  const invoke = async (capability, request) => {
+  const invoke = async (capability, request, grant) => {
     const handle = routes.get(capability);
     if (!handle) registryUnavailable();
     try {
-      return await handle(request, Object.freeze({ capability }));
+      const grantSnapshot = snapshotPrivateGrant(grant);
+      if (!grantSnapshot) providerCallFailed();
+      return await handle(request, deepFreeze({ capability, grant: grantSnapshot }));
     } catch {
       providerCallFailed();
     }
@@ -132,7 +136,7 @@ export function createCapabilityProviderRegistry(config) {
 
   const lookup = capability => {
     if (typeof capability !== 'string' || !CAPABILITIES.has(capability) || !routes.has(capability)) registryUnavailable();
-    return Object.freeze({ capability, call: request => invoke(capability, request) });
+    return Object.freeze({ capability, call: (request, grant) => invoke(capability, request, grant) });
   };
 
   return Object.freeze({
