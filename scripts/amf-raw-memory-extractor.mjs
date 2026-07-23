@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-import { buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, migrateExtractorStateToConversationV3, normalizeConversationExtractorState, normalizeState, proposalIdempotencyKey, reserveModelBudget, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
+import { buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, migrateExtractorStateToConversationV3, normalizeConversationExtractorState, normalizeState, proposalIdempotencyKey, reserveModelBudget, resumeExtractorInFlight, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/raw-memory-extractor.mjs';
 
 function fail(code) { throw new Error(code); }
 
@@ -195,6 +195,11 @@ async function tick(config, { dryRun, sessionId = null }) {
   if (!session) return { ok: true, dryRun, outcome: 'empty', scanned: 0 };
   const extractionIdentity = config.readerGeneration === 'conversation-v3' ? session.extractionIdentity : session.id;
   if (typeof extractionIdentity !== 'string' || !/^(?:ses_[a-f0-9]{64}|ccon_[a-z0-9][a-z0-9_-]{7,127})$/.test(extractionIdentity)) fail('extractor_identity_invalid');
+  const visibleRevisionDigest = config.readerGeneration === 'conversation-v3' ? session.visibleRevisionDigest : undefined;
+  if (config.readerGeneration === 'conversation-v3' && (typeof visibleRevisionDigest !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(visibleRevisionDigest))) {
+    fail('extractor_visible_revision_invalid');
+  }
+  const inFlightRevision = config.readerGeneration === 'conversation-v3' ? { visibleRevisionDigest } : {};
   const transcriptUrl = new URL(`/v2/internal/extractor/sessions/${encodeURIComponent(session.id)}/transcript`, config.baseUrl);
   transcriptUrl.searchParams.set('limit', String(config.transcriptItemLimit)); transcriptUrl.searchParams.set('window', 'newest');
   const transcript = await requestJson({ url: transcriptUrl, token }); const triage = triageConversation(transcript.items);
@@ -203,11 +208,11 @@ async function tick(config, { dryRun, sessionId = null }) {
     if (!dryRun) { state.cursor = page.nextCursor; state.inFlight = null; writeState(config.stateFile, state); }
     return { ...base, outcome: 'discarded', claims: [] };
   }
+  const resumed = dryRun ? null : resumeExtractorInFlight({ inFlight: state.inFlight, sessionId: session.id, extractionIdentity,
+    visibleRevisionDigest, readerGeneration: config.readerGeneration, maxClaims: config.maxClaimsPerConversation });
   let paid;
-  const inFlightIdentity = state.inFlight?.extractionIdentity
-    ?? (config.readerGeneration === 'legacy-v2' ? state.inFlight?.sessionId : null);
-  if (!dryRun && state.inFlight?.sessionId === session.id && inFlightIdentity === extractionIdentity && state.inFlight.stage === 'model_done') {
-    paid = { claims: validateClaims(state.inFlight.claims, { maxClaims: config.maxClaimsPerConversation }), usage: state.inFlight.usage, inputTokenUpperBound: state.inFlight.inputTokenUpperBound };
+  if (resumed) {
+    paid = resumed;
   } else {
     let planUsage;
     try { planUsage = await planUsageGate(config); } catch (error) { planUsage = { checkedAt: new Date().toISOString(), constrained: true, minimumRemainingPercent: null, pauseUntil: null, error: error.message }; }
@@ -215,21 +220,23 @@ async function tick(config, { dryRun, sessionId = null }) {
     if (planUsage.constrained) return { ...base, outcome: 'plan_usage_constrained', claims: [], planUsage };
     const reservation = reserveModelBudget(state, config);
     if (!reservation.reserved) return { ...base, outcome: 'budget_exhausted', claims: [] };
-    if (!dryRun) { state.inFlight = { sessionId: session.id, extractionIdentity, cursor: page.nextCursor, stage: 'model_pending', reservation }; writeState(config.stateFile, state); }
+    if (!dryRun) { state.inFlight = { sessionId: session.id, extractionIdentity, ...inFlightRevision, cursor: page.nextCursor, stage: 'model_pending', reservation }; writeState(config.stateFile, state); }
     paid = await extractWithCodex(triage.text, config);
     settleModelBudget(state, reservation, paid.usage);
-    if (!dryRun) { state.inFlight = { sessionId: session.id, extractionIdentity, cursor: page.nextCursor, stage: 'model_done', claims: paid.claims, usage: paid.usage, inputTokenUpperBound: paid.inputTokenUpperBound }; writeState(config.stateFile, state); }
+    if (!dryRun) { state.inFlight = { sessionId: session.id, extractionIdentity, ...inFlightRevision, cursor: page.nextCursor, stage: 'model_done', claims: paid.claims, usage: paid.usage, inputTokenUpperBound: paid.inputTokenUpperBound }; writeState(config.stateFile, state); }
   }
-  const records = [];
-  for (const claim of paid.claims) {
-    const canonical = await requestJson({ url: new URL('/v2/memory/search', config.baseUrl), token, method: 'POST', body: { scope: 'shared:global', query: claim.claim, purpose: 'memory_curation', limit: 20 } });
-    const existing = canonical?.result?.items || canonical?.items || [];
-    if (!duplicateCanonicalClaim(claim.claim, existing)) records.push(buildMemoryRecord({ sessionId: session.id, extractionIdentity, transcript: triage.text, claim, now: new Date().toISOString() }));
+  const records = resumed?.stage === 'proposing' ? resumed.proposalRecords : [];
+  if (!resumed || resumed.stage !== 'proposing') {
+    for (const claim of paid.claims) {
+      const canonical = await requestJson({ url: new URL('/v2/memory/search', config.baseUrl), token, method: 'POST', body: { scope: 'shared:global', query: claim.claim, purpose: 'memory_curation', limit: 20 } });
+      const existing = canonical?.result?.items || canonical?.items || [];
+      if (!duplicateCanonicalClaim(claim.claim, existing)) records.push(buildMemoryRecord({ sessionId: session.id, extractionIdentity, visibleRevisionDigest, transcript: triage.text, claim, now: new Date().toISOString() }));
+    }
   }
   if (!dryRun) {
-    state.inFlight = { sessionId: session.id, extractionIdentity, cursor: page.nextCursor, stage: 'proposing', claims: paid.claims, usage: paid.usage, proposalKeys: records.map(record => proposalIdempotencyKey({ sessionId: session.id, extractionIdentity, claim: record.claim.text })) };
+    state.inFlight = { sessionId: session.id, extractionIdentity, ...inFlightRevision, cursor: page.nextCursor, stage: 'proposing', claims: paid.claims, usage: paid.usage, proposalKeys: records.map(record => proposalIdempotencyKey({ sessionId: session.id, extractionIdentity, visibleRevisionDigest, claim: record.claim.text })), proposalRecords: records };
     writeState(config.stateFile, state);
-    for (const record of records) await requestJson({ url: new URL('/v2/memory/proposals', config.baseUrl), token, method: 'POST', headers: { 'idempotency-key': proposalIdempotencyKey({ sessionId: session.id, extractionIdentity, claim: record.claim.text }) }, body: { record, rationale: `Conversation extractor durable claim from ${session.id}; automatic curator and receipt applicator perform canonical plaintext deduplication.` } });
+    for (const record of records) await requestJson({ url: new URL('/v2/memory/proposals', config.baseUrl), token, method: 'POST', headers: { 'idempotency-key': proposalIdempotencyKey({ sessionId: session.id, extractionIdentity, visibleRevisionDigest, claim: record.claim.text }) }, body: { record, rationale: `Conversation extractor durable claim from ${session.id}; automatic curator and receipt applicator perform canonical plaintext deduplication.` } });
     state.cursor = page.nextCursor; state.inFlight = null; writeState(config.stateFile, state);
   }
   return { ...base, outcome: records.length ? (dryRun ? 'would_propose' : 'proposed') : 'no_durable_claim', claims: records.map(record => ({ claimType: record.claimType, claim: record.claim.text, confidence: record.confidence.score })), usage: paid.usage, inputTokenUpperBound: paid.inputTokenUpperBound };

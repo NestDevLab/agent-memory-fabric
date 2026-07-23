@@ -154,7 +154,7 @@ test('run validates hostile input and bounds before it reads private configurati
 test('real persisted Fabric v2 input resumes through the operator into SQLite and excludes system observations', async () => {
   const item = setup(); try {
     await seedFabric(item); const plan = await planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1 });
-    let nonce = 0; const operatorOptions = { clock: () => new Date('2026-07-22T12:00:00.000Z'), nonceFactory: () => `nonce${String(++nonce).padStart(11, '0')}` }; const first = await runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: plan.confirmationDigest }, operatorOptions);
+    let nonce = 0; const operatorOptions = { deliveryClock: () => new Date('2026-07-22T12:00:00.000Z'), nonceFactory: () => `nonce${String(++nonce).padStart(11, '0')}` }; const first = await runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: plan.confirmationDigest }, operatorOptions);
     const secondPlan = await planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1 });
     const second = await runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: secondPlan.confirmationDigest }, operatorOptions);
     assert.deepEqual([first.processed, first.complete, second.processed, second.complete], [1, false, 1, true]);
