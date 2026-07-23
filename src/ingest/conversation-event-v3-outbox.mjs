@@ -420,7 +420,14 @@ export class ConversationEventPlaintextOutbox {
   async deliver(id, sink) {
     id = eventId(id);
     const priorAck = this.#reconcileAck(id);
-    if (priorAck) return { ...priorAck, state: 'acknowledged', duplicate: true };
+    if (priorAck) {
+      return {
+        eventId: priorAck.eventId,
+        payloadDigest: priorAck.payloadDigest,
+        state: 'acknowledged',
+        duplicate: true
+      };
+    }
     if (!sink || typeof sink.deliver !== 'function') fail('conversation_outbox_sink_required');
     const record = this.#readRecord(this.pendingFile(id), id);
     if (!record) fail('conversation_outbox_event_missing');

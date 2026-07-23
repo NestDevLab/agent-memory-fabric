@@ -244,7 +244,12 @@ test('restart removes safe leftover temp files and reconciles durable ACK before
     const restarted = outbox(tree.root);
     assert.equal(fs.existsSync(temp), false);
     const result = await restarted.deliver(queued.eventId, { async deliver() { assert.fail('must not deliver'); } });
-    assert.equal(result.duplicate, true);
+    assert.deepEqual(result, {
+      eventId: queued.eventId,
+      payloadDigest: queued.integrity.payloadDigest,
+      state: 'acknowledged',
+      duplicate: true
+    });
     assert.deepEqual(restarted.pendingIds(), []);
   } finally { tree.cleanup(); }
 });
