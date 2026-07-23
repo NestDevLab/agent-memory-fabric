@@ -13,7 +13,7 @@
     "sourceInstanceId": { "$ref": "#/$defs/sourceInstanceId" },
     "threadId": { "$ref": "#/$defs/threadId" },
     "role": { "enum": ["user", "assistant"] },
-    "visibleText": { "type": "string", "minLength": 1, "maxLength": 65536, "pattern": "\\S" },
+    "visibleText": { "type": "string", "minLength": 1, "maxLength": 131072, "pattern": "\\S" },
     "sourceOccurredAt": { "$ref": "#/$defs/utcTimestamp" },
     "occurredAt": { "$ref": "#/$defs/utcTimestamp" },
     "ordering": { "$ref": "#/$defs/ordering" },

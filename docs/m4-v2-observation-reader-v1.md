@@ -26,9 +26,10 @@ The returned wrapper has only `eventId`, `sessionId`, `sourceTag`,
 `migrationSequence`, `projection`, and `visibleText`. `visibleText` is emitted
 only for supported user/inbound or assistant/outbound text conversations.
 Authoritative deletions and non-conversation observations are authenticated and
-then return `null`. Eligible text is complete, never truncated, and is bounded
-to 65,536 code points and 262,144 UTF-8 bytes. Text parts are exact text,
-input_text, or output_text parts, with at most 100 parts.
+then return `null`. Claude arrays containing any non-text block are also
+excluded under the source rules. Eligible text is complete, never truncated,
+and is bounded to 131,072 code points and 262,144 UTF-8 bytes. Text parts are
+exact text, input_text, or output_text parts, with at most 256 parts.
 
 The reader does not return encrypted envelopes, raw records, plaintext objects,
 catalog content IDs, owner tags, actor/source identities, paths, or payloads.

@@ -273,13 +273,32 @@ test('Claude thinking-only assistant content is private reasoning and never beco
     [{ type: 'thinking', thinking: 'private' }],
     [{ type: 'text', thinking: 'private', signature: 'signature' }],
   ]) {
-    await assertCode(() => read({
+    const excluded = await read({
       sourceKind: 'claude',
       role: 'assistant',
       direction: 'outbound',
       value,
       suffix: crypto.randomUUID(),
-    }), 'm4_v2_reader_normalized_invalid');
+    });
+    assert.equal(excluded.result.visibleText, null);
+    assert.equal(JSON.stringify(excluded.result).includes('private'), false);
+  }
+});
+
+test('Claude non-text and mixed arrays are source-ineligible and never become visible text', async () => {
+  for (const value of [
+    [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'synthetic' } }],
+    [{ type: 'text', text: 'visible' }, { type: 'tool_result', content: 'synthetic' }],
+  ]) {
+    const result = await read({
+      sourceKind: 'claude',
+      role: 'user',
+      direction: 'inbound',
+      value,
+      suffix: crypto.randomUUID(),
+    });
+    assert.equal(result.result.visibleText, null);
+    assert.equal(JSON.stringify(result.result).includes('synthetic'), false);
   }
 });
 
@@ -544,6 +563,15 @@ test('all-text arrays obey the safe part contract and fixture remains public-saf
   assert.equal(fixture.catalogTagKeyId, 'catalog-k1');
   const parts = [{ type: 'input_text', text: 'first' }, { type: 'output_text', text: 'second' }];
   assert.equal((await read({ suffix: 'parts', value: parts, contentParts: 2 })).result.visibleText, 'first\nsecond');
+  const boundedLiveParts = Array.from({ length: 130 }, (_, index) => ({
+    type: 'input_text',
+    text: `part-${index}`,
+  }));
+  assert.equal((await read({
+    suffix: 'bounded-live-parts',
+    value: boundedLiveParts,
+    contentParts: boundedLiveParts.length,
+  })).result.visibleText.split('\n').length, 130);
   const invalid = createItem({ suffix: 'bad-parts', value: [{ type: 'tool', text: 'no' }], contentParts: 1 });
   const invalidEnvelope = encrypt(invalid);
   await assertCode(() => readM4V2Observation({
@@ -555,8 +583,8 @@ test('all-text arrays obey the safe part contract and fixture remains public-saf
     auditDecrypt: async input => ({ recorded: true, eventId: input.eventId, contentId: input.contentId }),
   }), 'm4_v2_reader_normalized_invalid');
 
-  const tooManyParts = Array.from({ length: 101 }, () => ({ type: 'text', text: 'x' }));
-  const tooMany = createItem({ suffix: 'too-many-parts', value: tooManyParts, contentParts: 101 });
+  const tooManyParts = Array.from({ length: 257 }, () => ({ type: 'text', text: 'x' }));
+  const tooMany = createItem({ suffix: 'too-many-parts', value: tooManyParts, contentParts: 257 });
   const tooManyEnvelope = encrypt(tooMany);
   await assertCode(() => readM4V2Observation({
     catalogRow: rowFor(tooMany, tooManyEnvelope),
@@ -591,7 +619,13 @@ test('all-text arrays obey the safe part contract and fixture remains public-saf
   assert.equal([...maximumUnicodeResult.visibleText].length, 65_536);
   assert.equal(Buffer.byteLength(maximumUnicodeResult.visibleText, 'utf8'), 262_144);
 
-  const tooLong = createItem({ suffix: 'too-long', value: 'x'.repeat(65_537) });
+  const maximumCodePoints = await read({
+    suffix: 'maximum-code-points',
+    value: 'x'.repeat(131_072),
+  });
+  assert.equal([...maximumCodePoints.result.visibleText].length, 131_072);
+
+  const tooLong = createItem({ suffix: 'too-long', value: 'x'.repeat(131_073) });
   const tooLongEnvelope = encrypt(tooLong);
   await assertCode(() => readM4V2Observation({
     catalogRow: rowFor(tooLong, tooLongEnvelope),
