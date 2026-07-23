@@ -267,6 +267,21 @@ adapters, excluded content never crosses the filter, and recovery tests pass.
 
 ### M4 — Backfill, reconcile, and cut over
 
+Source safe stopping line:
+
+- [x] Publish release-manifest v2 with a SHA-256 digest for every released file.
+- [x] Require the deployment assembly to verify the exact revision, manifest
+  schema, canonical module list, and module bytes before importing cutover code.
+- [x] Document the metadata-only recovery paths for a missing `active` marker
+  after a successful route and a missing `rolled_back` marker after a successful
+  rollback.
+- [x] Pass focused release tests, deployment validation, and a concluding
+  security review of the exact released source.
+
+No live installation, deployment, restart, migration, cutover, replay, archive
+copy or restore, cleanup, or deletion is accepted by this source stopping line.
+The operational M4 checklist remains open:
+
 - [ ] Backfill normalized user and assistant content from the v2 archive without reading native raw rows into v3.
 - [ ] Backfill the paused interval from native sources using the same deterministic filters.
 - [ ] Replay preserved outboxes and dead letters through the native adapter path.
@@ -285,6 +300,9 @@ the compatibility API reads v3, rollback is proven, and cleanup targets are
 exactly enumerated before deletion.
 
 ### M5 — Restore conversation-to-memory extraction
+
+M5 acceptance remains open. Conversation-event extraction scheduling must stay
+disabled until the dry-run quality gate and the full checklist below pass:
 
 - [ ] Rename and adapt the existing extractor to consume conversation events.
 - [ ] Keep extraction proposal-only; it must not write canonical memory directly.
