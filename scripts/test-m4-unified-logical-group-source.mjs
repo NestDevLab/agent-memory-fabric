@@ -13,7 +13,8 @@ import { canonicalJson } from '../src/ingest/transcripts/canonical.mjs';
 import { ConversationEventPlaintextOutbox } from '../src/ingest/conversation-event-v3-outbox.mjs';
 import { runM4PreservedGroupReplay } from '../src/migration/m4-preserved-group-replay.mjs';
 import { prepareM4PreservedUnifiedIndex } from '../src/migration/m4-preserved-unified-index.mjs';
-import { prepareM4UnifiedLogicalGroupSource } from '../src/migration/m4-unified-logical-group-source.mjs';
+import { M4_UNIFIED_GROUP_MAX_TOTAL_INDEX_ENTRIES,
+  isM4UnifiedGroupAggregateEntryCountWithinBounds, prepareM4UnifiedLogicalGroupSource } from '../src/migration/m4-unified-logical-group-source.mjs';
 import { prepareM4V2UnifiedIndex } from '../src/migration/m4-v2-unified-index.mjs';
 
 const sha = value => `sha256:${crypto.createHash('sha256').update(value).digest('hex')}`;
@@ -65,6 +66,11 @@ function request(after = null, limits = {}) {
 }
 
 async function groups(opened) { const values = []; for await (const value of opened.groups) values.push(value); return values; }
+
+test('uses a distinct aggregate bound for the independently bounded origin indexes', () => {
+  assert.equal(isM4UnifiedGroupAggregateEntryCountWithinBounds(M4_UNIFIED_GROUP_MAX_TOTAL_INDEX_ENTRIES), true);
+  assert.equal(isM4UnifiedGroupAggregateEntryCountWithinBounds(M4_UNIFIED_GROUP_MAX_TOTAL_INDEX_ENTRIES + 1), false);
+});
 
 test('coalesces one legacy event across all origins into canonical locators and materializes once', async () => {
   const logical = logicalId('a'); const value = observation('a', logical); const materialized = new Map(); const entries = [];

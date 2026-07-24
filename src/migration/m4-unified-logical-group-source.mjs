@@ -3,10 +3,17 @@ import crypto from 'node:crypto';
 import { selectLogicalMessage } from '../ingest/raw-projection-v2.mjs';
 import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
 
+const ORIGINS = ['v2-archive', 'preserved-outbox', 'preserved-deadletter'];
+
 export const M4_UNIFIED_GROUP_MAX_GROUPS = 100;
 export const M4_UNIFIED_GROUP_MAX_MEMBERS = 1_000;
 export const M4_UNIFIED_GROUP_MAX_INDEX_ENTRIES = 1_000_000;
+export const M4_UNIFIED_GROUP_MAX_TOTAL_INDEX_ENTRIES = M4_UNIFIED_GROUP_MAX_INDEX_ENTRIES * ORIGINS.length;
 export const M4_UNIFIED_GROUP_MAX_PROJECTION_VARIANTS = 128;
+
+export function isM4UnifiedGroupAggregateEntryCountWithinBounds(value) {
+  return Number.isSafeInteger(value) && value >= 0 && value <= M4_UNIFIED_GROUP_MAX_TOTAL_INDEX_ENTRIES;
+}
 
 const AUTHORITY_SCHEMA = 'amf.m4-group-replay-authority/v1';
 const REQUEST_SCHEMA = 'amf.m4-preserved-group-replay-request/v1';
@@ -16,7 +23,6 @@ const INDEX_SCHEMA = 'amf.m4-unified-logical-index/v1';
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const LOGICAL = /^lmsg_[a-f0-9]{64}$/;
 const EVENT = /^evt_[a-f0-9]{64}$/;
-const ORIGINS = ['v2-archive', 'preserved-outbox', 'preserved-deadletter'];
 
 function fail(code) { const error = new Error(code); error.code = code; throw error; }
 function plain(value) { return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
@@ -98,7 +104,7 @@ export async function prepareM4UnifiedLogicalGroupSource(input = {}) {
   for (const origin of ORIGINS) {
     for (const indexed of indexes[origin]) {
       entryCount += 1;
-      if (entryCount > M4_UNIFIED_GROUP_MAX_INDEX_ENTRIES) fail('m4_unified_bound_invalid');
+      if (!isM4UnifiedGroupAggregateEntryCountWithinBounds(entryCount)) fail('m4_unified_bound_invalid');
       let logicalMessageId;
       try { logicalMessageId = await resolveCanonicalLogicalId({ authorityDigest: safeAuthority.authorityDigest,
         logicalMessageIds: indexed.projectionDigests.map(item => item.logicalMessageId) }); }
@@ -131,7 +137,8 @@ export async function prepareM4UnifiedLogicalGroupSource(input = {}) {
     members: sortCanonical(members),
   })).sort((left, right) => left.descriptor.logicalMessageId.localeCompare(right.descriptor.logicalMessageId)
     || left.descriptor.groupDigest.localeCompare(right.descriptor.groupDigest));
-  if (prepared.length > M4_UNIFIED_GROUP_MAX_INDEX_ENTRIES || prepared.some(group => group.members.length > M4_UNIFIED_GROUP_MAX_MEMBERS)) fail('m4_unified_bound_invalid');
+  if (!isM4UnifiedGroupAggregateEntryCountWithinBounds(prepared.length)
+    || prepared.some(group => group.members.length > M4_UNIFIED_GROUP_MAX_MEMBERS)) fail('m4_unified_bound_invalid');
 
   return Object.freeze({
     async open(rawRequest) {
