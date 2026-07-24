@@ -78,15 +78,31 @@ export function canonicalizeM4CrossPhaseIdentityTraversalBlock(value) {
   return safe;
 }
 
-function groupResult({ sequence, logicalMessageId, projected, identityBlock }) {
+function canonicalizeIdentityBlockGroup(identityBlocks) {
+  if (!Array.isArray(identityBlocks) || identityBlocks.length < 1 || identityBlocks.length > 8_192) {
+    fail('m4_cross_phase_identity_traversal_source_project_failed');
+  }
+  const blocks = identityBlocks.map(canonicalizeM4CrossPhaseIdentityTraversalBlock)
+    .sort((left, right) => left.session?.legacySessionId?.localeCompare(right.session?.legacySessionId) || digest(left).localeCompare(digest(right)));
+  if (blocks.length === 1) return blocks[0];
+  if (blocks.some((item, index) => index > 0
+    && item.session?.legacySessionId === blocks[index - 1].session?.legacySessionId)) {
+    fail('m4_cross_phase_identity_traversal_source_project_failed');
+  }
+  return {
+    schema: 'amf.m4-cross-phase-projector-identity-block-batch/v1',
+    blocks,
+  };
+}
+
+function groupResult({ sequence, logicalMessageId, projected, identityBlocks }) {
   if (projected.outcome === 'projected') {
-    if (identityBlock === null) fail('m4_cross_phase_identity_traversal_source_project_failed');
-    const canonicalIdentityBlock = canonicalizeM4CrossPhaseIdentityTraversalBlock(identityBlock);
+    const canonicalIdentityBlock = canonicalizeIdentityBlockGroup(identityBlocks);
     const identityBlockDigest = digest(canonicalIdentityBlock);
     const checkpoint = createM4CrossPhaseIdentityTraversalGroupCheckpoint({ sequence, logicalMessageId, outcome: 'accepted', identityBlockDigest });
     return Object.freeze({ sequence, checkpoint, logicalMessageId, outcome: 'accepted', reason: null, identityBlock: canonicalIdentityBlock, identityBlockDigest });
   }
-  if (projected.outcome !== 'excluded' || !EXCLUSION_REASONS.has(projected.reason) || identityBlock !== null) {
+  if (projected.outcome !== 'excluded' || !EXCLUSION_REASONS.has(projected.reason) || identityBlocks.length !== 0) {
     fail('m4_cross_phase_identity_traversal_source_project_failed');
   }
   const checkpoint = createM4CrossPhaseIdentityTraversalGroupCheckpoint({ sequence, logicalMessageId, outcome: 'excluded', identityBlockDigest: null });
@@ -150,14 +166,15 @@ export function createM4CrossPhaseIdentityTraversalSource(input = {}) {
                     auditDecrypt: safe.auditDecrypt, maxCiphertextBytes: safe.maxCiphertextBytes }));
                 } catch { fail('m4_cross_phase_identity_traversal_source_read_failed'); }
               }
-              let identityBlock = null; let collectorCalls = 0; let projected;
+              const identityBlocks = []; let projected;
               try {
                 projected = await projectM4V2LogicalGroup({ logical: group.logical, observations, integrityFor: safe.integrityFor,
-                  identityCollector: { async accept(block) { collectorCalls += 1; identityBlock = clone(block, 'm4_cross_phase_identity_traversal_source_project_failed'); } } });
+                  identityCollector: { async accept(block) { identityBlocks.push(clone(block, 'm4_cross_phase_identity_traversal_source_project_failed')); } } });
               } catch { fail('m4_cross_phase_identity_traversal_source_project_failed'); }
-              if (!exact(projected, ['schema', 'outcome', 'reason', 'evidence', 'events']) || collectorCalls > 1) fail('m4_cross_phase_identity_traversal_source_project_failed');
+              if (!exact(projected, ['schema', 'outcome', 'reason', 'evidence', 'events'])
+                || identityBlocks.length > group.observations.length) fail('m4_cross_phase_identity_traversal_source_project_failed');
               sequence += 1;
-              const result = groupResult({ sequence, logicalMessageId: group.logical.logicalMessageId, projected, identityBlock });
+              const result = groupResult({ sequence, logicalMessageId: group.logical.logicalMessageId, projected, identityBlocks });
               if (sequence <= request.afterSequence) {
                 if (sequence === request.afterSequence && canonicalJson(result.checkpoint) === canonicalJson(request.afterCheckpoint)) resumeVerified = true;
                 continue;

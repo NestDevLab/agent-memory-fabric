@@ -93,6 +93,26 @@ test('spools exact content-free blocks, acks deterministic pages, and resolves t
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('stores a multi-session logical group as one durable block with complete session coverage', async () => {
+  const root=temporary(); const pages=new Map(); const first=block('batch-one'); const second=block('batch-two');
+  const batch={ schema:'amf.m4-cross-phase-projector-identity-block-batch/v1', blocks:[second,first] };
+  const preflight={ availableBytes:5*1024*1024*1024, sampleBlocks:[batch], expectedBlockCount:1 };
+  try {
+    const value=writer(root,sink(pages),{capacityPreflight:preflight});
+    const accepted=value.accept(batch); assert.equal(accepted.accepted,true);
+    assert.equal(value.accept({ ...batch, blocks:[first,second] }).accepted,false);
+    assert.deepEqual(readM4CrossPhaseIdentityStreamingCoverage({databasePath:path.join(root,'private','identity.sqlite')}),{
+      schema:'amf.m4-cross-phase-identity-streaming-coverage/v1',state:'open',expectedBlockCount:1,
+      blockCount:1,sessionCount:2,eventCount:2,
+    });
+    const sealed=await seal(value,root,{groupCount:1});
+    assert.equal(sealed.coverage.acceptedBlockCount,1);
+    assert.equal(sealed.coverage.sessionCount,2);
+    assert.equal(sealed.coverage.eventCount,2);
+    value.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
 test('persists exact replay across restart and fails closed on identity drift', () => {
   const root = temporary(); const pages = new Map(); const original = block('restart');
   try {
