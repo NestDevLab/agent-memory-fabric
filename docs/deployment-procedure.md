@@ -9,7 +9,8 @@ The deployment root contains three classes of content:
 | Content | Recovery source | Installer behavior |
 |---|---|---|
 | Tracked code | Git revision and image rebuild | Replaced in place |
-| `.env`, `.env.runtime`, `runtime/` | Small deployment-owned configuration backup | Validated, bounded, preserved in place, and copied to the configuration backup |
+| `.env`, `.env.runtime`, `runtime/` except `runtime/m4/` | Small deployment-owned configuration backup | Validated, bounded, preserved in place, and copied to the configuration backup |
+| `runtime/m4/` | Whole-host or infrastructure disaster-recovery backup | Preserved by exact root inode; never copied into the in-container configuration backup |
 | `var/` | Whole-host or infrastructure disaster-recovery backup | Preserved in place; rejected if present in a release archive |
 
 Never rename or recursively copy the deployment root. In particular, never copy
@@ -85,7 +86,7 @@ Run the same command without `--dry-run`. The installer:
 6. rolls every source and manifest change back if any later installation check
    fails;
 7. verifies that every persistent root inode, including the application data
-   tree, is unchanged;
+   tree and M4 runtime state, is unchanged;
 8. enforces exactly `0711 root:root` on the approved release root.
 
 The JSON result records the configuration backup path, installed file count,
