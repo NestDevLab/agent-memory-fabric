@@ -9,7 +9,8 @@ import {
   validateClientCiphertext,
 } from '../ingest/raw-event-contract.mjs';
 import { buildM4V2LogicalGroup } from './m4-v2-catalog-groups.mjs';
-import { readM4V2Observation } from './m4-v2-observation-reader.mjs';
+import { isPotentialM4ConversationProjection } from './m4-v2-conversation-eligibility.mjs';
+import { readM4V2CatalogObservation, readM4V2Observation } from './m4-v2-observation-reader.mjs';
 
 export const M4_V2_UNIFIED_INDEX_MAX_ENTRIES = 1_000_000;
 export const M4_V2_UNIFIED_INDEX_MAX_BYTES = 512 * 1024 * 1024 * 1024;
@@ -104,12 +105,17 @@ export async function prepareM4V2UnifiedIndex(input = {}) {
         let group; try { group = buildM4V2LogicalGroup(candidate.logical, candidate.observations); } catch { fail('m4_v2_unified_catalog_invalid'); }
         if (last !== null && group.logical.logicalMessageId <= last) fail('m4_v2_unified_catalog_invalid'); last = group.logical.logicalMessageId;
         for (const row of group.observations) {
-          let rawEnvelope; try { rawEnvelope = await get.call(rawStore, row.contentId); } catch { fail('m4_v2_unified_envelope_invalid'); }
-          const envelope = snapshotEnvelope(rawEnvelope, maxCiphertextBytes);
-          const bytes = ciphertextBytes(envelope, maxCiphertextBytes); totalBytes += bytes; totalEntries += 1;
+          const potentialConversation = isPotentialM4ConversationProjection(row.projection);
+          let envelope = null; let bytes = 0;
+          if (potentialConversation) {
+            let rawEnvelope; try { rawEnvelope = await get.call(rawStore, row.contentId); } catch { fail('m4_v2_unified_envelope_invalid'); }
+            envelope = snapshotEnvelope(rawEnvelope, maxCiphertextBytes);
+            bytes = ciphertextBytes(envelope, maxCiphertextBytes);
+          }
+          totalBytes += bytes; totalEntries += 1;
           if (totalEntries > maxEntries || totalBytes > maxBytes) fail('m4_v2_unified_bound_invalid');
           if (seenEvents.has(row.eventId)) fail('m4_v2_unified_catalog_invalid'); seenEvents.add(row.eventId);
-          try {
+          if (potentialConversation) try {
             validateClientCiphertext({ actorId: envelope.actorId, sourceInstanceId: envelope.sourceInstanceId,
               projection: row.projection, envelope }, { allowedKeyIds: new Set(normalizedKeys.keys.keys()), authorizations: normalizedKeys.authorizations });
             if (ciphertextContentId(envelope) !== row.contentId || ciphertextPayloadDigest(envelope) !== row.payloadDigest) fail('m4_v2_unified_envelope_invalid');
@@ -150,9 +156,14 @@ export async function prepareM4V2UnifiedIndex(input = {}) {
     const signed = item.projectionDigests.find(value => value.logicalMessageId === safeLocator.canonicalLogicalMessageId);
     if (!signed || signed.projectionDigest !== safeLocator.projectionDigest) fail('m4_v2_unified_materialization_mismatch');
     const selectedRow = { ...item.row, logicalMessageId: safeLocator.canonicalLogicalMessageId };
-    let observation; try { observation = clone(await read.call(null, { catalogRow: selectedRow, envelope: item.envelope, ingestKeys,
-      migrationSequence: safeLocator.migrationSequence, verifyCatalogBinding, auditDecrypt, maxCiphertextBytes }),
-    'm4_v2_unified_materialization_invalid'); } catch { fail('m4_v2_unified_materialization_invalid'); }
+    let observation;
+    try {
+      observation = clone(isPotentialM4ConversationProjection(selectedRow.projection)
+        ? await read.call(null, { catalogRow: selectedRow, envelope: item.envelope, ingestKeys,
+          migrationSequence: safeLocator.migrationSequence, verifyCatalogBinding, auditDecrypt, maxCiphertextBytes })
+        : readM4V2CatalogObservation({ catalogRow: selectedRow, migrationSequence: safeLocator.migrationSequence }),
+      'm4_v2_unified_materialization_invalid');
+    } catch { fail('m4_v2_unified_materialization_invalid'); }
     try { if (!exact(observation, ['eventId', 'sessionId', 'sourceTag', 'migrationSequence', 'projection', 'visibleText'])
       || observation.eventId !== safeLocator.legacyEventId || typeof observation.sourceTag !== 'string' || !SOURCE_TAG.test(observation.sourceTag)
       || observation.migrationSequence !== safeLocator.migrationSequence || !plain(observation.projection)
