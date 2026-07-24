@@ -785,6 +785,8 @@ test("source callbacks open Fabric once and use audit, opaque tags, baseline pag
     };
     await assert.rejects(() => runM4CrossPhaseIdentityTraversalOperator({ configPath: item.files.config, confirmedPlanDigest: plan.confirmationDigest }, { dependencies }), { code: "m4_cross_phase_identity_traversal_operator_source_test" });
     assert.equal(opens, 1); assert.equal(limit, item.value.input.catalogBaseline.traversal.pageLimit); assert.deepEqual(audited.details, { transport: "m4-cross-phase-identity-traversal" }); assert.equal(delivery.key.every(byte => byte === 0), true);
+    assert.equal(source.ingestKeys.keys instanceof Map, false);
+    assert.equal(typeof source.ingestKeys.keys.ingest, "string");
   } finally { cleanup(item); }
 });
 
