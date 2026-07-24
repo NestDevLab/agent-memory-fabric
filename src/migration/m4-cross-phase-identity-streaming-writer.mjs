@@ -23,6 +23,7 @@ import {
 import { createM4CrossPhaseIdentityZeroStreamingCoverage, verifyM4CrossPhaseIdentityTraversalCompletion } from './m4-cross-phase-identity-traversal-completion.mjs';
 
 export const M4_CROSS_PHASE_IDENTITY_STREAMING_BLOCK_SCHEMA = 'amf.m4-cross-phase-projector-identity-block/v1';
+export const M4_CROSS_PHASE_IDENTITY_STREAMING_BLOCK_BATCH_SCHEMA = 'amf.m4-cross-phase-projector-identity-block-batch/v1';
 export const M4_CROSS_PHASE_IDENTITY_STREAMING_MAX_PAGE_BYTES = 8 * 1024 * 1024;
 export const M4_CROSS_PHASE_IDENTITY_STREAMING_MIN_AVAILABLE_BYTES = 5 * 1024 * 1024 * 1024;
 export const M4_CROSS_PHASE_IDENTITY_STREAMING_RECOMMENDED_AVAILABLE_BYTES = 8 * 1024 * 1024 * 1024;
@@ -116,6 +117,28 @@ function block(value) {
   if (new Set(events.map(item => item.legacyEventId)).size !== events.length) fail('m4_cross_phase_identity_streaming_block_invalid');
   return { schema: M4_CROSS_PHASE_IDENTITY_STREAMING_BLOCK_SCHEMA, session: safeSession, events };
 }
+function blockGroup(value) {
+  const input = clone(value, 'm4_cross_phase_identity_streaming_block_invalid');
+  if (input?.schema !== M4_CROSS_PHASE_IDENTITY_STREAMING_BLOCK_BATCH_SCHEMA) {
+    const safeBlock = block(input);
+    return { canonical: safeBlock, blocks: [safeBlock] };
+  }
+  if (!exact(input, ['schema', 'blocks']) || !Array.isArray(input.blocks)
+    || input.blocks.length < 2 || input.blocks.length > 8_192) {
+    fail('m4_cross_phase_identity_streaming_block_invalid');
+  }
+  const blocks = input.blocks.map(block)
+    .sort((left, right) => left.session.legacySessionId.localeCompare(right.session.legacySessionId));
+  const sessionIds = blocks.map(item => item.session.legacySessionId);
+  const eventIds = blocks.flatMap(item => item.events.map(eventItem => eventItem.legacyEventId));
+  if (new Set(sessionIds).size !== sessionIds.length || new Set(eventIds).size !== eventIds.length) {
+    fail('m4_cross_phase_identity_streaming_block_invalid');
+  }
+  return {
+    canonical: { schema: M4_CROSS_PHASE_IDENTITY_STREAMING_BLOCK_BATCH_SCHEMA, blocks },
+    blocks,
+  };
+}
 function capacityInput(value) {
   if (!exact(value, ['sampleBlocks', 'expectedBlockCount']) || !Array.isArray(value.sampleBlocks)
     || value.sampleBlocks.length < 1 || value.sampleBlocks.length > 10_000
@@ -131,7 +154,9 @@ export function estimateM4CrossPhaseIdentityStreamingCapacity(input = {}) {
   const safe = capacityInput(clone(input, 'm4_cross_phase_identity_capacity_request_invalid'));
   let sampleEntries = 0; let sampleBytes = 0;
   for (const item of safe.sampleBlocks) {
-    const safeBlock = block(item); sampleEntries += 1 + safeBlock.events.length; sampleBytes += canonicalBytes(safeBlock);
+    const safeGroup = blockGroup(item);
+    sampleEntries += safeGroup.blocks.reduce((total, safeBlock) => total + 1 + safeBlock.events.length, 0);
+    sampleBytes += canonicalBytes(safeGroup.canonical);
   }
   const estimatedPayloadBytes = Math.ceil((sampleBytes / safe.sampleBlocks.length) * safe.expectedBlockCount);
   const estimatedBytes = Math.ceil(estimatedPayloadBytes * 1.45) + (64 * 1024 * 1024);
@@ -412,33 +437,43 @@ export function createM4CrossPhaseIdentityStreamingWriter({ databasePath, regist
     return { binding, completionDigest };
   }).immediate;
   function assertOpen() { if (closed) fail('m4_cross_phase_identity_streaming_closed'); assertPinnedFile(pinnedPath, parent, file); }
-  const writeBlock = db.transaction(safeBlock => {
-    const blockDigest = digest(safeBlock);
+  const writeBlock = db.transaction(safeGroup => {
+    const blockDigest = digest(safeGroup.canonical);
     if (getBlock.get(blockDigest)) return { blockDigest, accepted: false };
     if (getMeta.get('seal_binding')) fail('m4_cross_phase_identity_streaming_sealed');
     const current = counts.get();
     if (current.blocks >= preflight.expectedBlockCount) fail('m4_cross_phase_identity_streaming_bounds_exceeded');
-    const knownSession = get.get(safeBlock.session.legacySessionId);
-    const sessionPayload = canonicalJson(safeBlock.session);
-    if (knownSession && knownSession.payload !== sessionPayload) fail('m4_cross_phase_identity_streaming_session_drift');
-    for (const item of safeBlock.events) {
+    const sessions = safeGroup.blocks.map(safeBlock => {
+      const known = get.get(safeBlock.session.legacySessionId);
+      const payload = canonicalJson(safeBlock.session);
+      if (known && known.payload !== payload) fail('m4_cross_phase_identity_streaming_session_drift');
+      return { value: safeBlock.session, known, payload };
+    });
+    const events = safeGroup.blocks.flatMap(safeBlock => safeBlock.events.map(item => {
       const known = getEvent.get(item.legacyEventId); const payload = canonicalJson(item);
       if (known && known.payload !== payload) fail('m4_cross_phase_identity_streaming_event_drift');
+      return { value: item, known, payload };
+    }));
+    const novelEntries = sessions.filter(item => !item.known).length + events.filter(item => !item.known).length;
+    if (current.sessions + current.events + novelEntries > M4_CROSS_PHASE_IDENTITY_MAX_TOTAL_ENTRIES) {
+      fail('m4_cross_phase_identity_streaming_bounds_exceeded');
     }
-    const novelEntries = (knownSession ? 0 : 1) + safeBlock.events.filter(item => !getEvent.get(item.legacyEventId)).length;
-    if (current.sessions + current.events + novelEntries > M4_CROSS_PHASE_IDENTITY_MAX_TOTAL_ENTRIES) fail('m4_cross_phase_identity_streaming_bounds_exceeded');
-    if (!knownSession) insertSession.run(safeBlock.session.legacySessionId, bucketFor(safeBlock.session.legacySessionId, 'ses_'), sessionPayload);
-    for (const item of safeBlock.events) {
-      if (!getEvent.get(item.legacyEventId)) {
-        insertEvent.run(item.legacyEventId, bucketFor(item.legacyEventId, 'evt_'), item.legacySessionId, item.conversationId, item.sourceInstanceId, canonicalJson(item));
-        for (const reference of [item.replacesLegacyEventId, item.tombstonesLegacyEventId, ...item.conflictsWithLegacyEventIds].filter(Boolean)) insertReference.run(item.legacyEventId, reference);
+    for (const item of sessions) {
+      if (!item.known) insertSession.run(item.value.legacySessionId, bucketFor(item.value.legacySessionId, 'ses_'), item.payload);
+    }
+    for (const item of events) {
+      if (!item.known) {
+        insertEvent.run(item.value.legacyEventId, bucketFor(item.value.legacyEventId, 'evt_'), item.value.legacySessionId,
+          item.value.conversationId, item.value.sourceInstanceId, item.payload);
+        for (const reference of [item.value.replacesLegacyEventId, item.value.tombstonesLegacyEventId,
+          ...item.value.conflictsWithLegacyEventIds].filter(Boolean)) insertReference.run(item.value.legacyEventId, reference);
       }
     }
     insertBlock.run(blockDigest); incrementAccepted.run();
     return { blockDigest, accepted: true };
   });
   function accept(input) {
-    try { assertOpen(); if (sealing || sealed || getMeta.get('seal_binding')) fail('m4_cross_phase_identity_streaming_sealed'); return Object.freeze(writeBlock(block(input))); }
+    try { assertOpen(); if (sealing || sealed || getMeta.get('seal_binding')) fail('m4_cross_phase_identity_streaming_sealed'); return Object.freeze(writeBlock(blockGroup(input))); }
     catch (error) { if (typeof error?.code === 'string' && error.code.startsWith('m4_cross_phase_identity_')) throw error; fail('m4_cross_phase_identity_streaming_state_invalid'); }
   }
   function validateStoredReferences() {
