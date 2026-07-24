@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,7 +9,10 @@ import { MemoryCatalog } from '../src/fabric-store.mjs';
 import { ciphertextContentId, normalizeIngestKeyRing, normalizedObservationDigest } from '../src/ingest/raw-event-contract.mjs';
 import { EncryptedOutbox } from '../src/ingest/outbox.mjs';
 import { deriveEventIdV2, deriveLogicalMessageIds, deriveSessionIdV2, opaqueContextTag } from '../src/ingest/raw-projection-v2.mjs';
-import { createM4CrossPhaseIdentityTraversalSource } from '../src/migration/m4-cross-phase-identity-traversal-source.mjs';
+import {
+  canonicalizeM4CrossPhaseIdentityTraversalBlock,
+  createM4CrossPhaseIdentityTraversalSource,
+} from '../src/migration/m4-cross-phase-identity-traversal-source.mjs';
 import { attestM4V2CatalogRevision } from '../src/migration/m4-v2-catalog-revision-attestation.mjs';
 import { fixture } from './helpers/m4-traversal-completion-fixtures.mjs';
 
@@ -34,6 +38,33 @@ async function realFixture() {
   const baseline=await attestM4V2CatalogRevision({catalog,keyDocument:SIGNING,pageLimit:10}); const calls={raw:0,binding:0,audit:0};
   const source=createM4CrossPhaseIdentityTraversalSource({catalog,rawStore:{async getClientCiphertext(contentId){calls.raw+=1;return structuredClone(ciphertexts.get(contentId));}},ingestKeys:KEYS,verifyCatalogBinding:async()=>{calls.binding+=1;return {owner:true,source:true};},auditDecrypt:async input=>{calls.audit+=1;return {recorded:true,eventId:input.eventId,contentId:input.contentId};},integrityFor:async()=>({keyId:'m4-test-k1',key:Buffer.alloc(32,5),sentAt:'2026-07-22T12:00:02Z',nonce:'nonce00000000001'}),catalogBaseline:baseline,catalogKeyDocument:SIGNING,runId:'source-fixture',planDigest:`sha256:${'d'.repeat(64)}`,pageLimit:10}); return {source,calls,catalog,baseline,ciphertexts};
 }
+
+test('canonicalizes multi-event identity blocks before source digesting without mutating projector output', () => {
+  const input = {
+    schema: 'amf.m4-cross-phase-projector-identity-block/v1',
+    session: { legacySessionId: `ses_${'a'.repeat(64)}` },
+    events: [
+      { legacyEventId: `evt_${'f'.repeat(64)}` },
+      { legacyEventId: `evt_${'0'.repeat(64)}` },
+    ],
+  };
+  const output = canonicalizeM4CrossPhaseIdentityTraversalBlock(input);
+  assert.deepEqual(output.events.map(item => item.legacyEventId), [
+    `evt_${'0'.repeat(64)}`,
+    `evt_${'f'.repeat(64)}`,
+  ]);
+  assert.deepEqual(input.events.map(item => item.legacyEventId), [
+    `evt_${'f'.repeat(64)}`,
+    `evt_${'0'.repeat(64)}`,
+  ]);
+  assert.equal(
+    crypto.createHash('sha256').update(JSON.stringify(output)).digest('hex'),
+    crypto.createHash('sha256').update(JSON.stringify({
+      ...input,
+      events: [...input.events].reverse(),
+    })).digest('hex'),
+  );
+});
 
 test('binds a signed nonempty catalog once, snapshots method getters, and fails closed on group-count drift', async () => {
   const item=fixture({coverage:{schema:'amf.m4-cross-phase-identity-streaming-coverage/v1',state:'open',expectedBlockCount:0,blockCount:0,sessionCount:0,eventCount:0},registrySecret:Buffer.alloc(32,7),groupCount:1});
