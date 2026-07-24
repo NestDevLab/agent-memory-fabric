@@ -347,9 +347,8 @@ function normalizeFabric(fabric, references) {
   if (!env.AMF_INGEST_KEY_RING_JSON)
     fail("m4_cross_phase_identity_traversal_operator_reference_invalid");
   try {
-    const ingestKeys = normalizeIngestKeyRing(
-      JSON.parse(env.AMF_INGEST_KEY_RING_JSON),
-    );
+    const ingestKeys = JSON.parse(env.AMF_INGEST_KEY_RING_JSON);
+    normalizeIngestKeyRing(ingestKeys);
     if (env.AMF_RAW_KEY_RING_JSON !== undefined) {
       const raw = JSON.parse(env.AMF_RAW_KEY_RING_JSON);
       if (
@@ -365,7 +364,11 @@ function normalizeFabric(fabric, references) {
       )
         throw new Error();
     }
-    return { rootPath: fabric.rootPath, env, ingestKeys };
+    return {
+      rootPath: fabric.rootPath,
+      env,
+      ingestKeys: structuredClone(ingestKeys),
+    };
   } catch {
     fail("m4_cross_phase_identity_traversal_operator_reference_invalid");
   }
