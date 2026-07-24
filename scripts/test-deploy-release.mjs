@@ -38,6 +38,7 @@ function fixture() {
   write(join(releaseRoot, '.env'), 'private-env\n');
   write(join(releaseRoot, '.env.runtime'), 'runtime-env\n');
   write(join(releaseRoot, 'runtime/secrets/key'), 'secret\n');
+  write(join(releaseRoot, 'runtime/m4/state/checkpoint.json'), '{"sequence":67426}\n');
   write(join(releaseRoot, 'var/agent-memory-fabric/raw/event.enc.json'), 'ciphertext\n');
   write(join(releaseRoot, 'src/removed.mjs'), 'old\n');
   write(join(releaseRoot, '.amf-release-manifest.json'), JSON.stringify({
@@ -72,6 +73,7 @@ test('installs code in place while preserving runtime configuration and raw data
       env: inode(join(item.releaseRoot, '.env')),
       runtimeEnv: inode(join(item.releaseRoot, '.env.runtime')),
       runtime: inode(join(item.releaseRoot, 'runtime')),
+      runtimeM4: inode(join(item.releaseRoot, 'runtime/m4')),
       data: inode(join(item.releaseRoot, 'var/agent-memory-fabric'))
     };
     const result = installRelease({
@@ -84,21 +86,25 @@ test('installs code in place while preserving runtime configuration and raw data
 
     assert.equal(result.dataIdentityPreserved, true);
     assert.equal(result.rootMode, '0711');
+    assert.equal(result.configBackupFiles, 3);
     assert.equal(existsSync(join(item.releaseRoot, 'src/current.mjs')), true);
     assert.equal(existsSync(join(item.releaseRoot, 'src/removed.mjs')), false);
     assert.equal(readFileSync(join(item.releaseRoot, '.env'), 'utf8'), 'private-env\n');
     assert.equal(readFileSync(join(item.releaseRoot, '.env.runtime'), 'utf8'), 'runtime-env\n');
     assert.equal(readFileSync(join(item.releaseRoot, 'runtime/secrets/key'), 'utf8'), 'secret\n');
+    assert.equal(readFileSync(join(item.releaseRoot, 'runtime/m4/state/checkpoint.json'), 'utf8'), '{"sequence":67426}\n');
     assert.equal(readFileSync(join(item.releaseRoot, 'var/agent-memory-fabric/raw/event.enc.json'), 'utf8'), 'ciphertext\n');
     assert.deepEqual({
       env: inode(join(item.releaseRoot, '.env')),
       runtimeEnv: inode(join(item.releaseRoot, '.env.runtime')),
       runtime: inode(join(item.releaseRoot, 'runtime')),
+      runtimeM4: inode(join(item.releaseRoot, 'runtime/m4')),
       data: inode(join(item.releaseRoot, 'var/agent-memory-fabric'))
     }, before);
     assert.equal(existsSync(join(result.backupPath, '.env')), true);
     assert.equal(existsSync(join(result.backupPath, '.env.runtime')), true);
     assert.equal(existsSync(join(result.backupPath, 'runtime/secrets/key')), true);
+    assert.equal(existsSync(join(result.backupPath, 'runtime/m4')), false);
     assert.equal(existsSync(join(result.backupPath, 'var')), false);
     const manifest = JSON.parse(readFileSync(join(item.releaseRoot, '.amf-release-manifest.json'), 'utf8'));
     assert.equal(manifest.schema, 'amf.release_manifest/v2');
@@ -310,6 +316,25 @@ test('rejects unsafe or oversized configuration before creating a backup', () =>
     } finally {
       rmSync(item.root, { recursive: true, force: true });
     }
+  }
+});
+
+test('rejects an aliased M4 runtime root before backup or source mutation', () => {
+  const item = fixture();
+  try {
+    rmSync(join(item.releaseRoot, 'runtime/m4'), { recursive: true });
+    symlinkSync('secrets', join(item.releaseRoot, 'runtime/m4'));
+    assert.throws(() => installRelease({
+      ...item,
+      revision: 'm4-runtime-alias',
+      dryRun: true,
+      expectedUid: process.getuid(),
+      expectedGid: process.getgid()
+    }), { code: 'persistent_directory_invalid' });
+    assert.deepEqual(readdirSync(item.backupRoot), []);
+    assert.equal(existsSync(join(item.releaseRoot, 'src/current.mjs')), false);
+  } finally {
+    rmSync(item.root, { recursive: true, force: true });
   }
 });
 

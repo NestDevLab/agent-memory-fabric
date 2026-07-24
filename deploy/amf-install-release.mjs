@@ -116,6 +116,14 @@ function ordinaryDirectory(path, code) {
 }
 
 function identity(path, type) {
+  if (type === 'optional-directory') {
+    try {
+      lstatSync(path);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return 'absent';
+      throw error;
+    }
+  }
   const stat = type === 'file'
     ? ordinaryFile(path, 'persistent_file_invalid')
     : ordinaryDirectory(path, 'persistent_directory_invalid');
@@ -217,6 +225,7 @@ function inspectConfiguration(persistent, maxBytes, maxFiles) {
     const stat = ordinaryDirectory(source, 'config_backup_entry_unsafe');
     entries.push({ type: 'directory', source, relativePath, stat });
     for (const name of readdirSync(source)) {
+      if (relativePath === 'runtime' && name === 'm4') continue;
       const childSource = join(source, name);
       const childRelative = `${relativePath}/${name}`;
       const childStat = lstatSync(childSource);
@@ -419,6 +428,7 @@ function installReleaseUnlocked({
     env: [join(resolvedRelease, '.env'), 'file'],
     runtimeEnv: [join(resolvedRelease, '.env.runtime'), 'file'],
     runtime: [join(resolvedRelease, 'runtime'), 'directory'],
+    runtimeM4: [join(resolvedRelease, 'runtime/m4'), 'optional-directory'],
     data: [join(resolvedRelease, 'var/agent-memory-fabric'), 'directory']
   };
   const before = Object.fromEntries(Object.entries(persistent).map(([name, [path, type]]) => [name, identity(path, type)]));
