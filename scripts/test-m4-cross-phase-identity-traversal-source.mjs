@@ -76,11 +76,11 @@ test('binds a signed nonempty catalog once, snapshots method getters, and fails 
   await assert.rejects(()=>drain(source.open({afterSequence:0,afterCheckpoint:null})),{code:'m4_cross_phase_identity_traversal_source_drift'});
 });
 
-test('projects and excludes one signed-catalog group each without exposing projected content', async () => {
+test('projects one signed-catalog group and excludes an ineligible group without opening its RAW blob', async () => {
   const {source,calls}=await realFixture(); const rows=[];
   for await (const row of source.open({afterSequence:0,afterCheckpoint:null})) rows.push(row);
   assert.deepEqual(rows.map(row=>[row.sequence,row.outcome]),[[1,'accepted'],[2,'excluded']]); assert.equal(rows[0].identityBlock.events.length,1); assert.equal(rows[1].identityBlock,null); assert.equal(rows[1].reason,'preferred_ineligible');
-  const serialized=JSON.stringify(rows); assert.equal(serialized.includes('visible accepted'),false); assert.equal(serialized.includes(JSON.stringify({ignored:true})),false); assert.equal(serialized.includes(Buffer.from('native-raw-accepted').toString('base64')),false); assert.equal(serialized.includes(Buffer.from('native-raw-excluded').toString('base64')),false); assert.doesNotMatch(serialized,/visibleText|normalizedPayloadDigest|integrity/); assert.equal(calls.raw,2); assert.equal(calls.binding,2); assert.equal(calls.audit,2);
+  const serialized=JSON.stringify(rows); assert.equal(serialized.includes('visible accepted'),false); assert.equal(serialized.includes(JSON.stringify({ignored:true})),false); assert.equal(serialized.includes(Buffer.from('native-raw-accepted').toString('base64')),false); assert.equal(serialized.includes(Buffer.from('native-raw-excluded').toString('base64')),false); assert.doesNotMatch(serialized,/visibleText|normalizedPayloadDigest|integrity/); assert.equal(calls.raw,1); assert.equal(calls.binding,1); assert.equal(calls.audit,1);
 });
 
 test('validates a resumed checkpoint before yielding a later group', async () => {
