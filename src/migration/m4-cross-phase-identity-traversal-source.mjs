@@ -70,12 +70,20 @@ function openRequest(value) {
   return clone(value, 'm4_cross_phase_identity_traversal_source_request_invalid');
 }
 
+export function canonicalizeM4CrossPhaseIdentityTraversalBlock(value) {
+  const safe = clone(value, 'm4_cross_phase_identity_traversal_source_project_failed');
+  if (!plain(safe) || !Array.isArray(safe.events)) fail('m4_cross_phase_identity_traversal_source_project_failed');
+  safe.events.sort((left, right) => left.legacyEventId.localeCompare(right.legacyEventId));
+  return safe;
+}
+
 function groupResult({ sequence, logicalMessageId, projected, identityBlock }) {
   if (projected.outcome === 'projected') {
     if (identityBlock === null) fail('m4_cross_phase_identity_traversal_source_project_failed');
-    const identityBlockDigest = digest(identityBlock);
+    const canonicalIdentityBlock = canonicalizeM4CrossPhaseIdentityTraversalBlock(identityBlock);
+    const identityBlockDigest = digest(canonicalIdentityBlock);
     const checkpoint = createM4CrossPhaseIdentityTraversalGroupCheckpoint({ sequence, logicalMessageId, outcome: 'accepted', identityBlockDigest });
-    return Object.freeze({ sequence, checkpoint, logicalMessageId, outcome: 'accepted', reason: null, identityBlock: clone(identityBlock, 'm4_cross_phase_identity_traversal_source_project_failed'), identityBlockDigest });
+    return Object.freeze({ sequence, checkpoint, logicalMessageId, outcome: 'accepted', reason: null, identityBlock: canonicalIdentityBlock, identityBlockDigest });
   }
   if (projected.outcome !== 'excluded' || !EXCLUSION_REASONS.has(projected.reason) || identityBlock !== null) {
     fail('m4_cross_phase_identity_traversal_source_project_failed');
