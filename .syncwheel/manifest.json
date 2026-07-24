@@ -12,7 +12,6 @@
     "strategy": "cherry-pick",
     "stacks": [
       "amf-fabric-core",
-      "amf-route-key-version",
       "amf-integration-framework",
       "semantic-reindex-timer",
       "amf-safe-deploy",
@@ -107,18 +106,6 @@
       "meta": {
         "purpose": "Canonical PAM bridge, receipt recovery and context-bound API"
       }
-    },
-    {
-      "id": "amf-route-key-version",
-      "branch": "amf/route-key-version",
-      "base": "origin/main",
-      "target_remote": "origin",
-      "target_branch": "main",
-      "integration_branch": "main-integration",
-      "commits": [
-        "c4d2b5084542409f15b77b118949a361e376c7db"
-      ],
-      "meta": {}
     },
     {
       "id": "amf-health-fleet-wide",
