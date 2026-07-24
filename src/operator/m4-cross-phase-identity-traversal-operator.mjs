@@ -716,6 +716,7 @@ export async function runM4CrossPhaseIdentityTraversalOperator(
     const traversalStore = {
       load: (...args) => ensureStore().load(...args),
       commit: (...args) => ensureStore().commit(...args),
+      commitExcludedBatch: (...args) => ensureStore().commitExcludedBatch(...args),
       complete: (...args) => ensureStore().complete(...args),
     };
     const lease = new dependencies.BackfillLease({
