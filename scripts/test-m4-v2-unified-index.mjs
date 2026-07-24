@@ -64,9 +64,10 @@ function catalogRow(value, envelope, logicalMessageId = value.projection.logical
 }
 async function fixture(values) {
   const catalog = new MemoryCatalog(); const envelopes = new Map(); const calls = { raw: 0, audit: 0, binding: 0 };
-  for (const { value, selectAlias = false } of values) {
+  for (const { value, selectAlias = false, omitEnvelope = false } of values) {
     const envelope = encrypt(value); const selected = selectAlias ? value.projection.logicalMessageAliases[0].logicalMessageId : value.projection.logicalMessageId;
-    const row = catalogRow(value, envelope, selected); envelopes.set(row.contentId, envelope);
+    const row = catalogRow(value, envelope, selected);
+    if (!omitEnvelope) envelopes.set(row.contentId, envelope);
     await catalog.ingestRawEventV2(row, { contentId: row.contentId, mediaType: 'application/json', byteLength: 1,
       storageRef: `test/${row.contentId}`, createdAt: row.createdAt },
     { id: `audit-${row.eventId.slice(4, 36)}`, ts: row.createdAt, actorTag: OWNER, action: 'synthetic', targetId: row.eventId, details: {} });
@@ -102,6 +103,31 @@ test('indexes real v2 catalog envelopes without plaintext and materializes a rot
   assert.equal(materialized.migrationSequence, 7); assert.match(materialized.visibleText, /^visible rotated/);
   assert.equal(env.calls.audit, 1); assert.equal(env.calls.binding, 1);
   assert.equal(env.calls.raw, 4, 'preparation and materialization each complete the two-row scan');
+});
+
+test('indexes and materializes an ineligible catalog row without opening unavailable RAW', async () => {
+  const proposal = item({ suffix: 'proposal-only' });
+  Object.assign(proposal.projection, {
+    direction: 'unknown',
+    conversationKind: 'unknown',
+    role: 'unknown',
+    contentType: 'none',
+    contentParts: 0,
+    hasContent: false
+  });
+  const env = await fixture([{ value: proposal, omitEnvelope: true }]);
+  const bridge = await prepareM4V2UnifiedIndex(env.input);
+  assert.equal(bridge.totalEntries, 1);
+  assert.equal(bridge.totalBytes, 0);
+  assert.equal(env.calls.raw, 0);
+  const entry = bridge.index.entries[0];
+  const materialized = await bridge.materializer(locator(entry, proposal.projection.logicalMessageId, 3));
+  assert.equal(materialized.visibleText, null);
+  assert.equal(materialized.projection.role, 'unknown');
+  assert.equal(materialized.migrationSequence, 3);
+  assert.equal(env.calls.raw, 0);
+  assert.equal(env.calls.audit, 0);
+  assert.equal(env.calls.binding, 0);
 });
 
 test('reopen detects exact envelope drift and never includes content in its error', async () => {
