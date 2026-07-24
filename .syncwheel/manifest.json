@@ -383,20 +383,6 @@
       "meta": {
         "purpose": "Pause legacy v2 growth with signed recovery evidence"
       }
-    },
-    {
-      "id": "amf-m4-unified-aggregate-bound",
-      "branch": "fix/amf-m4-unified-aggregate-bound",
-      "base": "origin/main",
-      "target_remote": "origin",
-      "target_branch": "main",
-      "integration_branch": "main-integration",
-      "commits": [
-        "03dc9fceac3c502ac243f89b2ac5737b1a59825d"
-      ],
-      "meta": {
-        "purpose": "Bound the aggregate M4 unified logical-group index across independently bounded origin indexes"
-      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
