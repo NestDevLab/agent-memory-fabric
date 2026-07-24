@@ -26,6 +26,19 @@ test('persists contiguous content-free traversal results and completes determini
   } finally { store.close(); fs.rmSync(rootPath,{recursive:true,force:true}); }
 });
 
+test('commits a bounded excluded-only batch with the same chain as individual durable commits',()=>{
+  const batchedRoot=root(); const serialRoot=root(); const batched=open(batchedRoot); const serial=open(serialRoot);
+  try {
+    const groups=[group(1,'excluded'),group(2,'excluded'),group(3,'excluded')];
+    assert.deepEqual(batched.commitExcludedBatch(groups),groups.at(-1));
+    for (const item of groups) serial.commit(item);
+    assert.deepEqual(batched.load(),serial.load());
+    code(()=>batched.commitExcludedBatch([]),'m4_cross_phase_identity_traversal_store_batch_invalid');
+    code(()=>batched.commitExcludedBatch([group(4,'accepted')]),'m4_cross_phase_identity_traversal_store_batch_invalid');
+    code(()=>batched.commitExcludedBatch([group(5,'excluded')]),'m4_cross_phase_identity_traversal_store_gap');
+  } finally { batched.close(); serial.close(); fs.rmSync(batchedRoot,{recursive:true,force:true}); fs.rmSync(serialRoot,{recursive:true,force:true}); }
+});
+
 test('rejects gaps, drift, outcome mismatch, count mismatch, and commits after completion',()=>{
   const rootPath=root(); const store=open(rootPath);
   try {

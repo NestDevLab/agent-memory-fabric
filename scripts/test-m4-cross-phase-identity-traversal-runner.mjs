@@ -49,6 +49,20 @@ test('all-excluded traversal never opens a writer and creates a deterministic em
   } finally { fs.rmSync(root,{recursive:true,force:true}); }
 });
 
+test('batches only consecutive excluded checkpoints around accepted writer commits', async () => {
+  const root=temporary(); const batches=[];
+  try {
+    const prepared=setup(root,[result(1,'excluded'),result(2,'excluded'),result(3,'accepted'),result(4,'excluded')]);
+    const original=prepared.store.commitExcludedBatch.bind(prepared.store);
+    prepared.store.commitExcludedBatch=input=>{batches.push(input.map(item=>item.sequence));return original(input);};
+    const output=await runM4CrossPhaseIdentityTraversal(prepared.input);
+    assert.deepEqual(batches,[[1,2],[4]]);
+    assert.equal(output.traversalRecord.acceptedGroupCount,1);
+    assert.equal(output.traversalRecord.excludedGroupCount,3);
+    prepared.store.close();
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
 test('restart rescans and validates the committed prefix, reopens one existing writer, then drains excluded tail', async () => {
   const root=temporary(); const calls={count:0};
   try {

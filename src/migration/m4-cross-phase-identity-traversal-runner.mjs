@@ -8,6 +8,7 @@ import { createM4CrossPhaseIdentityTraversalGroupCheckpoint, createM4CrossPhaseI
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9-]{2,79}$/;
+const EXCLUDED_COMMIT_BATCH_SIZE = 1_000;
 
 function fail(code) { const error = new Error(code); error.code = code; throw error; }
 function plain(value) { return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
@@ -24,7 +25,9 @@ function request(value) {
   if (!exact(value, keys)) fail('m4_cross_phase_identity_traversal_runner_input_invalid');
   value = Object.fromEntries(keys.map(key => [key, value[key]]));
   const source = value.source; let binding = source?.binding; const sourceOpen = source?.open;
-  const store = value.traversalStore; const storeLoad = store?.load; const storeCommit = store?.commit; const storeComplete = store?.complete;
+  const store = value.traversalStore; const storeLoad = store?.load; const storeCommit = store?.commit;
+  const storeCommitExcludedBatch = typeof store?.commitExcludedBatch === 'function' ? store.commitExcludedBatch : null;
+  const storeComplete = store?.complete;
   const lease = value.lease; const acquire = lease?.acquire; const heartbeat = lease?.heartbeat; const release = lease?.release;
   if (!object(source) || !exact(binding, ['runId', 'planDigest', 'catalogBaselineDigest', 'groupCount']) || typeof sourceOpen !== 'function'
     || !object(store) || typeof storeLoad !== 'function' || typeof storeCommit !== 'function' || typeof storeComplete !== 'function'
@@ -46,7 +49,7 @@ function request(value) {
   if (binding.runId !== value.runId || binding.planDigest !== value.planDigest
     || binding.catalogBaselineDigest !== baselineDigest || binding.groupCount !== baseline.traversal.groupCount) fail('m4_cross_phase_identity_traversal_runner_source_binding_invalid');
   return Object.freeze({
-    source, sourceOpen, store, storeLoad, storeCommit, storeComplete, baselineDigest,
+    source, sourceOpen, store, storeLoad, storeCommit, storeCommitExcludedBatch, storeComplete, baselineDigest,
     lease, acquire, heartbeat, release, runId: value.runId, planDigest: value.planDigest, baseline,
     catalogBaseline: clone(value.catalogBaseline, 'm4_cross_phase_identity_traversal_runner_input_invalid'),
     catalogKeyDocument: clone(value.catalogKeyDocument, 'm4_cross_phase_identity_traversal_runner_input_invalid'),
@@ -131,7 +134,18 @@ export async function runM4CrossPhaseIdentityTraversal(input = {}) {
     try { source = safe.sourceOpen.call(safe.source, { afterSequence: 0, afterCheckpoint: null }); }
     catch { fail('m4_cross_phase_identity_traversal_runner_source_failed'); }
     if (!source || typeof source[Symbol.asyncIterator] !== 'function') fail('m4_cross_phase_identity_traversal_runner_source_invalid');
-    let expectedSequence=1;
+    let expectedSequence=1; let excludedCommitBatch=[];
+    const flushExcludedCommitBatch = async () => {
+      if (excludedCommitBatch.length === 0) return;
+      if (safe.storeCommitExcludedBatch !== null) {
+        await invoke('m4_cross_phase_identity_traversal_runner_store_failed', safe.storeCommitExcludedBatch, safe.store, excludedCommitBatch);
+      } else {
+        for (const group of excludedCommitBatch) {
+          await invoke('m4_cross_phase_identity_traversal_runner_store_failed', safe.storeCommit, safe.store, group);
+        }
+      }
+      excludedCommitBatch=[];
+    };
     for await (const candidate of source) {
       const group = resultGroup(candidate);
       if (group.sequence!==expectedSequence || group.sequence>safe.baseline.traversal.groupCount) fail('m4_cross_phase_identity_traversal_runner_source_invalid');
@@ -161,6 +175,7 @@ export async function runM4CrossPhaseIdentityTraversal(input = {}) {
       if (!prefixVerified) fail('m4_cross_phase_identity_traversal_runner_prefix_drift');
       if (pendingOrphan && group.outcome !== 'accepted') fail('m4_cross_phase_identity_traversal_runner_prefix_drift');
       if (group.outcome === 'accepted') {
+        await flushExcludedCommitBatch();
         if (writer === null) {
           const made = await invoke('m4_cross_phase_identity_traversal_runner_writer_failed', safe.createWriter, null,
             { expectedBlockCount: safe.baseline.traversal.groupCount, firstBlock: clone(group.identityBlock, 'm4_cross_phase_identity_traversal_runner_source_invalid') });
@@ -177,9 +192,13 @@ export async function runM4CrossPhaseIdentityTraversal(input = {}) {
         if (!exact(accepted, ['blockDigest', 'accepted']) || accepted.blockDigest !== group.identityBlockDigest || typeof accepted.accepted !== 'boolean'
           || (pendingOrphan ? accepted.accepted !== false : accepted.accepted !== true)) fail('m4_cross_phase_identity_traversal_runner_prefix_drift');
         pendingOrphan = false;
+        await invoke('m4_cross_phase_identity_traversal_runner_store_failed', safe.storeCommit, safe.store, checkpointGroup(group));
+      } else {
+        excludedCommitBatch.push(checkpointGroup(group));
+        if (excludedCommitBatch.length >= EXCLUDED_COMMIT_BATCH_SIZE) await flushExcludedCommitBatch();
       }
-      await invoke('m4_cross_phase_identity_traversal_runner_store_failed', safe.storeCommit, safe.store, checkpointGroup(group));
     }
+    await flushExcludedCommitBatch();
     if (!prefixVerified || pendingOrphan) fail('m4_cross_phase_identity_traversal_runner_prefix_drift');
     let traversalRecord = await invoke('m4_cross_phase_identity_traversal_runner_store_failed', safe.storeComplete, safe.store,
       { expectedGroupCount: safe.baseline.traversal.groupCount });
