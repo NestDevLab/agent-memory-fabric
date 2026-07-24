@@ -103,6 +103,43 @@ test('persists exact replay across restart and fails closed on identity drift', 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('counts each unique block when its session and events already exist and migrates the legacy counter', async () => {
+  const root = temporary(); const pages = new Map(); const sharedSession = sessionId('shared-overlap');
+  const first = block('overlap-first', { legacySessionId: sharedSession });
+  const second = block('overlap-second', { legacySessionId: sharedSession });
+  const combined = structuredClone(first);
+  combined.events = [structuredClone(first.events[0]), structuredClone(second.events[0])];
+  const databasePath = path.join(root, 'private', 'identity.sqlite');
+  try {
+    const initial = writer(root, sink(pages));
+    assert.equal(initial.accept(first).accepted, true);
+    assert.equal(initial.accept(second).accepted, true);
+    assert.equal(initial.accept(combined).accepted, true);
+    assert.equal(initial.accept(combined).accepted, false);
+    initial.close();
+
+    const legacy = new Database(databasePath);
+    legacy.prepare("UPDATE m4_stream_meta SET value='1' WHERE key='schema_version'").run();
+    legacy.prepare("UPDATE m4_stream_meta SET value='2' WHERE key='accepted_blocks'").run();
+    legacy.close();
+
+    const resumed = writer(root, sink(pages));
+    assert.equal(resumed.accept(combined).accepted, false);
+    const sealed = await seal(resumed, root);
+    assert.equal(sealed.coverage.acceptedBlockCount, 3);
+    assert.equal(sealed.coverage.sessionCount, 1);
+    assert.equal(sealed.coverage.eventCount, 2);
+    assert.ok(sealed.coverage.pageCount >= 2);
+    resumed.close();
+    const migrated = new Database(databasePath, { readonly: true });
+    assert.deepEqual(migrated.prepare("SELECT key,value FROM m4_stream_meta WHERE key IN ('schema_version','accepted_blocks') ORDER BY key").all(), [
+      { key: 'accepted_blocks', value: '3' },
+      { key: 'schema_version', value: '2' },
+    ]);
+    migrated.close();
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('initializes a pinned empty database but rejects a nonempty invalid database before mutation', () => {
   const root = temporary(); const privateRoot = path.join(root, 'private'); const databasePath = path.join(privateRoot, 'identity.sqlite'); const pages = new Map();
   try {
