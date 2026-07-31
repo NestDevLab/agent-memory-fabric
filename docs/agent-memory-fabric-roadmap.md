@@ -282,7 +282,7 @@ No live installation, deployment, restart, migration, cutover, replay, archive
 copy or restore, cleanup, or deletion is accepted by this source stopping line.
 The operational M4 checklist remains open:
 
-- [ ] Backfill normalized user and assistant content from the v2 archive without reading native raw rows into v3.
+- [x] Backfill normalized user and assistant content from the v2 archive without reading native raw rows into v3.
 - [ ] Backfill the paused interval from native sources using the same deterministic filters.
 - [ ] Replay preserved outboxes and dead letters through the native adapter path.
 - [ ] Reconcile event counts, stable identifiers, digests, time ranges, edits, and tombstones.
@@ -298,6 +298,27 @@ The operational M4 checklist remains open:
 Acceptance: v3 covers the expected conversation history and paused interval,
 the compatibility API reads v3, rollback is proven, and cleanup targets are
 exactly enumerated before deletion.
+
+#### The paused interval has a different provenance
+
+The runtime pause fence was lifted on 2026-07-31 before the paused-native
+backfill ran, to end an eight-day archiving outage. RAW ingest resumed and the
+ordinary collectors are covering 2026-07-21 to 2026-07-31 from their retained
+cursors, so no conversation is lost — the native transcripts were never pruned.
+
+What that interval does not have is a pause checkpoint and capsule attesting its
+exact boundary, which every earlier interval does. Reconciliation must therefore
+treat it as ordinary collector output rather than an attested migration slice, or
+its counts will not tie out and the mismatch will read as data loss when it is
+not. That interval also lands in the v2 RAW archive and needs a later v2-archive
+backfill pass to appear in v3; the completion artifact for the first pass covers
+only the pre-pause set.
+
+A complete, verified pause set (`pause-manifest-v6-m4-20260731`, revision 1,
+signed, with matching checkpoints and capsules) is retained if the fence has to
+be re-armed for the final reconciliation. Earlier artifact generations are not
+usable: the 2026-07-24 checkpoints and capsules declare a manifest revision that
+was never generated, so they can never verify.
 
 ### M5 — Restore conversation-to-memory extraction
 
