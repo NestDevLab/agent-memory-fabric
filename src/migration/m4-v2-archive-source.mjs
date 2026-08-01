@@ -26,7 +26,7 @@ function predecessor(hex) {
   return value === 0n ? null : `lmsg_${(value - 1n).toString(16).padStart(64, '0')}`;
 }
 function validateFactory(value) {
-  if (!plain(value) || Object.keys(value).some(key => !['catalog','rawStore','ingestKeys','verifyCatalogBinding','auditDecrypt','integrityFor','identityCollector','startCheckpoint','pageLimit','maxCiphertextBytes'].includes(key))
+  if (!plain(value) || Object.keys(value).some(key => !['catalog','rawStore','ingestKeys','verifyCatalogBinding','auditDecrypt','integrityFor','identityCollector','startCheckpoint','pageLimit','maxCiphertextBytes','quarantine'].includes(key))
     || !objectLike(value.catalog) || typeof value.catalog.listM4V2LogicalGroups !== 'function'
     || !objectLike(value.rawStore) || typeof value.rawStore.getClientCiphertext !== 'function'
     || typeof value.verifyCatalogBinding !== 'function' || typeof value.auditDecrypt !== 'function'
@@ -42,12 +42,21 @@ function validateFactory(value) {
     || !Number.isSafeInteger(maxCiphertextBytes) || maxCiphertextBytes < 1024 || maxCiphertextBytes > RAW_EVENT_HTTP_MAX_BODY_BYTES) {
     fail('m4_v2_source_dependency_invalid');
   }
+  // Quarantine is opt-in: without it an unreadable row still stops the batch, which is
+  // the right default. Enabling it trades that for a bounded number of isolated rows, so
+  // one corrupt event cannot cost a multi-hour migration run. Exceeding maxRows still
+  // fails: at that point the corruption is systemic and must not be skipped quietly.
+  const quarantine = value.quarantine ?? null;
+  if (!(quarantine === null
+    || (plain(quarantine) && Object.keys(quarantine).length === 2
+      && Number.isSafeInteger(quarantine.maxRows) && quarantine.maxRows >= 1 && quarantine.maxRows <= 1000
+      && typeof quarantine.onRow === 'function'))) fail('m4_v2_source_dependency_invalid');
   let ingestKeys;
   try {
     normalizeIngestKeyRing(value.ingestKeys);
     ingestKeys = structuredClone(value.ingestKeys);
   } catch { fail('m4_v2_source_dependency_invalid'); }
-  return { ...value, ingestKeys, startCheckpoint, pageLimit, maxCiphertextBytes };
+  return { ...value, ingestKeys, startCheckpoint, pageLimit, maxCiphertextBytes, quarantine };
 }
 function validateOpen(value, startCheckpoint) {
   if (!exact(value, ['runId', 'phase', 'after', 'afterSequence', 'maxEvents'])
@@ -83,6 +92,7 @@ export function createM4V2ArchiveSource(input = {}) {
       let sequence = request.afterSequence;
       let after = null;
       let resume = null;
+      let quarantined = 0;
       if (request.afterSequence > 0) {
         const match = CHECKPOINT_ID.exec(request.after.id);
         const logicalMessageId = `lmsg_${match[1]}`;
@@ -113,6 +123,9 @@ export function createM4V2ArchiveSource(input = {}) {
             catch { fail('m4_v2_source_catalog_failed'); }
             if (resume && group?.logical?.logicalMessageId !== resume.logicalMessageId) fail('m4_v2_source_checkpoint_drift');
             const observations = [];
+            // Quarantine is per group, not per row: the projector needs a group's full
+            // observation set, so dropping one row would only move the failure downstream.
+            let groupQuarantined = null;
             for (const [index, catalogRow] of group.observations.entries()) {
               if (!isPotentialM4ConversationProjection(catalogRow.projection)) {
                 try {
@@ -130,7 +143,22 @@ export function createM4V2ArchiveSource(input = {}) {
                 observations.push(await readM4V2Observation({ catalogRow, envelope, ingestKeys: dependencies.ingestKeys,
                   migrationSequence: index + 1, verifyCatalogBinding: dependencies.verifyCatalogBinding,
                   auditDecrypt: dependencies.auditDecrypt, maxCiphertextBytes: dependencies.maxCiphertextBytes }));
-              } catch { fail('m4_v2_source_read_failed'); }
+              } catch (readError) {
+                if (dependencies.quarantine === null || quarantined >= dependencies.quarantine.maxRows) {
+                  fail('m4_v2_source_read_failed');
+                }
+                // Report the reason the reader gave, not this frame's code: an isolated group
+                // is only reviewable if the operator learns why it could not be read.
+                groupQuarantined = { contentId: catalogRow.contentId, migrationSequence: index + 1,
+                  reason: String(readError?.code || readError?.message || 'unknown') };
+                break;
+              }
+            }
+            if (groupQuarantined !== null) {
+              quarantined += 1;
+              dependencies.quarantine.onRow({ ...groupQuarantined,
+                logicalMessageId: group.logical.logicalMessageId });
+              continue;
             }
             let projected;
             try { projected = await projectM4V2LogicalGroup({ logical: group.logical, observations,
