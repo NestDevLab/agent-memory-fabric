@@ -51,9 +51,17 @@ function privateJson(filePath, code) {
 function configShape(value) {
   const v1 = ['schema', 'gate', 'fabricConfigPath', 'deliveryKeyRingPath', 'archiveConfigPath', 'leasePath', 'outboxRoot', 'progressRoot'];
   const v2 = [...v1, 'artifactRoot', 'manifestId', 'revision', 'catalogAttestationKeyPath', 'completionKeyPath'];
+  const v3 = [...v2, 'quarantineMaxRows'];
   if (!((value.schema === 'amf.m4-v2-backfill-operator/v1' && exact(value, v1))
-    || (value.schema === 'amf.m4-v2-backfill-operator/v2' && exact(value, v2)))
+    || (value.schema === 'amf.m4-v2-backfill-operator/v2' && exact(value, v2))
+    || (value.schema === 'amf.m4-v2-backfill-operator/v3' && exact(value, v3)))
     || !exact(value.gate, ['pauseManifestPath', 'pauseKeyPath', 'rollbackManifestPath', 'rollbackKeyPath'])) fail('m4_operator_config_invalid');
+  // v3 only adds the quarantine bound, so a v2 config keeps failing closed on an
+  // unreadable group. Declaring the bound is the operator's explicit consent to
+  // isolate a limited number of them instead of losing the whole run.
+  if (value.schema === 'amf.m4-v2-backfill-operator/v3'
+    && (!Number.isSafeInteger(value.quarantineMaxRows)
+      || value.quarantineMaxRows < 1 || value.quarantineMaxRows > 1000)) fail('m4_operator_config_invalid');
   for (const key of ['fabricConfigPath', 'deliveryKeyRingPath', 'archiveConfigPath', 'leasePath', 'outboxRoot', 'progressRoot']) absolute(value[key], 'm4_operator_config_invalid');
   for (const key of Object.keys(value.gate)) absolute(value.gate[key], 'm4_operator_config_invalid');
   if (value.schema === 'amf.m4-v2-backfill-operator/v1') return { ...structuredClone(value), completion: null };
@@ -206,9 +214,9 @@ function requireCatalogBaseline(baseline, current) {
   if (catalogDigest(baseline) !== catalogDigest(current)) fail('m4_operator_catalog_baseline_mismatch');
 }
 
-function operatorResult(result, completion = null) {
-  if (completion === null) return { schema: 'amf.m4-v2-backfill-operator-result/v1', operation: 'run', runId: result.runId, phase: result.phase, processed: result.processed, duplicates: result.duplicates, complete: result.complete };
-  return { schema: 'amf.m4-v2-backfill-operator-result/v2', operation: 'run', runId: result.runId, phase: result.phase, processed: result.processed, duplicates: result.duplicates, complete: result.complete,
+function operatorResult(result, completion = null, quarantined = []) {
+  if (completion === null) return { schema: 'amf.m4-v2-backfill-operator-result/v1', operation: 'run', runId: result.runId, phase: result.phase, processed: result.processed, duplicates: result.duplicates, complete: result.complete, quarantined };
+  return { schema: 'amf.m4-v2-backfill-operator-result/v2', operation: 'run', runId: result.runId, phase: result.phase, processed: result.processed, duplicates: result.duplicates, complete: result.complete, quarantined,
     completion: result.complete ? { state: 'published', digest: `sha256:${crypto.createHash('sha256').update(canonicalJson(completion), 'utf8').digest('hex')}` } : { state: 'pending', digest: null } };
 }
 
@@ -229,21 +237,27 @@ export async function runM4V2BackfillOperator(input = {}, options = {}) {
   if (baseline !== null) requireCatalogBaseline(baseline, beforeCatalog);
   const delivery = deliveryAdapter(prepared.delivery, options);
   const deliveryClock = options.deliveryClock || (() => new Date());
+  // Collected here so the run reports what it isolated: a quarantined group that is
+  // never surfaced is indistinguishable from one that was migrated.
+  const quarantined = [];
   const factories = {
     lease: async () => { revalidate(prepared); const lease = new deps.BackfillLease({ leasePath: prepared.config.leasePath }); await lease.acquire(); let held = true; const release = async () => { if (!held) return; await lease.release(); held = false; }; return { async acquire() { if (!held) throw new Error('m4_operator_lease_not_held'); }, async heartbeat() { if (!held) throw new Error('m4_operator_lease_not_held'); return lease.heartbeat(); }, release, close: release }; },
     source: async ({ sourceCheckpoint }) => { revalidate(prepared); const store = deps.createFabricStoreFromEnv({ rootPath: prepared.fabric.rootPath, env: prepared.fabric.env }); try { const source = createM4V2ArchiveSource({ catalog: store.catalog, rawStore: store.rawStore, ingestKeys: prepared.fabric.ingestKeys, startCheckpoint: sourceCheckpoint,
       verifyCatalogBinding: async value => ({ owner: store.rawStore.opaqueTags('raw-owner', value.actorId).includes(value.ownerTag), source: store.rawStore.opaqueTags('raw-source', value.sourceInstanceId).includes(value.sourceTag) }),
-      auditDecrypt: async value => { await store.audit({ actor: 'm4-backfill-operator', action: 'raw_redacted_decrypt_intent', outcome: 'authorized', targetId: value.eventId, details: { transport: 'm4-v2-backfill' } }); return { recorded: true, eventId: value.eventId, contentId: value.contentId }; }, integrityFor: delivery.integrityFor });
+      auditDecrypt: async value => { await store.audit({ actor: 'm4-backfill-operator', action: 'raw_redacted_decrypt_intent', outcome: 'authorized', targetId: value.eventId, details: { transport: 'm4-v2-backfill' } }); return { recorded: true, eventId: value.eventId, contentId: value.contentId }; }, integrityFor: delivery.integrityFor,
+      ...(prepared.config.quarantineMaxRows
+        ? { quarantine: { maxRows: prepared.config.quarantineMaxRows, onRow: entry => quarantined.push(entry) } }
+        : {}) });
       return { open: source.open.bind(source), close: () => store.close() }; } catch (error) { try { await store.close?.(); } catch {} throw error; } },
     outbox: async () => { revalidate(prepared); return new deps.ConversationEventPlaintextOutbox({ rootPath: prepared.config.outboxRoot, resolveIntegrityKey: delivery.resolveIntegrityKey, clock: () => deliveryClock().getTime(), ...(options.nonceFactory ? { nonceFactory: options.nonceFactory } : {}) }); },
     archive: async () => { revalidate(prepared); const archive = prepared.archive.kind === 'sqlite' ? new deps.SqliteConversationArchive({ filename: prepared.archive.filename, resolveIntegrityKey: delivery.resolveIntegrityKey, resolveExpiresAt: delivery.resolveExpiresAt, cursorKey: delivery.cursorKey }) : new deps.PostgresConversationArchive({ connectionString: prepared.archive.connectionString, resolveIntegrityKey: delivery.resolveIntegrityKey, resolveExpiresAt: delivery.resolveExpiresAt, cursorKey: delivery.cursorKey }); return { archive, resolveIntegrityKey: delivery.resolveIntegrityKey }; },
     checkpointStore: async ({ runId, phase, planDigest }) => { revalidate(prepared); return new deps.M4ProgressStore({ rootPath: prepared.config.progressRoot, runId, phase, planDigest }); },
   };
   const result = await runM4V2Backfill({ gateInput: prepared.gate, maxEvents: request.maxEvents, confirmedPlanDigest: prepared.runnerPlan.planDigest, factories });
-  if (prepared.completion === null) return operatorResult(result, null);
+  if (prepared.completion === null) return operatorResult(result, null, quarantined);
   const afterCatalog = await catalogAttestation(prepared, deps);
   requireCatalogBaseline(baseline, afterCatalog);
-  if (!result.complete) return operatorResult(result, prepared.completion);
+  if (!result.complete) return operatorResult(result, prepared.completion, quarantined);
   let completion;
   try {
     completion = await createM4V2ArchiveBackfillCompletion({ manifestId: prepared.completion.manifestId, revision: prepared.completion.revision,
@@ -252,5 +266,5 @@ export async function runM4V2BackfillOperator(input = {}, options = {}) {
       completionKeyDocument: prepared.completion.completionKeyDocument });
     writePrivateArtifact(prepared.completion.artifactRoot, 'v2-backfill', prepared.completion.manifestId, prepared.completion.revision, completion);
   } catch (error) { if (error?.code === 'private_artifact_target_exists') fail('m4_operator_completion_artifact_exists'); if (error?.code?.startsWith?.('m4_')) throw error; fail('m4_operator_completion_failed'); }
-  return operatorResult(result, completion);
+  return operatorResult(result, completion, quarantined);
 }

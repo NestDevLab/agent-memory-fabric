@@ -321,3 +321,30 @@ test('postgres selection is delayed, uses only the configured adapter, and close
     await assert.rejects(() => runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: digest('f') }, { dependencies }), { code: 'm4_operator_confirmation_invalid' }); assert.deepEqual([pg, sqlite], [0, 0]); const result = await runM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1, confirmedPlanDigest: plan.confirmationDigest }, { dependencies }); assert.equal(result.complete, true); assert.deepEqual([pg, sqlite, storeClosed, archiveClosed, leaseReleased], [1, 0, 1, 1, 1]);
   } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
 });
+
+// v3 only adds the quarantine bound. A v2 config must keep failing closed, and an
+// out-of-range bound must be rejected before any run touches the archive.
+test('the v3 config accepts a bounded quarantine and rejects an invalid bound', async () => {
+  const item = setup();
+  try {
+    enableV2Completion(item);
+    const base = JSON.parse(fs.readFileSync(item.files.config));
+    const planned = await planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1 });
+    assert.equal(typeof planned.confirmationDigest, 'string');
+
+    write(item.files.config, { ...base, schema: 'amf.m4-v2-backfill-operator/v3', quarantineMaxRows: 5 });
+    const v3 = await planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1 });
+    assert.equal(typeof v3.confirmationDigest, 'string');
+    assert.notEqual(v3.confirmationDigest, planned.confirmationDigest);
+
+    for (const bound of [0, -1, 1001, 1.5, '5', null]) {
+      write(item.files.config, { ...base, schema: 'amf.m4-v2-backfill-operator/v3', quarantineMaxRows: bound });
+      await assert.rejects(() => planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1 }),
+        { code: 'm4_operator_config_invalid' });
+    }
+
+    write(item.files.config, { ...base, schema: 'amf.m4-v2-backfill-operator/v2', quarantineMaxRows: 5 });
+    await assert.rejects(() => planM4V2BackfillOperator({ configPath: item.files.config, maxEvents: 1 }),
+      { code: 'm4_operator_config_invalid' });
+  } finally { fs.rmSync(item.root, { recursive: true, force: true }); }
+});
