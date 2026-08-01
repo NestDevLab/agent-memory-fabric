@@ -86,7 +86,7 @@ function catalogRow(value, envelope) {
     ownerTag: OWNER, sourceTag: SOURCE, createdAt: '2026-07-21T12:00:10Z' };
 }
 
-async function fixture({ ingestKeys = ROTATING_KEYS, identityCollector = null } = {}) {
+async function fixture({ ingestKeys = ROTATING_KEYS, identityCollector = null, quarantine = null, unreadableRow = null } = {}) {
   const catalog = new MemoryCatalog();
   const envelopes = new Map();
   const values = fixtureValues();
@@ -103,9 +103,14 @@ async function fixture({ ingestKeys = ROTATING_KEYS, identityCollector = null } 
   catalog.listM4V2LogicalGroups = async input => { calls.pages += 1; calls.pageRequests.push(structuredClone(input)); return enumerate(input); };
   class TestRawStore { async getClientCiphertext(contentId) { calls.raw.push(contentId); return structuredClone(envelopes.get(contentId)); } }
   const source = createM4V2ArchiveSource({ catalog, rawStore: new TestRawStore(), ingestKeys,
-  verifyCatalogBinding: async input => { calls.binding.push(structuredClone(input)); return { owner: true, source: true }; },
+  verifyCatalogBinding: async input => {
+    calls.binding.push(structuredClone(input));
+    if (unreadableRow !== null && calls.binding.length === unreadableRow) throw new Error('synthetic_unreadable_row');
+    return { owner: true, source: true };
+  },
   auditDecrypt: async input => { calls.audit.push(structuredClone(input)); return { recorded: true, eventId: input.eventId, contentId: input.contentId }; },
-  integrityFor: integrityFor(), identityCollector, startCheckpoint: START, pageLimit: 2 });
+  integrityFor: integrityFor(), identityCollector, startCheckpoint: START, pageLimit: 2,
+  ...(quarantine ? { quarantine } : {}) });
   return { catalog, envelopes, values, source, calls };
 }
 
@@ -178,6 +183,32 @@ test('missing RAW is tolerated only for catalog-proven non-conversation metadata
   const conversation = conversationEnv.values.find(value => value.projection.role === 'user');
   conversationEnv.envelopes.delete(conversationEnv.catalog.rawEventsV2.get(conversation.event.eventId).contentId);
   await exactError(async () => { await rows(conversationEnv.source); }, 'm4_v2_source_read_failed');
+});
+
+// A single unreadable row used to stop a multi-hour migration run. Quarantine is opt-in so
+// the default stays fail-closed, and bounded so systemic corruption is never skipped quietly.
+test('an unreadable row is quarantined only when opted in, and the bound still fails closed', async () => {
+  const strict = await fixture({ unreadableRow: 2 });
+  await exactError(async () => { await rows(strict.source); }, 'm4_v2_source_read_failed');
+
+  const isolated = [];
+  const tolerant = await fixture({ unreadableRow: 2,
+    quarantine: { maxRows: 5, onRow: entry => isolated.push(entry) } });
+  const produced = await rows(tolerant.source);
+  assert.equal(isolated.length, 1);
+  // The reader's own classification is what an operator can act on, not the raw throw.
+  assert.equal(isolated[0].reason, 'm4_v2_reader_binding_verification_failed');
+  assert.equal(typeof isolated[0].contentId, 'string');
+  assert.equal(typeof isolated[0].logicalMessageId, 'string');
+  assert.equal(produced.length > 0, true);
+  assert.equal(JSON.stringify(isolated).includes('visible '), false);
+
+  const capped = await fixture({ unreadableRow: 2,
+    quarantine: { maxRows: 1, onRow: () => {} }, ingestKeys: ROTATING_KEYS });
+  assert.equal((await rows(capped.source)).length > 0, true);
+
+  await assert.rejects(async () => fixture({ quarantine: { maxRows: 0, onRow: () => {} } }),
+    error => error?.code === 'm4_v2_source_dependency_invalid');
 });
 
 test('forwards the projector-only identity collector without placing identity data in rows', async () => {
