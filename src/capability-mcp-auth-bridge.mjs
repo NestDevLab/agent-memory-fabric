@@ -1,5 +1,11 @@
 const CAPS = new Set(['search', 'read', 'propose', 'proposal_status', 'status']);
-const SCOPE = /^[a-z][a-z0-9_-]{1,31}:[a-z0-9._-]{1,96}$/;
+const SCOPE = /^[a-z][a-z0-9_-]{1,31}(?::[a-z0-9._-]{1,96}){1,2}$/;
+// A `prefix:*` entry grants every scope under that owner. The trailing colon is
+// kept in the comparison so `vitae:*` cannot also match `vitae-canary:...`.
+function scopeGranted(allowed, scope) {
+  return allowed.includes('*') || allowed.includes(scope)
+    || allowed.some(entry => entry.endsWith(':*') && scope.startsWith(entry.slice(0, -1)));
+}
 function fail() { const error = new Error('capability_mcp_auth_bridge_invalid'); error.code = error.message; throw error; }
 function freeze(value) { if (value && typeof value === 'object' && !Object.isFrozen(value)) { for (const child of Object.values(value)) freeze(child); Object.freeze(value); } return value; }
 function plain(value) { try { return value && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; } catch { return false; } }
@@ -43,7 +49,7 @@ export function createCapabilityMcpAuthorizationBridge(config) {
     if (!requestedScopes || !originalScopes || canonical(requestedScopes) !== canonical(originalScopes) || mode === 'deny' || !allowedCapabilities.includes(request.capability)
       || (request.purpose !== null && !permissions.includes('*') && !permissions.includes(`purpose:${request.purpose}`))
       || (request.capability === 'propose' && mode === 'read_only_scoped')) return null;
-    if (requestedScopes.some(scope => !SCOPE.test(scope) || !Object.hasOwn(registeredScopes, scope) || ((mode === 'scoped' || mode === 'read_only_scoped') && !allowedScopes.includes('*') && !allowedScopes.includes(scope)))) return null;
+    if (requestedScopes.some(scope => !SCOPE.test(scope) || !Object.hasOwn(registeredScopes, scope) || ((mode === 'scoped' || mode === 'read_only_scoped') && !scopeGranted(allowedScopes, scope)))) return null;
     let context = null;
     if (request.purpose === 'conversation_recall') {
       if (typeof input.contextToken !== 'string' || !versions.length || !['search', 'read'].includes(request.capability)) return null;

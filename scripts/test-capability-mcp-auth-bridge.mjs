@@ -84,3 +84,26 @@ test('real composition resolves stable grants across search and later opaque rea
   const readArgs = { id: found.items[0].id, scopes: ['team:synthetic'], purpose: 'conversation_recall' }; const read = make(readArgs, signedToken(buildCapabilityContextRequest('read', readArgs), { nonce: 'nonce_synthetic0003' }), 'read'); const result = await call(read, 2, 'read', readArgs);
   assert.equal(result.ok, true); assert.equal(result.resource.text, 'Synthetic text'); assert.deepEqual(resolveCalls, ['search', 'read']);
 });
+
+function scopedBridge(allowedScopes, requestScopes) {
+  const scopedArgs = { query: 'synthetic', scopes: requestScopes, purpose: 'conversation_recall' };
+  return createCapabilityMcpAuthorizationBridge({
+    authContext: { actor: 'actor_synthetic', policy: { ...policy, allowedScopes } },
+    requestArguments: scopedArgs, contextToken: 'token',
+    contextVerifier: { verify() { return { actor: 'actor_synthetic', purpose: 'conversation_recall', runtime: 'runtime', conversationKind: 'direct', contextTags: {}, nonce: 'hidden', issuedAt: 'hidden', requestDigest: 'hidden' }; } },
+    policies: { ...policies, scopes: Object.fromEntries(requestScopes.map(scope => [scope, {}])) },
+    validateContextActorBinding() {},
+  });
+}
+function searchFor(scopes) { return { capability: 'search', permission: 'fabric:search', purpose: 'conversation_recall', scopes }; }
+
+test('owner-first scope names carrying three segments are accepted', async () => {
+  const scopes = ['vitae:person:joseph'];
+  assert.notEqual(await scopedBridge(scopes, scopes).authorize(searchFor(scopes)), null);
+});
+
+test('a prefix grant covers scopes under that owner and refuses a lookalike owner', async () => {
+  assert.notEqual(await scopedBridge(['tirrenia:*'], ['tirrenia:room:ops']).authorize(searchFor(['tirrenia:room:ops'])), null);
+  assert.equal(await scopedBridge(['vitae:*'], ['vitae-canary:person:joseph']).authorize(searchFor(['vitae-canary:person:joseph'])), null);
+  assert.equal(await scopedBridge(['shared:*'], ['vitae:person:joseph']).authorize(searchFor(['vitae:person:joseph'])), null);
+});
