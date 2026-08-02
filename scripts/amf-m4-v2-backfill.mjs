@@ -17,4 +17,14 @@ function parse(argv) {
 }
 export async function runM4V2BackfillCli(argv = process.argv) { const request = parse(argv); return request.operation === 'plan' ? planM4V2BackfillOperator(request.input) : runM4V2BackfillOperator(request.input); }
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
-if (isMain) runM4V2BackfillCli().then(value => process.stdout.write(`${JSON.stringify({ ok: true, ...value })}\n`)).catch(error => { process.stderr.write(`${JSON.stringify({ ok: false, error: error?.code?.startsWith?.('m4_operator_') ? error.code : 'm4_operator_failed' })}\n`); process.exitCode = 78; });
+// `m4_operator_failed` only means the code did not start with `m4_operator_`, so
+// reporting it alone hides which layer failed. The code is a fixed identifier,
+// never event content, so it is safe to surface; messages and causes are not.
+const SAFE_CODE = /^[a-z][a-z0-9_]{2,63}$/;
+export function reportedFailure(error) {
+  const code = typeof error?.code === 'string' && SAFE_CODE.test(error.code) ? error.code : null;
+  if (code?.startsWith('m4_operator_')) return { error: code };
+  // Only widen the compact contract where it would otherwise say nothing useful.
+  return code === null ? { error: 'm4_operator_failed' } : { error: 'm4_operator_failed', failedWith: code };
+}
+if (isMain) runM4V2BackfillCli().then(value => process.stdout.write(`${JSON.stringify({ ok: true, ...value })}\n`)).catch(error => { process.stderr.write(`${JSON.stringify({ ok: false, ...reportedFailure(error) })}\n`); process.exitCode = 78; });
