@@ -1107,7 +1107,10 @@ test('MCP sessions enforce caps, TTL, and token revocation with policy revalidat
 test('session reader capability is explicit and unconfigured access returns 503', async () => {
   await withServer(async ({ api }) => {
     const initialized = await api('/mcp/test-client/test-identity', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } }) });
-    assert.equal(initialized.body.result.capabilities.experimental.sessionReader, false);
+    const experimental = initialized.body.result.capabilities.experimental;
+    assert.equal(experimental.sessionReader.configured, false);
+    assert.ok(Object.values(experimental).every(value => value && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype));
+    assert.equal('streamableHttpGet' in experimental, false);
     const input = { query: 'x', purpose: 'continuity_resume' };
     const contextToken = contextTokenFor({ purpose: input.purpose, operation: 'sessions_search', input });
     const unavailable = await api('/v2/sessions/search', { method: 'POST', body: JSON.stringify({ ...input, contextToken }) });

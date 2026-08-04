@@ -498,7 +498,7 @@ function getMcpSessionHeader(req) {
 function buildInitializeResult(protocolVersion, sessionReader) {
   return {
     protocolVersion: protocolVersion || '2024-11-05',
-    capabilities: { tools: {}, experimental: { sessionReader: Boolean(sessionReader?.configured), streamableHttpGet: false } },
+    capabilities: { tools: {}, experimental: { sessionReader: { configured: Boolean(sessionReader?.configured) } } },
     serverInfo: { name: SERVICE_NAME, version: SERVICE_VERSION }
   };
 }

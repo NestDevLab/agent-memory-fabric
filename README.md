@@ -247,8 +247,9 @@ with a signed time window. Signed `canonicalScopes` are checked against the
 server registry before session access. REST GET clients send the signed context
 only in `X-AMF-Context-Token`; dedicated actors cannot place it in
 the query string. The session reader is configured automatically when the
-ingest key ring and catalog are available; otherwise MCP advertises
-`sessionReader: false` and the routes return `session_reader_unconfigured` (`503`).
+ingest key ring and catalog are available; MCP advertises its state as
+`sessionReader: { configured: false }` when it is unavailable, and the routes return
+`session_reader_unconfigured` (`503`).
 
 MCP advertises `memory_search`, `memory_read`, `memory_propose`, `context_search`,
 `memory_proposal_status`, `sessions_search`,
