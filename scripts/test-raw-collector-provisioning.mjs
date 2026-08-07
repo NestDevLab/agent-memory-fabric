@@ -147,6 +147,39 @@ test('dry-run validates the complete transaction with zero filesystem writes', (
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('dry-run accepts namespaced principals and rejects malformed ones', () => {
+  const { root, options } = fixture();
+  try {
+    const actors = ['agent:codex', 'service:memory-curator', 'client:obsidian:amf-canary'];
+    const registry = json(options.authRegistryPath);
+    registry.rows = actors.map((actor, index) => ({
+      tokenSha256: crypto.createHash('sha256').update(`existing-${index}`).digest('hex'),
+      active: true, actor, mode: 'scoped', allowedScopes: [`agent:${actor}`], permissions: RAW_COLLECTOR_PERMISSIONS
+    }));
+    privateJson(options.authRegistryPath, registry);
+    privateJson(options.policyPath, {
+      actors: Object.fromEntries(actors.map(actor => [actor, { mode: 'scoped', allowedScopes: [`agent:${actor}`] }])),
+      scopes: Object.fromEntries(actors.map(actor => [`agent:${actor}`, { backendUserId: actor }]))
+    });
+
+    const observed = instrumentWrites(() => provisionRawCollector({ ...options, dryRun: true }));
+    assert.equal(observed.result.ok, true); assert.deepEqual(observed.calls, []);
+
+    registry.rows[0].actor = ':agent:codex';
+    privateJson(options.authRegistryPath, registry);
+    assert.throws(() => provisionRawCollector({ ...options, dryRun: true }), /collector_auth_registry_invalid/);
+
+    privateJson(options.authRegistryPath, { rows: actors.map((actor, index) => ({
+      tokenSha256: crypto.createHash('sha256').update(`existing-${index}`).digest('hex'),
+      active: true, actor, mode: 'scoped', allowedScopes: [`agent:${actor}`], permissions: RAW_COLLECTOR_PERMISSIONS
+    })) });
+    const policy = json(options.policyPath);
+    policy.actors['agent/codex'] = policy.actors['agent:codex']; delete policy.actors['agent:codex'];
+    privateJson(options.policyPath, policy);
+    assert.throws(() => provisionRawCollector({ ...options, dryRun: true }), /collector_policy_invalid/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('live provisioning requires root while non-root dry-run remains read-only', () => {
   const { root, options } = fixture();
   try {
