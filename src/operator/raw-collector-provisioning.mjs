@@ -9,7 +9,7 @@ import { canonicalJson } from '../ingest/transcripts/canonical.mjs';
 export const RAW_COLLECTOR_HANDOFF_SCHEMA = 'amf.raw-collector-handoff/v1';
 export const RAW_COLLECTOR_PERMISSIONS = Object.freeze(['memory:status', 'raw:ingest']);
 
-const SAFE_PRINCIPAL = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const SAFE_PRINCIPAL = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$/;
 const SAFE_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const HEX_DIGEST = /^[a-f0-9]{64}$/;
 const AUTH_MODES = new Set(['allow_all', 'scoped', 'read_only_scoped', 'deny']);
