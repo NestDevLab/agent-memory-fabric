@@ -24,12 +24,11 @@ the narrow write grants so an older server cannot accidentally reinterpret a
 read wildcard as a write privilege.
 
 Fabric persists the nine `--tool` values in both the registry row and policy
-actor, filters `tools/list` from that server-side allowlist, and rejects an
-unlisted `tools/call` before dispatch. A `client:mcp:*` row without a persisted
-tool list receives no MCP tools: migrate it through the provisioner before it
-can be used. Legacy `allowedScopes: ['*']` remains read-compatible but is never
-a proposal grant; migrate proposal principals to an explicit non-wildcard
-`proposeScopes` list.
+actor, filters `tools/list` from the server-side fixed contract, and rejects an
+unlisted `tools/call` before dispatch. A `client:mcp:*` row with a missing,
+partial, or injected tool list receives no MCP tools. Legacy `allowedScopes:
+['*']` remains read-compatible but is never a proposal grant; migrate proposal
+principals to an explicit non-wildcard `proposeScopes` list.
 
 `document_delete` appends a revisioned tombstone. Both document writes retain
 the caller's expected revision and idempotency key; Fabric audits every allow,
@@ -75,6 +74,15 @@ registry, policy, key ring, and handoff as one rollback-capable transaction.
 Provision Codex and Claude with the same four grants and tools, then install
 their generated client configuration only after a conflict-free Agentwheel
 dry-run.
+
+To rotate an existing `client:mcp:codex` or `client:mcp:claude` principal to
+this schema, repeat the same complete grant set with `--migrate` and a fresh,
+absent handoff destination. The provisioner requires exactly one existing
+registry row, policy actor, and matching context-key version for that principal;
+it replaces all three and writes a pre-change backup and new handoff in the
+same rollback-capable transaction. It never widens an existing actor in place
+and never overwrites an old handoff. Applying this to a live principal remains
+behind the privileged G6/G9 rollout gates.
 
 Before enabling a client, verify `tools/list`, a read wildcard over registered
 scopes, denied proposal outside `--propose-scope`, denied write outside

@@ -415,6 +415,10 @@ test('server enforces the persisted interactive MCP tool surface and rejects leg
       token: 'unmigrated-mcp-token', active: true, actor: 'client:mcp:claude', mode: 'scoped',
       allowedScopes: ['domain:main-lab'], permissions: ['memory:status']
     });
+    registry.rows.push({
+      token: 'unknown-mcp-token', active: true, actor: 'client:mcp:other', mode: 'scoped',
+      allowedScopes: ['domain:main-lab'], permissions: ['memory:status'], tools: [...INTERACTIVE_MCP_TOOLS]
+    });
     writeRegistry();
 
     const headers = { authorization: 'Bearer interactive-mcp-token' };
@@ -450,6 +454,25 @@ test('server enforces the persisted interactive MCP tool surface and rejects leg
       body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'memory_status', arguments: {} } })
     });
     assert.equal(unmigratedCall.body.error.message, 'mcp_tool_forbidden');
+
+    const unknownActor = await api('/mcp/other/interactive', {
+      method: 'POST', headers: { authorization: 'Bearer unknown-mcp-token' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/list' })
+    });
+    assert.deepEqual(unknownActor.body.result.tools, []);
+
+    registry.rows.find(row => row.actor === 'client:mcp:codex').tools = ['context_search'];
+    writeRegistry();
+    const injected = await api('/mcp/codex/interactive', {
+      method: 'POST', headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 6, method: 'tools/list' })
+    });
+    assert.deepEqual(injected.body.result.tools, []);
+    const injectedCall = await api('/mcp/codex/interactive', {
+      method: 'POST', headers: { ...headers, 'mcp-session-id': injected.response.headers.get('mcp-session-id') },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'context_search', arguments: {} } })
+    });
+    assert.equal(injectedCall.body.error.message, 'mcp_tool_forbidden');
 
     const proposal = await api('/v2/memory/proposals', {
       method: 'POST', headers: { authorization: 'Bearer legacy-proposal-wildcard-token', 'idempotency-key': 'legacy-wildcard-denied' },

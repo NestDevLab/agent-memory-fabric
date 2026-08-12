@@ -700,16 +700,30 @@ export function provisionScopedConsumer({ authRegistryPath, policyPath, contextK
       throw fail('recall_consumer_vault_unregistered');
     }
     const hasContextKey = Object.hasOwn(contextRing.keys, profile.contextKeyVersion);
+    const migrating = profile.migrate === true;
+    if (migrating && !actorRow && !policyActor && !hasContextKey) {
+      throw fail('recall_consumer_migration_conflict');
+    }
     if (actorRow || policyActor || hasContextKey) {
-      const scopesExact = scopeEntries.every(entry => object(entry));
-      if (exactConsumerRow(actorRow, scopes, profile) && exactPolicyActor(policyActor, scopes, profile)
-        && scopesExact && hasContextKey) {
-        throw fail('recall_consumer_already_provisioned');
+      if (migrating) {
+        const rowVersions = actorRow ? optionalList(actorRow, 'contextKeyVersions') : [];
+        const policyVersions = policyActor ? optionalList(policyActor, 'contextKeyVersions') : [];
+        if (!actorRow || !policyActor || !hasContextKey
+          || rowVersions.length !== 1 || rowVersions[0] !== profile.contextKeyVersion
+          || policyVersions.length !== 1 || policyVersions[0] !== profile.contextKeyVersion) {
+          throw fail('recall_consumer_migration_conflict');
+        }
+      } else {
+        const scopesExact = scopeEntries.every(entry => object(entry));
+        if (exactConsumerRow(actorRow, scopes, profile) && exactPolicyActor(policyActor, scopes, profile)
+          && scopesExact && hasContextKey) {
+          throw fail('recall_consumer_already_provisioned');
+        }
+        throw fail('recall_consumer_provisioning_conflict');
       }
-      throw fail('recall_consumer_provisioning_conflict');
     }
 
-    const safeResult = { ok: true, schema: profile.handoffSchema, action: 'provision', dryRun,
+    const safeResult = { ok: true, schema: profile.handoffSchema, action: migrating ? 'migrate' : 'provision', dryRun,
       actor: profile.actor, contextKeyVersion: profile.contextKeyVersion,
       permissions: profile.permissions, scopes, scopeSetSha256,
       handoffPath: resolved.handoff, backupPath: null };
@@ -728,7 +742,10 @@ export function provisionScopedConsumer({ authRegistryPath, policyPath, contextK
     if (profile.allowedVaults) newRow.allowedVaults = profile.allowedVaults;
     if (profile.tools) newRow.tools = profile.tools;
     if (profile.operationGrants) Object.assign(newRow, profile.operationGrants);
-    const nextRegistry = withAuthRows(registry, extracted.wrapper, [...extracted.rows, newRow]);
+    const nextRows = migrating
+      ? extracted.rows.map(row => row.actor === profile.actor ? newRow : row)
+      : [...extracted.rows, newRow];
+    const nextRegistry = withAuthRows(registry, extracted.wrapper, nextRows);
     const newScopes = Object.fromEntries(scopes
       .map(scope => [scope, policy.scopes[scope] || { backendUserId }]));
     const nextPolicy = { ...policy,

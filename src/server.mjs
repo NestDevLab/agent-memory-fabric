@@ -15,6 +15,7 @@ import { RAW_EVENT_HTTP_MAX_BODY_BYTES } from './ingest/raw-event-contract.mjs';
 import { validatePamRuntimePrivateDirFromEnv } from './operator/pam-runtime-private-dir.mjs';
 import { isVerifiedMigrationPause, loadVerifiedMigrationPauseFromEnv } from './migration-pause.mjs';
 import { CONVERSATION_EVENT_V3_PATH } from './ingest/http-conversation-event-v3-endpoint.mjs';
+import { hasExactInteractiveMcpTools, INTERACTIVE_MCP_TOOLS, isInteractiveMcpActor, isMcpClientActor } from './operator/interactive-mcp-contract.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
@@ -519,11 +520,11 @@ function buildInitializeResult(protocolVersion, sessionReader) {
 }
 
 function isMcpToolAllowed(actor, policy, name) {
-  if (Array.isArray(policy.tools)) return policy.tools.includes(name);
-  // Interactive MCP principals must be migrated to a persisted server-side
-  // allowlist.  Do not fall back to the generic Fabric surface for an older
-  // handoff that lacks one.
-  return !String(actor).startsWith('client:mcp:');
+  if (isMcpClientActor(actor)) {
+    return isInteractiveMcpActor(actor) && hasExactInteractiveMcpTools(policy.tools)
+      && INTERACTIVE_MCP_TOOLS.includes(name);
+  }
+  return !Array.isArray(policy.tools) || policy.tools.includes(name);
 }
 
 function buildToolsListResult(actor, policy) {
@@ -649,11 +650,11 @@ function buildToolsListResult(actor, policy) {
     }
   ];
   const byName = new Map(allTools.map(tool => [tool.name, tool]));
-  return {
-    tools: Array.isArray(policy.tools)
-      ? policy.tools.map(name => byName.get(name)).filter(Boolean)
-      : allTools.filter(tool => isMcpToolAllowed(actor, policy, tool.name))
-  };
+  if (isMcpClientActor(actor)) {
+    return { tools: isInteractiveMcpActor(actor) && hasExactInteractiveMcpTools(policy.tools)
+      ? INTERACTIVE_MCP_TOOLS.map(name => byName.get(name)) : [] };
+  }
+  return { tools: allTools.filter(tool => isMcpToolAllowed(actor, policy, tool.name)) };
 }
 
 async function executeMcpMethod({ body, actor, policy, policies, fabricStore, canonicalStore, documentStore,

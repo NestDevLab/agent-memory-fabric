@@ -1,12 +1,11 @@
 import crypto from 'node:crypto';
 
 import { provisionScopedConsumer } from './recall-consumer-provisioning.mjs';
+import { INTERACTIVE_MCP_TOOLS } from './interactive-mcp-contract.mjs';
+
+export { INTERACTIVE_MCP_TOOLS } from './interactive-mcp-contract.mjs';
 
 export const INTERACTIVE_MCP_HANDOFF_SCHEMA = 'amf.interactive-mcp-handoff/v2';
-export const INTERACTIVE_MCP_TOOLS = Object.freeze([
-  'memory_search', 'memory_read', 'memory_propose', 'memory_proposal_status',
-  'documents_search', 'document_read', 'document_upsert', 'document_delete', 'memory_status'
-]);
 export const INTERACTIVE_MCP_PERMISSIONS = Object.freeze([
   'memory:search', 'memory:read', 'memory:propose', 'memory:status',
   'documents:search', 'documents:read', 'documents:write',
@@ -30,7 +29,7 @@ const OPTION_KEYS = new Set([
   'runtime', 'authRegistryPath', 'policyPath', 'contextKeyRingPath', 'handoffPath', 'backupRoot',
   'backendUserId', 'serviceOwnerUid', 'policyRevision', 'endpoint',
   'readScopes', 'proposeScopes', 'readVaults', 'writeVaults', 'tools',
-  'dryRun', 'clock', 'randomBytes', 'faultAt'
+  'dryRun', 'clock', 'randomBytes', 'faultAt', 'migrate'
 ]);
 
 function fail(code) { throw new Error(code); }
@@ -83,7 +82,7 @@ function profileFor(runtime, operationGrants, tools, policyRevision, targetEndpo
     sessionOwnerActors: [], mode: 'scoped', purpose: 'operator_review', purposes: interactiveMcpPurposes(tools),
     tools, handoffSchema: INTERACTIVE_MCP_HANDOFF_SCHEMA,
     backupSlug: `interactive-mcp-${runtime}`, policyRevision, endpoint: targetEndpoint,
-    requireRegisteredScopes: true, requireRegisteredVaults: true
+    requireRegisteredScopes: true, requireRegisteredVaults: true, migrate: false
   };
 }
 
@@ -99,7 +98,9 @@ export function interactiveMcpProfile(options = {}) {
     writeVaults: normalizedGrant(options.writeVaults, SAFE_VAULT, 'interactive_mcp_write_vault_invalid')
   });
   const tools = normalizedTools(options.tools);
-  return profileFor(options.runtime, operationGrants, tools, options.policyRevision, endpoint(options.endpoint));
+  const profile = profileFor(options.runtime, operationGrants, tools, options.policyRevision, endpoint(options.endpoint));
+  if (options.migrate !== undefined && typeof options.migrate !== 'boolean') fail('interactive_mcp_option_invalid');
+  return { ...profile, migrate: options.migrate === true };
 }
 
 export function provisionInteractiveMcp(options = {}) {

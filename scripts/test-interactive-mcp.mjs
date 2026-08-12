@@ -67,6 +67,25 @@ test('rejects wildcard writes, unknown scopes, incomplete grants, and asymmetric
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('migrates an existing interactive principal atomically without widening it', () => {
+  const { root, options } = fixture();
+  try {
+    const beforeRegistry = JSON.parse(fs.readFileSync(options.authRegistryPath, 'utf8'));
+    const beforeRow = beforeRegistry.rows.find(row => row.actor === 'client:mcp:codex');
+    const beforeKey = JSON.parse(fs.readFileSync(options.contextKeyRingPath, 'utf8')).keys['ctx-mcp-codex-v1'];
+    const migratedHandoffPath = path.join(path.dirname(options.handoffPath), 'codex-migrated');
+    const result = asRoot(() => provisionInteractiveMcp({ ...options, migrate: true, handoffPath: migratedHandoffPath }));
+    assert.equal(result.action, 'migrate'); assert.ok(result.backupPath); assert.ok(fs.existsSync(result.backupPath));
+    const afterRow = JSON.parse(fs.readFileSync(options.authRegistryPath, 'utf8')).rows.find(row => row.actor === 'client:mcp:codex');
+    assert.notEqual(afterRow.tokenSha256, beforeRow.tokenSha256); assert.deepEqual(afterRow.tools, INTERACTIVE_MCP_TOOLS);
+    const afterKey = JSON.parse(fs.readFileSync(options.contextKeyRingPath, 'utf8')).keys['ctx-mcp-codex-v1'];
+    assert.notEqual(afterKey, beforeKey);
+    assert.equal(loadInteractiveMcpHandoff(migratedHandoffPath).actor, 'client:mcp:codex');
+    assert.throws(() => asRoot(() => provisionInteractiveMcp({ ...options, runtime: 'claude', migrate: true,
+      handoffPath: path.join(path.dirname(options.handoffPath), 'claude-missing') })), /recall_consumer_migration_conflict/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('the bridge exposes the complete common MCP surface and forwards only operation grants', async () => {
   const { root, options } = fixture(); const fabric = await fakeFabric();
   try {

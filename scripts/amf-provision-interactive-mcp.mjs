@@ -11,7 +11,10 @@ function parseArguments(argv) {
   const output = {};
   for (let index = 0; index < argv.length; index += 1) {
     const option = argv[index];
-    if (option === '--dry-run') { if (output.dryRun) throw new Error('cli_argument_duplicate'); output.dryRun = true; continue; }
+    if (option === '--dry-run' || option === '--migrate') {
+      const key = option === '--dry-run' ? 'dryRun' : 'migrate';
+      if (output[key]) throw new Error('cli_argument_duplicate'); output[key] = true; continue;
+    }
     if (option === '--read-scope' || option === '--propose-scope' || option === '--read-vault' || option === '--write-vault' || option === '--tool') {
       const value = argv[++index]; if (!value || value.startsWith('--')) throw new Error('cli_argument_value_required');
       const key = option === '--read-scope' ? 'readScopes' : option === '--propose-scope' ? 'proposeScopes'
