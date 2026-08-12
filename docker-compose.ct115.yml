@@ -1,5 +1,5 @@
 services:
-  mem0-gateway:
+  agent-memory-fabric:
     image: node:22-bookworm-slim
     working_dir: /app
     command: ["node", "src/server.mjs"]
@@ -9,8 +9,8 @@ services:
     volumes:
       - ./:/app
       # Production deployments should mount a secret file and set:
-      # MEM0_AUTH_REGISTRY_PATH=/run/secrets/mem0-auth-registry.json
-      # - /root/.openclaw/secrets/mem0-auth-registry.json:/run/secrets/mem0-auth-registry.json:ro
+      # AMF_AUTH_REGISTRY_PATH=/run/secrets/agent-memory-fabric-auth.json
+      # - /run/secrets/agent-memory-fabric-auth.json:/run/secrets/agent-memory-fabric-auth.json:ro
     ports:
       - "8787:8787"
     logging:

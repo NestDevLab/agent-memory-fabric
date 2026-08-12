@@ -25,7 +25,7 @@ function requestWithToken(token) {
 }
 
 test('local auth registry loads rows without network access', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mem0-auth-registry-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-auth-registry-'));
   const registryPath = path.join(dir, 'auth-registry.json');
   fs.writeFileSync(registryPath, JSON.stringify({
     rows: [
@@ -49,7 +49,7 @@ test('local auth registry loads rows without network access', async () => {
   }));
 
   const originalEnv = {
-    MEM0_AUTH_REGISTRY_PATH: process.env.MEM0_AUTH_REGISTRY_PATH,
+    AMF_AUTH_REGISTRY_PATH: process.env.AMF_AUTH_REGISTRY_PATH,
     N8N_API_BASE_URL: process.env.N8N_API_BASE_URL,
     N8N_API_KEY: process.env.N8N_API_KEY,
     N8N_AUTH_TABLE_ID: process.env.N8N_AUTH_TABLE_ID
@@ -57,7 +57,7 @@ test('local auth registry loads rows without network access', async () => {
   const originalFetch = globalThis.fetch;
 
   try {
-    process.env.MEM0_AUTH_REGISTRY_PATH = registryPath;
+    process.env.AMF_AUTH_REGISTRY_PATH = registryPath;
     process.env.N8N_API_BASE_URL = 'http://127.0.0.1:1';
     process.env.N8N_API_KEY = 'placeholder-n8n-key';
     process.env.N8N_AUTH_TABLE_ID = 'placeholder-table-id';
@@ -93,14 +93,14 @@ test('local auth registry loads rows without network access', async () => {
 
 test('delegated session owners and context key versions are strict, active and non-chainable', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-auth-delegation-'));
-  const registryPath = path.join(dir, 'auth.json'); const previous = process.env.MEM0_AUTH_REGISTRY_PATH;
+  const registryPath = path.join(dir, 'auth.json'); const previous = process.env.AMF_AUTH_REGISTRY_PATH;
   const collector = { token: 'collector-token', active: true, actor: 'ct110-hermes-vitae', mode: 'scoped',
     allowedScopes: ['agent:ct110-hermes-vitae'], permissions: ['raw:ingest'] };
   const consumer = { token: 'consumer-token', active: true, actor: 'agent:vitae', mode: 'read_only_scoped',
     allowedScopes: ['agent:vitae'], permissions: ['sessions:read', 'purpose:conversation_recall'],
     sessionOwnerActors: ['ct110-hermes-vitae'], contextKeyVersions: ['ctx-vitae-v1'] };
   try {
-    process.env.MEM0_AUTH_REGISTRY_PATH = registryPath;
+    process.env.AMF_AUTH_REGISTRY_PATH = registryPath;
     const check = async rows => {
       fs.writeFileSync(registryPath, JSON.stringify({ rows }));
       return loadAuthRegistry({ forceRefresh: true });
@@ -121,8 +121,8 @@ test('delegated session owners and context key versions are strict, active and n
       [collector, { ...consumer, actor: ['agent:vitae'] }]
     ]) await assert.rejects(check(rows), /auth_registry_invalid_row/);
   } finally {
-    if (previous === undefined) delete process.env.MEM0_AUTH_REGISTRY_PATH;
-    else process.env.MEM0_AUTH_REGISTRY_PATH = previous;
+    if (previous === undefined) delete process.env.AMF_AUTH_REGISTRY_PATH;
+    else process.env.AMF_AUTH_REGISTRY_PATH = previous;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
