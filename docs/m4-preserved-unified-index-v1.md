@@ -64,5 +64,5 @@ To run the optional real-adapter path through the unified source and delivery
 test, point `AMF_RAW_ADAPTER_PATH` at a raw-adapter checkout:
 
 ```sh
-AMF_RAW_ADAPTER_PATH=/path/to/mem0-scoped-agent-plugin node --test scripts/test-m4-unified-logical-group-source.mjs
+AMF_RAW_ADAPTER_PATH=/path/to/agent-memory-fabric-runtime-adapters node --test scripts/test-m4-unified-logical-group-source.mjs
 ```

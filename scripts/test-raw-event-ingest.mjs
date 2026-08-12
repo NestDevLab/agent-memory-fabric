@@ -109,8 +109,8 @@ async function withRawServer(run, { bodyReadTimeoutMs, rawIngestBodyBytes } = {}
     { token: 'attacker-token', active: true, actor: 'other-owner', mode: 'allow_all', allowedScopes: '*', permissions: 'raw:ingest' },
     { token: 'attacker-reader-token', active: true, actor: 'other-owner', mode: 'allow_all', allowedScopes: '*', permissions: 'sessions:read,raw:decrypt,purpose:conversation_recall,purpose:incident_debug' }
   ] }));
-  const previous = process.env.MEM0_AUTH_REGISTRY_PATH;
-  process.env.MEM0_AUTH_REGISTRY_PATH = registryPath;
+  const previous = process.env.AMF_AUTH_REGISTRY_PATH;
+  process.env.AMF_AUTH_REGISTRY_PATH = registryPath;
   const rawStore = new MemoryRawStore({ encryptionKey: crypto.randomBytes(32).toString('base64') });
   const catalog = new MemoryCatalog();
   const store = new FabricStore({ rawStore, catalog, ingestKeyRing: KEY_RING });
@@ -125,7 +125,7 @@ async function withRawServer(run, { bodyReadTimeoutMs, rawIngestBodyBytes } = {}
   try { await run({ root, baseUrl, api, store, rawStore, catalog }); }
   finally {
     await new Promise(resolve => server.close(resolve));
-    if (previous === undefined) delete process.env.MEM0_AUTH_REGISTRY_PATH; else process.env.MEM0_AUTH_REGISTRY_PATH = previous;
+    if (previous === undefined) delete process.env.AMF_AUTH_REGISTRY_PATH; else process.env.AMF_AUTH_REGISTRY_PATH = previous;
     fs.rmSync(root, { recursive: true, force: true });
   }
 }

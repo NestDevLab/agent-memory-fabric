@@ -4,8 +4,8 @@ Target shape:
 
 - clients talk only to this fabric
 - the fabric enforces actor, scope and permission policy
-- backend memory engines remain abstracted and replaceable
-- public proposals enter an idempotent queue, never the Mem0 write API
+- canonical memory reads are served through PAM
+- public proposals enter an idempotent queue and never write directly to canonical memory
 - v2 proposals carry the complete `amf-memory/v1` record, rationale and expected revision
 - PAM 0.6 structural validation is a dedicated adapter with shared conformance fixtures; restricted records are sealed and envelope/AAD/key fields fail closed
 - proposal RAW is content-addressed and encrypted independently from catalog metadata
@@ -25,8 +25,7 @@ Surfaces:
 
 Trust rules:
 
-- Mem0/OpenMemory is not the security boundary
-- policy and audit live in the fabric
+- policy and audit live in the fabric; PAM is the canonical read authority
 - transcript output is redacted by default: only bounded normalized text from
   authenticated v2 `user`/`assistant` observations is returned after durable audit
 - textual session search is context-first and decrypts only the newest bounded
@@ -77,9 +76,9 @@ Compatibility:
 
 - integrated document corpus + recall + curation release identity is `0.6.0`
   (building on recall hardening introduced in `0.5.4`)
-- product identity is `agent-memory-fabric`; `mem0-gateway` is a legacy alias
-- `AMF_AUTH_REGISTRY_PATH` supersedes `MEM0_AUTH_REGISTRY_PATH`
-- `AMF_POLICY_PATH` supersedes `MEM0_GATEWAY_POLICY_PATH`
+- product identity is `agent-memory-fabric`
+- `AMF_AUTH_REGISTRY_PATH` and `AMF_POLICY_PATH` are the only supported
+  authorization configuration inputs
 - v1 search, SSE and Streamable HTTP continue to work during migration
 - v1 REST responses carry deprecation/sunset headers and missing add idempotency keys are derived deterministically
 - the process is disabled unless `AMF_SERVER_ENABLED=true` and an explicit policy path is set; the CT113 source overlay builds a pinned image and mounts policy/auth/key material read-only

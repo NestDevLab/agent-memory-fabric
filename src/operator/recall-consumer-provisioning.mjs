@@ -221,10 +221,24 @@ function normalizedList(value, { wildcard = false } = {}) {
   return output;
 }
 
-function optionalList(row, field) {
+function optionalList(row, field, options = {}) {
   if (!Object.hasOwn(row, field)) return [];
   if (!Array.isArray(row[field])) throw fail('recall_consumer_auth_registry_invalid');
-  return normalizedList(row[field]);
+  return normalizedList(row[field], options);
+}
+
+function validateOperationGrants(entry, code) {
+  const scopeFields = ['readScopes', 'proposeScopes'];
+  const vaultFields = ['readVaults', 'writeVaults'];
+  for (const fields of [scopeFields, vaultFields]) {
+    const present = fields.filter(field => Object.hasOwn(entry, field));
+    if (!present.length) continue;
+    if (present.length !== fields.length) throw fail(code);
+    try {
+      normalizedList(entry[fields[0]], { wildcard: true });
+      normalizedList(entry[fields[1]]);
+    } catch { throw fail(code); }
+  }
 }
 
 function authRows(registry) {
@@ -244,7 +258,8 @@ function validateAuthRegistry(registry) {
       throw fail('recall_consumer_auth_registry_invalid');
     }
     normalizedList(row.allowedScopes, { wildcard: true }); normalizedList(row.permissions, { wildcard: true });
-    optionalList(row, 'sessionOwnerActors'); optionalList(row, 'contextKeyVersions'); optionalList(row, 'allowedVaults');
+    optionalList(row, 'sessionOwnerActors'); optionalList(row, 'contextKeyVersions'); optionalList(row, 'allowedVaults'); optionalList(row, 'tools');
+    validateOperationGrants(row, 'recall_consumer_auth_registry_invalid');
     for (const version of optionalList(row, 'contextKeyVersions')) {
       const existing = contextVersionOwners.get(version);
       if (existing && existing !== row.actor) throw fail('recall_consumer_auth_registry_invalid');
@@ -274,7 +289,9 @@ function withAuthRows(registry, wrapper, rows) {
 }
 
 function validatePolicy(policy) {
-  if (!exactKeys(policy, ['actors', 'scopes']) || !object(policy.actors) || !object(policy.scopes)) {
+  const policyKeys = Object.keys(policy || {}).sort().join('\0');
+  if ((policyKeys !== ['actors', 'scopes'].join('\0') && policyKeys !== ['actors', 'scopes', 'vaults'].join('\0'))
+    || !object(policy.actors) || !object(policy.scopes)) {
     throw fail('recall_consumer_policy_invalid');
   }
   const contextVersionOwners = new Map();
@@ -283,6 +300,8 @@ function validatePolicy(policy) {
       throw fail('recall_consumer_policy_invalid');
     }
     if (entry.allowedScopes !== undefined) normalizedList(entry.allowedScopes, { wildcard: true });
+    if (entry.tools !== undefined) normalizedList(entry.tools);
+    validateOperationGrants(entry, 'recall_consumer_policy_invalid');
     if (entry.sessionOwnerActors !== undefined) {
       if (!Array.isArray(entry.sessionOwnerActors)) throw fail('recall_consumer_policy_invalid');
       normalizedList(entry.sessionOwnerActors);
@@ -299,6 +318,14 @@ function validatePolicy(policy) {
   for (const [scope, entry] of Object.entries(policy.scopes)) {
     if (!SAFE_ID.test(scope) || !object(entry) || typeof entry.backendUserId !== 'string' || !entry.backendUserId) {
       throw fail('recall_consumer_policy_invalid');
+    }
+  }
+  if (policy.vaults !== undefined) {
+    if (!object(policy.vaults)) throw fail('recall_consumer_policy_invalid');
+    for (const [vaultId, entry] of Object.entries(policy.vaults)) {
+      if (!SAFE_ID.test(vaultId) || !exactKeys(entry, ['canonicalId']) || entry.canonicalId !== vaultId) {
+        throw fail('recall_consumer_policy_invalid');
+      }
     }
   }
   return policy;
@@ -345,6 +372,8 @@ function exactConsumerRow(row, scopes, profile) {
     const keys = ['tokenSha256', 'active', 'actor', 'mode', 'allowedScopes', 'permissions', 'contextKeyVersions'];
     if (profile.sessionOwnerActors.length) keys.push('sessionOwnerActors');
     if (profile.allowedVaults) keys.push('allowedVaults');
+    if (profile.tools) keys.push('tools');
+    if (profile.operationGrants) keys.push('readScopes', 'proposeScopes', 'readVaults', 'writeVaults');
     return exactKeys(row, keys)
       && row.active === true && row.actor === profile.actor && row.mode === profile.mode
       && canonicalJson(normalizedList(row.allowedScopes)) === canonicalJson(scopes)
@@ -353,6 +382,12 @@ function exactConsumerRow(row, scopes, profile) {
         === canonicalJson(profile.sessionOwnerActors))
       && (!profile.allowedVaults || canonicalJson(normalizedList(row.allowedVaults))
         === canonicalJson(profile.allowedVaults))
+      && (!profile.tools || canonicalJson(normalizedList(row.tools)) === canonicalJson(profile.tools))
+      && (!profile.operationGrants || (canonicalJson(normalizedList(row.readScopes, { wildcard: true }))
+        === canonicalJson(profile.operationGrants.readScopes)
+        && canonicalJson(normalizedList(row.proposeScopes)) === canonicalJson(profile.operationGrants.proposeScopes)
+        && canonicalJson(normalizedList(row.readVaults, { wildcard: true })) === canonicalJson(profile.operationGrants.readVaults)
+        && canonicalJson(normalizedList(row.writeVaults)) === canonicalJson(profile.operationGrants.writeVaults)))
       && canonicalJson(normalizedList(row.contextKeyVersions)) === canonicalJson([profile.contextKeyVersion])
       && typeof row.tokenSha256 === 'string' && HEX_DIGEST.test(row.tokenSha256) && !Object.hasOwn(row, 'token');
   } catch { return false; }
@@ -362,11 +397,19 @@ function exactPolicyActor(entry, scopes, profile) {
   try {
     const keys = ['mode', 'allowedScopes', 'contextKeyVersions'];
     if (profile.sessionOwnerActors.length) keys.push('sessionOwnerActors');
+    if (profile.tools) keys.push('tools');
+    if (profile.operationGrants) keys.push('readScopes', 'proposeScopes', 'readVaults', 'writeVaults');
     return exactKeys(entry, keys)
       && entry.mode === profile.mode
       && canonicalJson(normalizedList(entry.allowedScopes)) === canonicalJson(scopes)
       && (!profile.sessionOwnerActors.length || canonicalJson(normalizedList(entry.sessionOwnerActors))
         === canonicalJson(profile.sessionOwnerActors))
+      && (!profile.tools || canonicalJson(normalizedList(entry.tools)) === canonicalJson(profile.tools))
+      && (!profile.operationGrants || (canonicalJson(normalizedList(entry.readScopes, { wildcard: true }))
+        === canonicalJson(profile.operationGrants.readScopes)
+        && canonicalJson(normalizedList(entry.proposeScopes)) === canonicalJson(profile.operationGrants.proposeScopes)
+        && canonicalJson(normalizedList(entry.readVaults, { wildcard: true })) === canonicalJson(profile.operationGrants.readVaults)
+        && canonicalJson(normalizedList(entry.writeVaults)) === canonicalJson(profile.operationGrants.writeVaults)))
       && canonicalJson(normalizedList(entry.contextKeyVersions)) === canonicalJson([profile.contextKeyVersion]);
   } catch { return false; }
 }
@@ -537,14 +580,18 @@ function stageHandoff({ handoffParent, handoffName, serviceOwnerUid, bearer, con
     keys: { [profile.contextKeyVersion]: contextKey } };
   const manifest = { schema: profile.handoffSchema, actor: profile.actor,
     contextKeyVersion: profile.contextKeyVersion, permissions: profile.permissions,
-    scopes, scopeSetSha256, purpose: profile.purpose, createdAt: clock().toISOString() };
+    purpose: profile.purpose, createdAt: clock().toISOString() };
+  if (profile.handoffOperationGrants) Object.assign(manifest, profile.operationGrants);
+  else Object.assign(manifest, { scopes, scopeSetSha256 });
   if (profile.sessionOwnerActors.length) manifest.sessionOwnerActors = profile.sessionOwnerActors;
-  if (profile.allowedVaults) manifest.allowedVaults = profile.allowedVaults;
+  if (profile.allowedVaults && !profile.handoffOperationGrants) manifest.allowedVaults = profile.allowedVaults;
   if (profile.runtime) manifest.runtime = profile.runtime;
   if (profile.profile) manifest.profile = profile.profile;
   if (profile.sessionDescriptor) manifest.sessionDescriptor = profile.sessionDescriptor;
   if (profile.policyRevision) manifest.policyRevision = profile.policyRevision;
   if (profile.endpoint) manifest.endpoint = profile.endpoint;
+  if (profile.tools) manifest.tools = profile.tools;
+  if (profile.purposes) manifest.purposes = profile.purposes;
   const files = {
     'bearer.token': Buffer.from(`${bearer}\n`, 'utf8'),
     'context-key-ring.json': canonicalBytes(contextRing),
@@ -595,6 +642,8 @@ export function provisionScopedConsumer({ authRegistryPath, policyPath, contextK
   if (typeof backendUserId !== 'string' || !SAFE_ID.test(backendUserId) || !Number.isSafeInteger(serviceOwnerUid)
     || serviceOwnerUid < 0 || typeof dryRun !== 'boolean') throw fail('recall_consumer_option_invalid');
   const scopes = profile.scopes;
+  const registeredScopes = profile.registeredScopes || scopes;
+  const registeredVaults = profile.registeredVaults || [];
   const scopeSetSha256 = crypto.createHash('sha256').update(canonicalJson(scopes), 'utf8').digest('hex');
   if (!dryRun && process.geteuid?.() !== 0) throw fail('recall_consumer_root_required');
 
@@ -643,23 +692,45 @@ export function provisionScopedConsumer({ authRegistryPath, policyPath, contextK
     validateContextActorBindings(extracted, policy, contextRing);
     const actorRow = extracted.rows.find(row => row.actor === profile.actor) || null;
     const policyActor = policy.actors[profile.actor] || null;
-    const scopeEntries = scopes.map(scope => policy.scopes[scope] || null);
+    const scopeEntries = registeredScopes.map(scope => policy.scopes[scope] || null);
+    if (profile.requireRegisteredScopes && scopeEntries.some(entry => !object(entry))) {
+      throw fail('recall_consumer_scope_unregistered');
+    }
+    if (profile.requireRegisteredVaults && registeredVaults.some(vaultId => !object(policy.vaults?.[vaultId]))) {
+      throw fail('recall_consumer_vault_unregistered');
+    }
     const hasContextKey = Object.hasOwn(contextRing.keys, profile.contextKeyVersion);
+    const migrating = profile.migrate === true;
+    if (migrating && !actorRow && !policyActor && !hasContextKey) {
+      throw fail('recall_consumer_migration_conflict');
+    }
     if (actorRow || policyActor || hasContextKey) {
-      const scopesExact = scopeEntries.every(entry => object(entry));
-      if (exactConsumerRow(actorRow, scopes, profile) && exactPolicyActor(policyActor, scopes, profile)
-        && scopesExact && hasContextKey) {
-        throw fail('recall_consumer_already_provisioned');
+      if (migrating) {
+        const rowVersions = actorRow ? optionalList(actorRow, 'contextKeyVersions') : [];
+        const policyVersions = policyActor ? optionalList(policyActor, 'contextKeyVersions') : [];
+        if (!actorRow || !policyActor || !hasContextKey
+          || rowVersions.length !== 1 || rowVersions[0] !== profile.contextKeyVersion
+          || policyVersions.length !== 1 || policyVersions[0] !== profile.contextKeyVersion) {
+          throw fail('recall_consumer_migration_conflict');
+        }
+      } else {
+        const scopesExact = scopeEntries.every(entry => object(entry));
+        if (exactConsumerRow(actorRow, scopes, profile) && exactPolicyActor(policyActor, scopes, profile)
+          && scopesExact && hasContextKey) {
+          throw fail('recall_consumer_already_provisioned');
+        }
+        throw fail('recall_consumer_provisioning_conflict');
       }
-      throw fail('recall_consumer_provisioning_conflict');
     }
 
-    const safeResult = { ok: true, schema: profile.handoffSchema, action: 'provision', dryRun,
+    const safeResult = { ok: true, schema: profile.handoffSchema, action: migrating ? 'migrate' : 'provision', dryRun,
       actor: profile.actor, contextKeyVersion: profile.contextKeyVersion,
       permissions: profile.permissions, scopes, scopeSetSha256,
       handoffPath: resolved.handoff, backupPath: null };
     if (profile.sessionOwnerActors.length) safeResult.sessionOwnerActors = profile.sessionOwnerActors;
     if (profile.allowedVaults) safeResult.allowedVaults = profile.allowedVaults;
+    if (profile.tools) safeResult.tools = profile.tools;
+    if (profile.operationGrants) Object.assign(safeResult, profile.operationGrants);
     if (dryRun) return safeResult;
 
     const tokenDigests = new Set(extracted.rows.map(row => row.tokenSha256));
@@ -669,7 +740,12 @@ export function provisionScopedConsumer({ authRegistryPath, policyPath, contextK
       contextKeyVersions: [profile.contextKeyVersion] };
     if (profile.sessionOwnerActors.length) newRow.sessionOwnerActors = profile.sessionOwnerActors;
     if (profile.allowedVaults) newRow.allowedVaults = profile.allowedVaults;
-    const nextRegistry = withAuthRows(registry, extracted.wrapper, [...extracted.rows, newRow]);
+    if (profile.tools) newRow.tools = profile.tools;
+    if (profile.operationGrants) Object.assign(newRow, profile.operationGrants);
+    const nextRows = migrating
+      ? extracted.rows.map(row => row.actor === profile.actor ? newRow : row)
+      : [...extracted.rows, newRow];
+    const nextRegistry = withAuthRows(registry, extracted.wrapper, nextRows);
     const newScopes = Object.fromEntries(scopes
       .map(scope => [scope, policy.scopes[scope] || { backendUserId }]));
     const nextPolicy = { ...policy,
@@ -679,6 +755,8 @@ export function provisionScopedConsumer({ authRegistryPath, policyPath, contextK
     if (profile.sessionOwnerActors.length) {
       nextPolicy.actors[profile.actor].sessionOwnerActors = profile.sessionOwnerActors;
     }
+    if (profile.tools) nextPolicy.actors[profile.actor].tools = profile.tools;
+    if (profile.operationGrants) Object.assign(nextPolicy.actors[profile.actor], profile.operationGrants);
     const nextContextRing = { ...contextRing, keys: { ...contextRing.keys,
       [profile.contextKeyVersion]: contextKey } };
     const nextExtracted = validateAuthRegistry(nextRegistry); const validatedNextPolicy = validatePolicy(nextPolicy);

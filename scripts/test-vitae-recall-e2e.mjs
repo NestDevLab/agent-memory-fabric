@@ -104,7 +104,7 @@ test('collector-owned Hermes RAW is recalled by Vitae through exact delegation a
     keys: { 'ctx-existing-v1': Buffer.alloc(32, 44).toString('base64') } };
   privateJson(contextPath, oldContextRing);
   const handoffPath = path.join(handoffs, 'vitae');
-  const previousRegistry = process.env.MEM0_AUTH_REGISTRY_PATH;
+  const previousRegistry = process.env.AMF_AUTH_REGISTRY_PATH;
   let server;
   try {
     const serviceOwnerUid = process.geteuid();
@@ -114,7 +114,7 @@ test('collector-owned Hermes RAW is recalled by Vitae through exact delegation a
     const bearer = fs.readFileSync(path.join(handoffPath, 'bearer.token'), 'utf8').trim();
     const consumerRing = JSON.parse(fs.readFileSync(path.join(handoffPath, 'context-key-ring.json'), 'utf8'));
     const serverRing = JSON.parse(fs.readFileSync(contextPath, 'utf8'));
-    process.env.MEM0_AUTH_REGISTRY_PATH = authPath;
+    process.env.AMF_AUTH_REGISTRY_PATH = authPath;
     const catalog = new MemoryCatalog(); let tick = Date.parse('2026-07-12T20:00:00Z');
     const store = new FabricStore({ rawStore: new MemoryRawStore({ encryptionKey: Buffer.alloc(32, 45).toString('base64') }),
       catalog, ingestKeyRing: KEY_RING, legacyV1Writes: false, clock: () => new Date(tick += 1) });
@@ -352,8 +352,8 @@ test('collector-owned Hermes RAW is recalled by Vitae through exact delegation a
       consumerRing.keys[RECALL_CONSUMER_CONTEXT_KEY_VERSION]);
   } finally {
     if (server) await new Promise(resolve => server.close(resolve));
-    if (previousRegistry === undefined) delete process.env.MEM0_AUTH_REGISTRY_PATH;
-    else process.env.MEM0_AUTH_REGISTRY_PATH = previousRegistry;
+    if (previousRegistry === undefined) delete process.env.AMF_AUTH_REGISTRY_PATH;
+    else process.env.AMF_AUTH_REGISTRY_PATH = previousRegistry;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

@@ -126,6 +126,7 @@ export class MemoryDocumentStore {
     return structuredClone(row);
   }
   search(request) { return searchRows([...this.heads.values()], request); }
+  listVaultIds() { return [...new Set([...this.revisions.values()].map(row => row.vaultId))].sort(); }
   health() { return { healthy: true, backend: 'memory', documents: this.heads.size }; }
 }
 
@@ -203,6 +204,7 @@ export class SqliteDocumentStore {
       ORDER BY r.path,r.document_id LIMIT ?`).all(...request.vaultIds, request.query, request.query, request.limit ?? 20).map(mapSqlite);
     return searchRows(rows, request);
   }
+  listVaultIds() { return this.db.prepare('SELECT DISTINCT vault_id FROM document_revisions_v1 ORDER BY vault_id').all().map(row => row.vault_id); }
   health() { return { healthy: true, backend: 'sqlite', documents: this.db.prepare('SELECT count(*) AS count FROM document_heads_v1').get().count }; }
   close() { if (this.db.open) this.db.close(); }
 }
@@ -285,6 +287,10 @@ export class PostgresDocumentStore {
       ORDER BY r.path,r.document_id LIMIT $3`, [request.vaultIds, request.query, request.limit ?? 20])).rows.map(mapPostgres);
     return searchRows(rows, request);
   }
+  async listVaultIds() {
+    await this.ready();
+    return (await this.pool.query('SELECT DISTINCT vault_id FROM agent_memory_fabric.document_revisions_v1 ORDER BY vault_id')).rows.map(row => row.vault_id);
+  }
   async health() { await this.ready(); const result = await this.pool.query('SELECT count(*)::bigint AS count FROM agent_memory_fabric.document_heads_v1'); return { healthy: true, backend: 'postgresql', documents: Number(result.rows[0].count) }; }
   async close() { await this.pool.end(); }
 }
@@ -302,5 +308,5 @@ export function createDocumentStoreFromEnv(env = process.env) {
 
 export function createUnconfiguredDocumentStore(reason = 'document_store_unconfigured') {
   const fail = async () => failure(reason, 503);
-  return { configured: false, kind: 'unconfigured', upsert: fail, delete: fail, search: fail, read: fail, health: async () => ({ healthy: false, backend: 'unconfigured', reason }), close: async () => {} };
+  return { configured: false, kind: 'unconfigured', upsert: fail, delete: fail, search: fail, read: fail, listVaultIds: fail, health: async () => ({ healthy: false, backend: 'unconfigured', reason }), close: async () => {} };
 }

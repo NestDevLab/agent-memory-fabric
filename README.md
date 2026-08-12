@@ -98,13 +98,12 @@ events.
 
 ## Auth registry
 
-Set `AMF_AUTH_REGISTRY_PATH` to a local JSON registry. The legacy
-`MEM0_AUTH_REGISTRY_PATH` name remains supported. Relative paths resolve from the
-repo root; deployments should use an absolute mounted secret path.
+Set `AMF_AUTH_REGISTRY_PATH` to a local JSON registry. Relative paths resolve
+from the repo root; deployments should use an absolute mounted secret path.
 
 ```bash
 AMF_AUTH_REGISTRY_PATH=/run/secrets/agent-memory-fabric-auth.json
-MEM0_AUTH_CACHE_TTL_MS=15000
+AMF_AUTH_CACHE_TTL_MS=15000
 ```
 
 ```json
@@ -208,14 +207,20 @@ Success uses `{ "ok": true, "data": ..., "meta": ... }`; errors use
 - `GET /v2/sessions/:id/transcript?purpose=...&view=redacted|original`
 - `GET /v2/status`
 
-The proposal body is exactly `{record,rationale,expectedRevision?}`. `record`
-must conform to PAM 0.6 `amf-memory/v1`: canonical scope IDs, exact fields and
-strict timestamps/provenance/lifecycle. `confidence` is required and exactly
+The proposal endpoint accepts exactly one of two bodies. A canonical proposal
+is `{record,rationale,expectedRevision?}`: `record` must conform to PAM 0.6
+`amf-memory/v1` with canonical scope IDs, exact fields and strict
+timestamps/provenance/lifecycle. `confidence` is required and exactly
 `{score,basis,assessedAt}` with a finite `[0,1]` score, approved basis and UTC
-timestamp. Restricted/confidential and
-person/relationship records must carry a sealed AES-256-GCM envelope with
-canonical base64, 12-byte IV, 16-byte tag, opaque `kekId`/`keyRef`, and the PAM
-canonical AAD digest. A successful REST or MCP acknowledgement exposes
+timestamp. Restricted/confidential and person/relationship canonical records
+must carry a sealed AES-256-GCM envelope with canonical base64, 12-byte IV,
+16-byte tag, opaque `kekId`/`keyRef`, and the PAM canonical AAD digest.
+
+A candidate proposal is `{scope,text,metadata?,infer?}`. It is an encrypted
+queued curation candidate, not a canonical-memory write; it does not relax the
+sealed-record requirement above. Runtime adapters use this form for
+person/relationship observations because they do not possess the canonical
+record key. A successful REST or MCP acknowledgement exposes
 `{status,proposalId,duplicate,idempotencyKey}`; the last field is the exact
 authoritative retry key accepted or derived by the Fabric.
 
@@ -258,7 +263,7 @@ MCP advertises `memory_search`, `memory_read`, `memory_propose`, `context_search
 
 `POST /v1/memory/add` remains available with HTTP `200`, deprecation/sunset
 headers and a deterministic derived idempotency key when an old client sends none. It reports the accepted
-proposal as `queued`/non-canonical, and never calls `Mem0.add()` directly. Search
+proposal as `queued`/non-canonical, and never writes directly to canonical memory. Search
 v1 and both MCP transports remain compatible.
 
 ## Run locally

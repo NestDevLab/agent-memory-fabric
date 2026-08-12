@@ -13,6 +13,8 @@ import { buildContextRequest } from '../src/access-contract.mjs';
 import { CanonicalPamBridge, CuratorReceiptCoordinator, MemoryReceiptLedger } from '../src/canonical-memory-bridge.mjs';
 import { MemoryDocumentStore } from '../src/document-store.mjs';
 import { aggregatePauseCheckpointInputs, createPauseManifest, verifyPauseManifest } from '../src/migration-pause.mjs';
+import { INTERACTIVE_MCP_TOOLS } from '../src/operator/interactive-mcp-provisioning.mjs';
+import { INTERACTIVE_MCP_PROPOSAL_CANDIDATE_SCHEMA } from '../src/operator/interactive-mcp-contract.mjs';
 
 const testPolicyPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'config', 'policies.example.json');
 const CONTEXT_RING = { currentKeyVersion: 'ctx-v1', keys: { 'ctx-v1': Buffer.alloc(32, 7).toString('base64') } };
@@ -80,7 +82,7 @@ function canonicalProposal(text, scope = 'main-lab', revision = 1) {
 
 async function withServer(run, { sessionOptions, clock, configuredSessionReader = true, conversationSessionReaderConfigured = configuredSessionReader,
   sessionReader: sessionReaderOverride, conversationSessionReader: conversationSessionReaderOverride, extractorSessionReader,
-  fabricStore: fabricStoreOverride, backend: backendOverride,
+  fabricStore: fabricStoreOverride,
   canonicalStore, documentStore, contextVerifier, receiptCoordinator, routeManifestSetup, migrationPause } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-server-'));
   const registryPath = path.join(dir, 'auth.json');
@@ -147,25 +149,8 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
   };
   const writeRegistry = () => fs.writeFileSync(registryPath, JSON.stringify(registry));
   writeRegistry();
-  const originalRegistry = process.env.MEM0_AUTH_REGISTRY_PATH;
-  process.env.MEM0_AUTH_REGISTRY_PATH = registryPath;
-  let backendAdds = 0;
-  const backend = backendOverride || {
-    kind: 'test-backend',
-    configured: true,
-    async search({ backendUserId, query }) {
-      if (query === 'explode') {
-        const error = new Error('/secret/path provider payload');
-        error.body = { raw: 'private provider response' };
-        throw error;
-      }
-      return { items: [{ id: 'memory-1', memory: query, userId: backendUserId }], total: 1, source: 'test' };
-    },
-    async add() {
-      backendAdds += 1;
-      throw new Error('backend_add_must_not_be_called');
-    }
-  };
+  const originalRegistry = process.env.AMF_AUTH_REGISTRY_PATH;
+  process.env.AMF_AUTH_REGISTRY_PATH = registryPath;
   const fabricStore = fabricStoreOverride || makeStore();
   const sessionReader = sessionReaderOverride || {
     kind: 'test-session-reader',
@@ -187,7 +172,7 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
   fs.chmodSync(routeManifestPath, 0o600);
   const effectiveRouteManifestPath = routeManifestSetup
     ? routeManifestSetup({ dir, routeManifestPath }) || routeManifestPath : routeManifestPath;
-  const server = createAgentMemoryFabricServer({ backend, fabricStore, canonicalStore,
+  const server = createAgentMemoryFabricServer({ fabricStore, canonicalStore,
     documentStore,
     contextVerifier: effectiveContextVerifier, routeManifestPath: effectiveRouteManifestPath, receiptCoordinator,
     sessionReader: configuredSessionReader ? sessionReader : undefined,
@@ -210,18 +195,17 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
     return { response, body: text ? JSON.parse(text) : null };
   };
   try {
-    await run({ api, baseUrl, fabricStore, registry, writeRegistry, routeManifestPath: effectiveRouteManifestPath,
-      getBackendAdds: () => backendAdds });
+    await run({ api, baseUrl, fabricStore, registry, writeRegistry, routeManifestPath: effectiveRouteManifestPath });
   } finally {
     await new Promise(resolve => server.close(resolve));
-    if (originalRegistry === undefined) delete process.env.MEM0_AUTH_REGISTRY_PATH;
-    else process.env.MEM0_AUTH_REGISTRY_PATH = originalRegistry;
+    if (originalRegistry === undefined) delete process.env.AMF_AUTH_REGISTRY_PATH;
+    else process.env.AMF_AUTH_REGISTRY_PATH = originalRegistry;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
 test('v2 REST queues idempotently while canonical read never exposes proposal payloads', async () => {
-  await withServer(async ({ api, fabricStore, getBackendAdds }) => {
+  await withServer(async ({ api, fabricStore }) => {
     const request = {
       method: 'POST',
       headers: { 'idempotency-key': 'event-123' },
@@ -239,7 +223,6 @@ test('v2 REST queues idempotently while canonical read never exposes proposal pa
     assert.equal(duplicate.body.data.proposalId, first.body.data.proposalId);
     assert.equal(duplicate.body.data.duplicate, true);
     assert.equal(duplicate.body.data.idempotencyKey, 'event-123');
-    assert.equal(getBackendAdds(), 0);
 
     const status = await api(`/v2/memory/proposals/${first.body.data.proposalId}`);
     assert.equal(status.body.data.status, 'queued');
@@ -379,6 +362,177 @@ test('document REST and MCP enforce revision, vault ACL, context binding, and au
     const actions = fabricStore.catalog.auditEvents.map(event => event.action);
     for (const action of ['document_upsert', 'documents_search', 'document_read', 'document_delete']) assert.ok(actions.includes(action));
   }, { documentStore });
+});
+
+test('operation grants allow read wildcards but keep proposals and document writes fail-closed', async () => {
+  const documentStore = new MemoryDocumentStore();
+  await withServer(async ({ api, registry, writeRegistry }) => {
+    registry.rows.push({
+      token: 'operation-grant-token', active: true, actor: 'operation-grant-actor', mode: 'scoped',
+      // These legacy fields are deliberately narrow for rollback safety.
+      allowedScopes: ['domain:main-lab'], allowedVaults: ['vault-personal'],
+      readScopes: ['*'], proposeScopes: ['domain:main-lab'], readVaults: ['*'], writeVaults: ['vault-personal'],
+      permissions: ['memory:search', 'memory:propose', 'documents:search', 'documents:read', 'documents:write', 'purpose:operator_review', 'purpose:memory_curation']
+    });
+    writeRegistry();
+    const headers = { authorization: 'Bearer operation-grant-token' };
+    const created = await api(`/v2/documents/${documentFixture.create.document.documentId}`, { method: 'PUT', body: JSON.stringify(documentFixture.create) });
+    assert.equal(created.response.status, 201);
+
+    const searchInput = { query: 'memory fabric', vaultIds: ['*'], purpose: 'operator_review' };
+    const searchToken = contextTokenFor({ actor: 'operation-grant-actor', purpose: searchInput.purpose, operation: 'documents_search', input: searchInput });
+    const searched = await api('/v2/documents/search', { method: 'POST', headers: { ...headers, 'x-amf-context-token': searchToken }, body: JSON.stringify(searchInput) });
+    assert.equal(searched.response.status, 200); assert.deepEqual(searched.body.data.vaultIds, ['vault-personal']);
+
+    const allowedProposal = await api('/v2/memory/proposals', { method: 'POST', headers: { ...headers, 'idempotency-key': 'operation-grant-allowed' }, body: JSON.stringify(canonicalProposal('allowed', 'main-lab')) });
+    assert.equal(allowedProposal.response.status, 202);
+    const deniedProposal = await api('/v2/memory/proposals', { method: 'POST', headers: { ...headers, 'idempotency-key': 'operation-grant-denied' }, body: JSON.stringify(canonicalProposal('denied', 'tirrenia')) });
+    assert.equal(deniedProposal.response.status, 403);
+
+    const allowedWrite = await api(`/v2/documents/${documentFixture.rename.document.documentId}`, { method: 'PUT', headers, body: JSON.stringify(documentFixture.rename) });
+    assert.equal(allowedWrite.response.status, 201);
+    const other = structuredClone(documentFixture.create);
+    other.document.documentId = 'doc_01JYYYYYYYYYYYYYYYYYYYYYYY'; other.document.vaultId = 'vault-other';
+    other.idempotencyKey = `doc:vault-other:${other.document.documentId.slice(4)}:1:${other.document.contentDigest.slice(7)}`;
+    const deniedWrite = await api(`/v2/documents/${other.document.documentId}`, { method: 'PUT', headers, body: JSON.stringify(other) });
+    assert.equal(deniedWrite.response.status, 403);
+  }, { documentStore });
+});
+
+test('V2 proposal candidates queue personal-scope input without weakening canonical-record sealing', async () => {
+  await withServer(async ({ api, fabricStore }) => {
+    const candidate = {
+      scope: 'person:alice', text: 'Private runtime candidate', infer: false,
+      metadata: { source: 'adapter-e2e', sourceAdapter: 'amf' }
+    };
+    const first = await api('/v2/memory/proposals', {
+      method: 'POST', headers: { 'idempotency-key': 'v2-person-candidate' }, body: JSON.stringify(candidate)
+    });
+    assert.equal(first.response.status, 202);
+    assert.equal(first.body.data.status, 'queued');
+    const duplicate = await api('/v2/memory/proposals', {
+      method: 'POST', headers: { 'idempotency-key': 'v2-person-candidate' }, body: JSON.stringify(candidate)
+    });
+    assert.equal(duplicate.response.status, 200);
+    assert.equal(duplicate.body.data.duplicate, true);
+    assert.equal(duplicate.body.data.proposalId, first.body.data.proposalId);
+    const stored = await fabricStore.readProposal(first.body.data.proposalId);
+    assert.deepEqual(stored.payload, {
+      type: 'memory-proposal', actor: 'test-actor', scope: 'person:alice',
+      text: 'Private runtime candidate', infer: false,
+      metadata: { source: 'adapter-e2e', sourceAdapter: 'amf' }
+    });
+
+    const plainPersonalRecord = canonicalRecord('Plain personal record');
+    plainPersonalRecord.scope = { type: 'person', id: 'person:alice' };
+    plainPersonalRecord.visibility = 'private';
+    plainPersonalRecord.claim = { encoding: 'plain', text: 'must remain rejected' };
+    const rejected = await api('/v2/memory/proposals', {
+      method: 'POST', headers: { 'idempotency-key': 'v2-plain-person-rejected' },
+      body: JSON.stringify({ record: plainPersonalRecord, rationale: 'must stay sealed', expectedRevision: 0 })
+    });
+    assert.equal(rejected.response.status, 400);
+    assert.equal(rejected.body.error.code, 'canonical_record_invalid');
+  });
+});
+
+test('server enforces the persisted interactive MCP tool surface and rejects legacy proposal wildcards', async () => {
+  await withServer(async ({ api, registry, writeRegistry }) => {
+    registry.rows.push({
+      token: 'interactive-mcp-token', active: true, actor: 'client:mcp:codex', mode: 'scoped',
+      allowedScopes: ['domain:main-lab'], allowedVaults: ['vault-personal'],
+      readScopes: ['*'], proposeScopes: ['domain:main-lab'], readVaults: ['*'], writeVaults: ['vault-personal'],
+      permissions: ['memory:search', 'memory:read', 'memory:propose', 'memory:status', 'documents:search', 'documents:read', 'documents:write', 'purpose:conversation_recall', 'purpose:memory_curation', 'purpose:operator_review'],
+      tools: [...INTERACTIVE_MCP_TOOLS]
+    });
+    registry.rows.push({
+      token: 'legacy-proposal-wildcard-token', active: true, actor: 'legacy-proposal-wildcard', mode: 'scoped',
+      allowedScopes: ['*'], permissions: ['memory:propose']
+    });
+    registry.rows.push({
+      token: 'unmigrated-mcp-token', active: true, actor: 'client:mcp:claude', mode: 'scoped',
+      allowedScopes: ['domain:main-lab'], permissions: ['memory:status']
+    });
+    registry.rows.push({
+      token: 'unknown-mcp-token', active: true, actor: 'client:mcp:other', mode: 'scoped',
+      allowedScopes: ['domain:main-lab'], permissions: ['memory:status'], tools: [...INTERACTIVE_MCP_TOOLS]
+    });
+    writeRegistry();
+
+    const headers = { authorization: 'Bearer interactive-mcp-token' };
+    const listed = await api('/mcp/codex/interactive', {
+      method: 'POST', headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
+    });
+    assert.deepEqual(listed.body.result.tools.map(tool => tool.name), INTERACTIVE_MCP_TOOLS);
+    assert.deepEqual(listed.body.result.tools.find(tool => tool.name === 'memory_propose').inputSchema, INTERACTIVE_MCP_PROPOSAL_CANDIDATE_SCHEMA);
+    const sessionHeaders = { ...headers, 'mcp-session-id': listed.response.headers.get('mcp-session-id') };
+
+    const allowedStatus = await api('/mcp/codex/interactive', {
+      method: 'POST', headers: sessionHeaders,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'memory_status', arguments: {} } })
+    });
+    assert.equal(allowedStatus.body.error, undefined);
+
+    const candidateProposal = await api('/mcp/codex/interactive', {
+      method: 'POST', headers: sessionHeaders,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'memory_propose', arguments: { scope: 'domain:main-lab', text: 'interactive candidate', idempotencyKey: 'interactive-candidate' } } })
+    });
+    assert.equal(candidateProposal.body.error, undefined);
+    assert.equal(JSON.parse(candidateProposal.body.result.content[0].text).status, 'queued');
+
+    const forbiddenCanonical = await api('/mcp/codex/interactive', {
+      method: 'POST', headers: sessionHeaders,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'memory_propose', arguments: { ...canonicalProposal('interactive canonical denied', 'main-lab'), idempotencyKey: 'interactive-canonical' } } })
+    });
+    assert.equal(forbiddenCanonical.body.error.message, 'invalid_request');
+
+    for (const name of ['context_search', 'list_scopes', 'gateway_health']) {
+      const forbidden = await api('/mcp/codex/interactive', {
+        method: 'POST', headers: sessionHeaders,
+        body: JSON.stringify({ jsonrpc: '2.0', id: name, method: 'tools/call', params: { name, arguments: {} } })
+      });
+      assert.equal(forbidden.body.error.code, -32000);
+      assert.equal(forbidden.body.error.message, 'mcp_tool_forbidden');
+    }
+
+    const unmigrated = await api('/mcp/claude/interactive', {
+      method: 'POST', headers: { authorization: 'Bearer unmigrated-mcp-token' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list' })
+    });
+    assert.deepEqual(unmigrated.body.result.tools, []);
+    const unmigratedCall = await api('/mcp/claude/interactive', {
+      method: 'POST', headers: { authorization: 'Bearer unmigrated-mcp-token', 'mcp-session-id': unmigrated.response.headers.get('mcp-session-id') },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'memory_status', arguments: {} } })
+    });
+    assert.equal(unmigratedCall.body.error.message, 'mcp_tool_forbidden');
+
+    const unknownActor = await api('/mcp/other/interactive', {
+      method: 'POST', headers: { authorization: 'Bearer unknown-mcp-token' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/list' })
+    });
+    assert.deepEqual(unknownActor.body.result.tools, []);
+
+    registry.rows.find(row => row.actor === 'client:mcp:codex').tools = ['context_search'];
+    writeRegistry();
+    const injected = await api('/mcp/codex/interactive', {
+      method: 'POST', headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 6, method: 'tools/list' })
+    });
+    assert.deepEqual(injected.body.result.tools, []);
+    const injectedCall = await api('/mcp/codex/interactive', {
+      method: 'POST', headers: { ...headers, 'mcp-session-id': injected.response.headers.get('mcp-session-id') },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'context_search', arguments: {} } })
+    });
+    assert.equal(injectedCall.body.error.message, 'mcp_tool_forbidden');
+
+    const proposal = await api('/v2/memory/proposals', {
+      method: 'POST', headers: { authorization: 'Bearer legacy-proposal-wildcard-token', 'idempotency-key': 'legacy-wildcard-denied' },
+      body: JSON.stringify(canonicalProposal('legacy wildcard denied', 'main-lab'))
+    });
+    assert.equal(proposal.response.status, 403);
+    assert.equal(proposal.body.error.code, 'scope_forbidden');
+  });
 });
 
 test('context search interleaves canonical memories and bounded document candidates', async () => {
@@ -841,25 +995,8 @@ test('internal identity and retention APIs enforce the existing auth, ACL and au
   });
 });
 
-test('explicit non-canonical candidate search filters lifecycle state and never masquerades as canonical memory', async () => {
-  const fabricStore = makeStore();
-  const proposal = await fabricStore.propose({ actor: 'test-actor', scope: 'main-lab', text: 'must disappear', metadata: { originalTimestamp: '2020-01-01T00:00:00.000Z' }, idempotencyKey: 'search-filter-source' });
-  await fabricStore.applyRetention({ actor: 'test-actor', idempotencyKey: 'search-filter-revoke', candidateIds: [proposal.contentId], expectedPlanAsOf: new Date().toISOString(), reason: 'revoked' }, { allowedScopes: ['main-lab'] });
-  const backend = {
-    kind: 'test-backend', configured: true,
-    async search() { return { items: [{ id: 'safe', memory: 'safe' }, { id: 'secret', memory: 'must disappear', proposalId: proposal.id }], total: 2, source: 'test' }; }
-  };
+test('legacy memory add queues without a direct canonical-memory write', async () => {
   await withServer(async ({ api }) => {
-    const result = await api('/v2/memory/candidates/search', { method: 'POST', body: JSON.stringify({ scope: 'main-lab', query: 'anything', purpose: 'memory_curation' }) });
-    assert.equal(result.response.status, 200);
-    assert.equal(result.body.data.canonical, false);
-    assert.deepEqual(result.body.data.candidates.map(item => item.id), ['safe']);
-    assert.equal(JSON.stringify(result.body).includes('must disappear'), false);
-  }, { fabricStore, backend });
-});
-
-test('legacy memory add queues instead of writing directly to Mem0', async () => {
-  await withServer(async ({ api, getBackendAdds }) => {
     const queued = await api('/v1/memory/add', {
       method: 'POST',
       headers: { 'idempotency-key': 'legacy-event-1' },
@@ -882,7 +1019,6 @@ test('legacy memory add queues instead of writing directly to Mem0', async () =>
     assert.equal(queued.body.scope, 'main-lab');
     assert.equal(queued.response.headers.get('deprecation'), 'true');
     assert.match(queued.response.headers.get('cache-control'), /no-store/);
-    assert.equal(getBackendAdds(), 0);
 
     const duplicate = await api('/v1/memory/add', {
       method: 'POST',
@@ -1039,6 +1175,20 @@ test('MCP v2 advertises the full tool contract while preserving streamable HTTP'
     const proposedAck = JSON.parse(proposed.body.result.content[0].text);
     assert.equal(proposedAck.status, 'queued');
     assert.equal(proposedAck.idempotencyKey, 'mcp-event-1');
+
+    const candidate = await api('/mcp/test-client/test-identity', {
+      method: 'POST',
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 21, method: 'tools/call', params: {
+          name: 'memory_propose',
+          arguments: { scope: 'person:alice', text: 'MCP personal candidate', metadata: { source: 'mcp-test' }, idempotencyKey: 'mcp-person-candidate' }
+        }
+      })
+    });
+    assert.equal(candidate.response.status, 200);
+    const candidateAck = JSON.parse(candidate.body.result.content[0].text);
+    assert.equal(candidateAck.status, 'queued');
+    assert.equal(candidateAck.idempotencyKey, 'mcp-person-candidate');
 
     const derivedRequest = {
       method: 'POST',
@@ -1253,15 +1403,14 @@ test('v2 authentication failures and unknown routes retain the v2 envelope', asy
     assert.equal(missing.body.error.code, 'not_found');
     assert.equal(JSON.stringify(missing.body).includes('/v2/unknown'), false);
 
-    const providerFailure = await api('/v2/memory/candidates/search', { method: 'POST', body: JSON.stringify({ scope: 'main-lab', query: 'explode', purpose: 'memory_curation' }) });
-    assert.equal(providerFailure.response.status, 500);
-    assert.equal(providerFailure.body.error.code, 'internal_error');
-    assert.equal(JSON.stringify(providerFailure.body).includes('/secret/path'), false);
-    assert.equal(JSON.stringify(providerFailure.body).includes('private provider response'), false);
+    const retired = await api('/v2/memory/candidates/search', { method: 'POST', body: JSON.stringify({ scope: 'main-lab', query: 'anything', purpose: 'memory_curation' }) });
+    assert.equal(retired.response.status, 404);
+    assert.equal(retired.body.error.code, 'not_found');
+    assert.equal(JSON.stringify(retired.body).includes('provider'), false);
   });
 });
 
-test('audit and catalog outages return controlled 503 responses for auth, search, and status', async () => {
+test('audit and catalog outages return controlled 503 responses for auth and status', async () => {
   const auditDown = makeStore();
   auditDown.audit = async () => { throw new Error('database offline'); };
   await withServer(async ({ api }) => {
@@ -1269,12 +1418,6 @@ test('audit and catalog outages return controlled 503 responses for auth, search
     assert.equal(auth.response.status, 503);
     assert.equal(auth.body.error.code, 'audit_unavailable');
 
-    const search = await api('/v2/memory/candidates/search', {
-      method: 'POST',
-      body: JSON.stringify({ scope: 'main-lab', query: 'appointment', purpose: 'memory_curation' })
-    });
-    assert.equal(search.response.status, 503);
-    assert.equal(search.body.error.code, 'audit_unavailable');
   }, { fabricStore: auditDown });
 
   const catalogDown = makeStore();
