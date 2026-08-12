@@ -207,14 +207,20 @@ Success uses `{ "ok": true, "data": ..., "meta": ... }`; errors use
 - `GET /v2/sessions/:id/transcript?purpose=...&view=redacted|original`
 - `GET /v2/status`
 
-The proposal body is exactly `{record,rationale,expectedRevision?}`. `record`
-must conform to PAM 0.6 `amf-memory/v1`: canonical scope IDs, exact fields and
-strict timestamps/provenance/lifecycle. `confidence` is required and exactly
+The proposal endpoint accepts exactly one of two bodies. A canonical proposal
+is `{record,rationale,expectedRevision?}`: `record` must conform to PAM 0.6
+`amf-memory/v1` with canonical scope IDs, exact fields and strict
+timestamps/provenance/lifecycle. `confidence` is required and exactly
 `{score,basis,assessedAt}` with a finite `[0,1]` score, approved basis and UTC
-timestamp. Restricted/confidential and
-person/relationship records must carry a sealed AES-256-GCM envelope with
-canonical base64, 12-byte IV, 16-byte tag, opaque `kekId`/`keyRef`, and the PAM
-canonical AAD digest. A successful REST or MCP acknowledgement exposes
+timestamp. Restricted/confidential and person/relationship canonical records
+must carry a sealed AES-256-GCM envelope with canonical base64, 12-byte IV,
+16-byte tag, opaque `kekId`/`keyRef`, and the PAM canonical AAD digest.
+
+A candidate proposal is `{scope,text,metadata?,infer?}`. It is an encrypted
+queued curation candidate, not a canonical-memory write; it does not relax the
+sealed-record requirement above. Runtime adapters use this form for
+person/relationship observations because they do not possess the canonical
+record key. A successful REST or MCP acknowledgement exposes
 `{status,proposalId,duplicate,idempotencyKey}`; the last field is the exact
 authoritative retry key accepted or derived by the Fabric.
 

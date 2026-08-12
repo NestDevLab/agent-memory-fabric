@@ -398,6 +398,43 @@ test('operation grants allow read wildcards but keep proposals and document writ
   }, { documentStore });
 });
 
+test('V2 proposal candidates queue personal-scope input without weakening canonical-record sealing', async () => {
+  await withServer(async ({ api, fabricStore }) => {
+    const candidate = {
+      scope: 'person:alice', text: 'Private runtime candidate', infer: false,
+      metadata: { source: 'adapter-e2e', sourceAdapter: 'amf' }
+    };
+    const first = await api('/v2/memory/proposals', {
+      method: 'POST', headers: { 'idempotency-key': 'v2-person-candidate' }, body: JSON.stringify(candidate)
+    });
+    assert.equal(first.response.status, 202);
+    assert.equal(first.body.data.status, 'queued');
+    const duplicate = await api('/v2/memory/proposals', {
+      method: 'POST', headers: { 'idempotency-key': 'v2-person-candidate' }, body: JSON.stringify(candidate)
+    });
+    assert.equal(duplicate.response.status, 200);
+    assert.equal(duplicate.body.data.duplicate, true);
+    assert.equal(duplicate.body.data.proposalId, first.body.data.proposalId);
+    const stored = await fabricStore.readProposal(first.body.data.proposalId);
+    assert.deepEqual(stored.payload, {
+      type: 'memory-proposal', actor: 'test-actor', scope: 'person:alice',
+      text: 'Private runtime candidate', infer: false,
+      metadata: { source: 'adapter-e2e', sourceAdapter: 'amf' }
+    });
+
+    const plainPersonalRecord = canonicalRecord('Plain personal record');
+    plainPersonalRecord.scope = { type: 'person', id: 'person:alice' };
+    plainPersonalRecord.visibility = 'private';
+    plainPersonalRecord.claim = { encoding: 'plain', text: 'must remain rejected' };
+    const rejected = await api('/v2/memory/proposals', {
+      method: 'POST', headers: { 'idempotency-key': 'v2-plain-person-rejected' },
+      body: JSON.stringify({ record: plainPersonalRecord, rationale: 'must stay sealed', expectedRevision: 0 })
+    });
+    assert.equal(rejected.response.status, 400);
+    assert.equal(rejected.body.error.code, 'canonical_record_invalid');
+  });
+});
+
 test('server enforces the persisted interactive MCP tool surface and rejects legacy proposal wildcards', async () => {
   await withServer(async ({ api, registry, writeRegistry }) => {
     registry.rows.push({
@@ -1123,6 +1160,20 @@ test('MCP v2 advertises the full tool contract while preserving streamable HTTP'
     const proposedAck = JSON.parse(proposed.body.result.content[0].text);
     assert.equal(proposedAck.status, 'queued');
     assert.equal(proposedAck.idempotencyKey, 'mcp-event-1');
+
+    const candidate = await api('/mcp/test-client/test-identity', {
+      method: 'POST',
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 21, method: 'tools/call', params: {
+          name: 'memory_propose',
+          arguments: { scope: 'person:alice', text: 'MCP personal candidate', metadata: { source: 'mcp-test' }, idempotencyKey: 'mcp-person-candidate' }
+        }
+      })
+    });
+    assert.equal(candidate.response.status, 200);
+    const candidateAck = JSON.parse(candidate.body.result.content[0].text);
+    assert.equal(candidateAck.status, 'queued');
+    assert.equal(candidateAck.idempotencyKey, 'mcp-person-candidate');
 
     const derivedRequest = {
       method: 'POST',

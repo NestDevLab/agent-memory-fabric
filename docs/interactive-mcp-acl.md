@@ -30,6 +30,12 @@ partial, or injected tool list receives no MCP tools. Legacy `allowedScopes:
 ['*']` remains read-compatible but is never a proposal grant; migrate proposal
 principals to an explicit non-wildcard `proposeScopes` list.
 
+`memory_propose` accepts only an encrypted queued candidate
+`{scope,text,metadata?,infer?}` from the interactive client. It requires an
+explicit `--propose-scope` match and cannot write canonical memory directly.
+The internal canonical-record proposal form remains subject to its separate
+sealed-record validation, including for person and relationship records.
+
 `document_delete` appends a revisioned tombstone. Both document writes retain
 the caller's expected revision and idempotency key; Fabric audits every allow,
 denial, duplicate, and tombstone.

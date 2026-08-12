@@ -474,6 +474,38 @@ function validateCanonicalProposalBody(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !allowed.has(key))) {
     throw Object.assign(new Error('invalid_request'), { status: 400 });
   }
+  const validated = validateCanonicalProposal(body.record, body.rationale, body.expectedRevision ?? null);
+  return { kind: 'canonical', scope: validated.scope, record: body.record, rationale: body.rationale.trim(), expectedRevision: body.expectedRevision ?? null };
+}
+
+function validateProposalCandidateBody(body) {
+  const allowed = new Set(['scope', 'text', 'metadata', 'infer']);
+  if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !allowed.has(key))
+      || typeof body.scope !== 'string' || typeof body.text !== 'string'
+      || (body.metadata !== undefined && (!body.metadata || typeof body.metadata !== 'object' || Array.isArray(body.metadata)))
+      || (body.infer !== undefined && typeof body.infer !== 'boolean')) {
+    throw Object.assign(new Error('invalid_request'), { status: 400 });
+  }
+  return { kind: 'candidate', scope: body.scope, text: body.text, metadata: body.metadata || {}, infer: body.infer === true };
+}
+
+function normalizeV2ProposalBody(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw Object.assign(new Error('invalid_request'), { status: 400 });
+  return Object.hasOwn(body, 'record') ? validateCanonicalProposalBody(body) : validateProposalCandidateBody(body);
+}
+
+function normalizeMcpProposalArgs(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) throw Object.assign(new Error('invalid_request'), { status: 400 });
+  if (Object.hasOwn(args, 'record')) {
+    const allowed = new Set(['record', 'rationale', 'expectedRevision', 'idempotencyKey']);
+    if (Object.keys(args).some(key => !allowed.has(key))) throw Object.assign(new Error('invalid_request'), { status: 400 });
+    const { idempotencyKey, ...body } = args;
+    return { ...validateCanonicalProposalBody(body), idempotencyKey };
+  }
+  const allowed = new Set(['scope', 'text', 'metadata', 'infer', 'idempotencyKey']);
+  if (Object.keys(args).some(key => !allowed.has(key))) throw Object.assign(new Error('invalid_request'), { status: 400 });
+  const { idempotencyKey, ...body } = args;
+  return { ...validateProposalCandidateBody(body), idempotencyKey };
 }
 
 function canonicalJson(value) {
@@ -593,16 +625,16 @@ function buildToolsListResult(actor, policy) {
     },
     {
       name: 'memory_propose',
-      description: 'Queue a canonical, revision-aware memory proposal for later curation.',
+      description: 'Queue either a proposal candidate or a canonical, revision-aware record for later curation.',
       inputSchema: {
         type: 'object',
         properties: {
           record: { type: 'object' },
           rationale: { type: 'string' },
           expectedRevision: { type: ['integer', 'null'], minimum: 0 },
+          scope: { type: 'string' }, text: { type: 'string' }, metadata: { type: 'object' }, infer: { type: 'boolean' },
           idempotencyKey: { type: 'string', description: 'Optional transport retry key; derived deterministically when omitted.' }
-        },
-        required: ['record', 'rationale']
+        }
       }
     },
     {
@@ -724,23 +756,24 @@ async function executeMcpMethod({ body, actor, policy, policies, fabricStore, ca
     }
 
     if (name === 'memory_propose') {
-      const validated = validateCanonicalProposal(args.record, args.rationale, args.expectedRevision ?? null);
-      const derivedIdempotencyKey = `mcp-${crypto.createHash('sha256').update(canonicalJson({ actor, record: args.record, rationale: args.rationale, expectedRevision: args.expectedRevision ?? null })).digest('hex')}`;
+      const input = normalizeMcpProposalArgs(args);
+      const { idempotencyKey: suppliedIdempotencyKey, ...idempotencyInput } = input;
+      const derivedIdempotencyKey = `mcp-${crypto.createHash('sha256').update(canonicalJson({ actor, ...idempotencyInput })).digest('hex')}`;
       const proposal = await performMemoryProposal({
         actor,
         policy,
         policies,
         fabricStore,
-        scope: validated.scope,
-        record: args.record,
-        rationale: args.rationale.trim(),
-        expectedRevision: args.expectedRevision ?? null,
-        idempotencyKey: String(args.idempotencyKey || derivedIdempotencyKey),
+        scope: input.scope,
+        ...(input.kind === 'canonical'
+          ? { record: input.record, rationale: input.rationale, expectedRevision: input.expectedRevision }
+          : { text: input.text, metadata: input.metadata, infer: input.infer }),
+        idempotencyKey: String(suppliedIdempotencyKey || derivedIdempotencyKey),
         source: 'mcp',
         requestId,
         requireIdempotencyKey: true
       });
-      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify({ status: proposal.status, proposalId: proposal.id, duplicate: proposal.duplicate, idempotencyKey: String(args.idempotencyKey || derivedIdempotencyKey) }, null, 2) }] });
+      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify({ status: proposal.status, proposalId: proposal.id, duplicate: proposal.duplicate, idempotencyKey: String(suppliedIdempotencyKey || derivedIdempotencyKey) }, null, 2) }] });
     }
 
     if (name === 'memory_proposal_status') {
@@ -2023,18 +2056,17 @@ const requestHandler = async (req, res) => {
   if (url.pathname === '/v2/memory/proposals' && req.method === 'POST') {
     try {
       const body = await parseBody(req, { timeoutMs: bodyReadTimeoutMs });
-      validateCanonicalProposalBody(body);
-      const validated = validateCanonicalProposal(body.record, body.rationale, body.expectedRevision ?? null);
+      const input = normalizeV2ProposalBody(body);
       const idempotencyKey = String(req.headers['idempotency-key'] || '');
       const proposal = await performMemoryProposal({
         actor,
         policy,
         policies,
         fabricStore,
-        scope: validated.scope,
-        record: body.record,
-        rationale: body.rationale.trim(),
-        expectedRevision: body.expectedRevision ?? null,
+        scope: input.scope,
+        ...(input.kind === 'canonical'
+          ? { record: input.record, rationale: input.rationale, expectedRevision: input.expectedRevision }
+          : { text: input.text, metadata: input.metadata, infer: input.infer }),
         idempotencyKey,
         source: 'v2-rest',
         requestId,
