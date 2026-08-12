@@ -12,6 +12,7 @@ inventory. It is a recovery envelope, not a cleanup or rollout authorization.
 | Primary checkout | `main` at `f3f2b113018a0b390c85245772a1b3a7623fd2ed`, clean, three commits ahead of `origin/main` | Preserve. Its net diff removes the previously re-applied Claude multi-conversation session identity and its test, and deletes one stale manifest record. It is conflicting recovery evidence, not disposable residue. |
 | Registered worktrees | 33 total, all clean; no stashes and no existing recovery/backup refs | Retain every worktree unchanged. Create a named recovery ref immediately before any B4.2 source transformation. |
 | Syncwheel manifest | Tracked, 14 declared legacy stacks; `main-integration` is `0ef0219` | `syncwheel validate` fails only because the primary checkout is `main` rather than manifest-required `main-integration`. Its plan proposes broad primary restoration and integration refreshes. Do not apply it: that would exceed the per-object recovery classification. |
+| Unselected local Syncwheel profiles | `amf-m4-projection-identity.local.json` and `amf-m4-native-openclaw.local.json`; the active selection is the shared manifest | Retain as historical local recovery metadata. They are not selected and must not be promoted or replayed incidentally. |
 | Open GitHub PRs | None for the adapter remote | A new product/companion PR is required under B4.4 after the recovered source passes review. |
 
 The three primary-only commits are `28a5f34` (revert of the Claude session
@@ -51,10 +52,24 @@ B5.1 remains its separate ownership and recovery gate.
 
 ## Next recovery boundary
 
-B4.2 starts from a clean, current-base adapter lane, with a named recovery
-ref for its start point and each source branch whose unique patch is compared.
-It must retain the source intent that still satisfies current AMF contracts,
-write current-base tests, and leave every listed worktree/branch intact. No
-`syncwheel reconcile --apply`, worktree removal, branch deletion, repository
-rename, runtime apply, or client configuration change is implied by this
-inventory.
+B4.2 has preserved `main` and every branch with unique current-base patches as
+named `recovery/amf-adapter-b42-20260812-*` refs. `git cherry origin/main`
+identifies only six non-equivalent source candidates: Claude stale-transcript,
+three collector-resilience patches, over-strict collector predicates, and the
+Claude conversation-session identity patch. All declared adapter/runtime/M4
+stacks otherwise have zero unique patches against `origin/main` and must not
+be replayed merely because the legacy manifest names them.
+
+The clean primary cannot yet become the canonical `main-integration` lane:
+that branch is held by a retained clean legacy worktree at
+`var/syncwheel/main-integration`, while the primary is the protected local
+`main` recovery branch. A broad `syncwheel reconcile --apply` would rewrite
+both the primary projection and the legacy integration membership. B4.2
+therefore stops before a branch/worktree change. It needs an exact
+non-destructive integration-rotation decision that names how the retained
+`main-integration` worktree/branch is preserved, released, or kept alongside
+a temporary recovery lane.
+
+No `syncwheel reconcile --apply`, worktree removal, branch deletion,
+repository rename, runtime apply, or client configuration change is implied by
+this inventory.
