@@ -14,6 +14,7 @@ import { CanonicalPamBridge, CuratorReceiptCoordinator, MemoryReceiptLedger } fr
 import { MemoryDocumentStore } from '../src/document-store.mjs';
 import { aggregatePauseCheckpointInputs, createPauseManifest, verifyPauseManifest } from '../src/migration-pause.mjs';
 import { INTERACTIVE_MCP_TOOLS } from '../src/operator/interactive-mcp-provisioning.mjs';
+import { INTERACTIVE_MCP_PROPOSAL_CANDIDATE_SCHEMA } from '../src/operator/interactive-mcp-contract.mjs';
 
 const testPolicyPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'config', 'policies.example.json');
 const CONTEXT_RING = { currentKeyVersion: 'ctx-v1', keys: { 'ctx-v1': Buffer.alloc(32, 7).toString('base64') } };
@@ -464,6 +465,7 @@ test('server enforces the persisted interactive MCP tool surface and rejects leg
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
     });
     assert.deepEqual(listed.body.result.tools.map(tool => tool.name), INTERACTIVE_MCP_TOOLS);
+    assert.deepEqual(listed.body.result.tools.find(tool => tool.name === 'memory_propose').inputSchema, INTERACTIVE_MCP_PROPOSAL_CANDIDATE_SCHEMA);
     const sessionHeaders = { ...headers, 'mcp-session-id': listed.response.headers.get('mcp-session-id') };
 
     const allowedStatus = await api('/mcp/codex/interactive', {
@@ -471,6 +473,19 @@ test('server enforces the persisted interactive MCP tool surface and rejects leg
       body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'memory_status', arguments: {} } })
     });
     assert.equal(allowedStatus.body.error, undefined);
+
+    const candidateProposal = await api('/mcp/codex/interactive', {
+      method: 'POST', headers: sessionHeaders,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'memory_propose', arguments: { scope: 'domain:main-lab', text: 'interactive candidate', idempotencyKey: 'interactive-candidate' } } })
+    });
+    assert.equal(candidateProposal.body.error, undefined);
+    assert.equal(JSON.parse(candidateProposal.body.result.content[0].text).status, 'queued');
+
+    const forbiddenCanonical = await api('/mcp/codex/interactive', {
+      method: 'POST', headers: sessionHeaders,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'memory_propose', arguments: { ...canonicalProposal('interactive canonical denied', 'main-lab'), idempotencyKey: 'interactive-canonical' } } })
+    });
+    assert.equal(forbiddenCanonical.body.error.message, 'invalid_request');
 
     for (const name of ['context_search', 'list_scopes', 'gateway_health']) {
       const forbidden = await api('/mcp/codex/interactive', {

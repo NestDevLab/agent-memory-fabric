@@ -5,6 +5,7 @@ import path from 'node:path';
 import { buildContextRequest, normalizeOpaqueTagMap } from '../access-contract.mjs';
 import { issueContextToken, normalizeContextKeyRing, requestDigest } from '../context-token.mjs';
 import { INTERACTIVE_MCP_HANDOFF_SCHEMA, INTERACTIVE_MCP_TOOLS, interactiveMcpPermissions, interactiveMcpPurposes } from './interactive-mcp-provisioning.mjs';
+import { INTERACTIVE_MCP_PROPOSAL_CANDIDATE_SCHEMA } from './interactive-mcp-contract.mjs';
 
 export const INTERACTIVE_MCP_HANDOFF_ENV = 'AMF_INTERACTIVE_MCP_HANDOFF_DIR';
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$/;
@@ -74,7 +75,7 @@ function definitions() {
   return {
     memory_search: { name: 'memory_search', description: 'Search canonical memories only in granted scopes.', inputSchema: { type: 'object', additionalProperties: false, properties: { query: { type: 'string', minLength: 1, maxLength: 4096 }, limit: { type: 'integer', minimum: 1, maximum: 100 }, cursor: { type: ['string', 'null'] }, from: { type: ['string', 'null'] }, to: { type: ['string', 'null'] } }, required: ['query'] } },
     memory_read: { name: 'memory_read', description: 'Read one authorized canonical memory.', inputSchema: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', minLength: 1, maxLength: 192 } }, required: ['id'] } },
-    memory_propose: { name: 'memory_propose', description: 'Queue an authorized proposal candidate for curation; it never applies a memory directly.', inputSchema: { type: 'object', additionalProperties: false, properties: { scope: { type: 'string', minLength: 1, maxLength: 192 }, text: { type: 'string', minLength: 1, maxLength: 4096 }, metadata: { type: 'object' }, infer: { type: 'boolean' }, idempotencyKey: { type: 'string', minLength: 1, maxLength: 192 } }, required: ['scope', 'text', 'idempotencyKey'] } },
+    memory_propose: { name: 'memory_propose', description: 'Queue an authorized proposal candidate for curation; it never applies a memory directly.', inputSchema: INTERACTIVE_MCP_PROPOSAL_CANDIDATE_SCHEMA },
     memory_proposal_status: { name: 'memory_proposal_status', description: 'Read the lifecycle of an authorized proposal.', inputSchema: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', minLength: 1, maxLength: 192 } }, required: ['id'] } },
     documents_search: { name: 'documents_search', description: 'Search documents in granted vaults only.', inputSchema: { type: 'object', additionalProperties: false, properties: { query: { type: 'string', minLength: 1, maxLength: 4096 }, limit: { type: 'integer', minimum: 1, maximum: 100 } }, required: ['query'] } },
     document_read: { name: 'document_read', description: 'Read an authorized document revision.', inputSchema: { type: 'object', additionalProperties: false, properties: { documentId: { type: 'string', minLength: 1, maxLength: 192 }, revision: { type: ['integer', 'null'], minimum: 1 } }, required: ['documentId'] } },

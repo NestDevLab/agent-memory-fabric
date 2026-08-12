@@ -15,7 +15,7 @@ import { RAW_EVENT_HTTP_MAX_BODY_BYTES } from './ingest/raw-event-contract.mjs';
 import { validatePamRuntimePrivateDirFromEnv } from './operator/pam-runtime-private-dir.mjs';
 import { isVerifiedMigrationPause, loadVerifiedMigrationPauseFromEnv } from './migration-pause.mjs';
 import { CONVERSATION_EVENT_V3_PATH } from './ingest/http-conversation-event-v3-endpoint.mjs';
-import { hasExactInteractiveMcpTools, INTERACTIVE_MCP_TOOLS, isInteractiveMcpActor, isMcpClientActor } from './operator/interactive-mcp-contract.mjs';
+import { hasExactInteractiveMcpTools, INTERACTIVE_MCP_PROPOSAL_CANDIDATE_SCHEMA, INTERACTIVE_MCP_TOOLS, isInteractiveMcpActor, isMcpClientActor } from './operator/interactive-mcp-contract.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
@@ -494,9 +494,10 @@ function normalizeV2ProposalBody(body) {
   return Object.hasOwn(body, 'record') ? validateCanonicalProposalBody(body) : validateProposalCandidateBody(body);
 }
 
-function normalizeMcpProposalArgs(args) {
+function normalizeMcpProposalArgs(args, { candidateOnly = false } = {}) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw Object.assign(new Error('invalid_request'), { status: 400 });
   if (Object.hasOwn(args, 'record')) {
+    if (candidateOnly) throw Object.assign(new Error('invalid_request'), { status: 400 });
     const allowed = new Set(['record', 'rationale', 'expectedRevision', 'idempotencyKey']);
     if (Object.keys(args).some(key => !allowed.has(key))) throw Object.assign(new Error('invalid_request'), { status: 400 });
     const { idempotencyKey, ...body } = args;
@@ -684,7 +685,9 @@ function buildToolsListResult(actor, policy) {
   const byName = new Map(allTools.map(tool => [tool.name, tool]));
   if (isMcpClientActor(actor)) {
     return { tools: isInteractiveMcpActor(actor) && hasExactInteractiveMcpTools(policy.tools)
-      ? INTERACTIVE_MCP_TOOLS.map(name => byName.get(name)) : [] };
+      ? INTERACTIVE_MCP_TOOLS.map(name => name === 'memory_propose'
+        ? { name, description: 'Queue an authorized proposal candidate for curation; it never applies a memory directly.', inputSchema: INTERACTIVE_MCP_PROPOSAL_CANDIDATE_SCHEMA }
+        : byName.get(name)) : [] };
   }
   return { tools: allTools.filter(tool => isMcpToolAllowed(actor, policy, tool.name)) };
 }
@@ -756,7 +759,7 @@ async function executeMcpMethod({ body, actor, policy, policies, fabricStore, ca
     }
 
     if (name === 'memory_propose') {
-      const input = normalizeMcpProposalArgs(args);
+      const input = normalizeMcpProposalArgs(args, { candidateOnly: isInteractiveMcpActor(actor) });
       const { idempotencyKey: suppliedIdempotencyKey, ...idempotencyInput } = input;
       const derivedIdempotencyKey = `mcp-${crypto.createHash('sha256').update(canonicalJson({ actor, ...idempotencyInput })).digest('hex')}`;
       const proposal = await performMemoryProposal({

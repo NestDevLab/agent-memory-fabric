@@ -3,6 +3,19 @@ export const INTERACTIVE_MCP_TOOLS = Object.freeze([
   'documents_search', 'document_read', 'document_upsert', 'document_delete', 'memory_status'
 ]);
 
+export const INTERACTIVE_MCP_PROPOSAL_CANDIDATE_SCHEMA = Object.freeze({
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    scope: { type: 'string', minLength: 1, maxLength: 192 },
+    text: { type: 'string', minLength: 1, maxLength: 4096 },
+    metadata: { type: 'object' },
+    infer: { type: 'boolean' },
+    idempotencyKey: { type: 'string', minLength: 1, maxLength: 192 }
+  },
+  required: ['scope', 'text', 'idempotencyKey']
+});
+
 export const INTERACTIVE_MCP_ACTORS = Object.freeze(['client:mcp:codex', 'client:mcp:claude']);
 
 export function isInteractiveMcpActor(actor) {
