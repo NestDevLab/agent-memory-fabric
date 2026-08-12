@@ -80,7 +80,7 @@ function canonicalProposal(text, scope = 'main-lab', revision = 1) {
 
 async function withServer(run, { sessionOptions, clock, configuredSessionReader = true, conversationSessionReaderConfigured = configuredSessionReader,
   sessionReader: sessionReaderOverride, conversationSessionReader: conversationSessionReaderOverride, extractorSessionReader,
-  fabricStore: fabricStoreOverride, backend: backendOverride,
+  fabricStore: fabricStoreOverride,
   canonicalStore, documentStore, contextVerifier, receiptCoordinator, routeManifestSetup, migrationPause } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-server-'));
   const registryPath = path.join(dir, 'auth.json');
@@ -147,25 +147,8 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
   };
   const writeRegistry = () => fs.writeFileSync(registryPath, JSON.stringify(registry));
   writeRegistry();
-  const originalRegistry = process.env.MEM0_AUTH_REGISTRY_PATH;
-  process.env.MEM0_AUTH_REGISTRY_PATH = registryPath;
-  let backendAdds = 0;
-  const backend = backendOverride || {
-    kind: 'test-backend',
-    configured: true,
-    async search({ backendUserId, query }) {
-      if (query === 'explode') {
-        const error = new Error('/secret/path provider payload');
-        error.body = { raw: 'private provider response' };
-        throw error;
-      }
-      return { items: [{ id: 'memory-1', memory: query, userId: backendUserId }], total: 1, source: 'test' };
-    },
-    async add() {
-      backendAdds += 1;
-      throw new Error('backend_add_must_not_be_called');
-    }
-  };
+  const originalRegistry = process.env.AMF_AUTH_REGISTRY_PATH;
+  process.env.AMF_AUTH_REGISTRY_PATH = registryPath;
   const fabricStore = fabricStoreOverride || makeStore();
   const sessionReader = sessionReaderOverride || {
     kind: 'test-session-reader',
@@ -187,7 +170,7 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
   fs.chmodSync(routeManifestPath, 0o600);
   const effectiveRouteManifestPath = routeManifestSetup
     ? routeManifestSetup({ dir, routeManifestPath }) || routeManifestPath : routeManifestPath;
-  const server = createAgentMemoryFabricServer({ backend, fabricStore, canonicalStore,
+  const server = createAgentMemoryFabricServer({ fabricStore, canonicalStore,
     documentStore,
     contextVerifier: effectiveContextVerifier, routeManifestPath: effectiveRouteManifestPath, receiptCoordinator,
     sessionReader: configuredSessionReader ? sessionReader : undefined,
@@ -210,18 +193,17 @@ async function withServer(run, { sessionOptions, clock, configuredSessionReader 
     return { response, body: text ? JSON.parse(text) : null };
   };
   try {
-    await run({ api, baseUrl, fabricStore, registry, writeRegistry, routeManifestPath: effectiveRouteManifestPath,
-      getBackendAdds: () => backendAdds });
+    await run({ api, baseUrl, fabricStore, registry, writeRegistry, routeManifestPath: effectiveRouteManifestPath });
   } finally {
     await new Promise(resolve => server.close(resolve));
-    if (originalRegistry === undefined) delete process.env.MEM0_AUTH_REGISTRY_PATH;
-    else process.env.MEM0_AUTH_REGISTRY_PATH = originalRegistry;
+    if (originalRegistry === undefined) delete process.env.AMF_AUTH_REGISTRY_PATH;
+    else process.env.AMF_AUTH_REGISTRY_PATH = originalRegistry;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
 test('v2 REST queues idempotently while canonical read never exposes proposal payloads', async () => {
-  await withServer(async ({ api, fabricStore, getBackendAdds }) => {
+  await withServer(async ({ api, fabricStore }) => {
     const request = {
       method: 'POST',
       headers: { 'idempotency-key': 'event-123' },
@@ -239,7 +221,6 @@ test('v2 REST queues idempotently while canonical read never exposes proposal pa
     assert.equal(duplicate.body.data.proposalId, first.body.data.proposalId);
     assert.equal(duplicate.body.data.duplicate, true);
     assert.equal(duplicate.body.data.idempotencyKey, 'event-123');
-    assert.equal(getBackendAdds(), 0);
 
     const status = await api(`/v2/memory/proposals/${first.body.data.proposalId}`);
     assert.equal(status.body.data.status, 'queued');
@@ -378,6 +359,41 @@ test('document REST and MCP enforce revision, vault ACL, context binding, and au
     assert.equal(afterDelete.body.data.items.length, 0);
     const actions = fabricStore.catalog.auditEvents.map(event => event.action);
     for (const action of ['document_upsert', 'documents_search', 'document_read', 'document_delete']) assert.ok(actions.includes(action));
+  }, { documentStore });
+});
+
+test('operation grants allow read wildcards but keep proposals and document writes fail-closed', async () => {
+  const documentStore = new MemoryDocumentStore();
+  await withServer(async ({ api, registry, writeRegistry }) => {
+    registry.rows.push({
+      token: 'operation-grant-token', active: true, actor: 'operation-grant-actor', mode: 'scoped',
+      // These legacy fields are deliberately narrow for rollback safety.
+      allowedScopes: ['domain:main-lab'], allowedVaults: ['vault-personal'],
+      readScopes: ['*'], proposeScopes: ['domain:main-lab'], readVaults: ['*'], writeVaults: ['vault-personal'],
+      permissions: ['memory:search', 'memory:propose', 'documents:search', 'documents:read', 'documents:write', 'purpose:operator_review', 'purpose:memory_curation']
+    });
+    writeRegistry();
+    const headers = { authorization: 'Bearer operation-grant-token' };
+    const created = await api(`/v2/documents/${documentFixture.create.document.documentId}`, { method: 'PUT', body: JSON.stringify(documentFixture.create) });
+    assert.equal(created.response.status, 201);
+
+    const searchInput = { query: 'memory fabric', vaultIds: ['*'], purpose: 'operator_review' };
+    const searchToken = contextTokenFor({ actor: 'operation-grant-actor', purpose: searchInput.purpose, operation: 'documents_search', input: searchInput });
+    const searched = await api('/v2/documents/search', { method: 'POST', headers: { ...headers, 'x-amf-context-token': searchToken }, body: JSON.stringify(searchInput) });
+    assert.equal(searched.response.status, 200); assert.deepEqual(searched.body.data.vaultIds, ['vault-personal']);
+
+    const allowedProposal = await api('/v2/memory/proposals', { method: 'POST', headers: { ...headers, 'idempotency-key': 'operation-grant-allowed' }, body: JSON.stringify(canonicalProposal('allowed', 'main-lab')) });
+    assert.equal(allowedProposal.response.status, 202);
+    const deniedProposal = await api('/v2/memory/proposals', { method: 'POST', headers: { ...headers, 'idempotency-key': 'operation-grant-denied' }, body: JSON.stringify(canonicalProposal('denied', 'tirrenia')) });
+    assert.equal(deniedProposal.response.status, 403);
+
+    const allowedWrite = await api(`/v2/documents/${documentFixture.rename.document.documentId}`, { method: 'PUT', headers, body: JSON.stringify(documentFixture.rename) });
+    assert.equal(allowedWrite.response.status, 201);
+    const other = structuredClone(documentFixture.create);
+    other.document.documentId = 'doc_01JYYYYYYYYYYYYYYYYYYYYYYY'; other.document.vaultId = 'vault-other';
+    other.idempotencyKey = `doc:vault-other:${other.document.documentId.slice(4)}:1:${other.document.contentDigest.slice(7)}`;
+    const deniedWrite = await api(`/v2/documents/${other.document.documentId}`, { method: 'PUT', headers, body: JSON.stringify(other) });
+    assert.equal(deniedWrite.response.status, 403);
   }, { documentStore });
 });
 
@@ -841,25 +857,8 @@ test('internal identity and retention APIs enforce the existing auth, ACL and au
   });
 });
 
-test('explicit non-canonical candidate search filters lifecycle state and never masquerades as canonical memory', async () => {
-  const fabricStore = makeStore();
-  const proposal = await fabricStore.propose({ actor: 'test-actor', scope: 'main-lab', text: 'must disappear', metadata: { originalTimestamp: '2020-01-01T00:00:00.000Z' }, idempotencyKey: 'search-filter-source' });
-  await fabricStore.applyRetention({ actor: 'test-actor', idempotencyKey: 'search-filter-revoke', candidateIds: [proposal.contentId], expectedPlanAsOf: new Date().toISOString(), reason: 'revoked' }, { allowedScopes: ['main-lab'] });
-  const backend = {
-    kind: 'test-backend', configured: true,
-    async search() { return { items: [{ id: 'safe', memory: 'safe' }, { id: 'secret', memory: 'must disappear', proposalId: proposal.id }], total: 2, source: 'test' }; }
-  };
+test('legacy memory add queues without a direct canonical-memory write', async () => {
   await withServer(async ({ api }) => {
-    const result = await api('/v2/memory/candidates/search', { method: 'POST', body: JSON.stringify({ scope: 'main-lab', query: 'anything', purpose: 'memory_curation' }) });
-    assert.equal(result.response.status, 200);
-    assert.equal(result.body.data.canonical, false);
-    assert.deepEqual(result.body.data.candidates.map(item => item.id), ['safe']);
-    assert.equal(JSON.stringify(result.body).includes('must disappear'), false);
-  }, { fabricStore, backend });
-});
-
-test('legacy memory add queues instead of writing directly to Mem0', async () => {
-  await withServer(async ({ api, getBackendAdds }) => {
     const queued = await api('/v1/memory/add', {
       method: 'POST',
       headers: { 'idempotency-key': 'legacy-event-1' },
@@ -882,7 +881,6 @@ test('legacy memory add queues instead of writing directly to Mem0', async () =>
     assert.equal(queued.body.scope, 'main-lab');
     assert.equal(queued.response.headers.get('deprecation'), 'true');
     assert.match(queued.response.headers.get('cache-control'), /no-store/);
-    assert.equal(getBackendAdds(), 0);
 
     const duplicate = await api('/v1/memory/add', {
       method: 'POST',
@@ -1253,15 +1251,14 @@ test('v2 authentication failures and unknown routes retain the v2 envelope', asy
     assert.equal(missing.body.error.code, 'not_found');
     assert.equal(JSON.stringify(missing.body).includes('/v2/unknown'), false);
 
-    const providerFailure = await api('/v2/memory/candidates/search', { method: 'POST', body: JSON.stringify({ scope: 'main-lab', query: 'explode', purpose: 'memory_curation' }) });
-    assert.equal(providerFailure.response.status, 500);
-    assert.equal(providerFailure.body.error.code, 'internal_error');
-    assert.equal(JSON.stringify(providerFailure.body).includes('/secret/path'), false);
-    assert.equal(JSON.stringify(providerFailure.body).includes('private provider response'), false);
+    const retired = await api('/v2/memory/candidates/search', { method: 'POST', body: JSON.stringify({ scope: 'main-lab', query: 'anything', purpose: 'memory_curation' }) });
+    assert.equal(retired.response.status, 404);
+    assert.equal(retired.body.error.code, 'not_found');
+    assert.equal(JSON.stringify(retired.body).includes('provider'), false);
   });
 });
 
-test('audit and catalog outages return controlled 503 responses for auth, search, and status', async () => {
+test('audit and catalog outages return controlled 503 responses for auth and status', async () => {
   const auditDown = makeStore();
   auditDown.audit = async () => { throw new Error('database offline'); };
   await withServer(async ({ api }) => {
@@ -1269,12 +1266,6 @@ test('audit and catalog outages return controlled 503 responses for auth, search
     assert.equal(auth.response.status, 503);
     assert.equal(auth.body.error.code, 'audit_unavailable');
 
-    const search = await api('/v2/memory/candidates/search', {
-      method: 'POST',
-      body: JSON.stringify({ scope: 'main-lab', query: 'appointment', purpose: 'memory_curation' })
-    });
-    assert.equal(search.response.status, 503);
-    assert.equal(search.body.error.code, 'audit_unavailable');
   }, { fabricStore: auditDown });
 
   const catalogDown = makeStore();

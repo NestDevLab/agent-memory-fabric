@@ -235,7 +235,7 @@ literal context token is only a one-shot compatibility mechanism.
 2. Select exactly one document backend. Shared deployments set
    `AMF_DOCUMENT_BACKEND=postgresql` and reuse the least-privilege catalog URL;
    local deployments use a distinct SQLite path.
-3. Start with Mem0 disabled and a synthetic vault in `shadow`. Require healthy
+3. Start with canonical-memory writes disabled and a synthetic vault in `shadow`. Require healthy
    document-store status, idempotent retry, tombstone replay, bounded snippets,
    cross-vault denial, and zero plaintext in logs.
 4. Provision a dedicated actor/key handoff, restart AMF, and enable a real vault

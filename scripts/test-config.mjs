@@ -30,7 +30,7 @@ test('the application executable is disabled unless explicitly enabled', () => {
 test('an enabled application still refuses the example-policy fallback', () => {
   const result = spawnSync(process.execPath, ['src/server.mjs'], {
     cwd: root,
-    env: { ...process.env, AMF_SERVER_ENABLED: 'true', AMF_POLICY_PATH: '', MEM0_GATEWAY_POLICY_PATH: '' },
+    env: { ...process.env, AMF_SERVER_ENABLED: 'true', AMF_POLICY_PATH: '' },
     encoding: 'utf8'
   });
   assert.equal(result.status, 78);
@@ -46,7 +46,6 @@ test('disabled module import does not parse Fabric keys or create catalog/RAW pa
       env: {
         ...process.env,
         AMF_SERVER_ENABLED: 'false',
-        MEM0_BACKEND_KIND: 'disabled',
         AMF_RAW_ENCRYPTION_KEY: 'not-a-canonical-key',
         AMF_DATA_PATH: dataPath,
         AMF_CATALOG_KIND: 'sqlite'

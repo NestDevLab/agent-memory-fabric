@@ -14,6 +14,7 @@
     "operator:provision-raw-collector": "node scripts/amf-provision-raw-collector.mjs",
     "operator:provision-recall-consumer": "node scripts/amf-provision-recall-consumer.mjs",
     "operator:provision-interactive-recall": "node scripts/amf-provision-interactive-recall.mjs",
+    "operator:provision-interactive-mcp": "node scripts/amf-provision-interactive-mcp.mjs",
     "operator:provision-document-client": "node scripts/amf-provision-document-client.mjs",
     "operator:provision-session-routes": "node scripts/amf-provision-session-routes.mjs",
     "operator:preflight-pam-runtime": "node src/operator/pam-runtime-private-dir.mjs",
@@ -26,6 +27,7 @@
     "operator:m4-reconciliation-collect": "node scripts/amf-m4-reconciliation-collect.mjs",
     "integrations": "node scripts/amf-integrations.mjs",
     "mcp:interactive-recall": "node scripts/amf-interactive-recall-mcp.mjs",
+    "mcp:interactive": "node scripts/amf-interactive-mcp.mjs",
     "test:conversation-event-outbox": "node --test scripts/test-conversation-event-v3-outbox.mjs",
     "test:conversation-event-ingest": "node --test scripts/test-conversation-event-v3-ingest-endpoint.mjs",
     "test:conversation-archive": "node --test scripts/test-conversation-archive-v1-adapters.mjs",
@@ -78,7 +80,6 @@
     "@supabase/supabase-js": "2.103.2",
     "better-sqlite3": "12.9.0",
     "gcp-metadata": "7.0.1",
-    "mem0ai": "3.0.13",
     "natural": "8.1.1",
     "ollama": "0.5.18",
     "pg": "8.11.3"

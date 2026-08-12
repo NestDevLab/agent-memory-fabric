@@ -98,13 +98,12 @@ events.
 
 ## Auth registry
 
-Set `AMF_AUTH_REGISTRY_PATH` to a local JSON registry. The legacy
-`MEM0_AUTH_REGISTRY_PATH` name remains supported. Relative paths resolve from the
-repo root; deployments should use an absolute mounted secret path.
+Set `AMF_AUTH_REGISTRY_PATH` to a local JSON registry. Relative paths resolve
+from the repo root; deployments should use an absolute mounted secret path.
 
 ```bash
 AMF_AUTH_REGISTRY_PATH=/run/secrets/agent-memory-fabric-auth.json
-MEM0_AUTH_CACHE_TTL_MS=15000
+AMF_AUTH_CACHE_TTL_MS=15000
 ```
 
 ```json
@@ -258,7 +257,7 @@ MCP advertises `memory_search`, `memory_read`, `memory_propose`, `context_search
 
 `POST /v1/memory/add` remains available with HTTP `200`, deprecation/sunset
 headers and a deterministic derived idempotency key when an old client sends none. It reports the accepted
-proposal as `queued`/non-canonical, and never calls `Mem0.add()` directly. Search
+proposal as `queued`/non-canonical, and never writes directly to canonical memory. Search
 v1 and both MCP transports remain compatible.
 
 ## Run locally

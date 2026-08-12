@@ -45,7 +45,6 @@ services:
       AMF_SEMANTIC_EMBEDDING_MODEL: nomic-embed-text
       AMF_SEMANTIC_EMBEDDING_DIMS: "768"
       AMF_MAX_BODY_BYTES: "1048576"
-      MEM0_BACKEND_KIND: disabled
     volumes:
       - amf-data:/var/lib/agent-memory-fabric
       - ${AMF_POLICY_FILE:?required}:/run/config/agent-memory-fabric-policy.json:ro

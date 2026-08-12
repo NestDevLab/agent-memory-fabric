@@ -4,7 +4,6 @@ import { URL } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createBackendAdapter } from './backend.mjs';
 import { createFabricStoreFromEnv, createUnconfiguredFabricStore } from './fabric-store.mjs';
 import { validateAmfMemoryRecord } from './amf-memory-record-validator.mjs';
 import { createCanonicalPamBridgeFromEnv, createReceiptCoordinatorFromEnv, createUnconfiguredCanonicalStore } from './canonical-memory-bridge.mjs';
@@ -27,12 +26,12 @@ function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } =
   return value;
 }
 
-const POLICY_PATH = process.env.AMF_POLICY_PATH || process.env.MEM0_GATEWAY_POLICY_PATH || '';
+const POLICY_PATH = process.env.AMF_POLICY_PATH || '';
 const SESSION_ROUTE_MANIFEST_PATH = process.env.AMF_SESSION_ROUTE_MANIFEST_PATH || '';
 const PORT = envInteger('PORT', 8787, { min: 1, max: 65535 });
 const SERVICE_NAME = 'agent-memory-fabric';
 const SERVICE_VERSION = '0.6.0';
-const LEGACY_SERVICE_ALIASES = ['mem0-gateway'];
+const LEGACY_SERVICE_ALIASES = [];
 const LIMITS = Object.freeze({
   bodyBytes: envInteger('AMF_MAX_BODY_BYTES', 262144, { min: 1024, max: 16 * 1024 * 1024 }),
   rawIngestBodyBytes: envInteger('AMF_MAX_RAW_INGEST_BODY_BYTES', RAW_EVENT_HTTP_MAX_BODY_BYTES, { min: RAW_EVENT_HTTP_MAX_BODY_BYTES, max: 16 * 1024 * 1024 }),
@@ -41,7 +40,7 @@ const LIMITS = Object.freeze({
   metadataBytes: envInteger('AMF_MAX_METADATA_BYTES', 16384, { min: 2, max: 1048576 }),
   idempotencyKeyChars: envInteger('AMF_MAX_IDEMPOTENCY_KEY_CHARS', 200, { min: 16, max: 1024 })
 });
-const AUTH_CACHE_TTL_MS = envInteger('MEM0_AUTH_CACHE_TTL_MS', 15000, { min: 0, max: 3600000 });
+const AUTH_CACHE_TTL_MS = envInteger('AMF_AUTH_CACHE_TTL_MS', 15000, { min: 0, max: 3600000 });
 const AUDIT_TIMEOUT_MS = envInteger('AMF_AUDIT_TIMEOUT_MS', 2000, { min: 100, max: 30000 });
 const CATALOG_HEALTH_TIMEOUT_MS = envInteger('AMF_CATALOG_HEALTH_TIMEOUT_MS', 3000, { min: 100, max: 30000 });
 const BODY_READ_TIMEOUT_MS = envInteger('AMF_BODY_READ_TIMEOUT_MS', 10000, { min: 100, max: 120000 });
@@ -100,7 +99,7 @@ const PUBLIC_ERRORS = new Map([
     ['raw_session_binding_conflict', [409, 'raw_session_binding_conflict']], ['raw_envelope_authentication_failed', [400, 'raw_envelope_authentication_failed']],
     ['session_text_scan_bound_exceeded', [503, 'session_text_scan_bound_exceeded']],
   ['raw_ingest_unconfigured', [503, 'raw_ingest_unconfigured']],
-  ['session_reader_unconfigured', [503, 'session_reader_unconfigured']], ['canonical_store_unconfigured', [503, 'canonical_store_unconfigured']], ['backend_not_configured', [503, 'backend_not_configured']],
+  ['session_reader_unconfigured', [503, 'session_reader_unconfigured']], ['canonical_store_unconfigured', [503, 'canonical_store_unconfigured']],
   ['audit_unavailable', [503, 'audit_unavailable']], ['catalog_unavailable', [503, 'catalog_unavailable']], ['service_unavailable', [503, 'service_unavailable']]
 ]);
 
@@ -325,10 +324,20 @@ function getScopeConfig(scope, policies) {
   return policies.scopes?.[scope] || null;
 }
 
+function scopeGrants(policy, operation) {
+  if (operation === 'read' && Array.isArray(policy.readScopes)) return policy.readScopes;
+  if (operation === 'propose' && Array.isArray(policy.proposeScopes)) return policy.proposeScopes;
+  return Array.isArray(policy.allowedScopes) ? policy.allowedScopes : [];
+}
+
+function grantAllows(grants, value) {
+  return Array.isArray(grants) && (grants.includes(value) || grants.includes('*'));
+}
+
 function canReadScope(policy, scope) {
   if (policy.mode === 'allow_all') return true;
   if (policy.mode === 'scoped' || policy.mode === 'read_only_scoped') {
-    return Array.isArray(policy.allowedScopes) && (policy.allowedScopes.includes(scope) || policy.allowedScopes.includes('*'));
+    return grantAllows(scopeGrants(policy, 'read'), scope);
   }
   return false;
 }
@@ -342,7 +351,7 @@ function canProposeScope(policy, scope) {
   if (!hasPermission(policy, 'memory:propose') && !hasPermission(policy, 'memory:add')) return false;
   if (policy.mode === 'allow_all') return true;
   if (policy.mode === 'scoped') {
-    return Array.isArray(policy.allowedScopes) && (policy.allowedScopes.includes(scope) || policy.allowedScopes.includes('*'));
+    return grantAllows(scopeGrants(policy, 'propose'), scope);
   }
   return false;
 }
@@ -522,15 +531,6 @@ function buildToolsListResult() {
         }
       },
       {
-        name: 'memory_candidates_search',
-        description: 'Explicitly rank non-canonical Mem0 candidates for memory curation; results are never canonical records.',
-        inputSchema: {
-          type: 'object', additionalProperties: false,
-          properties: { scope: { type: 'string' }, scopes: { type: 'array', items: { type: 'string' } }, query: { type: 'string' }, purpose: { const: 'memory_curation' }, contextToken: { type: 'string' } },
-          required: ['query', 'purpose']
-        }
-      },
-      {
         name: 'memory_read',
         description: 'Read an authorized canonical PAM record by canonical record id.',
         inputSchema: {
@@ -623,7 +623,7 @@ function buildToolsListResult() {
       },
       {
         name: 'memory_status',
-        description: 'Return fabric, backend, limits and compatibility status.',
+        description: 'Return fabric, canonical-store, document-store, limits and compatibility status.',
         inputSchema: { type: 'object', properties: {} }
       },
       {
@@ -640,7 +640,7 @@ function buildToolsListResult() {
   };
 }
 
-async function executeMcpMethod({ body, actor, policy, policies, backend, fabricStore, canonicalStore, documentStore,
+async function executeMcpMethod({ body, actor, policy, policies, fabricStore, canonicalStore, documentStore,
   contextVerifier, routeManifestPath, sessionReader, conversationSessionReader, migrationPause, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
   const method = body.method;
   const id = body.id ?? null;
@@ -679,7 +679,7 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
     if (name === 'memory_status') {
       requirePermission(policy, 'memory:status');
       await healthRequired(fabricStore);
-      const status = buildStatus({ backend, fabricStore, canonicalStore, documentStore, contextVerifier, conversationSessionReader, migrationPause });
+      const status = buildStatus({ fabricStore, canonicalStore, documentStore, contextVerifier, conversationSessionReader, migrationPause });
       await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] });
     }
@@ -698,16 +698,6 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
       return createRpcResult(id, {
         content: [{ type: 'text', text: JSON.stringify(searchResult, null, 2) }]
       });
-    }
-
-    if (name === 'memory_candidates_search') {
-      requirePermission(policy, 'memory:candidates:search');
-      const purpose = requirePurpose(args.purpose);
-      if (purpose !== 'memory_curation') throw Object.assign(new Error('purpose_invalid'), { status: 400 });
-      requirePurposePermission(policy, purpose);
-      const result = await performScopedSearch({ actor, scope: String(args.scope || ''), scopes: Array.isArray(args.scopes) ? args.scopes : [], query: String(args.query || ''), policy, policies, backend, fabricStore });
-      await auditRequired(fabricStore, { actor, action: 'memory_candidates_search', outcome: 'allowed', requestId, details: { resultCount: result.result.total, transport: 'mcp' } });
-      return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify({ canonical: false, candidates: result.result.items, scopes: result.scopes }, null, 2) }] });
     }
 
     if (name === 'memory_propose') {
@@ -744,7 +734,7 @@ async function executeMcpMethod({ body, actor, policy, policies, backend, fabric
     }
 
     if (name === 'documents_search') {
-      const result = await performDocumentsSearch({ actor, policy, fabricStore, documentStore, contextVerifier,
+      const result = await performDocumentsSearch({ actor, policy, policies, fabricStore, documentStore, contextVerifier,
         request: args, requestId, transport: 'mcp' });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
     }
@@ -863,15 +853,55 @@ function requirePermission(policy, permission) {
   throw error;
 }
 
-function documentVaultAllowed(policy, vaultId) {
-  if (policy.mode === 'allow_all') return true;
-  return Array.isArray(policy.allowedVaults) && policy.allowedVaults.includes(vaultId);
+function vaultGrants(policy, operation) {
+  if (operation === 'read' && Array.isArray(policy.readVaults)) return policy.readVaults;
+  if (operation === 'write' && Array.isArray(policy.writeVaults)) return policy.writeVaults;
+  return Array.isArray(policy.allowedVaults) ? policy.allowedVaults : [];
 }
 
-function requireDocumentVaults(policy, vaultIds) {
-  if (!Array.isArray(vaultIds) || !vaultIds.length || vaultIds.some(vaultId => !documentVaultAllowed(policy, vaultId))) {
+function documentVaultAllowed(policy, vaultId, operation = 'read') {
+  if (policy.mode === 'allow_all') return true;
+  if (operation === 'write' && policy.mode !== 'scoped') return false;
+  if (operation === 'read' && !['scoped', 'read_only_scoped'].includes(policy.mode)) return false;
+  return grantAllows(vaultGrants(policy, operation), vaultId);
+}
+
+function requireDocumentVaults(policy, vaultIds, operation = 'read') {
+  if (!Array.isArray(vaultIds) || !vaultIds.length || vaultIds.some(vaultId => !documentVaultAllowed(policy, vaultId, operation))) {
     throw Object.assign(new Error('forbidden'), { status: 403 });
   }
+}
+
+function policyVaultIds(policies) {
+  if (policies?.vaults === undefined) return null;
+  if (!policies.vaults || typeof policies.vaults !== 'object' || Array.isArray(policies.vaults)) {
+    throw Object.assign(new Error('policy_invalid'), { status: 500 });
+  }
+  const entries = Object.entries(policies.vaults);
+  if (entries.some(([vaultId, entry]) => !AUTH_ID.test(vaultId) || !entry || typeof entry !== 'object' || Array.isArray(entry)
+    || Object.keys(entry).sort().join('\0') !== 'canonicalId' || entry.canonicalId !== vaultId)) {
+    throw Object.assign(new Error('policy_invalid'), { status: 500 });
+  }
+  return entries.map(([vaultId]) => vaultId).sort();
+}
+
+async function resolveDocumentVaults(policy, vaultIds, documentStore, policies, operation = 'read') {
+  if (!Array.isArray(vaultIds) || !vaultIds.length) throw Object.assign(new Error('forbidden'), { status: 403 });
+  if (vaultIds.length !== 1 || vaultIds[0] !== '*') {
+    requireDocumentVaults(policy, vaultIds, operation);
+    return [...new Set(vaultIds)].sort();
+  }
+  if (!documentVaultAllowed(policy, '*', operation)) {
+    throw Object.assign(new Error('forbidden'), { status: 403 });
+  }
+  const configured = policyVaultIds(policies);
+  if (configured !== null) return configured;
+  if (typeof documentStore?.listVaultIds !== 'function') throw Object.assign(new Error('forbidden'), { status: 403 });
+  const resolved = await documentStore.listVaultIds();
+  if (!Array.isArray(resolved) || resolved.some(vaultId => typeof vaultId !== 'string' || !AUTH_ID.test(vaultId))) {
+    throw Object.assign(new Error('document_store_invalid'), { status: 503 });
+  }
+  return [...new Set(resolved)].sort();
 }
 
 function requireDocumentPurpose(value) {
@@ -886,7 +916,7 @@ async function performDocumentWrite({ actor, policy, fabricStore, documentStore,
   const action = deleting ? 'document_delete' : 'document_upsert';
   try {
     requirePermission(policy, 'documents:write');
-    requireDocumentVaults(policy, [request?.document?.vaultId]);
+    requireDocumentVaults(policy, [request?.document?.vaultId], 'write');
     const result = deleting ? await documentStore.delete(request) : await documentStore.upsert(request);
     await auditRequired(fabricStore, { actor, action, outcome: result.duplicate ? 'duplicate' : (deleting ? 'tombstoned' : 'stored'), requestId,
       targetId: result.document.documentId, details: { vaultId: result.document.vaultId, revision: result.document.revision, transport } });
@@ -898,19 +928,19 @@ async function performDocumentWrite({ actor, policy, fabricStore, documentStore,
   }
 }
 
-async function performDocumentsSearch({ actor, policy, fabricStore, documentStore, contextVerifier, request, contextToken = request.contextToken, requestId, transport }) {
+async function performDocumentsSearch({ actor, policy, policies, fabricStore, documentStore, contextVerifier, request, contextToken = request.contextToken, requestId, transport }) {
   try {
     requirePermission(policy, 'documents:search');
     const purpose = requireDocumentPurpose(request.purpose);
     requirePurposePermission(policy, purpose);
-    requireDocumentVaults(policy, request.vaultIds);
+    const vaultIds = await resolveDocumentVaults(policy, request.vaultIds, documentStore, policies);
     requireAccessContext(contextVerifier, { actor, policy, purpose, token: contextToken,
       request: buildContextRequest('documents_search', request), required: true });
-    const documents = await documentStore.search(request);
+    const documents = vaultIds.length ? await documentStore.search({ ...request, vaultIds }) : [];
     const items = documents.map((document, index) => documentSearchItem(document, request.query, index + 1));
     await auditRequired(fabricStore, { actor, action: 'documents_search', outcome: 'allowed', requestId,
-      details: { vaultIds: [...request.vaultIds].sort(), resultCount: items.length, transport } });
-    return { items, nextCursor: null, vaultIds: [...request.vaultIds].sort() };
+      details: { vaultIds, resultCount: items.length, transport } });
+    return { items, nextCursor: null, vaultIds };
   } catch (error) {
     if (error?.message !== 'audit_unavailable') await auditRequired(fabricStore, { actor, action: 'documents_search',
       outcome: Number(error?.status || 500) < 500 ? 'denied' : 'failed', requestId, details: { code: publicError(error).code, transport } });
@@ -926,7 +956,7 @@ async function performDocumentRead({ actor, policy, fabricStore, documentStore, 
     requireAccessContext(contextVerifier, { actor, policy, purpose, token: contextToken,
       request: buildContextRequest('document_read', request), required: true });
     const document = await documentStore.read(request);
-    if (!documentVaultAllowed(policy, document.vaultId)) throw Object.assign(new Error('document_not_found'), { status: 404 });
+    if (!documentVaultAllowed(policy, document.vaultId, 'read')) throw Object.assign(new Error('document_not_found'), { status: 404 });
     await auditRequired(fabricStore, { actor, action: 'document_read', outcome: 'allowed', requestId, targetId: document.documentId,
       details: { vaultId: document.vaultId, revision: document.revision, transport } });
     return { document };
@@ -979,7 +1009,7 @@ async function performContextSearch({ actor, policy, policies, fabricStore, cano
     requirePermission(policy, 'documents:search');
     const purpose = requireDocumentPurpose(request.purpose);
     requirePurposePermission(policy, purpose);
-    requireDocumentVaults(policy, request.vaultIds);
+    const vaultIds = await resolveDocumentVaults(policy, request.vaultIds, documentStore, policies);
     if (!canonicalStore.configured) throw Object.assign(new Error('canonical_store_unconfigured'), { status: 503 });
     if (!documentStore.configured) throw Object.assign(new Error('document_store_unconfigured'), { status: 503 });
     const limit = normalizeSessionLimit(request.limit);
@@ -987,10 +1017,10 @@ async function performContextSearch({ actor, policy, policies, fabricStore, cano
       request: buildContextRequest('context_search', request), required: true });
     const memoryResult = await performCanonicalSearch({ actor, scope: request.scope, scopes: request.scopes,
       query: request.query, policy, policies, canonicalStore, context, limit });
-    const documents = await documentStore.search({ query: request.query, vaultIds: request.vaultIds, limit });
+    const documents = vaultIds.length ? await documentStore.search({ query: request.query, vaultIds, limit }) : [];
     const preparedDocuments = documents.map(document => ({ ...document, query: request.query }));
     const items = interleaveContextResults(memoryResult.items, preparedDocuments, limit);
-    const result = { items, nextCursor: null, scopes: memoryResult.scopes, vaultIds: [...request.vaultIds].sort(),
+    const result = { items, nextCursor: null, scopes: memoryResult.scopes, vaultIds,
       sources: { memory: memoryResult.items.length, document: documents.length } };
     await auditRequired(fabricStore, { actor, action: 'context_search', outcome: 'allowed', requestId,
       details: { scopes: result.scopes, vaultIds: result.vaultIds, resultCount: items.length, transport } });
@@ -1124,7 +1154,7 @@ function createUnconfiguredSessionReader() {
   return { configured: false, kind: 'unconfigured', search: fail, get: fail, transcript: fail };
 }
 
-function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, conversationSessionReader = defaultSessionReader, migrationPause = null }) {
+function buildStatus({ fabricStore, canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, conversationSessionReader = defaultSessionReader, migrationPause = null }) {
   const sessionReader = { kind: conversationSessionReader.kind || 'custom', configured: Boolean(conversationSessionReader.configured) };
   try {
     const runtime = conversationSessionReader.runtimeStatus?.();
@@ -1140,7 +1170,7 @@ function buildStatus({ backend, fabricStore, canonicalStore = defaultCanonicalSt
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
     aliases: LEGACY_SERVICE_ALIASES,
-    backend: { kind: backend.kind, configured: backend.configured },
+    backend: { kind: 'canonical-only', configured: false },
     fabricStore: fabricStore.status(),
     canonicalStore: { kind: canonicalStore.kind || 'unconfigured', configured: Boolean(canonicalStore.configured) },
     documentStore: { kind: documentStore.kind || 'custom', configured: Boolean(documentStore.configured) },
@@ -1159,7 +1189,7 @@ function getAllowedScopes(policy, policies) {
   const registered = Object.keys(policies.scopes || {});
   if (policy.mode === 'allow_all') return registered;
   if (policy.mode === 'scoped' || policy.mode === 'read_only_scoped') {
-    const configured = policy.allowedScopes || [];
+    const configured = scopeGrants(policy, 'read');
     if (configured.includes('*')) return registered;
     return configured.filter(scope => registered.includes(scope));
   }
@@ -1169,7 +1199,7 @@ function getAllowedScopes(policy, policies) {
 function normalizeRequestedScopes(inputScope, inputScopes, policy, policies) {
   const availableScopes = Object.keys(policies.scopes || {});
   const allowedScopes = getAllowedScopes(policy, policies);
-  const hasWildcardAccess = policy.mode === 'allow_all' || (policy.allowedScopes || []).includes('*');
+  const hasWildcardAccess = policy.mode === 'allow_all' || scopeGrants(policy, 'read').includes('*');
 
   let requested = [];
   if (Array.isArray(inputScopes) && inputScopes.length) {
@@ -1224,6 +1254,14 @@ function strictAuthArray(value, { optional = false } = {}) {
   return strictAuthList(value);
 }
 
+function strictOperationGrantPair(row, first, second) {
+  const hasFirst = Object.hasOwn(row, first); const hasSecond = Object.hasOwn(row, second);
+  if (hasFirst !== hasSecond) throw new Error('auth_registry_invalid_row');
+  if (!hasFirst) return;
+  strictAuthList(row[first], { wildcard: true });
+  strictAuthList(row[second]);
+}
+
 function parseActive(value) {
   if (value === true) return true;
   if (value === false || value == null) return false;
@@ -1232,7 +1270,7 @@ function parseActive(value) {
 }
 
 function getAuthRegistrySource() {
-  const localPath = String(process.env.AMF_AUTH_REGISTRY_PATH || process.env.MEM0_AUTH_REGISTRY_PATH || '').trim();
+  const localPath = String(process.env.AMF_AUTH_REGISTRY_PATH || '').trim();
   if (localPath) {
     return {
       kind: 'local-json',
@@ -1292,6 +1330,8 @@ function validateAuthRows(rows, sourceKind) {
       strictAuthArray(row.sessionOwnerActors, { optional: true });
       strictAuthArray(row.contextKeyVersions, { optional: true });
       strictAuthArray(row.allowedVaults, { optional: true });
+      strictOperationGrantPair(row, 'readScopes', 'proposeScopes');
+      strictOperationGrantPair(row, 'readVaults', 'writeVaults');
     } catch { valid = false; }
     const credential = validDigest ? tokenSha256 : validToken ? crypto.createHash('sha256').update(token, 'utf8').digest('hex') : '';
     if (!valid || credentials.has(credential)) {
@@ -1467,6 +1507,9 @@ function authenticateDigest(candidate, rows) {
   if (Object.hasOwn(row, 'allowedVaults')) {
     policy.allowedVaults = strictAuthArray(row.allowedVaults);
   }
+  for (const [field, wildcard] of [['readScopes', true], ['proposeScopes', false], ['readVaults', true], ['writeVaults', false]]) {
+    if (Object.hasOwn(row, field)) policy[field] = strictAuthList(row[field], { wildcard });
+  }
   return {
     actor: String(row.actor || 'anonymous'),
     tokenDigestHex: candidate.toString('hex'),
@@ -1482,60 +1525,6 @@ async function revalidateSession(session) {
     error.status = 401;
     throw error;
   }
-}
-
-async function performScopedSearch({ actor, scope, scopes, query, policy, policies, backend, fabricStore }) {
-  if (!hasPermission(policy, 'memory:search')) {
-    const error = new Error('memory_search_forbidden');
-    error.status = 403;
-    error.data = { actor, permission: 'memory:search' };
-    throw error;
-  }
-  validateSearchInput(query);
-  const resolvedScopes = normalizeRequestedScopes(scope, scopes, policy, policies);
-  const searchResults = [];
-  const startedAt = Date.now();
-
-  for (const resolvedScope of resolvedScopes) {
-    const scopeConfig = getScopeConfig(resolvedScope, policies);
-    if (!scopeConfig?.backendUserId) {
-      const err = new Error('scope_unmapped');
-      err.status = 400;
-      err.data = { scope: resolvedScope };
-      throw err;
-    }
-    const scopeStartedAt = Date.now();
-    const result = await backend.search({ backendUserId: scopeConfig.backendUserId, query, scope: resolvedScope });
-    const filteredItems = await fabricStore.filterRecallItems(result?.items || [], { allowedScopes: [resolvedScope] });
-    const items = filteredItems.map(item => ({ ...item, scope: resolvedScope }));
-    searchResults.push({
-      scope: resolvedScope,
-      backendUserId: scopeConfig.backendUserId,
-      items,
-      total: items.length,
-      source: result?.source || backend.kind,
-      latencyMs: Date.now() - scopeStartedAt
-    });
-  }
-
-  const aggregatedItems = searchResults.flatMap(r => r.items || []);
-  const sources = [...new Set(searchResults.map(r => r.source).filter(Boolean))];
-  const backendUserIds = [...new Set(searchResults.map(r => r.backendUserId).filter(Boolean))];
-
-  return {
-    actor,
-    scope: resolvedScopes.length === 1 ? resolvedScopes[0] : '*',
-    scopes: resolvedScopes,
-    backendUserId: backendUserIds.length === 1 ? backendUserIds[0] : '*',
-    backendUserIds,
-    result: {
-      items: aggregatedItems,
-      total: aggregatedItems.length,
-      source: sources.length === 1 ? sources[0] : sources,
-      perScope: searchResults.map(({ scope, backendUserId, total, source, latencyMs }) => ({ scope, backendUserId, total, source, latencyMs })),
-      latencyMs: Date.now() - startedAt
-    }
-  };
 }
 
 async function performCanonicalSearch({ actor, scope, scopes, query, policy, policies, canonicalStore, context, limit = 20, cursor = null, from = null, to = null }) {
@@ -1640,13 +1629,12 @@ async function performMemoryRead({ actor, policy, policies, fabricStore, canonic
   throw Object.assign(new Error('memory_not_found'), { status: 404 });
 }
 
-const defaultBackend = createBackendAdapter();
 const defaultSessionReader = createUnconfiguredSessionReader();
 const defaultCanonicalStore = createUnconfiguredCanonicalStore();
 const defaultContextVerifier = createUnconfiguredContextVerifier();
 const defaultDocumentStore = createUnconfiguredDocumentStore();
 
-function createAgentMemoryFabricServer({ backend = defaultBackend, fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, conversationSessionReader = null, extractorSessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), conversationEventIngest = null, clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null } = {}) {
+function createAgentMemoryFabricServer({ fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, conversationSessionReader = null, extractorSessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), conversationEventIngest = null, clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null } = {}) {
   if (conversationEventIngest !== null && typeof conversationEventIngest !== 'function') throw new Error('conversation_event_ingest_invalid');
   if (!Buffer.isBuffer(curationCursorKey) || curationCursorKey.length < 32) throw new Error('curation_cursor_key_invalid');
 if (!Number.isSafeInteger(rawIngestBodyBytes) || rawIngestBodyBytes < 1024 || rawIngestBodyBytes > 16 * 1024 * 1024) throw new Error('raw_ingest_body_limit_invalid');
@@ -1754,7 +1742,7 @@ const requestHandler = async (req, res) => {
     try {
       requirePermission(policy, 'memory:status');
       await healthRequired(fabricStore);
-      const response = buildStatus({ backend, fabricStore, canonicalStore, documentStore, contextVerifier, conversationSessionReader, migrationPause });
+      const response = buildStatus({ fabricStore, canonicalStore, documentStore, contextVerifier, conversationSessionReader, migrationPause });
       await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
       return json(res, 200, v2Envelope(requestId, response));
     } catch (error) {
@@ -1785,7 +1773,7 @@ const requestHandler = async (req, res) => {
       const body = await parseBody(req);
       const allowed = new Set(['query', 'vaultIds', 'purpose', 'cursor', 'limit']);
       if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !allowed.has(key))) throw Object.assign(new Error('document_invalid'), { status: 400 });
-      const result = await performDocumentsSearch({ actor, policy, fabricStore, documentStore, contextVerifier,
+      const result = await performDocumentsSearch({ actor, policy, policies, fabricStore, documentStore, contextVerifier,
         request: body, contextToken: getAccessContextToken(req, url, policy), requestId, transport: 'rest' });
       return jsonNoStore(res, 200, v2Envelope(requestId, result));
     } catch (error) {
@@ -1977,24 +1965,6 @@ const requestHandler = async (req, res) => {
       return jsonNoStore(res, result.ok ? 200 : 409, v2Envelope(requestId, response));
     } catch (error) {
       const reported = await auditInternalFailure(fabricStore, { actor, action: 'curation_reconcile', requestId, error });
-      const failure = v2Error(requestId, reported, 500);
-      return jsonNoStore(res, failure.status, failure.body);
-    }
-  }
-
-  if (url.pathname === '/v2/memory/candidates/search' && req.method === 'POST') {
-    try {
-      requirePermission(policy, 'memory:candidates:search');
-      const body = await parseBody(req);
-      const purpose = requirePurpose(body.purpose);
-      if (purpose !== 'memory_curation') throw Object.assign(new Error('purpose_invalid'), { status: 400 });
-      requirePurposePermission(policy, purpose);
-      const result = await performScopedSearch({ actor, scope: String(body.scope || ''), scopes: Array.isArray(body.scopes) ? body.scopes : [], query: String(body.query || ''), policy, policies, backend, fabricStore });
-      const data = { canonical: false, candidates: result.result.items, scopes: result.scopes, nextCursor: null };
-      await auditRequired(fabricStore, { actor, action: 'memory_candidates_search', outcome: 'allowed', requestId, details: { resultCount: data.candidates.length, transport: 'rest' } });
-      return jsonNoStore(res, 200, v2Envelope(requestId, data));
-    } catch (error) {
-      const reported = await auditInternalFailure(fabricStore, { actor, action: 'memory_candidates_search', requestId, error });
       const failure = v2Error(requestId, reported, 500);
       return jsonNoStore(res, failure.status, failure.body);
     }
@@ -2430,7 +2400,6 @@ const requestHandler = async (req, res) => {
         actor: session.actor,
         policy: session.policy,
         policies,
-        backend,
         fabricStore,
         canonicalStore,
         documentStore,
@@ -2499,7 +2468,6 @@ const requestHandler = async (req, res) => {
         actor: currentActor,
         policy: currentPolicy,
         policies,
-        backend,
         fabricStore,
         canonicalStore,
         documentStore,
@@ -2583,7 +2551,7 @@ if (process.argv.includes('--check')) {
   try {
     const migrationPause = loadVerifiedMigrationPauseFromEnv(process.env);
     const checkStore = createUnconfiguredFabricStore('check_only');
-    console.log(JSON.stringify({ ok: true, service: SERVICE_NAME, aliases: LEGACY_SERVICE_ALIASES, policyPath: POLICY_PATH, port: PORT, backend: defaultBackend.kind, configured: defaultBackend.configured, fabricStore: checkStore.status(), authRegistry: getAuthRegistrySource().kind,
+    console.log(JSON.stringify({ ok: true, service: SERVICE_NAME, aliases: LEGACY_SERVICE_ALIASES, policyPath: POLICY_PATH, port: PORT, backend: 'canonical-only', configured: false, fabricStore: checkStore.status(), authRegistry: getAuthRegistrySource().kind,
       ...(migrationPause ? { migration: { rawIngest: { state: 'paused', health: 'degraded', verified: true } } } : {}) }, null, 2));
     process.exit(0);
   } catch (error) {
@@ -2636,7 +2604,7 @@ if (isMain) {
       runtimeServer.listen(PORT, () => {
         console.log(`${SERVICE_NAME} listening on :${PORT}`);
         console.log(`policy path: ${POLICY_PATH}`);
-        console.log(`backend kind: ${defaultBackend.kind}`);
+        console.log('canonical memory store: configured by AMF_PAM_*');
         console.log(`auth registry: ${getAuthRegistrySource().kind}`);
       });
     }).catch(async (error) => {

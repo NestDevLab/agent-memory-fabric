@@ -2,8 +2,7 @@
 
 Concept-level recall for canonical memory records, unioned into the existing
 substring + token search in `CanonicalPamBridge`. It is **default-off** and
-independent of the mem0/openmemory backend: it talks to a dedicated pgvector
-table and an embedding endpoint directly.
+uses a dedicated pgvector table and embedding endpoint directly.
 
 ## How it works
 

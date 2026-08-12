@@ -2,8 +2,8 @@
 
 The PostgreSQL catalog is an explicit production option. It stores catalog
 metadata only; encrypted RAW bodies remain in the configured RAW object store.
-Do not point it at the legacy Mem0/OpenMemory database or reuse a Mem0 vector
-collection. Provision a dedicated database and role for Agent Memory Fabric.
+Do not point it at a database or vector collection owned by another memory
+service. Provision a dedicated database and role for Agent Memory Fabric.
 
 ## Configuration
 
@@ -102,7 +102,7 @@ names, room names, or unencrypted cursor values. All runtime DML is parameterize
 ## Migration and rollout
 
 The v7 session-binding migration supports existing SQLite and PostgreSQL v2
-session rows in place. It does not migrate legacy Mem0 data. Take a consistent
+session rows in place. It does not migrate data from other memory services. Take a consistent
 catalog backup before starting a v7 binary and verify the backfilled binding count
 against the v2 session count before enabling writers.
 
@@ -116,7 +116,7 @@ against the v2 session count before enabling writers.
    node --test scripts/test-postgres-catalog-integration.mjs
    ```
 
-4. Start a shadow instance with Mem0 still disabled and verify `memory_status`,
+4. Start a shadow instance with canonical-memory writes still disabled and verify `memory_status`,
    proposal retries, audit persistence, pool health, and outage behavior.
 5. Start the v7 binary with writers stopped; verify `session_binding_json` for
    every v2 session and confirm `rawProjectionV2Ready` before enabling ingest.

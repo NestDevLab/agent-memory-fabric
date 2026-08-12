@@ -6,9 +6,8 @@ cross-repository fixture is
 `scripts/fixtures/contracts/principia-canonical-contract.json`.
 
 All successful REST responses use exactly `{ok,data,meta}`. Canonical memory
-search and read fail closed when PAM is unconfigured; Mem0 results are exposed
-only by the explicitly non-canonical candidate-ranking operation. Context-token
-request digests use the exact normalized shapes in the fixture, including
+search and read fail closed when PAM is unconfigured. Context-token request
+digests use the exact normalized shapes in the fixture, including
 sorted scope arrays and explicit pagination/time nulls.
 
 Transcript responses always use `items`. Redacted and original items are

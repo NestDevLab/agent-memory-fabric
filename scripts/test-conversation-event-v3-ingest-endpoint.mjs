@@ -170,8 +170,8 @@ async function withServer(run, { configured = true } = {}) {
     { token: 'allowed', active: true, actor: 'actor', mode: 'allow_all', allowedScopes: '*', permissions: 'conversation:ingest' },
     { token: 'denied', active: true, actor: 'actor', mode: 'allow_all', allowedScopes: '*', permissions: 'memory:search' }
   ] }));
-  const previous = process.env.MEM0_AUTH_REGISTRY_PATH;
-  process.env.MEM0_AUTH_REGISTRY_PATH = registry;
+  const previous = process.env.AMF_AUTH_REGISTRY_PATH;
+  process.env.AMF_AUTH_REGISTRY_PATH = registry;
   const writes = { count: 0, handler: 0 };
   const store = new FabricStore({ rawStore: new MemoryRawStore({ encryptionKey: KEY.toString('base64') }), catalog: new MemoryCatalog() });
   const endpoint = handler({ archive: { async append() { writes.count += 1; return { outcome: 'stored' }; }, async tombstone() { writes.count += 1; return { outcome: 'stored' }; } } });
@@ -182,8 +182,8 @@ async function withServer(run, { configured = true } = {}) {
   finally {
     await closeServer(server);
     await store.close();
-    if (previous === undefined) delete process.env.MEM0_AUTH_REGISTRY_PATH;
-    else process.env.MEM0_AUTH_REGISTRY_PATH = previous;
+    if (previous === undefined) delete process.env.AMF_AUTH_REGISTRY_PATH;
+    else process.env.AMF_AUTH_REGISTRY_PATH = previous;
     fs.rmSync(root, { recursive: true, force: true });
   }
 }
