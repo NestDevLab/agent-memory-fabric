@@ -23,6 +23,14 @@ anything. The compatibility `allowedScopes` and `allowedVaults` fields remain
 the narrow write grants so an older server cannot accidentally reinterpret a
 read wildcard as a write privilege.
 
+Fabric persists the nine `--tool` values in both the registry row and policy
+actor, filters `tools/list` from that server-side allowlist, and rejects an
+unlisted `tools/call` before dispatch. A `client:mcp:*` row without a persisted
+tool list receives no MCP tools: migrate it through the provisioner before it
+can be used. Legacy `allowedScopes: ['*']` remains read-compatible but is never
+a proposal grant; migrate proposal principals to an explicit non-wildcard
+`proposeScopes` list.
+
 `document_delete` appends a revisioned tombstone. Both document writes retain
 the caller's expected revision and idempotency key; Fabric audits every allow,
 denial, duplicate, and tombstone.

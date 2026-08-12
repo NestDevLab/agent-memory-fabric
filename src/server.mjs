@@ -72,6 +72,7 @@ const PUBLIC_ERRORS = new Map([
   ['purpose_invalid', [400, 'purpose_invalid']], ['context_required', [403, 'context_required']], ['context_invalid', [403, 'context_invalid']], ['session_limit_invalid', [400, 'session_limit_invalid']], ['raw_content_id_invalid', [400, 'raw_content_id_invalid']],
   ['missing_token', [401, 'missing_token']], ['invalid_token', [401, 'invalid_token']], ['session_expired', [401, 'session_expired']], ['session_revoked', [401, 'session_revoked']],
   ['forbidden', [403, 'forbidden']], ['scope_forbidden', [403, 'scope_forbidden']], ['memory_search_forbidden', [403, 'memory_search_forbidden']],
+  ['mcp_tool_forbidden', [403, 'mcp_tool_forbidden']],
   ['sessions_forbidden', [403, 'sessions_forbidden']], ['raw_decrypt_forbidden', [403, 'raw_decrypt_forbidden']],
   ['not_found', [404, 'not_found']], ['memory_not_found', [404, 'memory_not_found']], ['session_not_found', [404, 'session_not_found']], ['unknown_session', [404, 'unknown_session']],
   ['document_not_found', [404, 'document_not_found']],
@@ -327,7 +328,12 @@ function getScopeConfig(scope, policies) {
 function scopeGrants(policy, operation) {
   if (operation === 'read' && Array.isArray(policy.readScopes)) return policy.readScopes;
   if (operation === 'propose' && Array.isArray(policy.proposeScopes)) return policy.proposeScopes;
-  return Array.isArray(policy.allowedScopes) ? policy.allowedScopes : [];
+  const legacy = Array.isArray(policy.allowedScopes) ? policy.allowedScopes : [];
+  // `allowedScopes` predates operation-specific grants.  It remains a
+  // read-compatible fallback, but it can never turn a legacy read wildcard
+  // into a proposal grant.  An actor that needs to propose must be migrated to
+  // an explicit, non-wildcard `proposeScopes` list.
+  return operation === 'propose' ? legacy.filter(scope => scope !== '*') : legacy;
 }
 
 function grantAllows(grants, value) {
@@ -512,131 +518,141 @@ function buildInitializeResult(protocolVersion, sessionReader) {
   };
 }
 
-function buildToolsListResult() {
-  return {
-    tools: [
-      {
-        name: 'memory_search',
-        description: 'Search memory within one or more allowed scopes.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            scope: { type: 'string' },
-            scopes: { type: 'array', items: { type: 'string' } },
-            query: { type: 'string' },
-            purpose: { type: 'string' },
-            contextToken: { type: 'string' }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 }, from: { type: ['string', 'null'] }, to: { type: ['string', 'null'] }
-          },
-          required: ['query', 'purpose']
-        }
-      },
-      {
-        name: 'memory_read',
-        description: 'Read an authorized canonical PAM record by canonical record id.',
-        inputSchema: {
-          type: 'object',
-          properties: { id: { type: 'string' }, purpose: { type: 'string' }, contextToken: { type: 'string' } },
-          required: ['id', 'purpose']
-        }
-      },
-      {
-        name: 'documents_search',
-        description: 'Search authorized editorial documents without treating them as canonical memories.',
-        inputSchema: {
-          type: 'object', additionalProperties: false,
-          properties: { query: { type: 'string' }, vaultIds: { type: 'array', minItems: 1, items: { type: 'string' } },
-            purpose: { type: 'string' }, contextToken: { type: 'string' }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 } },
-          required: ['query', 'vaultIds', 'purpose', 'contextToken']
-        }
-      },
-      {
-        name: 'document_read',
-        description: 'Read one authorized editorial document revision with provenance.',
-        inputSchema: {
-          type: 'object', additionalProperties: false,
-          properties: { documentId: { type: 'string' }, revision: { type: ['integer', 'null'], minimum: 1 }, purpose: { type: 'string' }, contextToken: { type: 'string' } },
-          required: ['documentId', 'purpose', 'contextToken']
-        }
-      },
-      {
-        name: 'document_upsert',
-        description: 'Ingest one revisioned editorial document. Requires documents:write.',
-        inputSchema: { type: 'object', additionalProperties: false, properties: { document: { type: 'object' }, text: { type: ['string', 'null'] }, expectedRevision: { type: ['integer', 'null'] }, idempotencyKey: { type: 'string' } }, required: ['document', 'text', 'expectedRevision', 'idempotencyKey'] }
-      },
-      {
-        name: 'document_delete',
-        description: 'Append a document tombstone revision. Requires documents:write.',
-        inputSchema: { type: 'object', additionalProperties: false, properties: { document: { type: 'object' }, expectedRevision: { type: 'integer', minimum: 1 }, idempotencyKey: { type: 'string' } }, required: ['document', 'expectedRevision', 'idempotencyKey'] }
-      },
-      {
-        name: 'context_search',
-        description: 'Interleave authorized canonical memories and editorial documents without changing either canon.',
-        inputSchema: {
-          type: 'object', additionalProperties: false,
-          properties: { query: { type: 'string' }, scopes: { type: 'array', items: { type: 'string' } },
-            vaultIds: { type: 'array', minItems: 1, items: { type: 'string' } }, purpose: { type: 'string' }, contextToken: { type: 'string' },
-            limit: { type: 'integer', minimum: 1, maximum: 100 } },
-          required: ['query', 'scopes', 'vaultIds', 'purpose', 'contextToken']
-        }
-      },
-      {
-        name: 'memory_propose',
-        description: 'Queue a canonical, revision-aware memory proposal for later curation.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            record: { type: 'object' },
-            rationale: { type: 'string' },
-            expectedRevision: { type: ['integer', 'null'], minimum: 0 },
-            idempotencyKey: { type: 'string', description: 'Optional transport retry key; derived deterministically when omitted.' }
-          },
-          required: ['record', 'rationale']
-        }
-      },
-      {
-        name: 'memory_proposal_status',
-        description: 'Read proposal lifecycle status without decrypting the proposed record.',
-        inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] }
-      },
-      {
-        name: 'sessions_search',
-        description: 'Search native session metadata through the configured session reader.',
-        inputSchema: {
-          type: 'object',
-          properties: { query: { type: 'string' }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 }, from: { type: ['string', 'null'] }, to: { type: ['string', 'null'] }, purpose: { type: 'string', enum: ['conversation_recall', 'continuity_resume', 'incident_debug', 'operator_review', 'memory_curation'] }, contextToken: { type: 'string' } },
-          required: ['query', 'purpose']
-        }
-      },
-      {
-        name: 'session_get',
-        description: 'Read one session metadata record.',
-        inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, purpose: { type: 'string' }, contextToken: { type: 'string' } }, required: ['sessionId', 'purpose'] }
-      },
-      {
-        name: 'session_transcript',
-        description: 'Read a redacted transcript by default; original requires raw:decrypt.',
-        inputSchema: {
-          type: 'object',
-          properties: { sessionId: { type: 'string' }, view: { type: 'string', enum: ['redacted', 'original'] }, query: { type: 'string' }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 }, from: { type: ['string', 'null'] }, to: { type: ['string', 'null'] }, purpose: { type: 'string' }, contextToken: { type: 'string' } },
-          required: ['sessionId', 'purpose']
-        }
-      },
-      {
-        name: 'memory_status',
-        description: 'Return fabric, canonical-store, document-store, limits and compatibility status.',
-        inputSchema: { type: 'object', properties: {} }
-      },
-      {
-        name: 'list_scopes',
-        description: 'Legacy alias: list scopes visible to the current actor.',
-        inputSchema: { type: 'object', properties: {} }
-      },
-      {
-        name: 'gateway_health',
-        description: 'Legacy alias: return fabric health.',
-        inputSchema: { type: 'object', properties: {} }
+function isMcpToolAllowed(actor, policy, name) {
+  if (Array.isArray(policy.tools)) return policy.tools.includes(name);
+  // Interactive MCP principals must be migrated to a persisted server-side
+  // allowlist.  Do not fall back to the generic Fabric surface for an older
+  // handoff that lacks one.
+  return !String(actor).startsWith('client:mcp:');
+}
+
+function buildToolsListResult(actor, policy) {
+  const allTools = [
+    {
+      name: 'memory_search',
+      description: 'Search memory within one or more allowed scopes.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          scope: { type: 'string' },
+          scopes: { type: 'array', items: { type: 'string' } },
+          query: { type: 'string' },
+          purpose: { type: 'string' },
+          contextToken: { type: 'string' }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 }, from: { type: ['string', 'null'] }, to: { type: ['string', 'null'] }
+        },
+        required: ['query', 'purpose']
       }
-    ]
+    },
+    {
+      name: 'memory_read',
+      description: 'Read an authorized canonical PAM record by canonical record id.',
+      inputSchema: {
+        type: 'object',
+        properties: { id: { type: 'string' }, purpose: { type: 'string' }, contextToken: { type: 'string' } },
+        required: ['id', 'purpose']
+      }
+    },
+    {
+      name: 'documents_search',
+      description: 'Search authorized editorial documents without treating them as canonical memories.',
+      inputSchema: {
+        type: 'object', additionalProperties: false,
+        properties: { query: { type: 'string' }, vaultIds: { type: 'array', minItems: 1, items: { type: 'string' } },
+          purpose: { type: 'string' }, contextToken: { type: 'string' }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 } },
+        required: ['query', 'vaultIds', 'purpose', 'contextToken']
+      }
+    },
+    {
+      name: 'document_read',
+      description: 'Read one authorized editorial document revision with provenance.',
+      inputSchema: { type: 'object', additionalProperties: false,
+        properties: { documentId: { type: 'string' }, revision: { type: ['integer', 'null'], minimum: 1 }, purpose: { type: 'string' }, contextToken: { type: 'string' } },
+        required: ['documentId', 'purpose', 'contextToken'] }
+    },
+    {
+      name: 'document_upsert',
+      description: 'Ingest one revisioned editorial document. Requires documents:write.',
+      inputSchema: { type: 'object', additionalProperties: false, properties: { document: { type: 'object' }, text: { type: ['string', 'null'] }, expectedRevision: { type: ['integer', 'null'] }, idempotencyKey: { type: 'string' } }, required: ['document', 'text', 'expectedRevision', 'idempotencyKey'] }
+    },
+    {
+      name: 'document_delete',
+      description: 'Append a document tombstone revision. Requires documents:write.',
+      inputSchema: { type: 'object', additionalProperties: false, properties: { document: { type: 'object' }, expectedRevision: { type: 'integer', minimum: 1 }, idempotencyKey: { type: 'string' } }, required: ['document', 'expectedRevision', 'idempotencyKey'] }
+    },
+    {
+      name: 'context_search',
+      description: 'Interleave authorized canonical memories and editorial documents without changing either canon.',
+      inputSchema: {
+        type: 'object', additionalProperties: false,
+        properties: { query: { type: 'string' }, scopes: { type: 'array', items: { type: 'string' } },
+          vaultIds: { type: 'array', minItems: 1, items: { type: 'string' } }, purpose: { type: 'string' }, contextToken: { type: 'string' },
+          limit: { type: 'integer', minimum: 1, maximum: 100 } },
+        required: ['query', 'scopes', 'vaultIds', 'purpose', 'contextToken']
+      }
+    },
+    {
+      name: 'memory_propose',
+      description: 'Queue a canonical, revision-aware memory proposal for later curation.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          record: { type: 'object' },
+          rationale: { type: 'string' },
+          expectedRevision: { type: ['integer', 'null'], minimum: 0 },
+          idempotencyKey: { type: 'string', description: 'Optional transport retry key; derived deterministically when omitted.' }
+        },
+        required: ['record', 'rationale']
+      }
+    },
+    {
+      name: 'memory_proposal_status',
+      description: 'Read proposal lifecycle status without decrypting the proposed record.',
+      inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] }
+    },
+    {
+      name: 'sessions_search',
+      description: 'Search native session metadata through the configured session reader.',
+      inputSchema: {
+        type: 'object',
+        properties: { query: { type: 'string' }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 }, from: { type: ['string', 'null'] }, to: { type: ['string', 'null'] }, purpose: { type: 'string', enum: ['conversation_recall', 'continuity_resume', 'incident_debug', 'operator_review', 'memory_curation'] }, contextToken: { type: 'string' } },
+        required: ['query', 'purpose']
+      }
+    },
+    {
+      name: 'session_get',
+      description: 'Read one session metadata record.',
+      inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, purpose: { type: 'string' }, contextToken: { type: 'string' } }, required: ['sessionId', 'purpose'] }
+    },
+    {
+      name: 'session_transcript',
+      description: 'Read a redacted transcript by default; original requires raw:decrypt.',
+      inputSchema: {
+        type: 'object',
+        properties: { sessionId: { type: 'string' }, view: { type: 'string', enum: ['redacted', 'original'] }, query: { type: 'string' }, cursor: { type: ['string', 'null'] }, limit: { type: 'integer', minimum: 1, maximum: 100 }, from: { type: ['string', 'null'] }, to: { type: ['string', 'null'] }, purpose: { type: 'string' }, contextToken: { type: 'string' } },
+        required: ['sessionId', 'purpose']
+      }
+    },
+    {
+      name: 'memory_status',
+      description: 'Return fabric, canonical-store, document-store, limits and compatibility status.',
+      inputSchema: { type: 'object', properties: {} }
+    },
+    {
+      name: 'list_scopes',
+      description: 'Legacy alias: list scopes visible to the current actor.',
+      inputSchema: { type: 'object', properties: {} }
+    },
+    {
+      name: 'gateway_health',
+      description: 'Legacy alias: return fabric health.',
+      inputSchema: { type: 'object', properties: {} }
+    }
+  ];
+  const byName = new Map(allTools.map(tool => [tool.name, tool]));
+  return {
+    tools: Array.isArray(policy.tools)
+      ? policy.tools.map(name => byName.get(name)).filter(Boolean)
+      : allTools.filter(tool => isMcpToolAllowed(actor, policy, tool.name))
   };
 }
 
@@ -654,12 +670,18 @@ async function executeMcpMethod({ body, actor, policy, policies, fabricStore, ca
   }
 
   if (method === 'tools/list') {
-    return createRpcResult(id, buildToolsListResult());
+    return createRpcResult(id, buildToolsListResult(actor, policy));
   }
 
   if (method === 'tools/call') {
     const name = body.params?.name;
     const args = body.params?.arguments || {};
+
+    if (typeof name !== 'string' || !isMcpToolAllowed(actor, policy, name)) {
+      const error = new Error('mcp_tool_forbidden');
+      error.status = 403;
+      throw error;
+    }
 
     if (name === 'list_scopes') {
       const scopes = getAllowedScopes(policy, policies);
@@ -1330,6 +1352,7 @@ function validateAuthRows(rows, sourceKind) {
       strictAuthArray(row.sessionOwnerActors, { optional: true });
       strictAuthArray(row.contextKeyVersions, { optional: true });
       strictAuthArray(row.allowedVaults, { optional: true });
+      strictAuthArray(row.tools, { optional: true });
       strictOperationGrantPair(row, 'readScopes', 'proposeScopes');
       strictOperationGrantPair(row, 'readVaults', 'writeVaults');
     } catch { valid = false; }
@@ -1506,6 +1529,9 @@ function authenticateDigest(candidate, rows) {
   }
   if (Object.hasOwn(row, 'allowedVaults')) {
     policy.allowedVaults = strictAuthArray(row.allowedVaults);
+  }
+  if (Object.hasOwn(row, 'tools')) {
+    policy.tools = strictAuthArray(row.tools);
   }
   for (const [field, wildcard] of [['readScopes', true], ['proposeScopes', false], ['readVaults', true], ['writeVaults', false]]) {
     if (Object.hasOwn(row, field)) policy[field] = strictAuthList(row[field], { wildcard });

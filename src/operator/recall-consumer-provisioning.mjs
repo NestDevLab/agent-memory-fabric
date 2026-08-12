@@ -258,7 +258,7 @@ function validateAuthRegistry(registry) {
       throw fail('recall_consumer_auth_registry_invalid');
     }
     normalizedList(row.allowedScopes, { wildcard: true }); normalizedList(row.permissions, { wildcard: true });
-    optionalList(row, 'sessionOwnerActors'); optionalList(row, 'contextKeyVersions'); optionalList(row, 'allowedVaults');
+    optionalList(row, 'sessionOwnerActors'); optionalList(row, 'contextKeyVersions'); optionalList(row, 'allowedVaults'); optionalList(row, 'tools');
     validateOperationGrants(row, 'recall_consumer_auth_registry_invalid');
     for (const version of optionalList(row, 'contextKeyVersions')) {
       const existing = contextVersionOwners.get(version);
@@ -300,6 +300,7 @@ function validatePolicy(policy) {
       throw fail('recall_consumer_policy_invalid');
     }
     if (entry.allowedScopes !== undefined) normalizedList(entry.allowedScopes, { wildcard: true });
+    if (entry.tools !== undefined) normalizedList(entry.tools);
     validateOperationGrants(entry, 'recall_consumer_policy_invalid');
     if (entry.sessionOwnerActors !== undefined) {
       if (!Array.isArray(entry.sessionOwnerActors)) throw fail('recall_consumer_policy_invalid');
@@ -371,6 +372,7 @@ function exactConsumerRow(row, scopes, profile) {
     const keys = ['tokenSha256', 'active', 'actor', 'mode', 'allowedScopes', 'permissions', 'contextKeyVersions'];
     if (profile.sessionOwnerActors.length) keys.push('sessionOwnerActors');
     if (profile.allowedVaults) keys.push('allowedVaults');
+    if (profile.tools) keys.push('tools');
     if (profile.operationGrants) keys.push('readScopes', 'proposeScopes', 'readVaults', 'writeVaults');
     return exactKeys(row, keys)
       && row.active === true && row.actor === profile.actor && row.mode === profile.mode
@@ -380,6 +382,7 @@ function exactConsumerRow(row, scopes, profile) {
         === canonicalJson(profile.sessionOwnerActors))
       && (!profile.allowedVaults || canonicalJson(normalizedList(row.allowedVaults))
         === canonicalJson(profile.allowedVaults))
+      && (!profile.tools || canonicalJson(normalizedList(row.tools)) === canonicalJson(profile.tools))
       && (!profile.operationGrants || (canonicalJson(normalizedList(row.readScopes, { wildcard: true }))
         === canonicalJson(profile.operationGrants.readScopes)
         && canonicalJson(normalizedList(row.proposeScopes)) === canonicalJson(profile.operationGrants.proposeScopes)
@@ -394,12 +397,14 @@ function exactPolicyActor(entry, scopes, profile) {
   try {
     const keys = ['mode', 'allowedScopes', 'contextKeyVersions'];
     if (profile.sessionOwnerActors.length) keys.push('sessionOwnerActors');
+    if (profile.tools) keys.push('tools');
     if (profile.operationGrants) keys.push('readScopes', 'proposeScopes', 'readVaults', 'writeVaults');
     return exactKeys(entry, keys)
       && entry.mode === profile.mode
       && canonicalJson(normalizedList(entry.allowedScopes)) === canonicalJson(scopes)
       && (!profile.sessionOwnerActors.length || canonicalJson(normalizedList(entry.sessionOwnerActors))
         === canonicalJson(profile.sessionOwnerActors))
+      && (!profile.tools || canonicalJson(normalizedList(entry.tools)) === canonicalJson(profile.tools))
       && (!profile.operationGrants || (canonicalJson(normalizedList(entry.readScopes, { wildcard: true }))
         === canonicalJson(profile.operationGrants.readScopes)
         && canonicalJson(normalizedList(entry.proposeScopes)) === canonicalJson(profile.operationGrants.proposeScopes)
@@ -710,6 +715,7 @@ export function provisionScopedConsumer({ authRegistryPath, policyPath, contextK
       handoffPath: resolved.handoff, backupPath: null };
     if (profile.sessionOwnerActors.length) safeResult.sessionOwnerActors = profile.sessionOwnerActors;
     if (profile.allowedVaults) safeResult.allowedVaults = profile.allowedVaults;
+    if (profile.tools) safeResult.tools = profile.tools;
     if (profile.operationGrants) Object.assign(safeResult, profile.operationGrants);
     if (dryRun) return safeResult;
 
@@ -720,6 +726,7 @@ export function provisionScopedConsumer({ authRegistryPath, policyPath, contextK
       contextKeyVersions: [profile.contextKeyVersion] };
     if (profile.sessionOwnerActors.length) newRow.sessionOwnerActors = profile.sessionOwnerActors;
     if (profile.allowedVaults) newRow.allowedVaults = profile.allowedVaults;
+    if (profile.tools) newRow.tools = profile.tools;
     if (profile.operationGrants) Object.assign(newRow, profile.operationGrants);
     const nextRegistry = withAuthRows(registry, extracted.wrapper, [...extracted.rows, newRow]);
     const newScopes = Object.fromEntries(scopes
@@ -731,6 +738,7 @@ export function provisionScopedConsumer({ authRegistryPath, policyPath, contextK
     if (profile.sessionOwnerActors.length) {
       nextPolicy.actors[profile.actor].sessionOwnerActors = profile.sessionOwnerActors;
     }
+    if (profile.tools) nextPolicy.actors[profile.actor].tools = profile.tools;
     if (profile.operationGrants) Object.assign(nextPolicy.actors[profile.actor], profile.operationGrants);
     const nextContextRing = { ...contextRing, keys: { ...contextRing.keys,
       [profile.contextKeyVersion]: contextKey } };

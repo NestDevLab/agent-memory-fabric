@@ -48,6 +48,9 @@ test('provisions operation-specific MCP grants and keeps legacy fields write-nar
     const row = JSON.parse(fs.readFileSync(options.authRegistryPath, 'utf8')).rows.find(item => item.actor === handoff.actor);
     assert.equal(row.mode, 'scoped'); assert.deepEqual(row.allowedScopes, PROPOSE_SCOPES); assert.deepEqual(row.allowedVaults, WRITE_VAULTS);
     assert.deepEqual(row.readScopes, READ_SCOPES); assert.deepEqual(row.proposeScopes, PROPOSE_SCOPES); assert.deepEqual(row.readVaults, READ_VAULTS); assert.deepEqual(row.writeVaults, WRITE_VAULTS);
+    assert.deepEqual(row.tools, INTERACTIVE_MCP_TOOLS);
+    const actorPolicy = JSON.parse(fs.readFileSync(options.policyPath, 'utf8')).actors[handoff.actor];
+    assert.deepEqual(actorPolicy.tools, INTERACTIVE_MCP_TOOLS);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

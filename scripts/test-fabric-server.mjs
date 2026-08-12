@@ -13,6 +13,7 @@ import { buildContextRequest } from '../src/access-contract.mjs';
 import { CanonicalPamBridge, CuratorReceiptCoordinator, MemoryReceiptLedger } from '../src/canonical-memory-bridge.mjs';
 import { MemoryDocumentStore } from '../src/document-store.mjs';
 import { aggregatePauseCheckpointInputs, createPauseManifest, verifyPauseManifest } from '../src/migration-pause.mjs';
+import { INTERACTIVE_MCP_TOOLS } from '../src/operator/interactive-mcp-provisioning.mjs';
 
 const testPolicyPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'config', 'policies.example.json');
 const CONTEXT_RING = { currentKeyVersion: 'ctx-v1', keys: { 'ctx-v1': Buffer.alloc(32, 7).toString('base64') } };
@@ -395,6 +396,68 @@ test('operation grants allow read wildcards but keep proposals and document writ
     const deniedWrite = await api(`/v2/documents/${other.document.documentId}`, { method: 'PUT', headers, body: JSON.stringify(other) });
     assert.equal(deniedWrite.response.status, 403);
   }, { documentStore });
+});
+
+test('server enforces the persisted interactive MCP tool surface and rejects legacy proposal wildcards', async () => {
+  await withServer(async ({ api, registry, writeRegistry }) => {
+    registry.rows.push({
+      token: 'interactive-mcp-token', active: true, actor: 'client:mcp:codex', mode: 'scoped',
+      allowedScopes: ['domain:main-lab'], allowedVaults: ['vault-personal'],
+      readScopes: ['*'], proposeScopes: ['domain:main-lab'], readVaults: ['*'], writeVaults: ['vault-personal'],
+      permissions: ['memory:search', 'memory:read', 'memory:propose', 'memory:status', 'documents:search', 'documents:read', 'documents:write', 'purpose:conversation_recall', 'purpose:memory_curation', 'purpose:operator_review'],
+      tools: [...INTERACTIVE_MCP_TOOLS]
+    });
+    registry.rows.push({
+      token: 'legacy-proposal-wildcard-token', active: true, actor: 'legacy-proposal-wildcard', mode: 'scoped',
+      allowedScopes: ['*'], permissions: ['memory:propose']
+    });
+    registry.rows.push({
+      token: 'unmigrated-mcp-token', active: true, actor: 'client:mcp:claude', mode: 'scoped',
+      allowedScopes: ['domain:main-lab'], permissions: ['memory:status']
+    });
+    writeRegistry();
+
+    const headers = { authorization: 'Bearer interactive-mcp-token' };
+    const listed = await api('/mcp/codex/interactive', {
+      method: 'POST', headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
+    });
+    assert.deepEqual(listed.body.result.tools.map(tool => tool.name), INTERACTIVE_MCP_TOOLS);
+    const sessionHeaders = { ...headers, 'mcp-session-id': listed.response.headers.get('mcp-session-id') };
+
+    const allowedStatus = await api('/mcp/codex/interactive', {
+      method: 'POST', headers: sessionHeaders,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'memory_status', arguments: {} } })
+    });
+    assert.equal(allowedStatus.body.error, undefined);
+
+    for (const name of ['context_search', 'list_scopes', 'gateway_health']) {
+      const forbidden = await api('/mcp/codex/interactive', {
+        method: 'POST', headers: sessionHeaders,
+        body: JSON.stringify({ jsonrpc: '2.0', id: name, method: 'tools/call', params: { name, arguments: {} } })
+      });
+      assert.equal(forbidden.body.error.code, -32000);
+      assert.equal(forbidden.body.error.message, 'mcp_tool_forbidden');
+    }
+
+    const unmigrated = await api('/mcp/claude/interactive', {
+      method: 'POST', headers: { authorization: 'Bearer unmigrated-mcp-token' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list' })
+    });
+    assert.deepEqual(unmigrated.body.result.tools, []);
+    const unmigratedCall = await api('/mcp/claude/interactive', {
+      method: 'POST', headers: { authorization: 'Bearer unmigrated-mcp-token', 'mcp-session-id': unmigrated.response.headers.get('mcp-session-id') },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'memory_status', arguments: {} } })
+    });
+    assert.equal(unmigratedCall.body.error.message, 'mcp_tool_forbidden');
+
+    const proposal = await api('/v2/memory/proposals', {
+      method: 'POST', headers: { authorization: 'Bearer legacy-proposal-wildcard-token', 'idempotency-key': 'legacy-wildcard-denied' },
+      body: JSON.stringify(canonicalProposal('legacy wildcard denied', 'main-lab'))
+    });
+    assert.equal(proposal.response.status, 403);
+    assert.equal(proposal.body.error.code, 'scope_forbidden');
+  });
 });
 
 test('context search interleaves canonical memories and bounded document candidates', async () => {
