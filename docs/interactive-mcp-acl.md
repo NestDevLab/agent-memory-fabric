@@ -30,9 +30,10 @@ denial, duplicate, and tombstone.
 ## Provisioning procedure
 
 Use the actual private registry, policy, context-key ring, and service-owner
-paths from the deployment runbook. Resolve the canonical private scope and
-vault IDs first; this repository deliberately has no production vault catalog.
-Do not substitute a human-readable vault name. First preview the exact grant:
+paths from the deployment runbook. The approved target is
+`person:joseph` with the canonical vault ID `joseph-second-brain`; the
+privileged preflight must still prove that both entries are registered. Do not
+substitute a human-readable vault name. First preview the exact grant:
 
 ```bash
 node scripts/amf-provision-interactive-mcp.mjs --dry-run \
@@ -47,9 +48,9 @@ node scripts/amf-provision-interactive-mcp.mjs --dry-run \
   --policy-revision policy-revision-id \
   --endpoint https://amf.example.invalid/ \
   --read-scope '*' \
-  --propose-scope person:confirmed-owner \
+  --propose-scope person:joseph \
   --read-vault '*' \
-  --write-vault vault:confirmed-private \
+  --write-vault joseph-second-brain \
   --tool memory_search \
   --tool memory_read \
   --tool memory_propose \
