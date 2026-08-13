@@ -77,7 +77,7 @@ function instrumentWrites(operation) {
 }
 
 test('Codex and Claude dry-runs are exact, read-only, and never generate secrets', () => {
-  for (const profile of ['codex', 'claude']) {
+  for (const profile of ['codex', 'claude', 'chatgpt-web']) {
     const { root, options } = fixture(profile);
     try {
       const originals = [options.authRegistryPath, options.policyPath, options.contextKeyRingPath].map(bytes);

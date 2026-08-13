@@ -144,6 +144,17 @@ test('the handoff loader requires a private directory and private credential fil
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('ChatGPT Web uses a distinct read-only identity', () => {
+  const { root, handoffPath } = fixture('chatgpt-web');
+  try {
+    const handoff = loadInteractiveRecallHandoff(handoffPath);
+    assert.equal(handoff.actor, 'agent:chatgpt-web');
+    assert.equal(handoff.runtime, 'chatgpt-web');
+    assert.equal(handoff.contextKeyVersion, 'ctx-chatgpt-web-v1');
+    assert.deepEqual(handoff.permissions, ['memory:search', 'memory:read', 'purpose:conversation_recall']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('the stdio launcher accepts only the handoff-directory environment contract', () => {
   const { root, handoffPath } = fixture('codex');
   try {
