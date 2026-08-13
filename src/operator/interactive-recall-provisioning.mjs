@@ -9,7 +9,7 @@ export const INTERACTIVE_RECALL_PERMISSIONS = Object.freeze([
   'purpose:conversation_recall'
 ]);
 export const INTERACTIVE_RECALL_SCOPES = Object.freeze(['shared:global']);
-export const INTERACTIVE_RECALL_PROFILE_NAMES = Object.freeze(['codex', 'claude']);
+export const INTERACTIVE_RECALL_PROFILE_NAMES = Object.freeze(['codex', 'claude', 'chatgpt-web']);
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$/;
 const OPTION_KEYS = new Set([
@@ -40,6 +40,13 @@ const PROFILES = Object.freeze({
     runtime: 'claude',
     profile: 'interactive-recall',
     sessionDescriptor: fixedSessionDescriptor('claude')
+  }),
+  'chatgpt-web': Object.freeze({
+    actor: 'agent:chatgpt-web',
+    contextKeyVersion: 'ctx-chatgpt-web-v1',
+    runtime: 'chatgpt-web',
+    profile: 'interactive-recall',
+    sessionDescriptor: fixedSessionDescriptor('chatgpt-web')
   })
 });
 
