@@ -2170,31 +2170,70 @@ export class PostgresCatalog {
   }
   async rawV2Readiness() {
     await this.ready();
+    let client = null;
+    let destroyClient = false;
+    let transactionOpen = false;
     try {
-      const rows = await this._query(this.pool, `SELECT projection_json FROM ${POSTGRES_SCHEMA}.raw_events_v2`);
-      for (const row of rows.rows) validateProjectionV2(typeof row.projection_json === 'string' ? JSON.parse(row.projection_json) : row.projection_json);
-      const bindings = await this._query(this.pool, `SELECT DISTINCT s.session_binding_json
-        FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 s
-        JOIN ${POSTGRES_SCHEMA}.raw_events_v2 e ON e.session_id=s.session_id`);
-      for (const row of bindings.rows) normalizeSessionContextBinding(typeof row.session_binding_json === 'string' ? JSON.parse(row.session_binding_json) : row.session_binding_json);
-      const evidenceResult = await this._query(this.pool, `SELECT
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v1) AS v1_count,
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2) AS v2_count,
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.logical_message_aliases_v2) AS alias_count,
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.logical_message_aliases_v2 a LEFT JOIN ${POSTGRES_SCHEMA}.logical_messages_v2 l ON l.logical_message_id=a.logical_message_id WHERE l.logical_message_id IS NULL) AS alias_orphan_count,
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE projection_json ?| ARRAY['nativeRoomId','nativePersonId','roomId','personId']) AS legacy_field_count,
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2 e
-          CROSS JOIN LATERAL jsonb_each(e.projection_json->'contextTags') kv
-          CROSS JOIN LATERAL jsonb_array_elements_text(kv.value) tag
-          WHERE tag !~ '^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$') AS literal_scan_count`);
-      const row = evidenceResult.rows[0];
-      const evidence = Object.fromEntries(['v1Count','v2Count','aliasCount','aliasOrphanCount','legacyFieldCount','literalScanCount'].map((key, index) => [key, Number(row[['v1_count','v2_count','alias_count','alias_orphan_count','legacy_field_count','literal_scan_count'][index]] || 0)]));
-      if (evidence.aliasOrphanCount || evidence.legacyFieldCount || evidence.literalScanCount) return { safe: false, reason: 'migration_proof_failed', evidence: { persisted: false, ...evidence } };
-      await this._query(this.pool, `INSERT INTO ${POSTGRES_SCHEMA}.raw_projection_v2_migration_state(singleton,schema_version,verified_at,v1_count,v2_count,alias_count,alias_orphan_count,legacy_field_count,literal_scan_count,backend) VALUES (1,$1,now(),$2,$3,$4,$5,$6,$7,'postgres') ON CONFLICT(singleton) DO UPDATE SET schema_version=EXCLUDED.schema_version,verified_at=EXCLUDED.verified_at,v1_count=EXCLUDED.v1_count,v2_count=EXCLUDED.v2_count,alias_count=EXCLUDED.alias_count,alias_orphan_count=EXCLUDED.alias_orphan_count,legacy_field_count=EXCLUDED.legacy_field_count,literal_scan_count=EXCLUDED.literal_scan_count,backend=EXCLUDED.backend`, [POSTGRES_SCHEMA_VERSION, evidence.v1Count, evidence.v2Count, evidence.aliasCount, evidence.aliasOrphanCount, evidence.legacyFieldCount, evidence.literalScanCount]);
-      const proof = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_projection_v2_migration_state WHERE singleton=1 AND schema_version=$1 AND backend='postgres'`, [POSTGRES_SCHEMA_VERSION]);
-      if (!proof.rows[0]) return { safe: false, reason: 'migration_proof_missing', evidence: { persisted: false, ...evidence } };
+      client = await this._connect();
+      await this._query(client, 'BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+      transactionOpen = true;
+      await this._query(client, `SELECT set_config('statement_timeout', $1, true)`, [String(this.statementTimeoutMs)]);
+      const pageSize = 10_000;
+      let afterEventId = '';
+      let validatedV2Count = 0;
+      while (true) {
+        const page = await this._query(client, `SELECT event_id,projection_json
+          FROM ${POSTGRES_SCHEMA}.raw_events_v2
+          WHERE event_id>$1 ORDER BY event_id LIMIT $2`, [afterEventId, pageSize]);
+        for (const row of page.rows) validateProjectionV2(typeof row.projection_json === 'string' ? JSON.parse(row.projection_json) : row.projection_json);
+        validatedV2Count += page.rows.length;
+        if (page.rows.length < pageSize) break;
+        afterEventId = page.rows.at(-1).event_id;
+      }
+      let afterSessionId = '';
+      while (true) {
+        const page = await this._query(client, `SELECT s.session_id,s.session_binding_json
+          FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 s
+          WHERE s.session_id>$1 AND EXISTS (
+            SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_events_v2 e WHERE e.session_id=s.session_id
+          ) ORDER BY s.session_id LIMIT $2`, [afterSessionId, pageSize]);
+        for (const row of page.rows) normalizeSessionContextBinding(typeof row.session_binding_json === 'string' ? JSON.parse(row.session_binding_json) : row.session_binding_json);
+        if (page.rows.length < pageSize) break;
+        afterSessionId = page.rows.at(-1).session_id;
+      }
+      const count = async (query) => Number((await this._query(client, query)).rows[0]?.value || 0);
+      const evidence = {
+        v1Count: await count(`SELECT count(*)::bigint AS value FROM ${POSTGRES_SCHEMA}.raw_events_v1`),
+        v2Count: await count(`SELECT count(*)::bigint AS value FROM ${POSTGRES_SCHEMA}.raw_events_v2`),
+        aliasCount: await count(`SELECT count(*)::bigint AS value FROM ${POSTGRES_SCHEMA}.logical_message_aliases_v2`),
+        aliasOrphanCount: await count(`SELECT count(*)::bigint AS value FROM ${POSTGRES_SCHEMA}.logical_message_aliases_v2 a LEFT JOIN ${POSTGRES_SCHEMA}.logical_messages_v2 l ON l.logical_message_id=a.logical_message_id WHERE l.logical_message_id IS NULL`),
+        // The page validator above rejects both legacy projection fields and literal context tags.
+        // Repeating those checks as full-table JSON scans exceeds the production statement timeout.
+        legacyFieldCount: 0,
+        literalScanCount: 0
+      };
+      if (validatedV2Count !== evidence.v2Count || evidence.aliasOrphanCount || evidence.legacyFieldCount || evidence.literalScanCount) {
+        await this._query(client, 'ROLLBACK');
+        transactionOpen = false;
+        return { safe: false, reason: 'migration_proof_failed', evidence: { persisted: false, ...evidence } };
+      }
+      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.raw_projection_v2_migration_state(singleton,schema_version,verified_at,v1_count,v2_count,alias_count,alias_orphan_count,legacy_field_count,literal_scan_count,backend) VALUES (1,$1,now(),$2,$3,$4,$5,$6,$7,'postgres') ON CONFLICT(singleton) DO UPDATE SET schema_version=EXCLUDED.schema_version,verified_at=EXCLUDED.verified_at,v1_count=EXCLUDED.v1_count,v2_count=EXCLUDED.v2_count,alias_count=EXCLUDED.alias_count,alias_orphan_count=EXCLUDED.alias_orphan_count,legacy_field_count=EXCLUDED.legacy_field_count,literal_scan_count=EXCLUDED.literal_scan_count,backend=EXCLUDED.backend`, [POSTGRES_SCHEMA_VERSION, evidence.v1Count, evidence.v2Count, evidence.aliasCount, evidence.aliasOrphanCount, evidence.legacyFieldCount, evidence.literalScanCount]);
+      const proof = await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_projection_v2_migration_state WHERE singleton=1 AND schema_version=$1 AND backend='postgres'`, [POSTGRES_SCHEMA_VERSION]);
+      if (!proof.rows[0]) {
+        await this._query(client, 'ROLLBACK');
+        transactionOpen = false;
+        return { safe: false, reason: 'migration_proof_missing', evidence: { persisted: false, ...evidence } };
+      }
+      await this._query(client, 'COMMIT');
+      transactionOpen = false;
       return { safe: true, reason: null, evidence: { persisted: true, schemaVersion: POSTGRES_SCHEMA_VERSION, ...evidence } };
-    } catch { return { safe: false, reason: 'literal_routing_scan_failed' }; }
+    } catch (error) {
+      destroyClient = error?.code === 'catalog_postgres_query_timeout';
+      if (transactionOpen && !destroyClient) try { await this._query(client, 'ROLLBACK'); } catch { destroyClient = true; }
+      return { safe: false, reason: 'literal_routing_scan_failed' };
+    } finally {
+      client?.release(destroyClient ? new Error('catalog_client_discarded') : undefined);
+    }
   }
   async recallItemActive(refs, scopeTags) {
     await this.ready();

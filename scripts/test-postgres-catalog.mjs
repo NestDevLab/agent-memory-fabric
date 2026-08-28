@@ -202,6 +202,52 @@ class FakePool {
   async end() { this.endCalls += 1; }
 }
 
+class ReadinessPool extends FakePool {
+  constructor(projection) {
+    super({ schemaVersion: POSTGRES_SCHEMA_VERSION });
+    this.projection = projection;
+  }
+
+  async query(query, legacyValues = []) {
+    const text = typeof query === 'string' ? query : query.text;
+    const values = typeof query === 'string' ? legacyValues : (query.values || []);
+    const compact = text.replace(/\s+/g, ' ').trim();
+    if (compact.startsWith('SELECT event_id,projection_json FROM agent_memory_fabric.raw_events_v2 WHERE event_id>$1')) {
+      this.queries.push({ text, values });
+      const rows = values[0] === ''
+        ? Array.from({ length: values[1] }, (_, index) => ({ event_id: `evt-${String(index).padStart(5, '0')}`, projection_json: this.projection }))
+        : [{ event_id: 'evt-final', projection_json: this.projection }];
+      return { rows };
+    }
+    if (compact.startsWith('SELECT s.session_id,s.session_binding_json FROM agent_memory_fabric.raw_sessions_v1 s WHERE s.session_id>$1')) {
+      this.queries.push({ text, values });
+      const sessionBinding = {
+        conversation: this.projection.contextTags.conversation,
+        room: this.projection.contextTags.room
+      };
+      const rows = values[0] === ''
+        ? Array.from({ length: values[1] }, (_, index) => ({ session_id: `ses-${String(index).padStart(5, '0')}`, session_binding_json: sessionBinding }))
+        : [{ session_id: 'ses-final', session_binding_json: sessionBinding }];
+      return { rows };
+    }
+    const readinessCounts = new Map([
+      ['SELECT count(*)::bigint AS value FROM agent_memory_fabric.raw_events_v1', '0'],
+      ['SELECT count(*)::bigint AS value FROM agent_memory_fabric.raw_events_v2', '10001'],
+      ['SELECT count(*)::bigint AS value FROM agent_memory_fabric.logical_message_aliases_v2', '0'],
+      ['SELECT count(*)::bigint AS value FROM agent_memory_fabric.logical_message_aliases_v2 a LEFT JOIN agent_memory_fabric.logical_messages_v2 l ON l.logical_message_id=a.logical_message_id WHERE l.logical_message_id IS NULL', '0']
+    ]);
+    if (readinessCounts.has(compact)) {
+      this.queries.push({ text, values });
+      return { rows: [{ value: readinessCounts.get(compact) }] };
+    }
+    if (compact.startsWith('SELECT * FROM agent_memory_fabric.raw_projection_v2_migration_state')) {
+      this.queries.push({ text, values });
+      return { rows: [{ singleton: 1 }] };
+    }
+    return super.query(query, legacyValues);
+  }
+}
+
 function proposal(id, contentId, ownerTag = 'owner-secret', idempotencyTag = 'idem-secret') {
   return {
     id,
@@ -477,6 +523,43 @@ test('PostgreSQL catalog bounds pool exhaustion and query stalls', async () => {
   assert.ok(Date.now() - queryStarted < 1000);
   assert.ok(stalled.releaseError instanceof Error, 'timed-out client must be discarded');
   await queryCatalog.close();
+});
+
+test('PostgreSQL v2 readiness scans projections and session bindings in bounded snapshot pages', async () => {
+  const projection = JSON.parse(fs.readFileSync(new URL('./fixtures/raw-projection-v2.conformance.json', import.meta.url), 'utf8'));
+  const pool = new ReadinessPool(projection);
+  const catalog = new PostgresCatalog({ pool });
+  await catalog.ready();
+  pool.queries.length = 0;
+
+  assert.deepEqual(await catalog.rawV2Readiness(), {
+    safe: true,
+    reason: null,
+    evidence: {
+      persisted: true,
+      schemaVersion: POSTGRES_SCHEMA_VERSION,
+      v1Count: 0,
+      v2Count: 10001,
+      aliasCount: 0,
+      aliasOrphanCount: 0,
+      legacyFieldCount: 0,
+      literalScanCount: 0
+    }
+  });
+
+  const projectionPages = pool.queries.filter(({ text }) => text.includes('SELECT event_id,projection_json'));
+  const bindingPages = pool.queries.filter(({ text }) => text.includes('SELECT s.session_id,s.session_binding_json'));
+  assert.equal(projectionPages.length, 2);
+  assert.equal(bindingPages.length, 2);
+  assert.deepEqual(projectionPages.map(({ values }) => values), [['', 10_000], ['evt-09999', 10_000]]);
+  assert.deepEqual(bindingPages.map(({ values }) => values), [['', 10_000], ['ses-09999', 10_000]]);
+  assert.equal(pool.queries.some(({ text }) => /SELECT projection_json FROM agent_memory_fabric\.raw_events_v2\s*$/.test(text.trim())), false);
+  assert.equal(pool.queries.some(({ text }) => text.includes("projection_json ?| ARRAY['nativeRoomId'")), false);
+  assert.equal(pool.queries.some(({ text }) => text.includes('jsonb_each')), false);
+  assert.ok(pool.queries.some(({ text }) => text === 'BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ'));
+  assert.ok(pool.queries.some(({ text }) => text === 'COMMIT'));
+  assert.equal(pool.releaseError, null);
+  await catalog.close();
 });
 
 test('ambiguous COMMIT acknowledgement retains RAW and reconciles the committed proposal', async () => {
