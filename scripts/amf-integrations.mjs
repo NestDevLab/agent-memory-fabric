@@ -16,6 +16,17 @@ import {
   serializePlan,
   uninstallIntegration,
 } from '../src/integrations/lifecycle.mjs';
+import {
+  buildHarnessRawCapturePlan,
+  disableHarnessRawCapture,
+  enableHarnessRawCapture,
+  harnessRawCaptureStatus,
+  installHarnessRawCapture,
+  loadConfirmedHarnessRawCapturePlan,
+  runHarnessRawCapture,
+  serializeHarnessRawCapturePlan,
+  uninstallHarnessRawCapture,
+} from '../src/integrations/harness-raw-capture.mjs';
 
 const cliArgs = process.argv.slice(2);
 if (cliArgs[0] === 'integrations') cliArgs.shift();
@@ -27,6 +38,7 @@ function usage() {
   amf integrations list
   amf integrations describe <id>
   amf integrations plan <id> --instance ID --vault PATH --vault-id ID --actor ACTOR --amf-url URL --source-instance ID --client-root PATH --service-user USER --service-group GROUP --interval-sec N --jitter-sec N --output PATH
+  amf integrations plan harness-raw-capture --instance ID --runtime codex|claude --adapter-root PATH --runtime-config PATH --environment-file PATH --trigger-path PATH --capture-mode hook-push --conflict-policy fail|disable-managed --max-triggers-per-pass N --output PATH
   amf integrations status <id> --instance ID
   amf integrations <install|adopt|run|enable|disable|uninstall> <id> --plan PATH --confirm-sha256 HEX\n`);
 }
@@ -64,7 +76,9 @@ function loadMutationPlan() {
     'confirm-sha256': { type: 'string' },
   });
   required(values, ['plan', 'confirm-sha256']);
-  const plan = loadConfirmedPlan(values.plan, values['confirm-sha256']);
+  const plan = id === 'harness-raw-capture'
+    ? loadConfirmedHarnessRawCapturePlan(values.plan, values['confirm-sha256'])
+    : loadConfirmedPlan(values.plan, values['confirm-sha256']);
   if (plan.integrationId !== id) throw new Error('integration_plan_id_mismatch');
   return plan;
 }
@@ -73,6 +87,22 @@ async function main() {
   if (command === 'list' && !id) return output(listIntegrations().map(item => ({ id: item.id, category: item.category, version: item.version, capabilities: item.capabilities })));
   if (command === 'describe' && id) return output(describeIntegration(id));
   if (command === 'plan' && id) {
+    if (id === 'harness-raw-capture') {
+      const values = options({ instance: { type: 'string' }, runtime: { type: 'string' },
+        'adapter-root': { type: 'string' }, 'runtime-config': { type: 'string' },
+        'environment-file': { type: 'string' }, 'trigger-path': { type: 'string' },
+        'capture-mode': { type: 'string' }, 'conflict-policy': { type: 'string' },
+        'max-triggers-per-pass': { type: 'string' }, output: { type: 'string' } });
+      required(values, ['instance', 'runtime', 'adapter-root', 'runtime-config', 'environment-file', 'trigger-path',
+        'capture-mode', 'conflict-policy', 'max-triggers-per-pass', 'output']);
+      const plan = buildHarnessRawCapturePlan(id, { instance: values.instance, runtime: values.runtime,
+        adapterRoot: values['adapter-root'], runtimeConfig: values['runtime-config'],
+        environmentFile: values['environment-file'], triggerPath: values['trigger-path'],
+        captureMode: values['capture-mode'], conflictPolicy: values['conflict-policy'],
+        maxTriggersPerPass: Number(values['max-triggers-per-pass']) });
+      const bytes = serializeHarnessRawCapturePlan(plan); writePlan(values.output, bytes);
+      return output({ written: values.output, sha256: (await import('node:crypto')).createHash('sha256').update(bytes).digest('hex'), planDigest: plan.planDigest });
+    }
     const values = options({
       instance: { type: 'string' }, vault: { type: 'string' }, 'vault-id': { type: 'string' }, actor: { type: 'string' },
       'amf-url': { type: 'string' }, 'source-instance': { type: 'string' }, 'client-root': { type: 'string' },
@@ -100,10 +130,17 @@ async function main() {
   if (command === 'status' && id) {
     const values = options({ instance: { type: 'string' } });
     required(values, ['instance']);
-    return output(integrationStatus(id, values.instance));
+    return output(id === 'harness-raw-capture'
+      ? harnessRawCaptureStatus(id, values.instance) : integrationStatus(id, values.instance));
   }
   if (['install', 'adopt', 'run', 'enable', 'disable', 'uninstall'].includes(command) && id) {
     const plan = loadMutationPlan();
+    if (id === 'harness-raw-capture') {
+      if (command === 'adopt') throw new Error('integration_operation_unsupported');
+      const handlers = { install: installHarnessRawCapture, run: runHarnessRawCapture,
+        enable: enableHarnessRawCapture, disable: disableHarnessRawCapture, uninstall: uninstallHarnessRawCapture };
+      return output(handlers[command](plan));
+    }
     const handlers = { install: installIntegration, adopt: adoptIntegration, run: runIntegration, enable: enableIntegration, disable: disableIntegration, uninstall: uninstallIntegration };
     return output(handlers[command](plan));
   }
