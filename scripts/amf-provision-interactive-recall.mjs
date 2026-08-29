@@ -26,6 +26,10 @@ function parseArguments(argv) {
       if (Object.hasOwn(output, 'writeEnabled')) throw new Error('cli_argument_duplicate');
       output.writeEnabled = true; continue;
     }
+    if (option === '--migrate-governed-write') {
+      if (Object.hasOwn(output, 'migrateGovernedWrite')) throw new Error('cli_argument_duplicate');
+      output.migrateGovernedWrite = true; continue;
+    }
     if (!VALUE_OPTIONS.has(option)) throw new Error('cli_argument_unknown');
     const key = VALUE_OPTIONS.get(option); const value = argv[index + 1];
     if (!value || value.startsWith('--')) throw new Error('cli_argument_value_required');

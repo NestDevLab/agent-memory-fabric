@@ -19,7 +19,8 @@ export const INTERACTIVE_RECALL_PROFILE_NAMES = Object.freeze(['codex', 'claude'
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$/;
 const OPTION_KEYS = new Set([
   'profile', 'authRegistryPath', 'policyPath', 'contextKeyRingPath', 'handoffPath', 'backupRoot',
-  'backendUserId', 'serviceOwnerUid', 'policyRevision', 'endpoint', 'writeEnabled', 'dryRun', 'clock', 'randomBytes', 'faultAt'
+  'backendUserId', 'serviceOwnerUid', 'policyRevision', 'endpoint', 'writeEnabled', 'migrateGovernedWrite',
+  'dryRun', 'clock', 'randomBytes', 'faultAt'
 ]);
 
 function fail(code) { throw new Error(code); }
@@ -104,8 +105,13 @@ export function provisionInteractiveRecall(options = {}) {
     fail('interactive_recall_policy_revision_invalid');
   }
   const profile = interactiveRecallProfile(options.profile, { writeEnabled: options.writeEnabled === true });
+  if (options.migrateGovernedWrite !== undefined
+    && (options.migrateGovernedWrite !== true || options.writeEnabled !== true || options.profile !== 'chatgpt-web')) {
+    fail('interactive_recall_migration_invalid');
+  }
   return provisionScopedConsumer(options, {
     ...profile,
+    migrate: options.migrateGovernedWrite === true,
     policyRevision: options.policyRevision,
     endpoint: normalizeInteractiveRecallEndpoint(options.endpoint)
   });
