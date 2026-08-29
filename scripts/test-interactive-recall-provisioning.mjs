@@ -152,6 +152,20 @@ test('governed write is available only to ChatGPT Web and remains scope-bound', 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('governed write migration atomically replaces the existing ChatGPT actor contract', () => {
+  const { root, options } = fixture('chatgpt-web');
+  try {
+    withEffectiveUid(0, () => provisionInteractiveRecall(options));
+    fs.rmSync(options.handoffPath, { recursive: true });
+    const result = withEffectiveUid(0, () => provisionInteractiveRecall({ ...options, writeEnabled: true,
+      migrateGovernedWrite: true }));
+    assert.equal(result.action, 'migrate'); assert.ok(result.backupPath);
+    const row = json(options.authRegistryPath).rows.find(entry => entry.actor === 'agent:chatgpt-web');
+    assert.equal(row.mode, 'scoped'); assert.equal(row.permissions.includes('memory:propose'), true);
+    assert.deepEqual(row.allowedScopes, ['shared:global']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('profile, scope, capability, and endpoint widening are rejected before writes', () => {
   const { root, options } = fixture('codex');
   try {
