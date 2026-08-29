@@ -24,6 +24,9 @@ const { Pool } = pg;
 const RAW_FORMAT_VERSION = 2;
 const HKDF_SALT = Buffer.from('agent-memory-fabric/raw/v2', 'utf8');
 const SAFE_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const RAW_EVENT_ID = /^evt_[a-f0-9]{64}$/;
+const RAW_PAYLOAD_DIGEST = /^hmac-sha256:v1:[a-f0-9]{64}$/;
+const RAW_DELIVERY_PROOF_MAX_ENTRIES = 10_000;
 
 function createError(message, status, data) {
   const error = new Error(message);
@@ -648,6 +651,12 @@ export class MemoryCatalog {
     }
   }
   getRawEvent(id) { return this.rawEventsV2.get(id) || this.rawEvents.get(id) || null; }
+  findRawDeliveries({ eventIds, ownerTags, sourceTags }) {
+    const owners = new Set(ownerTags); const sources = new Set(sourceTags);
+    return eventIds.map(id => this.getRawEvent(id)).filter(record => record
+      && owners.has(record.ownerTag) && sources.has(record.sourceTag))
+      .map(record => ({ eventId: record.eventId, payloadDigest: record.payloadDigest }));
+  }
   searchSessions({ ownerTags = [], query = '', limit = 20, after = null, from = null, to = null,
     contextTags = null }) {
     const needle = query.toLowerCase();
@@ -1262,6 +1271,23 @@ export class SqliteCatalog {
     }
   }
   getRawEvent(id) { return this.mapRawEvent(this.db.prepare('SELECT * FROM raw_events_v2 WHERE event_id=?').get(id) || this.db.prepare('SELECT * FROM raw_events_v1 WHERE event_id=?').get(id)); }
+  findRawDeliveries({ eventIds, ownerTags, sourceTags }) {
+    if (!eventIds.length || !ownerTags.length || !sourceTags.length) return [];
+    const rows = [];
+    for (let offset = 0; offset < eventIds.length; offset += 400) {
+      const ids = eventIds.slice(offset, offset + 400);
+      const idSlots = ids.map(() => '?').join(','); const ownerSlots = ownerTags.map(() => '?').join(',');
+      const sourceSlots = sourceTags.map(() => '?').join(',');
+      rows.push(...this.db.prepare(`
+        SELECT event_id,payload_digest FROM raw_events_v2
+          WHERE event_id IN (${idSlots}) AND owner_tag IN (${ownerSlots}) AND source_tag IN (${sourceSlots})
+        UNION ALL
+        SELECT event_id,payload_digest FROM raw_events_v1
+          WHERE event_id IN (${idSlots}) AND owner_tag IN (${ownerSlots}) AND source_tag IN (${sourceSlots})
+      `).all(...ids, ...ownerTags, ...sourceTags, ...ids, ...ownerTags, ...sourceTags));
+    }
+    return rows.map(row => ({ eventId: row.event_id, payloadDigest: row.payload_digest }));
+  }
   mapSession(row) { return row ? { id: row.session_id, runtime: row.runtime, ownerTag: row.owner_tag, sourceTag: row.source_tag, conversationKind: row.conversation_kind || null, contextTags: row.session_binding_json ? JSON.parse(row.session_binding_json) : null, firstOccurredAt: row.first_occurred_at, lastOccurredAt: row.last_occurred_at, eventCount: row.event_count, createdAt: row.created_at } : null; }
   searchSessions({ ownerTags = [], query = '', limit = 20, after = null, from = null, to = null,
     contextTags = null }) {
@@ -2114,6 +2140,18 @@ export class PostgresCatalog {
     const v2 = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE event_id=$1`, [id]);
     return mapPostgresRawEvent(v2.rows[0] || (await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v1 WHERE event_id=$1`, [id])).rows[0]);
   }
+  async findRawDeliveries({ eventIds, ownerTags, sourceTags }) {
+    if (!eventIds.length || !ownerTags.length || !sourceTags.length) return [];
+    await this.ready();
+    const result = await this._query(this.pool, `
+      SELECT event_id,payload_digest FROM ${POSTGRES_SCHEMA}.raw_events_v2
+        WHERE event_id=ANY($1::text[]) AND owner_tag=ANY($2::text[]) AND source_tag=ANY($3::text[])
+      UNION ALL
+      SELECT event_id,payload_digest FROM ${POSTGRES_SCHEMA}.raw_events_v1
+        WHERE event_id=ANY($1::text[]) AND owner_tag=ANY($2::text[]) AND source_tag=ANY($3::text[])
+    `, [eventIds, ownerTags, sourceTags]);
+    return result.rows.map(row => ({ eventId: row.event_id, payloadDigest: row.payload_digest }));
+  }
   async searchSessions({ ownerTags = [], query = '', limit = 20, after = null, from = null, to = null,
     contextTags = null }) {
     if (!ownerTags.length) return [];
@@ -2866,6 +2904,32 @@ export class FabricStore {
     return { status: stored.duplicate ? 'duplicate' : 'stored', duplicate: stored.duplicate, eventId: projection.eventId, sessionId: projection.sessionId, contentId: stored.record.contentId, ...(projectionV2 ? { logicalMessageId: stored.record.logicalMessageId, preferredObservationId: stored.logical?.preferredObservationId, payloadConflict: stored.logical?.payloadConflict, tombstoned: stored.logical?.tombstoned } : {}) };
   }
 
+  async proveRawDeliveries(input, { requestId = null } = {}) {
+    if (!this.ingestKeys || typeof this.catalog.findRawDeliveries !== 'function') throw createError('raw_ingest_unconfigured', 503);
+    const { actor, sourceInstanceId, entries } = input || {};
+    if (typeof actor !== 'string' || actor.length < 1 || typeof sourceInstanceId !== 'string' || sourceInstanceId.length < 1
+      || sourceInstanceId.length > 256 || !Array.isArray(entries) || entries.length < 1
+      || entries.length > RAW_DELIVERY_PROOF_MAX_ENTRIES) throw createError('invalid_request', 400);
+    const requested = new Map();
+    for (const entry of entries) {
+      if (!entry || Object.keys(entry).sort().join('\0') !== 'eventId\0payloadDigest'
+        || !RAW_EVENT_ID.test(entry.eventId) || !RAW_PAYLOAD_DIGEST.test(entry.payloadDigest)
+        || requested.has(entry.eventId)) throw createError('invalid_request', 400);
+      requested.set(entry.eventId, entry.payloadDigest);
+    }
+    const rows = await this._catalogOperation(() => this.catalog.findRawDeliveries({
+      eventIds: [...requested.keys()], ownerTags: this.rawStore.opaqueTags('raw-owner', actor),
+      sourceTags: this.rawStore.opaqueTags('raw-source', sourceInstanceId),
+    }));
+    const delivered = rows.filter(row => requested.get(row.eventId) === row.payloadDigest)
+      .sort((left, right) => left.eventId.localeCompare(right.eventId));
+    const proof = { schema: 'amf.raw-outbox-fabric-delivery-proof/v1', sourceInstanceId, actorId: actor,
+      verifiedAt: this.clock().getTime(), entries: delivered };
+    await this.audit({ actor, action: 'raw_delivery_proof', outcome: 'verified', requestId,
+      details: { total: entries.length, resultCount: delivered.length } });
+    return { ...proof, proofDigest: canonicalDigest(proof) };
+  }
+
   createSessionReader({ textScanMaxCiphertextBytes = SESSION_TEXT_SCAN_MAX_CIPHERTEXT_BYTES } = {}) {
     if (!this.ingestKeys || !this.catalog.searchSessions) return null;
     if (!Number.isSafeInteger(textScanMaxCiphertextBytes) || textScanMaxCiphertextBytes < 1024
@@ -3310,7 +3374,7 @@ export class FabricStore {
 export function createUnconfiguredFabricStore(reason = 'raw_encryption_key_required') {
   const unavailable = async () => { throw createError('fabric_store_unconfigured', 503); };
   const rawUnavailable = async () => { throw createError('raw_ingest_unconfigured', 503); };
-  return { configured: false, reason, propose: unavailable, ingestRawEvent: rawUnavailable, createIdentity: unavailable, mergeIdentity: unavailable, splitIdentity: unavailable, readIdentityAuthorized: unavailable, planRetention: unavailable, applyRetention: unavailable, readProposalAuthorized: unavailable, readProposalForReceiptAuthorized: unavailable, getProposalStatusAuthorized: unavailable, readProposal: unavailable, createSessionReader() { return null; }, async filterRecallItems() { return []; }, async audit() {}, async ready() {}, async close() {}, status() { return { configured: false }; } };
+  return { configured: false, reason, propose: unavailable, ingestRawEvent: rawUnavailable, proveRawDeliveries: rawUnavailable, createIdentity: unavailable, mergeIdentity: unavailable, splitIdentity: unavailable, readIdentityAuthorized: unavailable, planRetention: unavailable, applyRetention: unavailable, readProposalAuthorized: unavailable, readProposalForReceiptAuthorized: unavailable, getProposalStatusAuthorized: unavailable, readProposal: unavailable, createSessionReader() { return null; }, async filterRecallItems() { return []; }, async audit() {}, async ready() {}, async close() {}, status() { return { configured: false }; } };
 }
 
 function loadLifecyclePolicies(env) {
