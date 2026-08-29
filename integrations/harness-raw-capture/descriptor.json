@@ -1,0 +1,25 @@
+{
+  "schema": "amf.integration/v1",
+  "id": "harness-raw-capture",
+  "category": "runtime-capture",
+  "version": "1.0.0",
+  "source": "NestDevLab/agent-memory-fabric-runtime-adapters",
+  "agentwheel": {
+    "resources": ["hook:raw-capture-stop"],
+    "supportedRuntimes": ["codex", "claude"],
+    "excludedRuntimes": ["openclaw", "hermes", "vitae"]
+  },
+  "capabilities": ["raw-conversation-capture", "event-driven-dispatch", "encrypted-trigger-queue"],
+  "modes": ["raw-poll", "hook-push"],
+  "automatedModes": ["hook-push"],
+  "schedulers": ["systemd-path"],
+  "lifecycle": ["plan", "install", "run", "status", "enable", "disable", "uninstall"],
+  "conflictGroups": ["raw-conversation-capture"],
+  "conflictPolicies": ["fail", "disable-managed"],
+  "health": {
+    "command": "status",
+    "healthyWhen": ["captureMode=hook-push", "artifactParity=true", "pathEnabled=true", "pollTimerEnabled=false"]
+  },
+  "dataPreservation": ["native-transcripts", "runtime-config", "environment", "outbox", "cursors", "triggers"],
+  "secretSlots": []
+}

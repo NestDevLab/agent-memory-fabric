@@ -4,10 +4,12 @@ Agent Memory Fabric exposes optional, versioned integrations through the
 `amf.integration/v1` catalog. An integration remains independently usable; AMF
 owns only its host lifecycle, health contract, and connection to the fabric.
 
-The first catalog entry is `obsidian-second-brain`. Agentwheel installs its
-`obsidian-memory` skill in supported agent runtimes. AMF optionally installs a
-Linux/systemd shadow poller. The poller is disabled after installation and only
-becomes scheduled after an explicit, confirmed `enable` operation.
+The catalog includes `obsidian-second-brain` and `harness-raw-capture`.
+Agentwheel installs the Obsidian skill and materializes harness hook
+contributions; AMF owns the host-side lifecycle and never hand-edits generated
+harness homes. For Obsidian, AMF optionally installs a Linux/systemd shadow
+poller. The poller is disabled after installation and only becomes scheduled
+after an explicit, confirmed `enable` operation.
 
 ## CLI
 
@@ -16,6 +18,7 @@ An installed package uses the namespaced interface:
 ```text
 amf integrations list
 amf integrations describe obsidian-second-brain
+amf integrations describe harness-raw-capture
 amf integrations plan obsidian-second-brain [options]
 amf integrations status obsidian-second-brain --instance INSTANCE
 amf integrations install|adopt|run|enable|disable|uninstall \
@@ -24,6 +27,29 @@ amf integrations install|adopt|run|enable|disable|uninstall \
 
 The source-tree equivalent is `node scripts/amf-integrations.mjs COMMAND ...`.
 Both forms intentionally use the same implementation.
+
+## Event-driven harness RAW capture
+
+`harness-raw-capture` supports Codex and Claude with `captureMode=hook-push`.
+The native `Stop` contribution invokes a small AMF wrapper that validates the
+reported transcript against the configured source root, writes an encrypted
+idempotent trigger, and exits without sending transcript content over hook
+stdout. A systemd path unit activates the existing one-shot RAW service. In
+hook mode that service processes only the named transcript through the existing
+cursor, projection, encrypted outbox, and retry path; it does not scan the
+transcript tree.
+
+The integration plan binds the runtime, adapter checkout, private runtime
+configuration, private environment file, trigger path, capture mode, and
+conflict policy. `install` verifies and writes the wrapper and path unit but
+leaves them disabled. `enable` either refuses an active matching RAW polling
+timer (`conflictPolicy=fail`) or disables that exact managed timer before
+enabling the path unit (`conflictPolicy=disable-managed`). It never changes
+unrelated timers or hooks.
+
+Agentwheel remains the only writer of `~/.codex/hooks.json` and
+`~/.claude/settings.json`. Uninstall preserves native transcripts, runtime
+configuration, environment, cursors, outbox, and encrypted triggers.
 
 `plan` validates the vault, resolves the Agentwheel-installed client through a
 known source layout without executing it, independently opens its files with

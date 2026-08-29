@@ -31,6 +31,22 @@
       "meta": {
         "purpose": "Bound PostgreSQL RAW v2 readiness scans at production scale"
       }
+    },
+    {
+      "id": "amf-hook-push-lifecycle",
+      "branch": "feat/harness-raw-capture-lifecycle",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [],
+      "state": "published",
+      "publication": {
+        "enabled": true
+      },
+      "meta": {
+        "purpose": "Add configurable hook-push lifecycle for harness RAW capture"
+      }
     }
   ],
   "syncwheel_tracking": "git-tracked",
