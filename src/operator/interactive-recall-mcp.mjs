@@ -6,7 +6,9 @@ import { buildContextRequest, normalizeOpaqueTagMap } from '../access-contract.m
 import { issueContextToken, normalizeContextKeyRing, requestDigest } from '../context-token.mjs';
 import {
   INTERACTIVE_RECALL_HANDOFF_SCHEMA,
+  INTERACTIVE_RECALL_WRITE_HANDOFF_SCHEMA,
   INTERACTIVE_RECALL_PERMISSIONS,
+  INTERACTIVE_RECALL_WRITE_PERMISSIONS,
   INTERACTIVE_RECALL_SCOPES,
   interactiveRecallProfile,
   normalizeInteractiveRecallEndpoint
@@ -76,17 +78,20 @@ function parseJson(bytes) {
 }
 
 function validateManifest(value) {
+  const writeEnabled = value?.schema === INTERACTIVE_RECALL_WRITE_HANDOFF_SCHEMA;
   const keys = ['schema', 'actor', 'runtime', 'profile', 'contextKeyVersion', 'permissions', 'scopes',
     'scopeSetSha256', 'purpose', 'sessionDescriptor', 'policyRevision', 'endpoint', 'createdAt'];
-  if (!exactKeys(value, keys) || value.schema !== INTERACTIVE_RECALL_HANDOFF_SCHEMA
+  if (writeEnabled) keys.push('tools');
+  if (!exactKeys(value, keys) || (!writeEnabled && value.schema !== INTERACTIVE_RECALL_HANDOFF_SCHEMA)
     || typeof value.runtime !== 'string' || typeof value.profile !== 'string') {
     fail('interactive_recall_handoff_invalid');
   }
   let expected;
-  try { expected = interactiveRecallProfile(value.runtime); } catch { fail('interactive_recall_handoff_invalid'); }
+  try { expected = interactiveRecallProfile(value.runtime, { writeEnabled }); } catch { fail('interactive_recall_handoff_invalid'); }
   if (value.actor !== expected.actor || value.profile !== expected.profile
     || value.contextKeyVersion !== expected.contextKeyVersion || value.purpose !== expected.purpose
     || !exactArray(value.permissions, expected.permissions) || !exactArray(value.scopes, expected.scopes)
+    || (writeEnabled && !exactArray(value.tools, expected.tools))
     || typeof value.scopeSetSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.scopeSetSha256)
     || value.scopeSetSha256 !== crypto.createHash('sha256').update(canonicalJson(expected.scopes), 'utf8').digest('hex')
     || typeof value.policyRevision !== 'string' || !SAFE_ID.test(value.policyRevision)
@@ -107,12 +112,13 @@ function validateManifest(value) {
     runtime: expected.runtime,
     profile: expected.profile,
     contextKeyVersion: expected.contextKeyVersion,
-    permissions: [...INTERACTIVE_RECALL_PERMISSIONS],
+    permissions: [...(writeEnabled ? INTERACTIVE_RECALL_WRITE_PERMISSIONS : INTERACTIVE_RECALL_PERMISSIONS)],
     scopes: [...INTERACTIVE_RECALL_SCOPES],
     purpose: expected.purpose,
     sessionDescriptor: expected.sessionDescriptor,
     policyRevision: value.policyRevision,
-    endpoint: value.endpoint
+    endpoint: value.endpoint,
+    tools: writeEnabled ? [...expected.tools] : ['memory_search', 'memory_read']
   };
 }
 
@@ -133,8 +139,8 @@ export function loadInteractiveRecallHandoff(directory) {
 function rpcResult(id, result) { return { jsonrpc: '2.0', id, result }; }
 function rpcError(id, code, message) { return { jsonrpc: '2.0', id, error: { code, message } }; }
 
-function toolDefinitions() {
-  return [
+function toolDefinitions(handoff) {
+  const definitions = [
     { name: 'memory_search', description: 'Search shared canonical memories for the current interactive session.',
       inputSchema: { type: 'object', additionalProperties: false,
         properties: { query: { type: 'string', minLength: 1, maxLength: 4096 },
@@ -144,6 +150,20 @@ function toolDefinitions() {
       inputSchema: { type: 'object', additionalProperties: false,
         properties: { id: { type: 'string', minLength: 1, maxLength: 192 } }, required: ['id'] } }
   ];
+  if (handoff.tools.includes('memory_upsert')) {
+    definitions.push(
+      { name: 'memory_upsert', description: 'Queue a governed canonical memory proposal. Updates require expectedRevision and a new revisioned record with lifecycle.supersedes; this tool never writes canonical state directly.',
+        inputSchema: { type: 'object', additionalProperties: false,
+          properties: { record: { type: 'object' }, rationale: { type: 'string', minLength: 1, maxLength: 4096 },
+            expectedRevision: { type: ['integer', 'null'], minimum: 0 },
+            idempotencyKey: { type: 'string', minLength: 1, maxLength: 192 } },
+          required: ['record', 'rationale', 'expectedRevision', 'idempotencyKey'] } },
+      { name: 'memory_proposal_status', description: 'Read the bounded lifecycle status of a governed memory proposal.',
+        inputSchema: { type: 'object', additionalProperties: false,
+          properties: { id: { type: 'string', minLength: 1, maxLength: 192 } }, required: ['id'] } }
+    );
+  }
+  return definitions;
 }
 
 function requireOnly(value, allowed) {
@@ -171,6 +191,25 @@ function readInput(value) {
   requireOnly(value, new Set(['id']));
   if (typeof value.id !== 'string' || !SAFE_ID.test(value.id)) fail('interactive_recall_tool_input_invalid');
   return { id: value.id };
+}
+
+function upsertInput(value) {
+  requireOnly(value, new Set(['record', 'rationale', 'expectedRevision', 'idempotencyKey']));
+  if (!object(value.record) || value.record?.scope?.id !== INTERACTIVE_RECALL_SCOPES[0]
+    || typeof value.rationale !== 'string' || !value.rationale.trim() || value.rationale.length > 4096
+    || (value.expectedRevision !== null && (!Number.isInteger(value.expectedRevision) || value.expectedRevision < 0))
+    || typeof value.idempotencyKey !== 'string' || !SAFE_ID.test(value.idempotencyKey)) {
+    fail('interactive_recall_tool_input_invalid');
+  }
+  const revision = Number(value.record.revision);
+  const supersedes = value.record?.lifecycle?.supersedes;
+  if (!Number.isInteger(revision) || revision < 1 || (value.expectedRevision === null
+    ? revision !== 1 || !Array.isArray(supersedes) || supersedes.length !== 0
+    : revision !== value.expectedRevision + 1 || !Array.isArray(supersedes) || supersedes.length < 1)) {
+    fail('interactive_recall_tool_input_invalid');
+  }
+  return { record: value.record, rationale: value.rationale.trim(), expectedRevision: value.expectedRevision,
+    idempotencyKey: value.idempotencyKey };
 }
 
 function nonce(randomBytes) {
@@ -234,6 +273,19 @@ export function createInteractiveRecallBridge({ handoff, fetchImpl = globalThis.
       return request(url, { method: 'GET', headers: { authorization: `Bearer ${handoff.bearer}`,
         'x-amf-context-token': token } });
     }
+    if (name === 'memory_upsert' && handoff.tools.includes(name)) {
+      const input = upsertInput(args); const { idempotencyKey, ...body } = input;
+      return request(new URL('v2/memory/proposals', handoff.endpoint), {
+        method: 'POST', headers: { authorization: `Bearer ${handoff.bearer}`, 'content-type': 'application/json',
+          'idempotency-key': idempotencyKey }, body: JSON.stringify(body)
+      });
+    }
+    if (name === 'memory_proposal_status' && handoff.tools.includes(name)) {
+      const input = readInput(args);
+      return request(new URL(`v2/memory/proposals/${input.id}`, handoff.endpoint), {
+        method: 'GET', headers: { authorization: `Bearer ${handoff.bearer}` }
+      });
+    }
     fail('interactive_recall_tool_unknown');
   }
 
@@ -247,10 +299,10 @@ export function createInteractiveRecallBridge({ handoff, fetchImpl = globalThis.
         capabilities: { tools: {} }, serverInfo: { name: 'amf-interactive-recall', version: '1' } });
     }
     if (message.method === 'notifications/initialized') return null;
-    if (message.method === 'tools/list') return rpcResult(id, { tools: toolDefinitions() });
+    if (message.method === 'tools/list') return rpcResult(id, { tools: toolDefinitions(handoff) });
     if (message.method !== 'tools/call') return rpcError(id, -32601, 'Unsupported method');
     const name = message.params?.name;
-    if (name !== 'memory_search' && name !== 'memory_read') return rpcError(id, -32601, 'Unknown tool');
+    if (!handoff.tools.includes(name)) return rpcError(id, -32601, 'Unknown tool');
     try {
       const result = await callTool(name, message.params?.arguments || {});
       return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result) }] });
@@ -260,7 +312,7 @@ export function createInteractiveRecallBridge({ handoff, fetchImpl = globalThis.
     }
   }
 
-  return Object.freeze({ handleRpc, tools: toolDefinitions() });
+  return Object.freeze({ handleRpc, tools: toolDefinitions(handoff) });
 }
 
 export function createInteractiveRecallBridgeFromDirectory(directory, options = {}) {

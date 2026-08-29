@@ -28,7 +28,7 @@ function withEffectiveUid(uid, operation) {
   try { return operation(); } finally { process.geteuid = original; }
 }
 
-function fixture(profile = 'codex') {
+function fixture(profile = 'codex', writeEnabled = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-interactive-mcp-'));
   const authRegistryPath = path.join(root, 'auth-registry.json');
   const policyPath = path.join(root, 'policy.json');
@@ -41,7 +41,7 @@ function fixture(profile = 'codex') {
     scopes: { 'domain:existing': { backendUserId: 'existing' } } });
   privateJson(contextKeyRingPath, { currentKeyVersion: 'ctx-existing-v1', keys: { 'ctx-existing-v1': key() } });
   const handoffPath = path.join(handoffParent, profile);
-  const options = { profile, authRegistryPath, policyPath, contextKeyRingPath, handoffPath, backupRoot,
+  const options = { profile, writeEnabled, authRegistryPath, policyPath, contextKeyRingPath, handoffPath, backupRoot,
     backendUserId: 'openmemory', serviceOwnerUid: process.geteuid?.() ?? fs.statSync(root).uid,
     policyRevision: 'policy-v1', endpoint: 'https://amf.example.test/', clock: () => FIXED_NOW };
   withEffectiveUid(0, () => provisionInteractiveRecall(options));
@@ -153,6 +153,39 @@ test('ChatGPT Web uses a distinct read-only identity', () => {
     assert.equal(handoff.contextKeyVersion, 'ctx-chatgpt-web-v1');
     assert.deepEqual(handoff.permissions, ['memory:search', 'memory:read', 'purpose:conversation_recall']);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('ChatGPT Web governed write queues revision-aware proposals without widening scope', async () => {
+  const { root, handoffPath } = fixture('chatgpt-web', true); const fabric = await fakeFabric();
+  try {
+    const handoff = loadInteractiveRecallHandoff(handoffPath);
+    assert.deepEqual(handoff.scopes, ['shared:global']);
+    assert.deepEqual(handoff.permissions, ['memory:search', 'memory:read', 'purpose:conversation_recall', 'memory:propose']);
+    const bridge = createInteractiveRecallBridge({ handoff, fetchImpl: fabric.fetchImpl,
+      clock: () => FIXED_NOW.getTime(), randomBytes: testRandom() });
+    const tools = await bridge.handleRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+    assert.deepEqual(tools.result.tools.map(tool => tool.name),
+      ['memory_search', 'memory_read', 'memory_upsert', 'memory_proposal_status']);
+    const record = { id: 'memory:new', revision: 2, scope: { id: 'shared:global' },
+      lifecycle: { supersedes: ['memory:old'] } };
+    const upsert = await bridge.handleRpc({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+      name: 'memory_upsert', arguments: { record, rationale: 'verified correction', expectedRevision: 1,
+        idempotencyKey: 'chatgpt-upsert-1' }
+    } });
+    assert.equal(upsert.error, undefined); assert.equal(fabric.calls.length, 1);
+    assert.equal(fabric.calls[0].method, 'POST'); assert.equal(fabric.calls[0].url, '/v2/memory/proposals');
+    assert.equal(fabric.calls[0].headers['idempotency-key'], 'chatgpt-upsert-1');
+    assert.deepEqual(fabric.calls[0].body, { record, rationale: 'verified correction', expectedRevision: 1 });
+    const status = await bridge.handleRpc({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: {
+      name: 'memory_proposal_status', arguments: { id: 'proposal:1' }
+    } });
+    assert.equal(status.error, undefined); assert.equal(fabric.calls[1].url, '/v2/memory/proposals/proposal:1');
+    const widened = await bridge.handleRpc({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: {
+      name: 'memory_upsert', arguments: { record: { ...record, scope: { id: 'person:joseph' } },
+        rationale: 'x', expectedRevision: 1, idempotencyKey: 'chatgpt-upsert-2' }
+    } });
+    assert.equal(widened.error.code, -32602); assert.equal(fabric.calls.length, 2);
+  } finally { await fabric.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('the stdio launcher accepts only the handoff-directory environment contract', () => {
