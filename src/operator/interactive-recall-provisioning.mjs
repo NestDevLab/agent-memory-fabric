@@ -3,18 +3,23 @@ import crypto from 'node:crypto';
 import { provisionScopedConsumer } from './recall-consumer-provisioning.mjs';
 
 export const INTERACTIVE_RECALL_HANDOFF_SCHEMA = 'amf.interactive-recall-handoff/v1';
+export const INTERACTIVE_RECALL_WRITE_HANDOFF_SCHEMA = 'amf.interactive-recall-handoff/v2';
 export const INTERACTIVE_RECALL_PERMISSIONS = Object.freeze([
   'memory:search',
   'memory:read',
   'purpose:conversation_recall'
 ]);
 export const INTERACTIVE_RECALL_SCOPES = Object.freeze(['shared:global']);
+export const INTERACTIVE_RECALL_WRITE_PERMISSIONS = Object.freeze([
+  ...INTERACTIVE_RECALL_PERMISSIONS,
+  'memory:propose'
+]);
 export const INTERACTIVE_RECALL_PROFILE_NAMES = Object.freeze(['codex', 'claude', 'chatgpt-web']);
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$/;
 const OPTION_KEYS = new Set([
   'profile', 'authRegistryPath', 'policyPath', 'contextKeyRingPath', 'handoffPath', 'backupRoot',
-  'backendUserId', 'serviceOwnerUid', 'policyRevision', 'endpoint', 'dryRun', 'clock', 'randomBytes', 'faultAt'
+  'backendUserId', 'serviceOwnerUid', 'policyRevision', 'endpoint', 'writeEnabled', 'dryRun', 'clock', 'randomBytes', 'faultAt'
 ]);
 
 function fail(code) { throw new Error(code); }
@@ -68,8 +73,11 @@ function cloneSessionDescriptor(value) {
   };
 }
 
-export function interactiveRecallProfile(profileName) {
+export function interactiveRecallProfile(profileName, { writeEnabled = false } = {}) {
   if (!INTERACTIVE_RECALL_PROFILE_NAMES.includes(profileName)) fail('interactive_recall_profile_invalid');
+  if (typeof writeEnabled !== 'boolean' || (writeEnabled && profileName !== 'chatgpt-web')) {
+    fail('interactive_recall_write_profile_invalid');
+  }
   const profile = PROFILES[profileName];
   return {
     actor: profile.actor,
@@ -77,13 +85,14 @@ export function interactiveRecallProfile(profileName) {
     runtime: profile.runtime,
     profile: profile.profile,
     sessionDescriptor: cloneSessionDescriptor(profile.sessionDescriptor),
-    permissions: [...INTERACTIVE_RECALL_PERMISSIONS],
+    permissions: [...(writeEnabled ? INTERACTIVE_RECALL_WRITE_PERMISSIONS : INTERACTIVE_RECALL_PERMISSIONS)],
     scopes: [...INTERACTIVE_RECALL_SCOPES],
     sessionOwnerActors: [],
     allowedVaults: null,
-    mode: 'read_only_scoped',
+    mode: writeEnabled ? 'scoped' : 'read_only_scoped',
     purpose: 'conversation_recall',
-    handoffSchema: INTERACTIVE_RECALL_HANDOFF_SCHEMA,
+    handoffSchema: writeEnabled ? INTERACTIVE_RECALL_WRITE_HANDOFF_SCHEMA : INTERACTIVE_RECALL_HANDOFF_SCHEMA,
+    tools: writeEnabled ? ['memory_search', 'memory_read', 'memory_upsert', 'memory_proposal_status'] : null,
     backupSlug: `interactive-recall-${profileName}`
   };
 }
@@ -94,7 +103,7 @@ export function provisionInteractiveRecall(options = {}) {
   if (typeof options.policyRevision !== 'string' || !SAFE_ID.test(options.policyRevision)) {
     fail('interactive_recall_policy_revision_invalid');
   }
-  const profile = interactiveRecallProfile(options.profile);
+  const profile = interactiveRecallProfile(options.profile, { writeEnabled: options.writeEnabled === true });
   return provisionScopedConsumer(options, {
     ...profile,
     policyRevision: options.policyRevision,
