@@ -99,6 +99,12 @@ function syntheticItemV2(secret = 'SYNTHETIC_V2_RAW_PRIVATE_TEXT') {
   return { event, projection };
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+
 async function withRawServer(run, { bodyReadTimeoutMs, rawIngestBodyBytes } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amf-raw-server-'));
   const registryPath = path.join(root, 'auth.json');
@@ -152,6 +158,40 @@ test('HTTP ciphertext sink stores idempotently without sending RAW plaintext', a
     const rotated = new EncryptedOutbox({ rootPath: path.join(root, 'rotated'), encryptionKey: KEY2, digestKey: KEY, sourceInstanceId: 'synthetic-host', actorId: 'raw-owner', keyId: 'client-v2' });
     const rotationDuplicate = await api('/v2/ingest/raw-events', { method: 'POST', body: JSON.stringify({ ...body, envelope: rotated.encrypt(item) }) });
     assert.equal(rotationDuplicate.body.data.status, 'duplicate', 'stable digest survives encryption-key rotation');
+  });
+});
+
+test('delivery proof is bounded to the authenticated actor, source and exact payload digest', async () => {
+  await withRawServer(async ({ root, api, catalog }) => {
+    const outbox = new EncryptedOutbox({ rootPath: path.join(root, 'proof-outbox'), ...RAW_OUTBOX });
+    const item = syntheticItemV2();
+    const envelope = outbox.encrypt(item);
+    assert.equal((await api('/v2/ingest/raw-events', { method: 'POST', body: JSON.stringify({
+      sourceInstanceId: 'synthetic-host', projection: item.projection, envelope,
+    }) })).response.status, 201);
+    const entry = { eventId: item.event.eventId, payloadDigest: envelope.payloadDigest };
+    const request = { schema: 'amf.raw-outbox-delivery-proof-request/v1', sourceInstanceId: 'synthetic-host', entries: [entry] };
+    const proved = await api('/v2/ingest/raw-events/delivery-proof', { method: 'POST', body: JSON.stringify(request) });
+    assert.equal(proved.response.status, 200);
+    assert.deepEqual(proved.body.data.entries, [entry]);
+    const { proofDigest, ...unsigned } = proved.body.data;
+    assert.equal(proofDigest, crypto.createHash('sha256').update(canonicalJson(unsigned)).digest('hex'));
+    assert.ok(catalog.auditEvents.some(event => event.action === 'raw_delivery_proof'
+      && event.outcome === 'verified' && event.details.total === 1 && event.details.resultCount === 1));
+
+    const wrongDigest = await api('/v2/ingest/raw-events/delivery-proof', { method: 'POST', body: JSON.stringify({
+      ...request, entries: [{ ...entry, payloadDigest: `hmac-sha256:v1:${'0'.repeat(64)}` }],
+    }) });
+    assert.deepEqual(wrongDigest.body.data.entries, []);
+    const wrongSource = await api('/v2/ingest/raw-events/delivery-proof', { method: 'POST', body: JSON.stringify({
+      ...request, sourceInstanceId: 'other-host',
+    }) });
+    assert.deepEqual(wrongSource.body.data.entries, []);
+    const wrongActor = await api('/v2/ingest/raw-events/delivery-proof', { token: 'attacker-token', method: 'POST', body: JSON.stringify(request) });
+    assert.deepEqual(wrongActor.body.data.entries, []);
+    const denied = await api('/v2/ingest/raw-events/delivery-proof', { token: 'denied-token', method: 'POST', body: JSON.stringify(request) });
+    assert.equal(denied.response.status, 403);
+    assert.equal(denied.body.error.code, 'forbidden');
   });
 });
 

@@ -2169,6 +2169,27 @@ const requestHandler = async (req, res) => {
     }
   }
 
+  if (url.pathname === '/v2/ingest/raw-events/delivery-proof' && req.method === 'POST') {
+    try {
+      requirePermission(policy, 'raw:ingest');
+      const body = await parseBody(req, { maxBytes: rawIngestBodyBytes, timeoutMs: bodyReadTimeoutMs });
+      if (!body || Object.keys(body).sort().join('\0') !== 'entries\0schema\0sourceInstanceId'
+        || body.schema !== 'amf.raw-outbox-delivery-proof-request/v1') {
+        throw Object.assign(new Error('invalid_request'), { status: 400 });
+      }
+      const result = await fabricStore.proveRawDeliveries({ actor, sourceInstanceId: body.sourceInstanceId,
+        entries: body.entries }, { requestId });
+      return jsonNoStore(res, 200, v2Envelope(requestId, result));
+    } catch (error) {
+      if (error?.message !== 'audit_unavailable') {
+        try { await auditRequired(fabricStore, { actor, action: 'raw_delivery_proof', outcome: 'failed', requestId,
+          details: { code: publicError(error).code } }); } catch (auditError) { if (auditError?.message === 'audit_unavailable') error = auditError; }
+      }
+      const failure = v2Error(requestId, error, 500);
+      return jsonNoStore(res, failure.status, failure.body);
+    }
+  }
+
   if (pathnameParts[0] === 'v2' && pathnameParts[1] === 'memory' && pathnameParts[2] === 'proposals' && pathnameParts[3] && pathnameParts.length === 4 && req.method === 'GET') {
     try {
       const status = await performMemoryProposalStatus({ actor, policy, policies, fabricStore, id: pathnameParts[3], requestId });
