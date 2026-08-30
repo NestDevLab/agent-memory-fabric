@@ -25,6 +25,8 @@ function fixture(conflictPolicy = 'disable-managed') {
   const adapterRoot = path.join(root, 'adapter'); const bin = path.join(adapterRoot, 'runtime/raw-adapters/bin');
   const sessions = path.join(root, 'sessions'); fs.mkdirSync(bin, { recursive: true }); fs.mkdirSync(sessions);
   fs.writeFileSync(path.join(bin, 'amf-runtime-raw.mjs'), '#!/usr/bin/env node\n', { mode: 0o755 });
+  const nodeBinary = path.join(root, 'node');
+  fs.writeFileSync(nodeBinary, '#!/bin/sh\n', { mode: 0o755 });
   const runtimeConfig = path.join(root, 'runtime.json'); const environmentFile = path.join(root, 'runtime.env');
   const triggerPath = path.join(root, 'triggers');
   fs.writeFileSync(runtimeConfig, JSON.stringify({ schema: 'amf.runtime-raw-adapters/v1', captureMode: 'hook-push',
@@ -41,7 +43,7 @@ function fixture(conflictPolicy = 'disable-managed') {
     if (verb === 'enable') { enabled.add(unit); active.add(unit); return { status: 0, stdout: '', stderr: '' }; }
     return { status: 0, stdout: '', stderr: '' };
   };
-  const options = { instance: 'ct107-codex', runtime: 'codex', adapterRoot, runtimeConfig, environmentFile,
+  const options = { instance: 'ct107-codex', runtime: 'codex', adapterRoot, nodeBinary, runtimeConfig, environmentFile,
     triggerPath, captureMode: 'hook-push', conflictPolicy, maxTriggersPerPass: 100 };
   return { root, roots, options, deps: { roots, systemctl }, calls, enabled, active, runtimeConfig, environmentFile, triggerPath };
 }
@@ -66,6 +68,7 @@ test('harness RAW capture lifecycle is digest-gated, disabled on install, confli
   assert.throws(() => installHarnessRawCapture(tampered, value.deps), /integration_plan_digest_mismatch/);
 
   const installed = installHarnessRawCapture(first, value.deps); assert.equal(installed.changed, true);
+  assert.match(fs.readFileSync(first.artifacts.wrapper.path, 'utf8'), new RegExp(`exec '${value.options.nodeBinary}'`));
   assert.equal(value.calls.some(call => call[0] === 'enable'), false, 'install never activates the path unit');
   assert.equal(harnessRawCaptureStatus('harness-raw-capture', 'ct107-codex', value.deps).health, 'degraded');
   const enabled = enableHarnessRawCapture(first, value.deps);
@@ -78,6 +81,17 @@ test('harness RAW capture lifecycle is digest-gated, disabled on install, confli
   disableHarnessRawCapture(first, value.deps); const removed = uninstallHarnessRawCapture(first, value.deps);
   assert.equal(removed.changed, true);
   for (const preserved of [value.runtimeConfig, value.environmentFile]) assert.equal(fs.existsSync(preserved), true);
+});
+
+test('node binary must be an executable regular file, not a symlink', () => {
+  const value = fixture();
+  fs.chmodSync(value.options.nodeBinary, 0o644);
+  assert.throws(() => buildHarnessRawCapturePlan('harness-raw-capture', value.options, value.deps),
+    /integration_permissions_unsafe/);
+  fs.unlinkSync(value.options.nodeBinary);
+  fs.symlinkSync('/bin/sh', value.options.nodeBinary);
+  assert.throws(() => buildHarnessRawCapturePlan('harness-raw-capture', value.options, value.deps),
+    /integration_path_unsafe/);
 });
 
 test('fail conflict policy refuses activation while the managed RAW timer is active', () => {

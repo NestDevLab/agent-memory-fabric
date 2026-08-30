@@ -31,6 +31,7 @@ function regular(fsImpl, target, options = {}) {
   let stat; try { stat = fsImpl.lstatSync(target); } catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) fail('integration_path_unsafe', target);
   if (options.mode !== undefined && (stat.mode & 0o777) !== options.mode) fail('integration_permissions_unsafe', target);
+  if (options.executable && (stat.mode & 0o111) === 0) fail('integration_permissions_unsafe', target);
   return stat;
 }
 function directory(fsImpl, target) {
@@ -69,13 +70,15 @@ function validateOptions(value, deps, { requirePaths = true } = {}) {
   const conflictPolicy = value.conflictPolicy === undefined ? 'fail' : value.conflictPolicy;
   if (!['fail', 'disable-managed'].includes(conflictPolicy)) fail('integration_option_invalid', 'conflict-policy');
   const adapterRoot = absolute(value.adapterRoot, 'adapter-root');
+  const nodeBinary = absolute(value.nodeBinary, 'node-binary');
   const runtimeConfig = absolute(value.runtimeConfig, 'runtime-config');
   const environmentFile = absolute(value.environmentFile, 'environment-file');
   const triggerPath = absolute(value.triggerPath, 'trigger-path');
   const maxTriggersPerPass = bounded(value.maxTriggersPerPass, 100, 'max-triggers-per-pass');
   const hookFile = path.join(adapterRoot, 'runtime/raw-adapters/bin/amf-runtime-raw.mjs');
   if (requirePaths) {
-    directory(deps.fs, adapterRoot); regular(deps.fs, hookFile); regular(deps.fs, runtimeConfig, { mode: 0o600 });
+    directory(deps.fs, adapterRoot); regular(deps.fs, nodeBinary, { executable: true });
+    regular(deps.fs, hookFile); regular(deps.fs, runtimeConfig, { mode: 0o600 });
     regular(deps.fs, environmentFile, { mode: 0o600 });
     let parsed; try { parsed = JSON.parse(readRegular(deps.fs, runtimeConfig)); } catch { fail('integration_runtime_config_invalid'); }
     if (parsed?.schema !== 'amf.runtime-raw-adapters/v1' || parsed.captureMode !== captureMode
@@ -85,12 +88,12 @@ function validateOptions(value, deps, { requirePaths = true } = {}) {
       fail('integration_runtime_config_mismatch');
     }
   }
-  return { instanceId, runtime, captureMode, conflictPolicy, adapterRoot, runtimeConfig, environmentFile,
+  return { instanceId, runtime, captureMode, conflictPolicy, adapterRoot, nodeBinary, runtimeConfig, environmentFile,
     triggerPath, maxTriggersPerPass, hookFile };
 }
 
 function render(config, names, targets) {
-  const wrapper = Buffer.from(`#!/bin/sh\nset -eu\nset -a\n. '${config.environmentFile}'\nset +a\nexec /usr/bin/node '${config.hookFile}' --config '${config.runtimeConfig}' --mode hook --harness '${config.runtime}'\n`, 'utf8');
+  const wrapper = Buffer.from(`#!/bin/sh\nset -eu\nset -a\n. '${config.environmentFile}'\nset +a\nexec '${config.nodeBinary}' '${config.hookFile}' --config '${config.runtimeConfig}' --mode hook --harness '${config.runtime}'\n`, 'utf8');
   const pathUnit = Buffer.from(`[Unit]\nDescription=Agent Memory Fabric event-driven RAW capture (${config.instanceId})\nAfter=local-fs.target\n\n[Path]\nPathExistsGlob=${config.triggerPath}/*.enc.json\nUnit=${names.service}\n\n[Install]\nWantedBy=multi-user.target\n`, 'utf8');
   return { wrapper, pathUnit, targets };
 }
@@ -120,7 +123,7 @@ function validatePlan(plan, overrides = {}, requirePaths = true) {
   const deps = dependencies(overrides); const descriptor = describeIntegration(ID);
   const config = validateOptions({ instance: plan.config?.instanceId, runtime: plan.config?.runtime,
     captureMode: plan.config?.captureMode, conflictPolicy: plan.config?.conflictPolicy,
-    adapterRoot: plan.config?.adapterRoot, runtimeConfig: plan.config?.runtimeConfig,
+    adapterRoot: plan.config?.adapterRoot, nodeBinary: plan.config?.nodeBinary, runtimeConfig: plan.config?.runtimeConfig,
     environmentFile: plan.config?.environmentFile, triggerPath: plan.config?.triggerPath,
     maxTriggersPerPass: plan.config?.maxTriggersPerPass }, deps, { requirePaths });
   const targets = locations(config.instanceId, deps.roots); const names = unitNames(config.instanceId);
