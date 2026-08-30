@@ -2,7 +2,7 @@
   "schema": "amf.integration/v1",
   "id": "harness-raw-capture",
   "category": "runtime-capture",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "source": "NestDevLab/agent-memory-fabric-runtime-adapters",
   "agentwheel": {
     "resources": ["hook:raw-capture-stop"],

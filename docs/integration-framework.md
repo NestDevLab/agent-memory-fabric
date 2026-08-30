@@ -39,17 +39,21 @@ hook mode that service processes only the named transcript through the existing
 cursor, projection, encrypted outbox, and retry path; it does not scan the
 transcript tree.
 
-The integration plan binds the runtime, adapter checkout, private runtime
-configuration, private environment file, trigger path, capture mode, and
-conflict policy. `install` verifies and writes the wrapper and path unit but
-leaves them disabled. `enable` either refuses an active matching RAW polling
-timer (`conflictPolicy=fail`) or disables that exact managed timer before
-enabling the path unit (`conflictPolicy=disable-managed`). It never changes
-unrelated timers or hooks.
+The integration plan binds the runtime, adapter checkout, explicit Node.js
+executable, private runtime configuration, private environment file, trigger
+path, capture mode, and conflict policy. `install` verifies and writes the
+wrapper and path unit but leaves them disabled. `enable` either refuses an
+active matching RAW polling timer (`conflictPolicy=fail`) or disables that
+exact managed timer before enabling the path unit
+(`conflictPolicy=disable-managed`). It never changes unrelated timers or hooks.
 
 Agentwheel remains the only writer of `~/.codex/hooks.json` and
 `~/.claude/settings.json`. Uninstall preserves native transcripts, runtime
 configuration, environment, cursors, outbox, and encrypted triggers.
+
+Planning requires `--node-binary` with an absolute path to an executable,
+non-symlink regular file. This keeps host runtime selection explicit and binds
+the selected interpreter into the confirmed plan and rendered wrapper.
 
 `plan` validates the vault, resolves the Agentwheel-installed client through a
 known source layout without executing it, independently opens its files with
