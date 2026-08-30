@@ -19,7 +19,8 @@ Use `--deployment-env <path>` only for an authorized AMF deployment file; the sc
 
 Interpret four independent layers:
 
-1. **Capture:** collectors are recent, successful, and have no pending/dead events.
+1. **Capture:** each collector's explicitly configured timer or hook-path
+   scheduler is active, recent, successful, and has no pending/dead events.
 2. **Corpus:** when `requireDocumentStore` is enabled, AMF reports a configured document backend and the Obsidian client reports no retrying delivery.
 3. **Access:** the current session exposes `memory_status`, `memory_search`, `memory_read`, or equivalent native recall. Inspect the actual tool surface; the script cannot see tools injected into the session.
 4. **Recall:** a fresh session retrieves a benign unique fact with correct scope and provenance.
