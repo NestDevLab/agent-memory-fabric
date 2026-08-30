@@ -68,7 +68,8 @@ export function evaluateFabricPayload(payload, { requireSemanticBackend = false,
 export function evaluateCollectorSnapshot(snapshot, { maxPending = 0, maxAgeMs = 15 * 60_000 } = {}) {
   const id = `collector:${snapshot.id}`;
   const intentionallyPaused = snapshot.migrationPause?.state === "paused" && snapshot.migrationPause?.verified === true;
-  if (!intentionallyPaused && snapshot.timerActive !== true) return check(id, "critical", "Collector timer is not active", publicCollectorEvidence(snapshot));
+  const schedulerActive = snapshot.schedulerActive ?? snapshot.timerActive;
+  if (!intentionallyPaused && schedulerActive !== true) return check(id, "critical", "Collector scheduler is not active", publicCollectorEvidence(snapshot));
   if (snapshot.result && snapshot.result !== "success") return check(id, "critical", `Collector result is ${snapshot.result}`, publicCollectorEvidence(snapshot));
   if (Number(snapshot.execMainStatus ?? 0) !== 0) return check(id, "critical", `Collector exit status is ${snapshot.execMainStatus}`, publicCollectorEvidence(snapshot));
   if (Number(snapshot.dead ?? 0) > 0) return check(id, "degraded", `Collector has ${snapshot.dead} dead event(s)`, publicCollectorEvidence(snapshot));
@@ -79,7 +80,7 @@ export function evaluateCollectorSnapshot(snapshot, { maxPending = 0, maxAgeMs =
   if (snapshot.lastTriggerMs && Date.now() - snapshot.lastTriggerMs > maxAgeMs) {
     return check(id, "degraded", "Collector has not triggered recently", publicCollectorEvidence(snapshot));
   }
-  return check(id, "healthy", "Collector timer and outbox are healthy", publicCollectorEvidence(snapshot));
+  return check(id, "healthy", "Collector scheduler and outbox are healthy", publicCollectorEvidence(snapshot));
 }
 
 export function formatHuman(report) {
@@ -284,13 +285,21 @@ function verifiedMigrationPause(payload) {
 function collectorSnapshot(collector, stateRoot = "/var/lib/agent-memory-fabric/runtime-raw") {
   const id = String(collector.id);
   const timer = systemctlShow(`agent-memory-fabric-runtime-raw@${id}.timer`, collector);
+  const schedulerKind = collector.scheduler || "systemd-timer";
+  if (!["systemd-timer", "hook-path"].includes(schedulerKind)) throw new Error(`collector_scheduler_invalid:${id}`);
+  const scheduler = schedulerKind === "hook-path"
+    ? systemctlShow(`agent-memory-fabric-runtime-raw-hook-${id}.path`, collector)
+    : timer;
   const service = systemctlShow(`agent-memory-fabric-runtime-raw@${id}.service`, collector);
   const outbox = collector.outbox || path.join(stateRoot, id, "outbox");
   return {
     id,
+    schedulerKind,
+    schedulerActive: scheduler.ActiveState === "active",
+    schedulerState: scheduler.SubState || "unknown",
     timerActive: timer.ActiveState === "active",
     timerState: timer.SubState || "unknown",
-    lastTriggerMs: dateMs(timer.LastTriggerUSec),
+    lastTriggerMs: dateMs(scheduler.LastTriggerUSec || service.ExecMainStartTimestamp),
     serviceState: service.ActiveState || "unknown",
     result: service.Result || "",
     execMainStatus: finiteOr(service.ExecMainStatus, 0),
@@ -300,7 +309,7 @@ function collectorSnapshot(collector, stateRoot = "/var/lib/agent-memory-fabric/
 }
 
 function systemctlShow(unit, target = { transport: "local" }) {
-  const result = runTarget(target, "systemctl", ["show", unit, "-p", "ActiveState", "-p", "SubState", "-p", "LastTriggerUSec", "-p", "Result", "-p", "ExecMainStatus"]);
+  const result = runTarget(target, "systemctl", ["show", unit, "-p", "ActiveState", "-p", "SubState", "-p", "LastTriggerUSec", "-p", "Result", "-p", "ExecMainStatus", "-p", "ExecMainStartTimestamp"]);
   if (result.error || result.status !== 0) return {};
   return Object.fromEntries(result.stdout.split(/\r?\n/).filter(Boolean).map(line => {
     const index = line.indexOf("=");
@@ -323,6 +332,8 @@ function dateMs(value) {
 
 function publicCollectorEvidence(snapshot) {
   return {
+    schedulerKind: snapshot.schedulerKind || "systemd-timer",
+    schedulerState: snapshot.schedulerState || snapshot.timerState,
     timerState: snapshot.timerState,
     serviceState: snapshot.serviceState,
     result: snapshot.result || "unknown",

@@ -114,6 +114,18 @@ test("collector distinguishes normal one-shot inactivity, dead letters, and time
   assert.equal(evaluateCollectorSnapshot({ ...base, timerActive: false }).status, "critical");
 });
 
+test("collector accepts an explicitly healthy hook path scheduler with an inactive polling timer", () => {
+  const result = evaluateCollectorSnapshot({
+    id: "runtime", schedulerKind: "hook-path", schedulerActive: true, schedulerState: "waiting",
+    timerActive: false, timerState: "dead", serviceState: "inactive", result: "success",
+    execMainStatus: 0, pending: 0, dead: 0, lastTriggerMs: Date.now()
+  });
+  assert.equal(result.status, "healthy");
+  assert.equal(result.evidence.schedulerKind, "hook-path");
+  assert.equal(result.evidence.schedulerState, "waiting");
+  assert.equal(result.evidence.timerState, "dead");
+});
+
 test("pending and stale collectors degrade", () => {
   const base = { id: "runtime", timerActive: true, result: "success", execMainStatus: 0, pending: 2, dead: 0, lastTriggerMs: Date.now() };
   assert.equal(evaluateCollectorSnapshot(base).status, "degraded");
