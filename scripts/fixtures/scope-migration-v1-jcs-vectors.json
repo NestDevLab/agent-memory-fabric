@@ -1,0 +1,23 @@
+{
+  "schema": "amf.scope-migration-jcs-vectors/v1",
+  "cases": [
+    {
+      "id": "controls-quote-backslash-bmp-astral",
+      "value": { "text": "\u0000\b\t\n\f\r\u001f\"\\€😀" },
+      "canonical": "{\"text\":\"\\u0000\\b\\t\\n\\f\\r\\u001f\\\"\\\\€😀\"}",
+      "digest": "sha256:b7d7059b80dd2918190f3cc0cf1ed1b189f7ba45cc5f5d22e32cb7daee21b185"
+    },
+    {
+      "id": "utf16-key-order",
+      "value": { "": "bmp", "😀": "astral", "A": "ascii" },
+      "canonical": "{\"A\":\"ascii\",\"😀\":\"astral\",\"\":\"bmp\"}",
+      "digest": "sha256:4dd477277eed6b46b9464a562a31e6f3d9468c616e5d61548a1468ef420ecc1b"
+    },
+    {
+      "id": "safe-integer-boundaries",
+      "value": { "safeMax": 9007199254740991, "safeMin": -9007199254740991, "negativeZero": 0 },
+      "canonical": "{\"negativeZero\":0,\"safeMax\":9007199254740991,\"safeMin\":-9007199254740991}",
+      "digest": "sha256:cdfe8c5f0fe5b941154823a78e4e43f50a0f0ea884c3e23245d272553f2461c5"
+    }
+  ]
+}

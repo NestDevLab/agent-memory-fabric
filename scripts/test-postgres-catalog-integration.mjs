@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test from 'node:test';
 
-import { FabricStore, MemoryRawStore, POSTGRES_SCHEMA_VERSION, PostgresCatalog } from '../src/fabric-store.mjs';
+import { FabricStore, MemoryRawStore, PostgresCatalog } from '../src/fabric-store.mjs';
+import { verifyAndPublishRawProjectionV2Proof } from '../src/raw-projection-v2-readiness.mjs';
 
 const connectionString = String(process.env.AMF_TEST_POSTGRES_URL || '').trim();
 const enabled = connectionString && process.env.AMF_TEST_POSTGRES_ALLOW_MUTATION === 'true';
@@ -65,12 +66,16 @@ test('real PostgreSQL catalog integration in an explicitly isolated test databas
   try {
     await catalog.ready();
     catalogReady = true;
+    await verifyAndPublishRawProjectionV2Proof(catalog);
     const readinessStore = new FabricStore({ rawStore, catalog, clock, idFactory, legacyV1Writes: false });
     await readinessStore.ready();
     assert.equal(readinessStore.status().rawProjectionV2Ready, true);
     assert.equal(readinessStore.status().rawProjectionV2ReadinessReason, null);
-    const migrationProof = await catalog.pool.query('SELECT schema_version,backend,alias_orphan_count,legacy_field_count,literal_scan_count FROM agent_memory_fabric.raw_projection_v2_migration_state WHERE singleton=1');
-    assert.deepEqual({ schemaVersion: Number(migrationProof.rows[0].schema_version), backend: migrationProof.rows[0].backend, aliasOrphans: Number(migrationProof.rows[0].alias_orphan_count), legacyFields: Number(migrationProof.rows[0].legacy_field_count), literalTags: Number(migrationProof.rows[0].literal_scan_count) }, { schemaVersion: POSTGRES_SCHEMA_VERSION, backend: 'postgres', aliasOrphans: 0, legacyFields: 0, literalTags: 0 });
+    const readinessProof = await catalog.rawV2Readiness();
+    assert.equal(readinessProof.evidence.version, 1);
+    assert.equal(readinessProof.evidence.evidence.aliasOrphanCount, 0);
+    assert.equal(readinessProof.evidence.evidence.legacyFieldCount, 0);
+    assert.equal(readinessProof.evidence.evidence.literalScanCount, 0);
 
     // A schema-6 row is backfilled on startup while preserving the former
     // full context metadata for binary rollback compatibility.

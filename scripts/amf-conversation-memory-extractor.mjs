@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-import { assertExtractorStateRunnable, buildMemoryRecord, createExtractorState, duplicateCanonicalClaim, migrateExtractorStateToConversationV3, normalizeConversationExtractorState, normalizeState, proposalIdempotencyKey, reserveModelBudget, resumeExtractorInFlight, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/conversation-memory-extractor.mjs';
+import { assertExtractorStateRunnable, buildMemoryRecord, createExtractorState, migrateExtractorStateToConversationV3, normalizeConversationExtractorState, normalizeState, proposalIdempotencyKey, reserveModelBudget, resumeExtractorInFlight, settleModelBudget, sharedDurableClaim, triageConversation, truncateUtf8ToTokenUpperBound, utf8TokenUpperBound, validateClaims } from '../src/conversation-memory-extractor.mjs';
 import { createConversationMemoryQualityReport, verifyConversationMemoryQualityGate } from '../src/conversation-memory-quality-gate.mjs';
 import { canonicalJson } from '../src/ingest/transcripts/canonical.mjs';
 
@@ -189,7 +189,7 @@ async function extractWithCodex(text, config) {
   } finally { try { fs.unlinkSync(outputFile); } catch (error) { if (error?.code !== 'ENOENT') throw error; } }
 }
 
-export async function tick(config, { dryRun, sessionId = null }) {
+export async function tick(config, { dryRun, sessionId = null, sessionScopeRouteComposer = null } = {}) {
   if (sessionId && !dryRun) fail('extractor_session_selector_requires_dry_run');
   fs.mkdirSync(config.codexWorkDir, { recursive: true, mode: 0o700 });
   const state = loadExtractorState(config, { dryRun });
@@ -213,12 +213,26 @@ export async function tick(config, { dryRun, sessionId = null }) {
   transcriptUrl.searchParams.set('limit', String(config.transcriptItemLimit)); transcriptUrl.searchParams.set('window', 'newest');
   const transcript = await requestJson({ url: transcriptUrl, token }); const triage = triageConversation(transcript.items);
   const base = { ok: true, dryRun, sessionId: session.id, occurredAt: session.lastOccurredAt, triage: triage.reason, scanned: 1 };
+  let route;
+  try {
+    if (!sessionScopeRouteComposer || sessionScopeRouteComposer.schema !== 'amf.session-scope-route-composer/v1'
+      || typeof sessionScopeRouteComposer.routeSession !== 'function' || typeof sessionScopeRouteComposer.proposeCandidate !== 'function') {
+      fail('extractor_session_scope_route_composer_required');
+    }
+    route = sessionScopeRouteComposer.routeSession(session);
+  }
+  catch (error) {
+    if (error?.message === 'session_scope_unmapped' || error?.message === 'session_scope_ambiguous') {
+      return { ...base, outcome: error.message.replace('session_scope_', ''), claims: [] };
+    }
+    fail('extractor_session_route_invalid');
+  }
   if (!triage.pass) {
     if (!dryRun) { state.cursor = page.nextCursor; state.inFlight = null; writeState(config.stateFile, state); }
     return { ...base, outcome: 'discarded', claims: [] };
   }
   const resumed = dryRun ? null : resumeExtractorInFlight({ inFlight: state.inFlight, sessionId: session.id, extractionIdentity,
-    visibleRevisionDigest, readerGeneration: config.readerGeneration, maxClaims: config.maxClaimsPerConversation });
+    visibleRevisionDigest, readerGeneration: config.readerGeneration, maxClaims: config.maxClaimsPerConversation, route });
   let paid;
   if (resumed) {
     paid = resumed;
@@ -235,20 +249,24 @@ export async function tick(config, { dryRun, sessionId = null }) {
     if (!dryRun) { state.inFlight = { sessionId: session.id, extractionIdentity, ...inFlightRevision, cursor: page.nextCursor, stage: 'model_done', claims: paid.claims, usage: paid.usage, inputTokenUpperBound: paid.inputTokenUpperBound }; writeState(config.stateFile, state); }
   }
   const records = resumed?.stage === 'proposing' ? resumed.proposalRecords : [];
+  if (resumed?.stage === 'proposing' && records.some(record => record?.schema !== 'amf.conversation-memory-candidate/v1')) {
+    // A persisted v1/v2 canonical record is readable for recovery evidence but
+    // cannot be converted or re-submitted as a v3 attributed candidate.
+    return { ...base, outcome: 'legacy_proposal_review_required', claims: [] };
+  }
   if (!resumed || resumed.stage !== 'proposing') {
     for (const claim of paid.claims) {
-      const canonical = await requestJson({ url: new URL('/v2/memory/search', config.baseUrl), token, method: 'POST', body: { scope: 'shared:global', query: claim.claim, purpose: 'memory_curation', limit: 20 } });
-      const existing = canonical?.result?.items || canonical?.items || [];
-      if (!duplicateCanonicalClaim(claim.claim, existing)) records.push(buildMemoryRecord({ sessionId: session.id, extractionIdentity, visibleRevisionDigest, transcript: triage.text, claim, now: new Date().toISOString() }));
+      records.push(buildMemoryRecord({ sessionId: session.id, extractionIdentity, visibleRevisionDigest, claim, route }));
     }
   }
   if (!dryRun) {
-    state.inFlight = { sessionId: session.id, extractionIdentity, ...inFlightRevision, cursor: page.nextCursor, stage: 'proposing', claims: paid.claims, usage: paid.usage, proposalKeys: records.map(record => proposalIdempotencyKey({ sessionId: session.id, extractionIdentity, visibleRevisionDigest, claim: record.claim.text })), proposalRecords: records };
+    state.inFlight = { sessionId: session.id, extractionIdentity, ...inFlightRevision, cursor: page.nextCursor, stage: 'proposing', claims: paid.claims, usage: paid.usage, proposalKeys: records.map(record => proposalIdempotencyKey({ sessionId: session.id, extractionIdentity, visibleRevisionDigest, claim: record.text, route })), proposalRecords: records };
     writeState(config.stateFile, state);
-    for (const record of records) await requestJson({ url: new URL('/v2/memory/proposals', config.baseUrl), token, method: 'POST', headers: { 'idempotency-key': proposalIdempotencyKey({ sessionId: session.id, extractionIdentity, visibleRevisionDigest, claim: record.claim.text }) }, body: { record, rationale: `Conversation extractor durable claim from ${session.id}; automatic curator and receipt applicator perform canonical plaintext deduplication.` } });
+    for (const record of records) await sessionScopeRouteComposer.proposeCandidate({ session, candidate: record,
+      idempotencyKey: proposalIdempotencyKey({ sessionId: session.id, extractionIdentity, visibleRevisionDigest, claim: record.text, route }) });
     state.cursor = page.nextCursor; state.inFlight = null; writeState(config.stateFile, state);
   }
-  return { ...base, outcome: records.length ? (dryRun ? 'would_propose' : 'proposed') : 'no_durable_claim', claims: records.map(record => ({ claimType: record.claimType, claim: record.claim.text, confidence: record.confidence.score })), usage: paid.usage, inputTokenUpperBound: paid.inputTokenUpperBound };
+  return { ...base, outcome: records.length ? (dryRun ? 'would_propose' : 'proposed') : 'no_durable_claim', claims: records.map(record => ({ claimType: record.claimType, claim: record.text, confidence: record.confidence })), usage: paid.usage, inputTokenUpperBound: paid.inputTokenUpperBound };
 }
 
 // This evaluation deliberately owns no cursor or state.  It records only the
@@ -292,12 +310,9 @@ export async function evaluateConversationMemoryQuality(config, { now = new Date
     counts.candidateClaims += candidateCount;
     counts.invalidOrUnsafeClaims += paid.invalidOrUnsafeClaims;
     if (candidateCount === 0) { counts.modelNoOp += 1; continue; }
-    for (const claim of paid.claims) {
-      const canonical = await qualityRequest({ url: new URL('/v2/memory/search', config.baseUrl), token, method: 'POST', body: { scope: 'shared:global', query: claim.claim, purpose: 'memory_curation', limit: 20 } });
-      const existing = array(canonical?.result?.items ?? canonical?.items);
-      if (duplicateCanonicalClaim(claim.claim, existing)) counts.duplicateClaims += 1;
-      else counts.wouldProposeClaims += 1;
-    }
+    // Quality sampling has no reviewed ScopeRef route. It measures model
+    // candidates only and never performs a canonical-memory dedup lookup.
+    counts.wouldProposeClaims += paid.claims.length;
   }
   const report = createConversationMemoryQualityReport({ policy, key, releaseDigest: config.qualityReleaseDigest,
     configDigest: extractorConfigDigest(config), completedAt: now, sample: counts });

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
-import { ContextTokenVerifier, issueSessionRouteBinding } from '../src/context-token.mjs';
+import { ContextTokenVerifier, issueSessionRouteBinding, issueSessionRouteBindingV3 } from '../src/context-token.mjs';
 import { provisionSessionRoutes } from '../src/operator/session-route-provisioning.mjs';
 
 const TAG_A = `hmac-sha256:routing-v1:${'a'.repeat(64)}`;
@@ -128,6 +128,27 @@ test('legacy v1 input supports an explicit CLI key version and rejects conflicts
     { encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(JSON.parse(result.stdout).ok, true);
+  } finally { fs.rmSync(sample.root, { recursive: true, force: true }); }
+});
+
+test('v3 provisioning signs a structured ScopeRef with reviewed mapping evidence and does not convert a v1 manifest', () => {
+  const sample = fixture();
+  try {
+    const v3 = { actor: sample.binding.actor, scope: { tenantId: 'tenant_alpha', type: 'project', scopeId: 'atlas' },
+      conversationKind: sample.binding.conversationKind, contextTags: sample.binding.contextTags,
+      mappingEvidence: { id: 'evidence-route-001', digest: `sha256:${'c'.repeat(64)}` }, keyVersion: 'ctx-v1' };
+    privateJson(sample.inputPath, { schema: 'amf.session-route-input/v3', bindings: [v3] });
+    const options = { inputPath: sample.inputPath, contextKeyRingPath: sample.contextKeyRingPath,
+      manifestPath: sample.manifestPath, serviceOwnerUid: sample.serviceOwnerUid };
+    asRoot(() => provisionSessionRoutes(options));
+    const manifest = JSON.parse(fs.readFileSync(sample.manifestPath, 'utf8'));
+    assert.equal(manifest.schema, 'amf.session-route-manifest/v3');
+    const verifier = new ContextTokenVerifier({ keyRing: sample.ring, policyRevision: '' });
+    assert.deepEqual(verifier.verifySessionRouteBindingV3(manifest.bindings[0]).scope, v3.scope);
+    assert.deepEqual(verifier.verifySessionRouteBindingV3(manifest.bindings[0]).mappingEvidence, v3.mappingEvidence);
+    privateJson(sample.manifestPath, { schema: 'amf.session-route-manifest/v1', bindings: [issueSessionRouteBinding(sample.binding, sample.ring)] });
+    assert.throws(() => provisionSessionRoutes({ ...options, dryRun: true }), /session_route_legacy_read_only/);
+    assert.throws(() => issueSessionRouteBindingV3({ ...v3, scope: { ...v3.scope, scopeId: 'atlas*' } }, sample.ring), /route_binding_invalid/);
   } finally { fs.rmSync(sample.root, { recursive: true, force: true }); }
 });
 

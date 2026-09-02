@@ -59,7 +59,7 @@ same native session. Their opaque values remain on the individual event projecti
 
 Adapters and rollout automation must read that path. Readiness is false until
 v1 writes are disabled and the production PostgreSQL catalog has persisted a
-schema-v7 migration proof containing v1/v2/alias counts, zero orphan aliases,
+schema-v7 readiness proof containing v1/v2/alias counts, zero orphan aliases,
 zero forbidden legacy fields, and a database-side scan proving that every
 context value is an opaque HMAC tag. Every v2 session binding is also parsed and
 validated before readiness can become true. Memory and SQLite catalogs remain useful

@@ -2,6 +2,16 @@ const OPAQUE_TAG = /^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$/;
 const CONTEXT_KEYS = new Set(['actor', 'sender', 'conversation', 'room', 'person', 'relationship', 'thread']);
 export const PURPOSES = Object.freeze(['conversation_recall', 'continuity_resume', 'incident_debug', 'operator_review', 'memory_curation']);
 
+// Kept local to avoid making legacy string-scope callers appear structured.
+// B2.2 routes are the only write path which may use a ScopeRef.
+export function isStructuredScopeRef(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).sort().join('\0') === 'scopeId\0tenantId\0type'
+    && /^[a-z][a-z0-9_-]{2,63}$/.test(value.tenantId)
+    && /^[a-z][a-z0-9_-]{2,63}$/.test(value.type)
+    && /^[a-z][a-z0-9._-]{2,127}$/.test(value.scopeId);
+}
+
 export function normalizeOpaqueTagMap(value, { required = true } = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('context_invalid');
   const result = {};

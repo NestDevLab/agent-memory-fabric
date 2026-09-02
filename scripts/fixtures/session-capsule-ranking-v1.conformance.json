@@ -1,0 +1,40 @@
+{
+  "schema": "amf.session-capsule-ranking-conformance/v1",
+  "policy": "capability-mcp-v2-rank/v2",
+  "scenarios": [
+    {
+      "id": "deterministic_authority_freshness_rrf",
+      "input": {
+        "rankedAt": "2026-09-01T12:00:00.000Z",
+        "query": "Atlas Cafe",
+        "vectorIds": ["rid_vector0003", "rid_review0002", "rid_vector0003", "rid_unknown9999"],
+        "capsules": [
+          { "id": "rid_source0001", "redactedText": "Atlas Café decision", "anchors": ["Atlas Cafe"], "authorityClass": "source_authority", "freshnessAt": "2026-09-01T12:00:00.000Z", "recencyAt": "2026-09-01T10:00:00.000Z", "expiresAt": "2026-09-02T12:00:00.000Z" },
+          { "id": "rid_review0002", "redactedText": "Atlas decision review", "anchors": ["decision"], "authorityClass": "reviewed_canonical", "freshnessAt": "2026-08-31T12:00:00.000Z", "recencyAt": "2026-09-01T11:00:00.000Z" },
+          { "id": "rid_vector0003", "redactedText": "Atlus coffee note", "anchors": ["coffee"], "authorityClass": "derived_projection", "freshnessAt": "2026-08-20T12:00:00.000Z", "recencyAt": "2026-08-20T12:00:00.000Z" },
+          { "id": "rid_expired004", "redactedText": "Atlas expired", "anchors": ["Atlas"], "authorityClass": "source_authority", "freshnessAt": "2026-09-01T12:00:00.000Z", "recencyAt": "2026-09-01T12:00:00.000Z", "expiresAt": "2026-09-01T12:00:00.000Z" },
+          { "id": "rid_future0005", "redactedText": "Atlas future", "anchors": ["Atlas"], "authorityClass": "source_authority", "freshnessAt": "2026-09-01T12:00:01.000Z", "recencyAt": "2026-09-01T12:00:00.000Z" }
+        ]
+      },
+      "expected": [
+        { "id": "rid_source0001", "position": 1, "reasons": ["exact_anchor", "authority", "freshness", "hybrid_similarity", "recency"] },
+        { "id": "rid_review0002", "position": 2, "reasons": ["authority", "freshness", "hybrid_similarity", "recency"] },
+        { "id": "rid_vector0003", "position": 3, "reasons": ["authority", "freshness", "hybrid_similarity", "recency"] }
+      ]
+    },
+    {
+      "id": "opaque_id_tie",
+      "input": {
+        "rankedAt": "2026-09-01T12:00:00.000Z", "query": "match", "vectorIds": [],
+        "capsules": [
+          { "id": "rid_tie_beta01", "redactedText": "match", "anchors": [], "authorityClass": "unknown", "freshnessAt": "2026-08-01T12:00:00.000Z", "recencyAt": "2026-08-01T12:00:00.000Z" },
+          { "id": "rid_tie_alpha2", "redactedText": "match", "anchors": [], "authorityClass": "unknown", "freshnessAt": "2026-08-01T12:00:00.000Z", "recencyAt": "2026-08-01T12:00:00.000Z" }
+        ]
+      },
+      "expected": [
+        { "id": "rid_tie_alpha2", "position": 1, "reasons": ["freshness", "hybrid_similarity", "recency"] },
+        { "id": "rid_tie_beta01", "position": 2, "reasons": ["freshness", "hybrid_similarity", "recency"] }
+      ]
+    }
+  ]
+}

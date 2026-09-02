@@ -1,11 +1,13 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { normalizeOpaqueTagMap } from './access-contract.mjs';
+import { normalizeMappingEvidence, normalizeScopeRef } from './scope-substrate.mjs';
 
 const TOKEN_FIELDS = ['actor', 'runtime', 'profile', 'conversationKind', 'contextTags', 'purpose', 'policyRevision', 'issuedAt', 'expiresAt', 'nonce', 'keyVersion', 'requestDigest'];
 const OPTIONAL_TOKEN_FIELDS = ['canonicalScopes'];
 const CANONICAL_SCOPE = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$/;
 const ROUTE_BINDING_FIELDS = ['actor', 'canonicalScope', 'conversationKind', 'contextTags', 'keyVersion'];
+const ROUTE_BINDING_V3_FIELDS = ['actor', 'scope', 'conversationKind', 'contextTags', 'mappingEvidence', 'keyVersion'];
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
@@ -69,6 +71,22 @@ function normalizeRouteBinding(value) {
     conversationKind: value.conversationKind, contextTags, keyVersion: value.keyVersion };
 }
 
+function normalizeRouteBindingV3(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join('\0') !== [...ROUTE_BINDING_V3_FIELDS].sort().join('\0')
+    || typeof value.actor !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$/.test(value.actor)
+    || typeof value.keyVersion !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.keyVersion)
+    || !['dm', 'group', 'channel', 'thread', 'session'].includes(value.conversationKind)) {
+    throw new Error('route_binding_invalid');
+  }
+  const contextTags = normalizeOpaqueTagMap(value.contextTags);
+  if (canonicalJson(contextTags) !== canonicalJson(value.contextTags)) throw new Error('route_binding_invalid');
+  try {
+    return { actor: value.actor, scope: normalizeScopeRef(value.scope), conversationKind: value.conversationKind,
+      contextTags, mappingEvidence: normalizeMappingEvidence(value.mappingEvidence), keyVersion: value.keyVersion };
+  } catch { throw new Error('route_binding_invalid'); }
+}
+
 export function issueSessionRouteBinding(payload, keyRing) {
   const normalizedRing = keyRing?.keys instanceof Map ? keyRing : normalizeContextKeyRing(keyRing);
   if (payload && Object.hasOwn(payload, 'keyVersion') && typeof payload.keyVersion !== 'string') {
@@ -77,6 +95,17 @@ export function issueSessionRouteBinding(payload, keyRing) {
   const keyVersion = payload?.keyVersion === undefined ? normalizedRing.currentKeyVersion : payload.keyVersion;
   if (!normalizedRing.keys.has(keyVersion)) throw new Error('context_key_version_missing');
   const unsigned = normalizeRouteBinding({ ...payload, keyVersion });
+  return { ...unsigned, mac: sign(canonicalJson(unsigned), normalizedRing.keys.get(unsigned.keyVersion)) };
+}
+
+export function issueSessionRouteBindingV3(payload, keyRing) {
+  const normalizedRing = keyRing?.keys instanceof Map ? keyRing : normalizeContextKeyRing(keyRing);
+  if (payload && Object.hasOwn(payload, 'keyVersion') && typeof payload.keyVersion !== 'string') {
+    throw new Error('context_key_version_invalid');
+  }
+  const keyVersion = payload?.keyVersion === undefined ? normalizedRing.currentKeyVersion : payload.keyVersion;
+  if (!normalizedRing.keys.has(keyVersion)) throw new Error('context_key_version_missing');
+  const unsigned = normalizeRouteBindingV3({ ...payload, keyVersion });
   return { ...unsigned, mac: sign(canonicalJson(unsigned), normalizedRing.keys.get(unsigned.keyVersion)) };
 }
 
@@ -138,6 +167,18 @@ export class ContextTokenVerifier {
       || Object.keys(value).sort().join('\0') !== [...ROUTE_BINDING_FIELDS, 'mac'].sort().join('\0')
       || typeof value.mac !== 'string') throw new Error('route_binding_invalid');
     const { mac, ...candidate } = value; const unsigned = normalizeRouteBinding(candidate);
+    const key = this.keyRing.keys.get(unsigned.keyVersion);
+    const expected = key ? sign(canonicalJson(unsigned), key) : '';
+    if (!key || mac.length !== expected.length
+      || !crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(expected))) throw new Error('route_binding_invalid');
+    return unsigned;
+  }
+
+  verifySessionRouteBindingV3(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).sort().join('\0') !== [...ROUTE_BINDING_V3_FIELDS, 'mac'].sort().join('\0')
+      || typeof value.mac !== 'string') throw new Error('route_binding_invalid');
+    const { mac, ...candidate } = value; const unsigned = normalizeRouteBindingV3(candidate);
     const key = this.keyRing.keys.get(unsigned.keyVersion);
     const expected = key ? sign(canonicalJson(unsigned), key) : '';
     if (!key || mac.length !== expected.length

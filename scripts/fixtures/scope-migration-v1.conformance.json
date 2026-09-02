@@ -1,0 +1,37 @@
+{
+  "schema": "amf.scope-migration-plan-conformance/v1",
+  "mode": "dry-run",
+  "authorityEvidence": { "id": "evidence-authority-001", "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  "knownTenants": ["tenant_alpha", "tenant_beta"],
+  "canonicalScopes": [
+    { "tenantId": "tenant_alpha", "type": "organization", "scopeId": "northstar" },
+    { "tenantId": "tenant_alpha", "type": "project", "scopeId": "atlas" },
+    { "tenantId": "tenant_alpha", "type": "team", "scopeId": "research" },
+    { "tenantId": "tenant_beta", "type": "project", "scopeId": "harbor" }
+  ],
+  "legacyValues": [
+    { "id": "legacy-naked-001", "kind": "scope", "value": "atlas", "sourceRef": "legacy-catalog-a" },
+    { "id": "legacy-two-segment-001", "kind": "scope", "value": "tenant_alpha:atlas", "sourceRef": "legacy-catalog-a", "observedCandidates": [{ "tenantId": "tenant_alpha", "type": "project", "scopeId": "atlas" }] },
+    { "id": "legacy-owner-first-001", "kind": "grant", "value": "owner_joseph:tenant_alpha:atlas", "sourceRef": "legacy-catalog-b" },
+    { "id": "legacy-type-first-001", "kind": "bundle", "value": "project:tenant_alpha:atlas", "sourceRef": "legacy-catalog-b" },
+    { "id": "legacy-prefix-001", "kind": "record", "value": "scope:tenant_alpha:atlas", "sourceRef": "legacy-catalog-b" },
+    { "id": "legacy-wildcard-001", "kind": "grant", "value": "tenant_alpha:*", "sourceRef": "legacy-policy-a" },
+    { "id": "legacy-duplicate-001", "kind": "scope", "value": "tenant_alpha:atlas", "sourceRef": "legacy-catalog-c", "observedCandidates": [{ "tenantId": "tenant_alpha", "type": "project", "scopeId": "atlas" }] },
+    { "id": "legacy-unknown-tenant-001", "kind": "scope", "value": "tenant_omega:atlas", "sourceRef": "legacy-catalog-d" },
+    { "id": "legacy-collision-001", "kind": "route", "value": "tenant_alpha:research", "sourceRef": "legacy-catalog-e", "observedCandidates": [{ "tenantId": "tenant_alpha", "type": "project", "scopeId": "atlas" }, { "tenantId": "tenant_alpha", "type": "team", "scopeId": "research" }] },
+    { "id": "legacy-stale-opaque-001", "kind": "cursor", "value": "opaque_7f3a91b2", "sourceRef": "legacy-token-a" }
+  ],
+  "plan": [
+    { "legacyId": "legacy-naked-001", "classification": "naked", "disposition": "block" },
+    { "legacyId": "legacy-two-segment-001", "classification": "two-segment", "disposition": "map", "target": { "tenantId": "tenant_alpha", "type": "project", "scopeId": "atlas" }, "mappingEvidence": { "id": "evidence-review-001", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111" } },
+    { "legacyId": "legacy-owner-first-001", "classification": "owner-first", "disposition": "block" },
+    { "legacyId": "legacy-type-first-001", "classification": "type-first", "disposition": "block" },
+    { "legacyId": "legacy-prefix-001", "classification": "prefix", "disposition": "block" },
+    { "legacyId": "legacy-wildcard-001", "classification": "wildcard", "disposition": "expire-and-reissue", "reissueRequestId": "reissue-wildcard-001" },
+    { "legacyId": "legacy-duplicate-001", "classification": "duplicate", "disposition": "map", "target": { "tenantId": "tenant_alpha", "type": "project", "scopeId": "atlas" }, "mappingEvidence": { "id": "evidence-review-002", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222" } },
+    { "legacyId": "legacy-unknown-tenant-001", "classification": "unknown-tenant", "disposition": "block" },
+    { "legacyId": "legacy-collision-001", "classification": "collision", "disposition": "block" },
+    { "legacyId": "legacy-stale-opaque-001", "classification": "stale-opaque-reference", "disposition": "expire-and-reissue", "reissueRequestId": "reissue-opaque-001" }
+  ],
+  "writeOperations": []
+}

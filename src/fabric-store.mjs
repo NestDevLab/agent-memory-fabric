@@ -6,6 +6,7 @@ import pg from 'pg';
 import { exactContextIntersection } from './access-contract.mjs';
 import { ciphertextContentId, ciphertextPayloadDigest, decryptClientCiphertext, normalizeIngestKeyRing, validateClientCiphertext } from './ingest/raw-event-contract.mjs';
 import { normalizeSessionContextBinding, selectLogicalMessage, sessionBindingMatches, sessionContextBinding, validateProjectionV2 } from './ingest/raw-projection-v2.mjs';
+import { validateRawProjectionV2Proof } from './raw-projection-v2-readiness.mjs';
 import { strictIsoTimestamp } from './ingest/transcripts/canonical.mjs';
 import {
   buildM4V2LogicalGroup,
@@ -943,8 +944,10 @@ export class SqliteCatalog {
       CREATE TABLE IF NOT EXISTS retention_tombstones_v2 (id TEXT PRIMARY KEY, content_id TEXT NOT NULL, content_checksum TEXT NOT NULL, source_pointer_tag TEXT, reason_code TEXT NOT NULL CHECK(reason_code IN ('retention_expired','revoked','forgotten')), original_created_at TEXT NOT NULL, expired_at TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS retention_operations_v2 (id TEXT PRIMARY KEY, idempotency_tag TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL, response_json TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS raw_projection_v2_migration_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, verified_at TEXT NOT NULL, v1_count INTEGER NOT NULL, v2_count INTEGER NOT NULL, alias_count INTEGER NOT NULL, alias_orphan_count INTEGER NOT NULL, legacy_field_count INTEGER NOT NULL, literal_scan_count INTEGER NOT NULL, backend TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS raw_projection_v2_readiness_v2 (singleton INTEGER PRIMARY KEY CHECK(singleton=1), mutation_revision INTEGER NOT NULL, proof_json TEXT, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS curator_receipt_state_v1 (proposal_id TEXT PRIMARY KEY REFERENCES fabric_proposals(id), status TEXT NOT NULL, decision_json TEXT NOT NULL, apply_json TEXT);
     `);
+    this.db.prepare("INSERT OR IGNORE INTO raw_projection_v2_readiness_v2(singleton,mutation_revision,proof_json,updated_at) VALUES (1,0,NULL,strftime('%Y-%m-%dT%H:%M:%fZ','now'))").run();
     const sessionColumns = new Set(this.db.prepare('PRAGMA table_info(raw_sessions_v1)').all().map(row => row.name));
     if (!sessionColumns.has('conversation_kind')) this.db.exec('ALTER TABLE raw_sessions_v1 ADD COLUMN conversation_kind TEXT');
     if (!sessionColumns.has('context_tags_json')) this.db.exec('ALTER TABLE raw_sessions_v1 ADD COLUMN context_tags_json TEXT');
@@ -1047,6 +1050,7 @@ export class SqliteCatalog {
       const logical = { ...selection, logicalMessageId: canonicalId, eventIds, updatedAt: record.createdAt };
       this.db.prepare('INSERT INTO logical_messages_v2(logical_message_id,preferred_observation_id,payload_conflict,tombstoned,selection_version,event_ids_json,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(logical_message_id) DO UPDATE SET preferred_observation_id=excluded.preferred_observation_id,payload_conflict=excluded.payload_conflict,tombstoned=excluded.tombstoned,selection_version=excluded.selection_version,event_ids_json=excluded.event_ids_json,updated_at=excluded.updated_at').run(canonicalId, logical.preferredObservationId, logical.payloadConflict ? 1 : 0, logical.tombstoned ? 1 : 0, logical.selectionVersion, JSON.stringify(eventIds), record.createdAt);
       for (const id of ids) this.db.prepare('INSERT INTO logical_message_aliases_v2(alias_id,logical_message_id) VALUES (?,?) ON CONFLICT(alias_id) DO UPDATE SET logical_message_id=excluded.logical_message_id').run(id, canonicalId);
+      this.db.prepare("UPDATE raw_projection_v2_readiness_v2 SET mutation_revision=mutation_revision+1,proof_json=NULL,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE singleton=1").run();
       this.db.prepare("UPDATE raw_sessions_v1 SET event_count=event_count+1,first_occurred_at=CASE WHEN ? IS NULL THEN first_occurred_at WHEN first_occurred_at IS NULL OR julianday(?)<julianday(first_occurred_at) THEN ? ELSE first_occurred_at END,last_occurred_at=CASE WHEN ? IS NULL THEN last_occurred_at WHEN last_occurred_at IS NULL OR julianday(?)>julianday(last_occurred_at) THEN ? ELSE last_occurred_at END WHERE session_id=?").run(record.projection.occurredAt, record.projection.occurredAt, record.projection.occurredAt, record.projection.occurredAt, record.projection.occurredAt, record.projection.occurredAt, record.sessionId);
       this.db.prepare('INSERT INTO audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json) VALUES (?,?,?,?,?,?,?,?,?)').run(auditEvent.id, auditEvent.ts, auditEvent.actorTag, auditEvent.action, 'stored', auditEvent.requestId || null, auditEvent.targetId, null, JSON.stringify(auditEvent.details || {}));
       return { record: { ...record, logicalMessageId: canonicalId }, duplicate: false, logical };
@@ -1078,6 +1082,7 @@ export class SqliteCatalog {
         LIMIT 1
       `).get(expectedContentId, expectedContentId, expectedContentId, expectedContentId, expectedContentId);
       if (!references) this.db.prepare('DELETE FROM raw_objects_v2 WHERE content_id=?').run(expectedContentId);
+      this.db.prepare("UPDATE raw_projection_v2_readiness_v2 SET mutation_revision=mutation_revision+1,proof_json=NULL,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE singleton=1").run();
       return {
         record: this.mapRawEvent(this.db.prepare('SELECT * FROM raw_events_v2 WHERE event_id=?').get(eventId)),
         recovered: true,
@@ -1302,23 +1307,47 @@ export class SqliteCatalog {
     ) events WHERE (? IS NULL OR effective_at_ms>=amf_epoch_ms(?)) AND (? IS NULL OR effective_at_ms<=amf_epoch_ms(?)) ORDER BY ${order} LIMIT ? OFFSET ?`).all(id, id, from, from, to, to, limit + 1, offset);
     return { items: rows.slice(0, limit).map(row => this.mapRawEvent(row)), hasMore: rows.length > limit };
   }
-  rawV2Readiness() {
-    let counts;
-    try {
-      const rows = this.db.prepare('SELECT projection_json FROM raw_events_v2').all();
-      for (const row of rows) validateProjectionV2(JSON.parse(row.projection_json));
-      counts = {
-        v1Count: this.db.prepare('SELECT count(*) AS n FROM raw_events_v1').get().n,
-        v2Count: rows.length,
-        aliasCount: this.db.prepare('SELECT count(*) AS n FROM logical_message_aliases_v2').get().n,
-        aliasOrphanCount: this.db.prepare('SELECT count(*) AS n FROM logical_message_aliases_v2 a LEFT JOIN logical_messages_v2 l ON l.logical_message_id=a.logical_message_id WHERE l.logical_message_id IS NULL').get().n,
-        legacyFieldCount: rows.filter(row => /\"(?:nativeRoomId|nativePersonId|roomId|personId)\"\s*:/.test(row.projection_json)).length,
-        literalScanCount: rows.filter(row => !validateProjectionV2(JSON.parse(row.projection_json))).length
-      };
-      this.db.prepare('INSERT INTO raw_projection_v2_migration_state(singleton,schema_version,verified_at,v1_count,v2_count,alias_count,alias_orphan_count,legacy_field_count,literal_scan_count,backend) VALUES (1,5,?,?,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET schema_version=excluded.schema_version,verified_at=excluded.verified_at,v1_count=excluded.v1_count,v2_count=excluded.v2_count,alias_count=excluded.alias_count,alias_orphan_count=excluded.alias_orphan_count,legacy_field_count=excluded.legacy_field_count,literal_scan_count=excluded.literal_scan_count,backend=excluded.backend').run(new Date().toISOString(), counts.v1Count, counts.v2Count, counts.aliasCount, counts.aliasOrphanCount, counts.legacyFieldCount, counts.literalScanCount, 'sqlite');
+  rawV2ReadinessRevision() { return Number(this.db.prepare('SELECT mutation_revision FROM raw_projection_v2_readiness_v2 WHERE singleton=1').get()?.mutation_revision); }
+  rawV2ReadinessEvidence() {
+    const projections = this.db.prepare('SELECT projection_json FROM raw_events_v2').all();
+    let legacyFieldCount = 0;
+    let literalScanCount = 0;
+    for (const row of projections) {
+      const projection = JSON.parse(row.projection_json);
+      if (['nativeRoomId', 'nativePersonId', 'roomId', 'personId'].some(key => Object.hasOwn(projection, key))) legacyFieldCount += 1;
+      const contextTags = projection.contextTags;
+      if (!contextTags || typeof contextTags !== 'object' || Array.isArray(contextTags)) { literalScanCount += 1; continue; }
+      for (const tags of Object.values(contextTags)) {
+        if (!Array.isArray(tags) || !tags.length) { literalScanCount += 1; continue; }
+        for (const tag of tags) if (typeof tag !== 'string' || !/^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$/.test(tag)) literalScanCount += 1;
+      }
     }
-    catch { return { safe: false, reason: 'literal_routing_scan_failed' }; }
-    return { safe: false, reason: 'production_postgres_required', evidence: { persisted: true, ...counts } };
+    return {
+      v1Count: Number(this.db.prepare('SELECT count(*) AS count FROM raw_events_v1').get().count),
+      v2Count: projections.length,
+      aliasCount: Number(this.db.prepare('SELECT count(*) AS count FROM logical_message_aliases_v2').get().count),
+      aliasOrphanCount: Number(this.db.prepare('SELECT count(*) AS count FROM logical_message_aliases_v2 a LEFT JOIN logical_messages_v2 l ON l.logical_message_id=a.logical_message_id WHERE l.logical_message_id IS NULL').get().count),
+      legacyFieldCount,
+      literalScanCount
+    };
+  }
+  listRawV2ReadinessPage({ after = null, limit }) {
+    const rows = this.db.prepare(`SELECT e.event_id,e.projection_json,s.session_binding_json FROM raw_events_v2 e JOIN raw_sessions_v1 s ON s.session_id=e.session_id WHERE (? IS NULL OR e.event_id>?) ORDER BY e.event_id LIMIT ?`).all(after, after, limit + 1);
+    const items = rows.slice(0, limit).map(row => ({ eventId: row.event_id, projection: JSON.parse(row.projection_json), sessionBinding: row.session_binding_json ? JSON.parse(row.session_binding_json) : null }));
+    return { items, next: rows.length > limit ? items.at(-1).eventId : null };
+  }
+  publishRawV2ReadinessProof({ expectedRevision, proof }) {
+    return this.db.transaction(() => this.db.prepare("UPDATE raw_projection_v2_readiness_v2 SET proof_json=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE singleton=1 AND mutation_revision=?").run(JSON.stringify(proof), expectedRevision).changes === 1)();
+  }
+  rawV2Readiness() {
+    try {
+      const state = this.db.prepare('SELECT mutation_revision,proof_json FROM raw_projection_v2_readiness_v2 WHERE singleton=1').get();
+      if (!state?.proof_json) return { safe: false, reason: 'production_postgres_required', evidence: { persisted: false, proofState: 'missing' } };
+      const proof = JSON.parse(state.proof_json);
+      return validateRawProjectionV2Proof(proof, Number(state.mutation_revision))
+        ? { safe: false, reason: 'production_postgres_required', evidence: { persisted: true, proofState: 'valid', ...proof } }
+        : { safe: false, reason: 'production_postgres_required', evidence: { persisted: false, proofState: 'stale' } };
+    } catch { return { safe: false, reason: 'production_postgres_required', evidence: { persisted: false, proofState: 'invalid' } }; }
   }
   createIdentity(record, event, rawRecord) { return this.createIdentityTransaction(record, event, rawRecord); }
   findIdentityOperation(idempotencyTags) {
@@ -1517,6 +1546,7 @@ const POSTGRES_SCHEMA_SQL = [
     v1_count BIGINT NOT NULL, v2_count BIGINT NOT NULL, alias_count BIGINT NOT NULL, alias_orphan_count BIGINT NOT NULL,
     legacy_field_count BIGINT NOT NULL, literal_scan_count BIGINT NOT NULL, backend TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.raw_projection_v2_readiness_v2 (singleton INTEGER PRIMARY KEY CHECK(singleton=1), mutation_revision BIGINT NOT NULL, proof_json JSONB, updated_at TIMESTAMPTZ NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.curator_receipt_state_v1 (
     proposal_id TEXT PRIMARY KEY REFERENCES ${POSTGRES_SCHEMA}.fabric_proposals(id), status TEXT NOT NULL,
     decision_json JSONB NOT NULL, apply_json JSONB
@@ -1741,6 +1771,7 @@ export class PostgresCatalog {
         `INSERT INTO ${POSTGRES_SCHEMA}.schema_migrations(version) VALUES ($1) ON CONFLICT (version) DO NOTHING`,
         [POSTGRES_SCHEMA_VERSION]
       );
+      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.raw_projection_v2_readiness_v2(singleton,mutation_revision,proof_json,updated_at) VALUES (1,0,NULL,now()) ON CONFLICT(singleton) DO NOTHING`);
       await this._query(client, 'COMMIT');
       this._healthy = true;
       this._lastError = null;
@@ -2020,6 +2051,7 @@ export class PostgresCatalog {
       const matched = await this.findLogicalMessage(ids, client);
       const canonicalId = matched?.logicalMessageId || record.logicalMessageId;
       await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.raw_events_v2(event_id,session_id,logical_message_id,content_id,payload_digest,projection_json,owner_tag,source_tag,created_at) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9)`, [record.eventId, record.sessionId, canonicalId, record.contentId, record.payloadDigest, JSON.stringify(record.projection), record.ownerTag, record.sourceTag, record.createdAt]);
+      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.raw_projection_v2_readiness_v2(singleton,mutation_revision,proof_json,updated_at) VALUES (1,1,NULL,now()) ON CONFLICT(singleton) DO UPDATE SET mutation_revision=${POSTGRES_SCHEMA}.raw_projection_v2_readiness_v2.mutation_revision+1,proof_json=NULL,updated_at=now()`);
       const eventIds = [...new Set([...(matched?.eventIds || []), record.eventId])];
       const observations = (await this._query(client, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE event_id=ANY($1::text[])`, [eventIds])).rows.map(mapPostgresRawEvent).map(item => ({ ...item, projection: { ...item.projection, logicalMessageId: canonicalId } }));
       const selection = selectLogicalMessage(observations);
@@ -2068,6 +2100,7 @@ export class PostgresCatalog {
          WHERE event_id=$2 AND content_id=$3 RETURNING *`,
         [rawRecord.contentId, eventId, expectedContentId]);
       if (!changed.rows[0]) throw createError('raw_event_recovery_conflict', 409);
+      await this._query(client, `INSERT INTO ${POSTGRES_SCHEMA}.raw_projection_v2_readiness_v2(singleton,mutation_revision,proof_json,updated_at) VALUES (1,1,NULL,now()) ON CONFLICT(singleton) DO UPDATE SET mutation_revision=${POSTGRES_SCHEMA}.raw_projection_v2_readiness_v2.mutation_revision+1,proof_json=NULL,updated_at=now()`);
       await this._query(client,
         `INSERT INTO ${POSTGRES_SCHEMA}.audit_events_v2(id,ts,actor_tag,action,outcome,request_id,target_id,scope_tag,details_json)
          VALUES ($1,$2,$3,$4,'recovered',$5,$6,NULL,$7::jsonb)`,
@@ -2168,33 +2201,49 @@ export class PostgresCatalog {
     ) events WHERE ($2::timestamptz IS NULL OR effective_at_ms>=floor(extract(epoch FROM $2::timestamptz)*1000)::bigint) AND ($3::timestamptz IS NULL OR effective_at_ms<=floor(extract(epoch FROM $3::timestamptz)*1000)::bigint) ORDER BY ${order} LIMIT $4 OFFSET $5`, [id, from, to, limit + 1, offset]);
     return { items: result.rows.slice(0, limit).map(mapPostgresRawEvent), hasMore: result.rows.length > limit };
   }
+  async rawV2ReadinessRevision() { await this.ready(); return Number((await this._query(this.pool, `SELECT mutation_revision FROM ${POSTGRES_SCHEMA}.raw_projection_v2_readiness_v2 WHERE singleton=1`)).rows[0]?.mutation_revision || 0); }
+  async rawV2ReadinessEvidence() {
+    await this.ready();
+    const result = await this._query(this.pool, `SELECT
+      (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v1) AS v1_count,
+      (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2) AS v2_count,
+      (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.logical_message_aliases_v2) AS alias_count,
+      (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.logical_message_aliases_v2 a LEFT JOIN ${POSTGRES_SCHEMA}.logical_messages_v2 l ON l.logical_message_id=a.logical_message_id WHERE l.logical_message_id IS NULL) AS alias_orphan_count,
+      (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE projection_json ?| ARRAY['nativeRoomId','nativePersonId','roomId','personId']) AS legacy_field_count,
+      (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2 e WHERE jsonb_typeof(e.projection_json->'contextTags') IS DISTINCT FROM 'object' OR EXISTS (
+        SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(e.projection_json->'contextTags')='object' THEN e.projection_json->'contextTags' ELSE '{}'::jsonb END) tags
+        WHERE jsonb_typeof(tags.value) <> 'array'
+          OR CASE WHEN jsonb_typeof(tags.value)='array' THEN jsonb_array_length(tags.value)=0 ELSE false END
+          OR EXISTS (
+          SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(tags.value)='array' THEN tags.value ELSE '[]'::jsonb END) tag
+          WHERE tag !~ '^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$'
+        )
+      )) AS literal_scan_count`);
+    const row = result.rows[0] || {};
+    return {
+      v1Count: Number(row.v1_count || 0),
+      v2Count: Number(row.v2_count || 0),
+      aliasCount: Number(row.alias_count || 0),
+      aliasOrphanCount: Number(row.alias_orphan_count || 0),
+      legacyFieldCount: Number(row.legacy_field_count || 0),
+      literalScanCount: Number(row.literal_scan_count || 0)
+    };
+  }
+  async listRawV2ReadinessPage({ after = null, limit }) {
+    await this.ready();
+    const rows = (await this._query(this.pool, `SELECT e.event_id,e.projection_json,s.session_binding_json FROM ${POSTGRES_SCHEMA}.raw_events_v2 e JOIN ${POSTGRES_SCHEMA}.raw_sessions_v1 s ON s.session_id=e.session_id WHERE ($1::text IS NULL OR e.event_id>$1) ORDER BY e.event_id LIMIT $2`, [after, limit + 1])).rows;
+    const items = rows.slice(0, limit).map(row => ({ eventId: row.event_id, projection: typeof row.projection_json === 'string' ? JSON.parse(row.projection_json) : row.projection_json, sessionBinding: typeof row.session_binding_json === 'string' ? JSON.parse(row.session_binding_json) : row.session_binding_json }));
+    return { items, next: rows.length > limit ? items.at(-1).eventId : null };
+  }
+  async publishRawV2ReadinessProof({ expectedRevision, proof }) { await this.ready(); return (await this._query(this.pool, `UPDATE ${POSTGRES_SCHEMA}.raw_projection_v2_readiness_v2 SET proof_json=$1::jsonb,updated_at=now() WHERE singleton=1 AND mutation_revision=$2 RETURNING singleton`, [JSON.stringify(proof), expectedRevision])).rows.length === 1; }
   async rawV2Readiness() {
     await this.ready();
     try {
-      const rows = await this._query(this.pool, `SELECT projection_json FROM ${POSTGRES_SCHEMA}.raw_events_v2`);
-      for (const row of rows.rows) validateProjectionV2(typeof row.projection_json === 'string' ? JSON.parse(row.projection_json) : row.projection_json);
-      const bindings = await this._query(this.pool, `SELECT DISTINCT s.session_binding_json
-        FROM ${POSTGRES_SCHEMA}.raw_sessions_v1 s
-        JOIN ${POSTGRES_SCHEMA}.raw_events_v2 e ON e.session_id=s.session_id`);
-      for (const row of bindings.rows) normalizeSessionContextBinding(typeof row.session_binding_json === 'string' ? JSON.parse(row.session_binding_json) : row.session_binding_json);
-      const evidenceResult = await this._query(this.pool, `SELECT
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v1) AS v1_count,
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2) AS v2_count,
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.logical_message_aliases_v2) AS alias_count,
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.logical_message_aliases_v2 a LEFT JOIN ${POSTGRES_SCHEMA}.logical_messages_v2 l ON l.logical_message_id=a.logical_message_id WHERE l.logical_message_id IS NULL) AS alias_orphan_count,
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2 WHERE projection_json ?| ARRAY['nativeRoomId','nativePersonId','roomId','personId']) AS legacy_field_count,
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_events_v2 e
-          CROSS JOIN LATERAL jsonb_each(e.projection_json->'contextTags') kv
-          CROSS JOIN LATERAL jsonb_array_elements_text(kv.value) tag
-          WHERE tag !~ '^hmac-sha256:[A-Za-z0-9._-]{1,128}:[a-f0-9]{64}$') AS literal_scan_count`);
-      const row = evidenceResult.rows[0];
-      const evidence = Object.fromEntries(['v1Count','v2Count','aliasCount','aliasOrphanCount','legacyFieldCount','literalScanCount'].map((key, index) => [key, Number(row[['v1_count','v2_count','alias_count','alias_orphan_count','legacy_field_count','literal_scan_count'][index]] || 0)]));
-      if (evidence.aliasOrphanCount || evidence.legacyFieldCount || evidence.literalScanCount) return { safe: false, reason: 'migration_proof_failed', evidence: { persisted: false, ...evidence } };
-      await this._query(this.pool, `INSERT INTO ${POSTGRES_SCHEMA}.raw_projection_v2_migration_state(singleton,schema_version,verified_at,v1_count,v2_count,alias_count,alias_orphan_count,legacy_field_count,literal_scan_count,backend) VALUES (1,$1,now(),$2,$3,$4,$5,$6,$7,'postgres') ON CONFLICT(singleton) DO UPDATE SET schema_version=EXCLUDED.schema_version,verified_at=EXCLUDED.verified_at,v1_count=EXCLUDED.v1_count,v2_count=EXCLUDED.v2_count,alias_count=EXCLUDED.alias_count,alias_orphan_count=EXCLUDED.alias_orphan_count,legacy_field_count=EXCLUDED.legacy_field_count,literal_scan_count=EXCLUDED.literal_scan_count,backend=EXCLUDED.backend`, [POSTGRES_SCHEMA_VERSION, evidence.v1Count, evidence.v2Count, evidence.aliasCount, evidence.aliasOrphanCount, evidence.legacyFieldCount, evidence.literalScanCount]);
-      const proof = await this._query(this.pool, `SELECT * FROM ${POSTGRES_SCHEMA}.raw_projection_v2_migration_state WHERE singleton=1 AND schema_version=$1 AND backend='postgres'`, [POSTGRES_SCHEMA_VERSION]);
-      if (!proof.rows[0]) return { safe: false, reason: 'migration_proof_missing', evidence: { persisted: false, ...evidence } };
-      return { safe: true, reason: null, evidence: { persisted: true, schemaVersion: POSTGRES_SCHEMA_VERSION, ...evidence } };
-    } catch { return { safe: false, reason: 'literal_routing_scan_failed' }; }
+      const row = (await this._query(this.pool, `SELECT mutation_revision,proof_json FROM ${POSTGRES_SCHEMA}.raw_projection_v2_readiness_v2 WHERE singleton=1`)).rows[0];
+      if (!row?.proof_json) return { safe: false, reason: 'migration_proof_missing' };
+      const proof = typeof row.proof_json === 'string' ? JSON.parse(row.proof_json) : row.proof_json;
+      return validateRawProjectionV2Proof(proof, Number(row.mutation_revision)) ? { safe: true, reason: null, evidence: { persisted: true, ...proof } } : { safe: false, reason: 'migration_proof_stale' };
+    } catch { return { safe: false, reason: 'migration_proof_invalid' }; }
   }
   async recallItemActive(refs, scopeTags) {
     await this.ready();

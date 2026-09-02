@@ -1,0 +1,32 @@
+{
+  "schema": "amf.scope-substrate-conformance/v1",
+  "scopes": [
+    { "tenantId": "tenant_alpha", "type": "organization", "scopeId": "northstar" },
+    { "tenantId": "tenant_alpha", "type": "project", "scopeId": "atlas" },
+    { "tenantId": "tenant_alpha", "type": "team", "scopeId": "research" }
+  ],
+  "relations": [
+    {
+      "from": { "tenantId": "tenant_alpha", "type": "organization", "scopeId": "northstar" },
+      "to": { "tenantId": "tenant_alpha", "type": "project", "scopeId": "atlas" },
+      "provenance": { "source": "scope-catalog", "assertion": "catalog-declaration", "recordedAt": "2026-09-01T00:00:00Z" }
+    }
+  ],
+  "resourceMemberships": [
+    {
+      "resource": { "tenantId": "tenant_alpha", "resourceId": "record-alpha" },
+      "scope": { "tenantId": "tenant_alpha", "type": "project", "scopeId": "atlas" },
+      "provenance": { "source": "memory-import", "assertion": "membership-import", "recordedAt": "2026-09-01T00:00:00Z" }
+    },
+    {
+      "resource": { "tenantId": "tenant_alpha", "resourceId": "record-alpha" },
+      "scope": { "tenantId": "tenant_alpha", "type": "team", "scopeId": "research" },
+      "provenance": { "source": "memory-import", "assertion": "membership-import", "recordedAt": "2026-09-01T00:00:00Z" }
+    },
+    {
+      "resource": { "tenantId": "tenant_alpha", "resourceId": "record-beta" },
+      "scope": { "tenantId": "tenant_alpha", "type": "project", "scopeId": "atlas" },
+      "provenance": { "source": "memory-import", "assertion": "membership-import", "recordedAt": "2026-09-01T00:00:00Z" }
+    }
+  ]
+}

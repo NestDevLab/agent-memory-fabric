@@ -5,6 +5,10 @@ import { assertExtractorStateRunnable, buildMemoryRecord, createExtractorState, 
 import { buildBoundedModelInput, evaluatePlanUsage, loadExtractorState } from './amf-raw-memory-extractor.mjs';
 
 const durable = [{ role: 'user', text: 'We decided to keep the extractor slow and cost bounded.' }, { role: 'assistant', text: 'Agreed: one conversation per tick and a daily ceiling.' }];
+const ROUTE = { outcome: 'routed', scope: { tenantId: 'tenant_alpha', type: 'project', scopeId: 'atlas' }, routingEvidence: {
+  schema: 'amf.session-route-evidence/v1', routeBindingDigest: `sha256:${'a'.repeat(64)}`,
+  mappingEvidence: { id: 'evidence-route-001', digest: `sha256:${'b'.repeat(64)}` }
+} };
 
 test('free triage passes durable language but rejects operational chatter', () => {
   assert.equal(triageConversation(durable).pass, true);
@@ -56,12 +60,14 @@ test('plan usage pauses only below the configured remaining threshold or on a re
   assert.equal(evaluatePlanUsage({ rateLimits: { primary: { usedPercent: 0, resetsAt: 30 }, rateLimitReachedType: 'primary' } }, config).constrained, true);
 });
 
-test('claims exclude operational material and records use shared global plus deterministic retry key', () => {
+test('claims exclude operational material and candidates require an attributed route', () => {
   const [claim] = validateClaims([{ claimType: 'decision', claim: 'Keep the extractor slow and cost bounded.', confidence: 0.8 }]);
   assert.throws(() => validateClaims([{ claimType: 'decision', claim: 'The deployment failed because of an error.', confidence: 0.8 }]), /extractor_claim_invalid/);
-  const record = buildMemoryRecord({ sessionId: 'ses_123', transcript: 'decrypted transcript', claim, now: '2026-07-20T12:00:00Z' });
-  assert.equal(record.scope.id, 'shared:global'); assert.equal(record.visibility, 'shared');
-  assert.equal(proposalIdempotencyKey({ sessionId: 'ses_123', claim: claim.claim }), proposalIdempotencyKey({ sessionId: 'ses_123', claim: claim.claim }));
+  assert.throws(() => buildMemoryRecord({ sessionId: 'ses_123', claim }), /session_scope_unmapped/);
+  const candidate = buildMemoryRecord({ sessionId: 'ses_123', claim, route: ROUTE });
+  assert.deepEqual(candidate.scope, ROUTE.scope); assert.equal(candidate.infer, false);
+  assert.deepEqual(candidate.routingEvidence, ROUTE.routingEvidence);
+  assert.equal(proposalIdempotencyKey({ sessionId: 'ses_123', claim: claim.claim, route: ROUTE }), proposalIdempotencyKey({ sessionId: 'ses_123', claim: claim.claim, route: ROUTE }));
 });
 
 test('conversation reader state migrates only at a legacy cycle boundary without mutating rollback state', () => {
@@ -104,27 +110,27 @@ test('conversation reader state loader preserves the legacy file and resumes the
   assert.equal(loadExtractorState(config, { dryRun: true }).cursor, null);
 });
 
-test('v3 route identity preserves legacy proposal and provenance identity', () => {
+test('v3 candidate identity binds route evidence instead of a shared default', () => {
   const claim = { claimType: 'decision', claim: 'Keep the extractor transition identity stable.', confidence: 0.9 };
   const legacyId = `ses_${'a'.repeat(64)}`;
-  const legacy = buildMemoryRecord({ sessionId: legacyId, transcript: 'redacted', claim, now: '2026-07-20T12:00:00Z' });
-  const v3 = buildMemoryRecord({ sessionId: 'ccon_example123', extractionIdentity: legacyId, transcript: 'redacted', claim, now: '2026-07-20T12:00:00Z' });
+  const legacy = buildMemoryRecord({ sessionId: legacyId, claim, route: ROUTE });
+  const v3 = buildMemoryRecord({ sessionId: 'ccon_example123', extractionIdentity: legacyId, claim, route: ROUTE });
   assert.deepEqual(v3, legacy);
-  assert.equal(proposalIdempotencyKey({ sessionId: legacyId, claim: claim.claim }),
-    proposalIdempotencyKey({ sessionId: 'ccon_example123', extractionIdentity: legacyId, claim: claim.claim }));
+  assert.equal(proposalIdempotencyKey({ sessionId: legacyId, claim: claim.claim, route: ROUTE }),
+    proposalIdempotencyKey({ sessionId: 'ccon_example123', extractionIdentity: legacyId, claim: claim.claim, route: ROUTE }));
 });
 
 test('v3 visible revision digest makes proposal and record identity revision-aware without changing legacy keys', () => {
   const claim = { claimType: 'decision', claim: 'Keep the visible conversation revision in the proposal identity.', confidence: 0.9 };
   const sessionId = 'ccon_revisionexample1'; const extractionIdentity = `ses_${'c'.repeat(64)}`;
   const firstDigest = `sha256:${'a'.repeat(64)}`; const revisedDigest = `sha256:${'b'.repeat(64)}`;
-  const stableFirst = proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest: firstDigest, claim: claim.claim });
-  assert.equal(stableFirst, proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest: firstDigest, claim: claim.claim }));
-  assert.notEqual(stableFirst, proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest: revisedDigest, claim: claim.claim }));
-  const firstRecord = buildMemoryRecord({ sessionId, extractionIdentity, visibleRevisionDigest: firstDigest, transcript: 'redacted', claim, now: '2026-07-20T12:00:00Z' });
-  const revisedRecord = buildMemoryRecord({ sessionId, extractionIdentity, visibleRevisionDigest: revisedDigest, transcript: 'redacted', claim, now: '2026-07-20T12:00:00Z' });
+  const stableFirst = proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest: firstDigest, claim: claim.claim, route: ROUTE });
+  assert.equal(stableFirst, proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest: firstDigest, claim: claim.claim, route: ROUTE }));
+  assert.notEqual(stableFirst, proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest: revisedDigest, claim: claim.claim, route: ROUTE }));
+  const firstRecord = buildMemoryRecord({ sessionId, extractionIdentity, visibleRevisionDigest: firstDigest, claim, route: ROUTE });
+  const revisedRecord = buildMemoryRecord({ sessionId, extractionIdentity, visibleRevisionDigest: revisedDigest, claim, route: ROUTE });
   assert.notEqual(firstRecord.id, revisedRecord.id);
-  assert.equal(firstRecord.provenance[0].sourceId, extractionIdentity, 'revision only affects record and proposal identity');
+  assert.equal(firstRecord.infer, false, 'candidate remains non-canonical');
   assert.throws(() => proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest: 'not-a-digest', claim: claim.claim }), /extractor_visible_revision_invalid/);
 });
 
@@ -166,17 +172,18 @@ test('matching model_pending reservations require explicit recovery and never re
 test('matching proposing state replays persisted records and keys byte-for-byte without model work', () => {
   const [claim] = validateClaims([{ claimType: 'decision', claim: 'Persist an exact proposal body before retrying delivery.', confidence: 0.8 }]);
   const sessionId = 'ccon_revisionexample1'; const extractionIdentity = `ses_${'c'.repeat(64)}`; const visibleRevisionDigest = `sha256:${'a'.repeat(64)}`;
-  const record = buildMemoryRecord({ sessionId, extractionIdentity, visibleRevisionDigest, transcript: 'redacted transcript', claim, now: '2026-07-20T12:00:00Z' });
-  const proposalKey = proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest, claim: claim.claim });
+  const record = buildMemoryRecord({ sessionId, extractionIdentity, visibleRevisionDigest, claim, route: ROUTE });
+  const proposalKey = proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest, claim: claim.claim, route: ROUTE });
   const inFlight = { sessionId, extractionIdentity, visibleRevisionDigest, stage: 'proposing', claims: [claim], usage: { inputTokens: 12, outputTokens: 3 }, proposalKeys: [proposalKey], proposalRecords: [record] };
-  const resumed = resumeExtractorInFlight({ inFlight, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3' });
+  const resumed = resumeExtractorInFlight({ inFlight, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3', route: ROUTE });
   assert.equal(resumed.stage, 'proposing'); assert.deepEqual(resumed.proposalKeys, [proposalKey]); assert.deepEqual(resumed.proposalRecords, [record]);
-  const body = value => ({ record: value, rationale: `Conversation extractor durable claim from ${sessionId}; automatic curator and receipt applicator perform canonical plaintext deduplication.` });
+  const body = value => ({ scope: value.scope, text: value.text, infer: false, metadata: { routingEvidence: value.routingEvidence } });
   assert.equal(JSON.stringify(body(resumed.proposalRecords[0])), JSON.stringify(body(record)), 'retry body is exactly the staged body');
   assert.equal(resumeExtractorInFlight({ inFlight, sessionId, extractionIdentity, visibleRevisionDigest: `sha256:${'b'.repeat(64)}`, readerGeneration: 'conversation-v3' }), null);
   assert.equal(resumeExtractorInFlight({ inFlight: { ...inFlight, stage: 'model_done' }, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3' }).stage, 'model_done');
-  assert.throws(() => resumeExtractorInFlight({ inFlight: { ...inFlight, proposalRecords: [{ ...record, id: 'mem_extract_invalid' }] }, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3' }), /extractor_inflight_invalid/);
-  assert.throws(() => resumeExtractorInFlight({ inFlight: { ...inFlight, proposalRecords: [{ ...record, scope: { type: 'agent', id: 'agent:mutated-scope' } }] }, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3' }), /extractor_inflight_invalid/);
+  assert.throws(() => resumeExtractorInFlight({ inFlight: { ...inFlight, proposalRecords: [{ ...record, id: 'cmp_extract_invalid' }] }, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3', route: ROUTE }), /extractor_inflight_invalid/);
+  assert.throws(() => resumeExtractorInFlight({ inFlight: { ...inFlight, proposalRecords: [{ ...record, scope: { tenantId: 'tenant_alpha', type: 'project', scopeId: 'other' } }] }, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3', route: ROUTE }), /extractor_inflight_invalid/);
+  assert.throws(() => resumeExtractorInFlight({ inFlight, sessionId, extractionIdentity, visibleRevisionDigest, readerGeneration: 'conversation-v3', route: { ...ROUTE, routingEvidence: { ...ROUTE.routingEvidence, routeBindingDigest: `sha256:${'c'.repeat(64)}` } } }), /extractor_route_binding_changed/);
 });
 
 test('shared global extraction drops explicitly project-scoped claims', () => {

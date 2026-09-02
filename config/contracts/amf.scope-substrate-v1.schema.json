@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-memory-fabric.local/contracts/amf.scope-substrate-v1.schema.json",
+  "title": "AMF scope substrate v1 conformance manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "scopes", "resourceMemberships"],
+  "properties": {
+    "schema": { "const": "amf.scope-substrate-conformance/v1" },
+    "scopes": { "type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": { "$ref": "#/$defs/scopeRef" } },
+    "relations": { "type": "array", "maxItems": 1024, "uniqueItems": true, "items": { "$ref": "#/$defs/relation" } },
+    "resourceMemberships": { "type": "array", "maxItems": 4096, "uniqueItems": true, "items": { "$ref": "#/$defs/resourceMembership" } }
+  },
+  "$defs": {
+    "tenantId": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{2,63}$" },
+    "scopeType": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{2,63}$" },
+    "scopeId": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{2,127}$" },
+    "resourceId": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{2,127}$" },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "assertion", "recordedAt"],
+      "properties": {
+        "source": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{2,127}$" },
+        "assertion": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{2,127}$" },
+        "recordedAt": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" }
+      }
+    },
+    "scopeRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenantId", "type", "scopeId"],
+      "properties": {
+        "tenantId": { "$ref": "#/$defs/tenantId" },
+        "type": { "$ref": "#/$defs/scopeType" },
+        "scopeId": { "$ref": "#/$defs/scopeId" }
+      }
+    },
+    "resourceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenantId", "resourceId"],
+      "properties": {
+        "tenantId": { "$ref": "#/$defs/tenantId" },
+        "resourceId": { "$ref": "#/$defs/resourceId" }
+      }
+    },
+    "relation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "provenance"],
+      "properties": {
+        "from": { "$ref": "#/$defs/scopeRef" },
+        "to": { "$ref": "#/$defs/scopeRef" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "resourceMembership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resource", "scope", "provenance"],
+      "properties": {
+        "resource": { "$ref": "#/$defs/resourceRef" },
+        "scope": { "$ref": "#/$defs/scopeRef" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    }
+  }
+}

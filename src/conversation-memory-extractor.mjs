@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { validateAmfMemoryRecord } from './amf-memory-record-validator.mjs';
 import { canonicalJson } from './ingest/transcripts/canonical.mjs';
+import { requireSessionScopeRoute } from './session-scope-router.mjs';
 
 export const RAW_MEMORY_EXTRACTOR_STATE_SCHEMA = 'amf.raw-memory-extractor-state/v1';
 export const CONVERSATION_MEMORY_EXTRACTOR_STATE_SCHEMA = 'amf.raw-memory-extractor-state/v2';
@@ -56,7 +57,7 @@ export function triageConversation(items, { minChars = 80 } = {}) {
 
 export function createExtractorState({ readerGeneration = 'legacy-v2' } = {}) {
   if (readerGeneration === 'conversation-v3') return { schema: CONVERSATION_MEMORY_EXTRACTOR_STATE_SCHEMA, version: 2,
-    stream: 'shared:global', phase: 'newest-first', readerGeneration, cursor: null, inFlight: null, days: {}, legacyBoundary: null };
+    stream: 'route-bound', phase: 'newest-first', readerGeneration, cursor: null, inFlight: null, days: {}, legacyBoundary: null };
   if (readerGeneration !== 'legacy-v2') throw new Error('extractor_state_generation_invalid');
   return { schema: RAW_MEMORY_EXTRACTOR_STATE_SCHEMA, version: 1, stream: 'shared:global', phase: 'newest-first',
     cursor: null, inFlight: null, days: {} };
@@ -72,7 +73,7 @@ export function normalizeState(value) {
 
 export function normalizeConversationExtractorState(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.schema !== CONVERSATION_MEMORY_EXTRACTOR_STATE_SCHEMA
-      || value.version !== 2 || value.stream !== 'shared:global' || value.phase !== 'newest-first'
+      || value.version !== 2 || !['route-bound', 'shared:global'].includes(value.stream) || value.phase !== 'newest-first'
       || value.readerGeneration !== 'conversation-v3' || (value.cursor !== null && typeof value.cursor !== 'string')
       || (value.inFlight !== null && !validConversationInFlight(value.inFlight)) || !value.days || typeof value.days !== 'object'
       || Array.isArray(value.days) || (value.inFlight?.stage === 'model_pending' && !validReservationBacking(value.inFlight.reservation, value.days))
@@ -188,7 +189,7 @@ export function assertExtractorStateRunnable(state) {
   throw new Error('extractor_model_pending_recovery_required');
 }
 
-export function resumeExtractorInFlight({ inFlight, sessionId, extractionIdentity, visibleRevisionDigest = undefined, readerGeneration = 'legacy-v2', maxClaims = 2 }) {
+export function resumeExtractorInFlight({ inFlight, sessionId, extractionIdentity, visibleRevisionDigest = undefined, readerGeneration = 'legacy-v2', maxClaims = 2, route = undefined }) {
   if (!inFlight || typeof inFlight !== 'object' || Array.isArray(inFlight) || !['legacy-v2', 'conversation-v3'].includes(readerGeneration)) return null;
   // A pending reservation records an uncertain external model side effect. It
   // blocks every automatic path, even when the fetched session or revision has
@@ -203,6 +204,13 @@ export function resumeExtractorInFlight({ inFlight, sessionId, extractionIdentit
   if (inFlight.stage !== 'proposing') return { stage: inFlight.stage, claims, usage: inFlight.usage, inputTokenUpperBound: inFlight.inputTokenUpperBound };
   const proposalRecords = validatePersistedProposalRecords({ records: inFlight.proposalRecords, proposalKeys: inFlight.proposalKeys,
     claims, sessionId, extractionIdentity, visibleRevisionDigest });
+  if (route !== undefined && proposalRecords.some(record => record?.schema === 'amf.conversation-memory-candidate/v1')) {
+    const routed = requireSessionScopeRoute(route);
+    if (proposalRecords.some(record => canonicalJson(record.scope) !== canonicalJson(routed.scope)
+      || canonicalJson(record.routingEvidence) !== canonicalJson(routed.routingEvidence))) {
+      throw new Error('extractor_route_binding_changed');
+    }
+  }
   return { stage: inFlight.stage, claims, usage: inFlight.usage, inputTokenUpperBound: inFlight.inputTokenUpperBound,
     proposalKeys: [...inFlight.proposalKeys], proposalRecords };
 }
@@ -212,9 +220,23 @@ function validatePersistedProposalRecords({ records, proposalKeys, claims, sessi
       || new Set(proposalKeys).size !== proposalKeys.length) throw new Error('extractor_inflight_invalid');
   const byClaim = new Map(claims.map(claim => [claim.claim, claim]));
   return records.map((record, index) => {
-    const claim = byClaim.get(record?.claim?.text);
-    const key = proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest, claim: record?.claim?.text });
+    const candidateClaim = typeof record?.text === 'string' ? record.text : record?.claim?.text;
+    const claim = byClaim.get(candidateClaim);
+    const route = record?.routingEvidence ? { outcome: 'routed', scope: record.scope, routingEvidence: record.routingEvidence } : null;
+    const key = proposalIdempotencyKey({ sessionId, extractionIdentity, visibleRevisionDigest, claim: candidateClaim,
+      ...(route ? { route } : {}) });
     const timestamp = record?.createdAt; const provenance = record?.provenance?.[0];
+    if (record?.schema === 'amf.conversation-memory-candidate/v1') {
+      let routed;
+      try { routed = requireSessionScopeRoute(route); } catch { throw new Error('extractor_inflight_invalid'); }
+      if (!claim || proposalKeys[index] !== key || record.id !== `cmp_extract_${key.slice('raw-extractor:'.length, 'raw-extractor:'.length + 40)}`
+        || record.text !== claim.claim || record.infer !== false || record.claimType !== claim.claimType
+        || record.confidence !== claim.confidence || canonicalJson(record.scope) !== canonicalJson(routed.scope)
+        || canonicalJson(record.routingEvidence) !== canonicalJson(routed.routingEvidence)) throw new Error('extractor_inflight_invalid');
+      return record;
+    }
+    // Existing v1/v2 in-flight entries stay readable for recovery/audit. They
+    // are not converted or reissued as structured candidates by this module.
     if (!claim || proposalKeys[index] !== key || !validateAmfMemoryRecord(record).ok || record.schema !== 'amf-memory/v1'
       || record.id !== `mem_extract_${key.slice('raw-extractor:'.length, 'raw-extractor:'.length + 40)}`
       || record.claimType !== claim.claimType || record.claim?.encoding !== 'plain' || record.claim?.text !== claim.claim
@@ -244,20 +266,21 @@ export function extractionFingerprint({ sessionId, extractionIdentity = sessionI
   return sha256(`${RAW_MEMORY_EXTRACTOR_VERSION}\0${identity}\0${normalizeClaimText(claim)}`);
 }
 
-export function buildMemoryRecord({ sessionId, extractionIdentity = sessionId, visibleRevisionDigest = undefined, transcript, claim, now }) {
-  const fingerprint = extractionFingerprint({ extractionIdentity, visibleRevisionDigest, claim: claim.claim });
-  const timestamp = new Date(now).toISOString().replace('.000Z', 'Z');
+export function buildMemoryRecord({ sessionId, extractionIdentity = sessionId, visibleRevisionDigest = undefined, claim, route }) {
+  const routed = requireSessionScopeRoute(route);
+  const fingerprint = extractionFingerprint({ extractionIdentity, visibleRevisionDigest,
+    claim: `${claim.claim}\0${canonicalJson(routed.scope)}\0${canonicalJson(routed.routingEvidence)}` });
   return {
-    schema: 'amf-memory/v1', id: `mem_extract_${fingerprint.slice(0, 40)}`, revision: 1,
-    claimType: claim.claimType, scope: { type: 'shared', id: 'shared:global' }, visibility: 'shared',
-    confidence: { score: claim.confidence, basis: 'inferred', assessedAt: timestamp },
-    subjects: [{ identityId: 'agent:raw-extractor', role: 'owner' }], claim: { encoding: 'plain', text: claim.claim },
-    lifecycle: { status: 'active', validFrom: timestamp, validTo: null, supersedes: [], revokedAt: null, revocationReason: null },
-    provenance: [{ sourceType: 'raw-conversation', sourceId: String(extractionIdentity), eventId: `session-${sha256(String(extractionIdentity)).slice(0, 32)}`,
-      contentSha256: sha256(transcript), capturedAt: timestamp }], createdAt: timestamp, updatedAt: timestamp
+    schema: 'amf.conversation-memory-candidate/v1', id: `cmp_extract_${fingerprint.slice(0, 40)}`,
+    scope: routed.scope, text: claim.claim, claimType: claim.claimType, confidence: claim.confidence, infer: false,
+    routingEvidence: routed.routingEvidence
   };
 }
 
-export function proposalIdempotencyKey({ sessionId, extractionIdentity = sessionId, visibleRevisionDigest = undefined, claim }) {
-  return `raw-extractor:${extractionFingerprint({ extractionIdentity, visibleRevisionDigest, claim })}`;
+export function proposalIdempotencyKey({ sessionId, extractionIdentity = sessionId, visibleRevisionDigest = undefined, claim, route = undefined }) {
+  const routing = route === undefined ? '' : (() => {
+    const routed = requireSessionScopeRoute(route);
+    return `\0${canonicalJson(routed.scope)}\0${canonicalJson(routed.routingEvidence)}`;
+  })();
+  return `raw-extractor:${extractionFingerprint({ extractionIdentity, visibleRevisionDigest, claim: `${claim}${routing}` })}`;
 }

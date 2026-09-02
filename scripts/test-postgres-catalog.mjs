@@ -14,13 +14,15 @@ import {
   createFabricStoreFromEnv,
   identityPairLockKey
 } from '../src/fabric-store.mjs';
+import { verifyAndPublishRawProjectionV2Proof } from '../src/raw-projection-v2-readiness.mjs';
 
 class FakePool {
-  constructor({ failInitialization = false, schemaVersion = null, hangConnect = false, hangQuery = false } = {}) {
+  constructor({ failInitialization = false, schemaVersion = null, hangConnect = false, hangQuery = false, readinessEvidence = null } = {}) {
     this.failInitialization = failInitialization;
     this.schemaVersion = schemaVersion;
     this.hangConnect = hangConnect;
     this.hangQuery = hangQuery;
+    this.readinessEvidence = readinessEvidence || { v1_count: '0', v2_count: '0', alias_count: '0', alias_orphan_count: '0', legacy_field_count: '0', literal_scan_count: '0' };
     this.queries = [];
     this.rawObjects = new Map();
     this.proposals = new Map();
@@ -187,6 +189,9 @@ class FakePool {
       this.auditEvents.set(values[0], values);
       return { rows: [] };
     }
+    if (compact.startsWith('SELECT (SELECT count(*)::bigint FROM agent_memory_fabric.raw_events_v1) AS v1_count')) {
+      return { rows: [this.readinessEvidence] };
+    }
     if (compact.startsWith('SELECT (SELECT count(*)::bigint')) {
       return { rows: [{ raw_objects: String(this.rawObjects.size), queued_proposals: String([...this.proposals.values()].filter((row) => row.status === 'queued').length), audit_events: String(this.auditEvents.size) }] };
     }
@@ -245,6 +250,38 @@ test('PostgreSQL catalog bootstraps the complete versioned metadata schema idemp
   const migration = pool.queries.find((entry) => entry.text.includes('schema_migrations(version) VALUES'));
   assert.deepEqual(migration.values, [POSTGRES_SCHEMA_VERSION]);
   assert.equal(catalog.status().healthy, true);
+});
+
+test('PostgreSQL readiness reads only the persisted proof and fails closed when it is missing', async () => {
+  const pool = new FakePool();
+  const catalog = new PostgresCatalog({ pool });
+  await catalog.ready();
+  const readiness = await catalog.rawV2Readiness();
+  assert.deepEqual(readiness, { safe: false, reason: 'migration_proof_missing' });
+  const readinessQueries = pool.queries.map(entry => entry.text).join('\n');
+  assert.match(readinessQueries, /raw_projection_v2_readiness_v2/);
+  assert.doesNotMatch(readinessQueries, /SELECT projection_json FROM agent_memory_fabric\.raw_events_v2/);
+});
+
+test('PostgreSQL verifier evidence is database-side and records every persisted proof invariant', async () => {
+  const pool = new FakePool();
+  const catalog = new PostgresCatalog({ pool });
+  const evidence = await catalog.rawV2ReadinessEvidence();
+  assert.deepEqual(evidence, { v1Count: 0, v2Count: 0, aliasCount: 0, aliasOrphanCount: 0, legacyFieldCount: 0, literalScanCount: 0 });
+  const evidenceQuery = pool.queries.find(entry => entry.text.includes('AS v1_count'))?.text || '';
+  assert.match(evidenceQuery, /logical_message_aliases_v2 a LEFT JOIN agent_memory_fabric\.logical_messages_v2/);
+  assert.match(evidenceQuery, /projection_json \?\| ARRAY\['nativeRoomId','nativePersonId','roomId','personId'\]/);
+  assert.match(evidenceQuery, /jsonb_each/);
+  assert.match(evidenceQuery, /hmac-sha256/);
+  assert.match(evidenceQuery, /jsonb_array_length\(tags\.value\)=0/);
+});
+
+test('PostgreSQL verifier rejects a database-detected empty context-tag array before paging or publication', async () => {
+  const pool = new FakePool({ readinessEvidence: { v1_count: '0', v2_count: '1', alias_count: '1', alias_orphan_count: '0', legacy_field_count: '0', literal_scan_count: '1' } });
+  const catalog = new PostgresCatalog({ pool });
+  await assert.rejects(verifyAndPublishRawProjectionV2Proof(catalog), /raw_projection_v2_invariant_failed/);
+  assert.equal(pool.queries.some(entry => entry.text.includes('SELECT e.event_id,e.projection_json')), false);
+  assert.equal(pool.queries.some(entry => entry.text.includes('UPDATE agent_memory_fabric.raw_projection_v2_readiness_v2 SET proof_json')), false);
 });
 
 test('PostgreSQL proposal transaction resolves concurrent idempotency conflicts and parameterizes data', async () => {

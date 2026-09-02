@@ -2,7 +2,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { ContextTokenVerifier, issueSessionRouteBinding, normalizeContextKeyRing } from '../context-token.mjs';
+import { ContextTokenVerifier, issueSessionRouteBinding, issueSessionRouteBindingV3, normalizeContextKeyRing } from '../context-token.mjs';
+import { SESSION_ROUTE_INPUT_SCHEMA_V3, SESSION_ROUTE_MANIFEST_SCHEMA_V3, sessionRouteBindingIdentity } from '../session-scope-router.mjs';
 
 const INPUT_SCHEMA_V1 = 'amf.session-route-input/v1';
 const INPUT_SCHEMA_V2 = 'amf.session-route-input/v2';
@@ -64,7 +65,7 @@ function readPrivateFile(filePath, serviceOwnerUid, { optional = false } = {}) {
 function closeRecord(record) { if (record?.directory?.fd !== undefined) fs.closeSync(record.directory.fd); }
 
 function validateInput(value, keyRing, defaultKeyVersion) {
-  if (!exactKeys(value, ['schema', 'bindings']) || ![INPUT_SCHEMA_V1, INPUT_SCHEMA_V2].includes(value.schema)
+  if (!exactKeys(value, ['schema', 'bindings']) || ![INPUT_SCHEMA_V1, INPUT_SCHEMA_V2, SESSION_ROUTE_INPUT_SCHEMA_V3].includes(value.schema)
     || !Array.isArray(value.bindings) || !value.bindings.length || value.bindings.length > 1000) {
     throw fail('session_route_input_invalid');
   }
@@ -76,14 +77,16 @@ function validateInput(value, keyRing, defaultKeyVersion) {
     throw fail('session_route_key_version_invalid');
   }
   const seen = new Set();
-  return value.bindings.map(candidate => {
-    const expectedKeys = value.schema === INPUT_SCHEMA_V2
+  const bindings = value.bindings.map(candidate => {
+    const expectedKeys = value.schema === SESSION_ROUTE_INPUT_SCHEMA_V3
+      ? ['actor', 'scope', 'conversationKind', 'contextTags', 'mappingEvidence', 'keyVersion']
+      : value.schema === INPUT_SCHEMA_V2
       ? ['actor', 'canonicalScope', 'conversationKind', 'contextTags', 'keyVersion']
       : ['actor', 'canonicalScope', 'conversationKind', 'contextTags'];
     if (!exactKeys(candidate, expectedKeys)) {
       throw fail('session_route_input_invalid');
     }
-    if (value.schema === INPUT_SCHEMA_V2 && typeof candidate.keyVersion !== 'string') {
+    if ((value.schema === INPUT_SCHEMA_V2 || value.schema === SESSION_ROUTE_INPUT_SCHEMA_V3) && typeof candidate.keyVersion !== 'string') {
       throw fail('session_route_key_version_invalid');
     }
     const candidateKeyVersion = candidate.keyVersion === undefined ? defaultKeyVersion : candidate.keyVersion;
@@ -97,31 +100,43 @@ function validateInput(value, keyRing, defaultKeyVersion) {
       throw fail('session_route_key_version_invalid');
     }
     let binding;
-    try { binding = issueSessionRouteBinding({ ...candidate, keyVersion }, normalizedRing); }
+    try { binding = value.schema === SESSION_ROUTE_INPUT_SCHEMA_V3
+      ? issueSessionRouteBindingV3({ ...candidate, keyVersion }, normalizedRing)
+      : issueSessionRouteBinding({ ...candidate, keyVersion }, normalizedRing); }
     catch (error) { throw fail('session_route_input_invalid', error); }
-    const identity = `${binding.actor}\0${binding.conversationKind}\0${binding.canonicalScope}`;
+    const identity = value.schema === SESSION_ROUTE_INPUT_SCHEMA_V3
+      ? sessionRouteBindingIdentity(binding) : `${binding.actor}\0${binding.conversationKind}\0${binding.canonicalScope}`;
     if (seen.has(identity)) throw fail('session_route_binding_duplicate');
     seen.add(identity); return binding;
   });
+  return { schema: value.schema === SESSION_ROUTE_INPUT_SCHEMA_V3 ? SESSION_ROUTE_MANIFEST_SCHEMA_V3 : MANIFEST_SCHEMA, bindings };
 }
 
 function validateExisting(value, verifier) {
-  if (!exactKeys(value, ['schema', 'bindings']) || value.schema !== MANIFEST_SCHEMA
+  if (!exactKeys(value, ['schema', 'bindings']) || ![MANIFEST_SCHEMA, 'amf.session-route-manifest/v2', SESSION_ROUTE_MANIFEST_SCHEMA_V3].includes(value.schema)
     || !Array.isArray(value.bindings) || value.bindings.length > 10000) throw fail('session_route_manifest_invalid');
   const seen = new Set();
-  return value.bindings.map(candidate => {
+  const bindings = value.bindings.map(candidate => {
     let binding;
-    try { binding = { ...verifier.verifySessionRouteBinding(candidate), mac: candidate.mac }; }
+    try { binding = value.schema === SESSION_ROUTE_MANIFEST_SCHEMA_V3
+      ? { ...verifier.verifySessionRouteBindingV3(candidate), mac: candidate.mac }
+      : { ...verifier.verifySessionRouteBinding(candidate), mac: candidate.mac }; }
     catch (error) { throw fail('session_route_manifest_invalid', error); }
-    const identity = `${binding.actor}\0${binding.conversationKind}\0${binding.canonicalScope}`;
+    const identity = value.schema === SESSION_ROUTE_MANIFEST_SCHEMA_V3
+      ? sessionRouteBindingIdentity(binding) : `${binding.actor}\0${binding.conversationKind}\0${binding.canonicalScope}`;
     if (seen.has(identity)) throw fail('session_route_binding_duplicate');
     seen.add(identity); return binding;
   });
+  return { schema: value.schema, bindings };
 }
 
-function canonicalManifest(bindings) {
-  return { schema: MANIFEST_SCHEMA, bindings: [...bindings].sort((a, b) => a.actor.localeCompare(b.actor)
-    || a.conversationKind.localeCompare(b.conversationKind) || a.canonicalScope.localeCompare(b.canonicalScope)) };
+function routeIdentity(binding, schema) {
+  return schema === SESSION_ROUTE_MANIFEST_SCHEMA_V3
+    ? sessionRouteBindingIdentity(binding) : `${binding.actor}\0${binding.conversationKind}\0${binding.canonicalScope}`;
+}
+
+function canonicalManifest(bindings, schema) {
+  return { schema, bindings: [...bindings].sort((a, b) => routeIdentity(a, schema).localeCompare(routeIdentity(b, schema))) };
 }
 
 function assertManifestSnapshot(record, directory, name, serviceOwnerUid) {
@@ -187,13 +202,13 @@ export function provisionSessionRoutes({ inputPath, contextKeyRingPath, manifest
     }
     const verifier = new ContextTokenVerifier({ keyRing: ring.value, policyRevision: '' });
     const replacements = validateInput(input.value, ring.value, keyVersion);
-    const current = existing.missing ? [] : validateExisting(existing.value, verifier);
-    const replacementIds = new Set(replacements.map(item => `${item.actor}\0${item.conversationKind}\0${item.canonicalScope}`));
-    const manifest = canonicalManifest([...current.filter(item => !replacementIds.has(
-      `${item.actor}\0${item.conversationKind}\0${item.canonicalScope}`)), ...replacements]);
+    const current = existing.missing ? { schema: replacements.schema, bindings: [] } : validateExisting(existing.value, verifier);
+    if (current.schema !== replacements.schema) throw fail('session_route_legacy_read_only');
+    const replacementIds = new Set(replacements.bindings.map(item => routeIdentity(item, replacements.schema)));
+    const manifest = canonicalManifest([...current.bindings.filter(item => !replacementIds.has(routeIdentity(item, replacements.schema))), ...replacements.bindings], replacements.schema);
     const action = existing.missing ? 'create' : 'update';
-    const result = { ok: true, schema: MANIFEST_SCHEMA, action, dryRun, bindingCount: manifest.bindings.length,
-      updatedBindingCount: replacements.length, manifestPath: path.resolve(manifestPath),
+    const result = { ok: true, schema: manifest.schema, action, dryRun, bindingCount: manifest.bindings.length,
+      updatedBindingCount: replacements.bindings.length, manifestPath: path.resolve(manifestPath),
       concurrency: dryRun ? 'read_only_snapshot' : 'locked_cas' };
     if (dryRun) return result;
     assertManifestSnapshot(existing, targetDirectory, targetName, serviceOwnerUid);
