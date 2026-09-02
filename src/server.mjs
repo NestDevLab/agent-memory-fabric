@@ -250,14 +250,46 @@ function curationCursorBinding(actor, statuses, authorization) {
 
 function v2Error(requestId, error, fallbackStatus = 500) {
   const [mappedStatus, code] = PUBLIC_ERRORS.get(error?.message) || [fallbackStatus >= 500 ? 500 : fallbackStatus, fallbackStatus >= 500 ? 'internal_error' : 'request_failed'];
+  const details = publicErrorDetails(error, code);
   return {
     status: mappedStatus,
     body: {
       ok: false,
-      error: { code, message: code, details: null },
+      error: { code, message: code, details },
       meta: { requestId, service: SERVICE_NAME, version: SERVICE_VERSION }
     }
   };
+}
+
+function canonicalRecordIssueFields(errors) {
+  const fields = new Set();
+  for (const error of Array.isArray(errors) ? errors : []) {
+    const text = String(error || '');
+    const match = /^(schema|id|revision|claimType|scope|visibility|subjects|claim|confidence|lifecycle|provenance|createdAt|updatedAt|record)\b/.exec(text);
+    fields.add(match?.[1] || 'record');
+  }
+  if (fields.size > 1) fields.delete('record');
+  return [...fields].sort().slice(0, 12);
+}
+
+function publicErrorDetails(error, code) {
+  if (code === 'canonical_record_invalid') {
+    return {
+      fields: canonicalRecordIssueFields(error?.data?.validationErrors),
+      action: 'Use the published amf-memory/v1 record template and supply every required field.'
+    };
+  }
+  if (code === 'proposal_too_large') {
+    const maxChars = Number(error?.data?.maxChars);
+    const observedChars = Number(error?.data?.observedChars);
+    return {
+      ...(Number.isSafeInteger(maxChars) && maxChars > 0 ? { maxChars } : {}),
+      ...(Number.isSafeInteger(observedChars) && observedChars > 0 ? { observedChars } : {}),
+      strategy: 'summary_plus_pointer',
+      action: 'Store the full document durably, then submit a bounded summary or instruction claim with a durable reference.'
+    };
+  }
+  return null;
 }
 
 function publicError(error, fallbackStatus = 500) {
@@ -431,7 +463,7 @@ function validateProposalInput({ scope, text, metadata, idempotencyKey, requireI
   if (text.length > LIMITS.proposalChars) {
     const error = new Error('proposal_too_large');
     error.status = 413;
-    error.data = { maxChars: LIMITS.proposalChars };
+    error.data = { maxChars: LIMITS.proposalChars, observedChars: text.length };
     throw error;
   }
   if (Buffer.byteLength(JSON.stringify(metadata), 'utf8') > LIMITS.metadataBytes) {
@@ -459,9 +491,15 @@ function validateCanonicalProposal(record, rationale, expectedRevision) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) throw Object.assign(new Error('canonical_record_required'), { status: 400 });
   const revision = Number(record.revision);
   const validation = validateAmfMemoryRecord(record, { allowPlainSensitiveClaims: ALLOW_PLAIN_SENSITIVE_CLAIMS });
-  if (!validation.ok) throw Object.assign(new Error('canonical_record_invalid'), { status: 400 });
+  if (!validation.ok) throw Object.assign(new Error('canonical_record_invalid'), {
+    status: 400,
+    data: { validationErrors: validation.errors }
+  });
   const recordBytes = Buffer.byteLength(canonicalJson(record), 'utf8') + Buffer.byteLength(String(rationale || ''), 'utf8');
-  if (recordBytes > LIMITS.proposalChars) throw Object.assign(new Error('proposal_too_large'), { status: 413 });
+  if (recordBytes > LIMITS.proposalChars) throw Object.assign(new Error('proposal_too_large'), {
+    status: 413,
+    data: { maxChars: LIMITS.proposalChars, observedChars: recordBytes }
+  });
   if (typeof rationale !== 'string' || !rationale.trim()) throw Object.assign(new Error('rationale_required'), { status: 400 });
   if (expectedRevision != null && (!Number.isInteger(expectedRevision) || expectedRevision < 0 || expectedRevision !== revision - 1)) {
     throw Object.assign(new Error('revision_invalid'), { status: 400 });

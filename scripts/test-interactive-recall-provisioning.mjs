@@ -8,6 +8,7 @@ import test from 'node:test';
 
 import {
   INTERACTIVE_RECALL_HANDOFF_SCHEMA,
+  INTERACTIVE_RECALL_WRITE_HANDOFF_SCHEMA,
   INTERACTIVE_RECALL_PERMISSIONS,
   INTERACTIVE_RECALL_SCOPES,
   interactiveRecallProfile,
@@ -77,7 +78,7 @@ function instrumentWrites(operation) {
 }
 
 test('Codex and Claude dry-runs are exact, read-only, and never generate secrets', () => {
-  for (const profile of ['codex', 'claude']) {
+  for (const profile of ['codex', 'claude', 'chatgpt-web']) {
     const { root, options } = fixture(profile);
     try {
       const originals = [options.authRegistryPath, options.policyPath, options.contextKeyRingPath].map(bytes);
@@ -126,6 +127,28 @@ test('the interactive provisioner writes only the strict profile and handoff met
       endpoint: 'https://amf.example.test/', createdAt: FIXED_NOW.toISOString()
     });
     assert.equal(fs.readdirSync(options.handoffPath).some(name => /raw|session|proposal|decrypt/i.test(name)), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('governed write is available only to ChatGPT Web and remains scope-bound', () => {
+  const { root, options } = fixture('chatgpt-web');
+  try {
+    const result = withEffectiveUid(0, () => provisionInteractiveRecall({ ...options, writeEnabled: true }));
+    const row = json(options.authRegistryPath).rows.find(entry => entry.actor === 'agent:chatgpt-web');
+    const actor = json(options.policyPath).actors['agent:chatgpt-web'];
+    const manifest = json(path.join(options.handoffPath, 'manifest.json'));
+    assert.equal(result.schema, INTERACTIVE_RECALL_WRITE_HANDOFF_SCHEMA);
+    assert.equal(row.mode, 'scoped'); assert.deepEqual(row.allowedScopes, ['shared:global']);
+    assert.deepEqual(row.permissions, ['memory:search', 'memory:read', 'purpose:conversation_recall', 'memory:propose']);
+    assert.deepEqual(row.tools, ['memory_search', 'memory_read', 'memory_upsert', 'memory_proposal_status']);
+    assert.deepEqual(actor.allowedScopes, ['shared:global']); assert.deepEqual(actor.tools, row.tools);
+    assert.equal(manifest.schema, INTERACTIVE_RECALL_WRITE_HANDOFF_SCHEMA);
+    assert.deepEqual(manifest.tools, row.tools);
+    const other = fixture('codex');
+    try {
+      assert.throws(() => provisionInteractiveRecall({ ...other.options, writeEnabled: true, dryRun: true }),
+        /interactive_recall_write_profile_invalid/);
+    } finally { fs.rmSync(other.root, { recursive: true, force: true }); }
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
