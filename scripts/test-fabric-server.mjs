@@ -1123,7 +1123,25 @@ test('v2 validates idempotency and query limits with stable error envelopes', as
       });
       assert.equal(rejected.response.status, 400, `${idempotencyKey} was accepted`);
       assert.equal(rejected.body.error.code, 'canonical_record_invalid');
+      if (idempotencyKey === 'missing-confidence') {
+        assert.deepEqual(rejected.body.error.details, {
+          fields: ['confidence'],
+          action: 'Use the published amf-memory/v1 record template and supply every required field.'
+        });
+      }
     }
+
+    const oversizedRecord = canonicalRecord('x'.repeat(32768));
+    const oversized = await api('/v2/memory/proposals', {
+      method: 'POST', headers: { 'idempotency-key': 'oversized-canonical-record' },
+      body: JSON.stringify({ record: oversizedRecord, rationale: 'oversized contract regression', expectedRevision: 0 })
+    });
+    assert.equal(oversized.response.status, 413);
+    assert.equal(oversized.body.error.code, 'proposal_too_large');
+    assert.equal(oversized.body.error.details.maxChars, 32768);
+    assert.ok(oversized.body.error.details.observedChars > 32768);
+    assert.equal(oversized.body.error.details.strategy, 'summary_plus_pointer');
+    assert.match(oversized.body.error.details.action, /Store the full document durably/);
 
     const forbidden = await api('/v2/memory/proposals', {
       method: 'POST',

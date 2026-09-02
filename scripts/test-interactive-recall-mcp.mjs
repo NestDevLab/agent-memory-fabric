@@ -166,6 +166,10 @@ test('ChatGPT Web governed write queues revision-aware proposals without widenin
     const tools = await bridge.handleRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
     assert.deepEqual(tools.result.tools.map(tool => tool.name),
       ['memory_search', 'memory_read', 'memory_upsert', 'memory_proposal_status']);
+    const upsertTool = tools.result.tools.find(tool => tool.name === 'memory_upsert');
+    assert.match(upsertTool.description, /schema, id, revision, claimType, scope, visibility, subjects, claim, confidence, lifecycle, provenance, createdAt, and updatedAt/);
+    assert.match(upsertTool.description, /summary_plus_pointer|summary or instruction claim/);
+    assert.match(upsertTool.description, /mem_example_handoff_0001/);
     const record = { id: 'memory:new', revision: 2, scope: { id: 'shared:global' },
       lifecycle: { supersedes: ['memory:old'] } };
     const upsert = await bridge.handleRpc({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
@@ -186,6 +190,29 @@ test('ChatGPT Web governed write queues revision-aware proposals without widenin
     } });
     assert.equal(widened.error.code, -32602); assert.equal(fabric.calls.length, 2);
   } finally { await fabric.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('ChatGPT Web governed write returns sanitized actionable upstream diagnoses', async () => {
+  const { root, handoffPath } = fixture('chatgpt-web', true);
+  const record = { id: 'memory:new', revision: 1, scope: { id: 'shared:global' }, lifecycle: { supersedes: [] } };
+  const failures = [
+    [{ code: 'canonical_record_invalid', details: { fields: ['confidence', 'secret'] } },
+      { code: 'canonical_record_invalid', fields: ['confidence'], action: 'Use the published amf-memory/v1 record template and supply every required field.' }],
+    [{ code: 'proposal_too_large', details: { maxChars: 32768, observedChars: 45000 } },
+      { code: 'proposal_too_large', maxChars: 32768, observedChars: 45000, strategy: 'summary_plus_pointer', action: 'Store the full document durably, then submit a bounded summary or instruction claim with a durable reference.' }]
+  ];
+  try {
+    for (const [error, expected] of failures) {
+      const bridge = createInteractiveRecallBridge({ handoff: loadInteractiveRecallHandoff(handoffPath),
+        fetchImpl: async () => new Response(JSON.stringify({ ok: false, error }), { status: error.code === 'proposal_too_large' ? 413 : 400 }),
+        clock: () => FIXED_NOW.getTime(), randomBytes: testRandom() });
+      const response = await bridge.handleRpc({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {
+        name: 'memory_upsert', arguments: { record, rationale: 'diagnostic fixture', expectedRevision: null, idempotencyKey: `diagnostic-${error.code}` }
+      } });
+      assert.equal(response.error.code, -32602);
+      assert.deepEqual(response.error.data, expected);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('the stdio launcher accepts only the handoff-directory environment contract', () => {
