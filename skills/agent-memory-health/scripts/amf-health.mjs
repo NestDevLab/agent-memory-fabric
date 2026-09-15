@@ -69,6 +69,31 @@ export function evaluateCollectorSnapshot(snapshot, { maxPending = 0, maxAgeMs =
   const id = `collector:${snapshot.id}`;
   const intentionallyPaused = snapshot.migrationPause?.state === "paused" && snapshot.migrationPause?.verified === true;
   const schedulerActive = snapshot.schedulerActive ?? snapshot.timerActive;
+  if (snapshot.enabled === false) {
+    const observations = {
+      scheduler: snapshot.schedulerObserved ?? typeof schedulerActive === "boolean",
+      timer: snapshot.timerObserved ?? typeof snapshot.timerActive === "boolean",
+      service: snapshot.serviceObserved ?? typeof snapshot.serviceState === "string",
+      runtimeMarker: snapshot.runtimeMarkerObserved ?? typeof snapshot.runtimeMarkerActive === "boolean"
+    };
+    const unverified = Object.entries(observations).filter(([, observed]) => observed !== true).map(([name]) => name);
+    if (unverified.length) {
+      return check(id, "critical", `DISABLED collector inactivity could not be verified: ${unverified.join(", ")}`,
+        publicCollectorEvidence(snapshot));
+    }
+    const active = [
+      ...(schedulerActive === true ? ["scheduler"] : []),
+      ...(snapshot.timerActive === true ? ["timer"] : []),
+      ...(["active", "activating", "reloading"].includes(snapshot.serviceState) ? ["service"] : []),
+      ...(snapshot.runtimeMarkerActive === true ? ["runtime marker"] : [])
+    ];
+    if (active.length) {
+      return check(id, "critical", `Collector is DISABLED by configuration but capture remains active: ${active.join(", ")}`,
+        publicCollectorEvidence(snapshot));
+    }
+    return check(id, "skipped", "DISABLED by configuration; scheduler, timer, service, and runtime marker are inactive",
+      publicCollectorEvidence(snapshot));
+  }
   if (!intentionallyPaused && schedulerActive !== true) return check(id, "critical", "Collector scheduler is not active", publicCollectorEvidence(snapshot));
   if (snapshot.result && snapshot.result !== "success") return check(id, "critical", `Collector result is ${snapshot.result}`, publicCollectorEvidence(snapshot));
   if (Number(snapshot.execMainStatus ?? 0) !== 0) return check(id, "critical", `Collector exit status is ${snapshot.execMainStatus}`, publicCollectorEvidence(snapshot));
@@ -109,6 +134,19 @@ export function parseHarnessMap(text, home = process.env.AMF_HEALTH_HOME || proc
     collectors: [collector("ct107-codex", ct107), collector("ct107-claude", ct107),
       collector("ct110-openclaw", ct110), collector("ct110-hermes", ct110)]
   };
+}
+
+export function parseHealthConfig(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.schema !== CONFIG_SCHEMA) {
+    throw new Error(`health_config_schema_invalid:${value?.schema ?? "missing"}`);
+  }
+  if (value.settings !== undefined && (!value.settings || typeof value.settings !== "object" || Array.isArray(value.settings))) {
+    throw new Error("health_config_settings_invalid");
+  }
+  if (value.collectors !== undefined && !Array.isArray(value.collectors)) throw new Error("health_config_collectors_invalid");
+  const collectors = value.collectors?.map(validateCollector) ?? value.collectors;
+  const { settings = {}, ...config } = value;
+  return { ...settings, ...config, ...(collectors ? { collectors } : {}) };
 }
 
 export function evaluateCodexSnapshot(snapshot) {
@@ -170,7 +208,7 @@ export async function runHealth(options = {}) {
   const collectors = Array.isArray(settings.collectors) ? settings.collectors : discoverCollectors(settings.configRoot);
   if (!collectors.length) checks.push(check("collectors", "skipped", "No local RAW collectors discovered"));
   for (const collector of collectors) {
-    const snapshot = { ...collectorSnapshot(collector, settings.stateRoot), migrationPause };
+    const snapshot = { ...collectorSnapshot(collector, settings.stateRoot, settings.configRoot), migrationPause };
     checks.push(evaluateCollectorSnapshot(snapshot, {
       maxPending: finiteOr(collector.maxPending, finiteOr(settings.maxPending, 0)),
       maxAgeMs: finiteOr(collector.maxAgeMs, finiteOr(settings.maxAgeMs, 15 * 60_000))
@@ -203,9 +241,26 @@ function finiteOr(value, fallback) {
 
 function loadConfig(configPath) {
   if (!configPath) return {};
-  const parsed = JSON.parse(readFileSync(configPath, "utf8"));
-  if (parsed.schema !== CONFIG_SCHEMA) throw new Error(`health_config_schema_invalid:${parsed.schema ?? "missing"}`);
-  return parsed;
+  return parseHealthConfig(JSON.parse(readFileSync(configPath, "utf8")));
+}
+
+function validateCollector(collector) {
+  if (!collector || typeof collector !== "object" || Array.isArray(collector)
+    || !collector.id || !/^[a-zA-Z0-9._-]+$/.test(String(collector.id))) {
+    throw new Error(`collector_id_invalid:${collector?.id ?? "missing"}`);
+  }
+  if (collector.enabled !== undefined && typeof collector.enabled !== "boolean") {
+    throw new Error(`collector_enabled_invalid:${collector.id}`);
+  }
+  const scheduler = collector.scheduler || "systemd-timer";
+  if (!["systemd-timer", "hook-path"].includes(scheduler)) throw new Error(`collector_scheduler_invalid:${collector.id}`);
+  const transport = collector.transport || "local";
+  if (!["local", "ssh"].includes(transport)) throw new Error(`collector_transport_invalid:${collector.id}`);
+  if (transport === "ssh" && !collector.host) throw new Error(`collector_ssh_host_missing:${collector.id}`);
+  if (collector.runtimeMarker !== undefined && !path.isAbsolute(collector.runtimeMarker)) {
+    throw new Error(`collector_runtime_marker_invalid:${collector.id}`);
+  }
+  return { ...collector, enabled: collector.enabled !== false, scheduler, transport };
 }
 
 function applyDiscoveredTopology(settings) {
@@ -242,7 +297,10 @@ function discoverEndpoint(configRoot = "/etc/agent-memory-fabric") {
 }
 
 function discoverCollectors(configRoot = "/etc/agent-memory-fabric") {
-  return enabledConfigFiles(configRoot).map(file => ({ id: path.basename(file).replace(/^runtime-raw-/, "").replace(/\.json$/, "") }));
+  return enabledConfigFiles(configRoot).map(file => validateCollector({
+    id: path.basename(file).replace(/^runtime-raw-/, "").replace(/\.json$/, ""),
+    runtimeMarker: file.replace(/\.json$/, ".enabled")
+  }));
 }
 
 function enabledConfigFiles(root) {
@@ -282,25 +340,36 @@ function verifiedMigrationPause(payload) {
   return { state: "paused", verified: true };
 }
 
-function collectorSnapshot(collector, stateRoot = "/var/lib/agent-memory-fabric/runtime-raw") {
+function collectorSnapshot(collector, stateRoot = "/var/lib/agent-memory-fabric/runtime-raw", configRoot = "/etc/agent-memory-fabric") {
   const id = String(collector.id);
-  const timer = systemctlShow(`agent-memory-fabric-runtime-raw@${id}.timer`, collector);
+  const timerProbe = systemctlShow(`agent-memory-fabric-runtime-raw@${id}.timer`, collector);
+  const timer = timerProbe.values;
   const schedulerKind = collector.scheduler || "systemd-timer";
   if (!["systemd-timer", "hook-path"].includes(schedulerKind)) throw new Error(`collector_scheduler_invalid:${id}`);
-  const scheduler = schedulerKind === "hook-path"
+  const schedulerProbe = schedulerKind === "hook-path"
     ? systemctlShow(`agent-memory-fabric-runtime-raw-hook-${id}.path`, collector)
-    : timer;
-  const service = systemctlShow(`agent-memory-fabric-runtime-raw@${id}.service`, collector);
+    : timerProbe;
+  const scheduler = schedulerProbe.values;
+  const serviceProbe = systemctlShow(`agent-memory-fabric-runtime-raw@${id}.service`, collector);
+  const service = serviceProbe.values;
+  const runtimeMarker = collector.runtimeMarker || path.join(configRoot, `runtime-raw-${id}.enabled`);
+  const markerProbe = filePresence(runtimeMarker, collector);
   const outbox = collector.outbox || path.join(stateRoot, id, "outbox");
   return {
     id,
+    enabled: collector.enabled !== false,
     schedulerKind,
     schedulerActive: scheduler.ActiveState === "active",
+    schedulerObserved: schedulerProbe.observed,
     schedulerState: scheduler.SubState || "unknown",
     timerActive: timer.ActiveState === "active",
+    timerObserved: timerProbe.observed,
     timerState: timer.SubState || "unknown",
     lastTriggerMs: dateMs(scheduler.LastTriggerUSec || service.ExecMainStartTimestamp),
     serviceState: service.ActiveState || "unknown",
+    serviceObserved: serviceProbe.observed,
+    runtimeMarkerActive: markerProbe.active,
+    runtimeMarkerObserved: markerProbe.observed,
     result: service.Result || "",
     execMainStatus: finiteOr(service.ExecMainStatus, 0),
     pending: countFiles(path.join(outbox, "pending"), collector),
@@ -310,11 +379,17 @@ function collectorSnapshot(collector, stateRoot = "/var/lib/agent-memory-fabric/
 
 function systemctlShow(unit, target = { transport: "local" }) {
   const result = runTarget(target, "systemctl", ["show", unit, "-p", "ActiveState", "-p", "SubState", "-p", "LastTriggerUSec", "-p", "Result", "-p", "ExecMainStatus", "-p", "ExecMainStartTimestamp"]);
-  if (result.error || result.status !== 0) return {};
-  return Object.fromEntries(result.stdout.split(/\r?\n/).filter(Boolean).map(line => {
+  if (result.error || result.status !== 0) return { observed: false, values: {} };
+  return { observed: true, values: Object.fromEntries(result.stdout.split(/\r?\n/).filter(Boolean).map(line => {
     const index = line.indexOf("=");
     return [line.slice(0, index), line.slice(index + 1)];
-  }));
+  })) };
+}
+
+function filePresence(file, target = { transport: "local" }) {
+  const result = runTarget(target, "test", ["-f", file]);
+  if (!result.error && [0, 1].includes(result.status)) return { active: result.status === 0, observed: true };
+  return { active: null, observed: false };
 }
 
 function countFiles(directory, target = { transport: "local" }) {
@@ -332,10 +407,12 @@ function dateMs(value) {
 
 function publicCollectorEvidence(snapshot) {
   return {
+    enabled: snapshot.enabled !== false,
     schedulerKind: snapshot.schedulerKind || "systemd-timer",
     schedulerState: snapshot.schedulerState || snapshot.timerState,
     timerState: snapshot.timerState,
     serviceState: snapshot.serviceState,
+    runtimeMarkerState: snapshot.runtimeMarkerObserved !== true ? "unknown" : snapshot.runtimeMarkerActive ? "active" : "inactive",
     result: snapshot.result || "unknown",
     execMainStatus: snapshot.execMainStatus,
     pending: snapshot.pending,

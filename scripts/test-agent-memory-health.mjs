@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -15,6 +16,7 @@ import {
   evaluateRuntimeCoverage,
   formatHuman,
   parseEnvText,
+  parseHealthConfig,
   parseHarnessMap
 } from "../skills/agent-memory-health/scripts/amf-health.mjs";
 
@@ -124,6 +126,54 @@ test("collector accepts an explicitly healthy hook path scheduler with an inacti
   assert.equal(result.evidence.schedulerKind, "hook-path");
   assert.equal(result.evidence.schedulerState, "waiting");
   assert.equal(result.evidence.timerState, "dead");
+});
+
+test("health config parses mixed enabled and disabled collectors with enabled defaulting true", () => {
+  const parsed = parseHealthConfig({ schema: "amf.health/v1", collectors: [
+    { id: "ct107-codex", transport: "local" },
+    { id: "ct110-openclaw", enabled: false, scheduler: "hook-path", transport: "ssh", host: "example.invalid",
+      runtimeMarker: "/etc/agent-memory-fabric/runtime-raw-ct110-openclaw.enabled" }
+  ], settings: { maxPending: 1000 } });
+  assert.equal(parsed.collectors[0].enabled, true);
+  assert.equal(parsed.collectors[1].enabled, false);
+  assert.equal(parsed.collectors[1].scheduler, "hook-path");
+  assert.equal(parsed.maxPending, 1000);
+  assert.throws(() => parseHealthConfig({ schema: "amf.health/v1", collectors: [
+    { id: "runtime", enabled: "false" }
+  ] }), /collector_enabled_invalid/);
+
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const schema = JSON.parse(fs.readFileSync(path.join(here, "../config/contracts/amf.health-v1.schema.json"), "utf8"));
+  assert.equal(schema.$defs.collector.properties.enabled.type, "boolean");
+  assert.equal(schema.$defs.collector.properties.enabled.default, true);
+});
+
+test("mixed collector policy keeps enabled capture healthy and disabled inactive capture neutral", () => {
+  const enabled = evaluateCollectorSnapshot({ id: "codex", enabled: true, schedulerActive: true, timerActive: true,
+    serviceState: "inactive", result: "success", execMainStatus: 0, pending: 0, dead: 0, lastTriggerMs: Date.now() });
+  const disabled = evaluateCollectorSnapshot({ id: "openclaw", enabled: false, schedulerActive: false,
+    schedulerObserved: true, timerActive: false, timerObserved: true, serviceState: "inactive", serviceObserved: true,
+    runtimeMarkerActive: false, runtimeMarkerObserved: true, pending: 8, dead: 3 });
+  assert.equal(enabled.status, "healthy");
+  assert.equal(disabled.status, "skipped");
+  assert.match(disabled.summary, /DISABLED/);
+  assert.deepEqual({ pending: disabled.evidence.pending, dead: disabled.evidence.dead }, { pending: 8, dead: 3 });
+});
+
+test("disabled collector fails policy when scheduler, timer, service, or runtime marker remains active", () => {
+  const inactive = { id: "hermes", enabled: false, schedulerActive: false, schedulerObserved: true,
+    timerActive: false, timerObserved: true, serviceState: "inactive", serviceObserved: true,
+    runtimeMarkerActive: false, runtimeMarkerObserved: true };
+  for (const active of [
+    { schedulerActive: true }, { timerActive: true }, { serviceState: "active" }, { runtimeMarkerActive: true }
+  ]) {
+    const result = evaluateCollectorSnapshot({ ...inactive, ...active });
+    assert.equal(result.status, "critical");
+    assert.match(result.summary, /capture remains active/);
+  }
+  const unknown = evaluateCollectorSnapshot({ ...inactive, runtimeMarkerObserved: false });
+  assert.equal(unknown.status, "critical");
+  assert.match(unknown.summary, /could not be verified/);
 });
 
 test("pending and stale collectors degrade", () => {
