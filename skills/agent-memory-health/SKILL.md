@@ -20,7 +20,12 @@ Use `--deployment-env <path>` only for an authorized AMF deployment file; the sc
 Interpret four independent layers:
 
 1. **Capture:** each collector's explicitly configured timer or hook-path
-   scheduler is active, recent, successful, and has no pending/dead events.
+   scheduler is active, recent, successful, and has no pending/dead events. A
+   collector with explicit `enabled: false` is neutral `SKIPPED/DISABLED` only
+   after the probe verifies its scheduler, polling timer, service, and runtime
+   activation marker are inactive. Any active or unverifiable capture path is
+   critical. Disabling ingest does not remove its outbox, dead letters, cursors,
+   historical data, or corresponding runtime target/access checks.
 2. **Corpus:** when `requireDocumentStore` is enabled, AMF reports a configured document backend and the Obsidian client reports no retrying delivery.
 3. **Access:** the current session exposes `memory_status`, `memory_search`, `memory_read`, or equivalent native recall. Inspect the actual tool surface; the script cannot see tools injected into the session.
 4. **Recall:** a fresh session retrieves a benign unique fact with correct scope and provenance.
@@ -30,3 +35,7 @@ Report `HEALTHY` only when every required layer passes. Storage without access i
 For an end-to-end canary, store a random non-sensitive token through the runtime's supported proposal/native-memory path, open a new session, retrieve it without repeating it, verify source and scope, then revoke/delete it when supported. Do not write a canary unless the user authorizes that run.
 
 Keep deployment topology outside this package. Fleet configuration owns targets, transports, endpoint, token-file, collectors, profiles, and thresholds; never add private hosts, paths, actors, or credentials here.
+The generic configuration contract is
+`config/contracts/amf.health-v1.schema.json`; `enabled` defaults to `true`, and
+`runtimeMarker` may override the standard
+`<configRoot>/runtime-raw-<collector-id>.enabled` path.

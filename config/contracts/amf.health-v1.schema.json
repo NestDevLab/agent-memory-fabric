@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-memory-fabric.local/contracts/amf.health-v1.schema.json",
+  "title": "Agent Memory Fabric health configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema"],
+  "properties": {
+    "schema": { "const": "amf.health/v1" },
+    "endpoint": { "type": "string" },
+    "tokenEnv": { "$ref": "#/$defs/nonEmptyString" },
+    "envFile": { "$ref": "#/$defs/absolutePath" },
+    "configRoot": { "$ref": "#/$defs/absolutePath" },
+    "stateRoot": { "$ref": "#/$defs/absolutePath" },
+    "harnessMap": { "$ref": "#/$defs/absolutePath" },
+    "home": { "$ref": "#/$defs/absolutePath" },
+    "requireSemanticBackend": { "type": "boolean" },
+    "requireDocumentStore": { "type": "boolean" },
+    "maxQueuedProposals": { "type": "integer", "minimum": 0 },
+    "maxPending": { "type": "integer", "minimum": 0 },
+    "maxAgeMs": { "type": "integer", "minimum": 0 },
+    "timeoutMs": { "type": "integer", "minimum": 1 },
+    "collectors": { "type": "array", "items": { "$ref": "#/$defs/collector" } },
+    "targets": { "type": "array", "items": { "$ref": "#/$defs/runtimeTarget" } },
+    "runtimes": { "type": "array", "items": { "$ref": "#/$defs/runtimeTarget" } },
+    "settings": { "$ref": "#/$defs/settings" }
+  },
+  "$defs": {
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "absolutePath": { "type": "string", "pattern": "^/" },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+    "transport": { "enum": ["local", "ssh"] },
+    "collector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "enabled": { "type": "boolean", "default": true },
+        "scheduler": { "enum": ["systemd-timer", "hook-path"] },
+        "transport": { "$ref": "#/$defs/transport" },
+        "host": { "$ref": "#/$defs/nonEmptyString" },
+        "user": { "$ref": "#/$defs/nonEmptyString" },
+        "connectTimeoutSec": { "type": "integer", "minimum": 1 },
+        "outbox": { "$ref": "#/$defs/absolutePath" },
+        "runtimeMarker": { "$ref": "#/$defs/absolutePath" },
+        "maxPending": { "type": "integer", "minimum": 0 },
+        "maxAgeMs": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "transport": { "const": "ssh" } }, "required": ["transport"] },
+          "then": { "required": ["host"] }
+        }
+      ]
+    },
+    "runtimeTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["codex", "claude", "openclaw", "hermes"] },
+        "transport": { "$ref": "#/$defs/transport" },
+        "host": { "$ref": "#/$defs/nonEmptyString" },
+        "user": { "$ref": "#/$defs/nonEmptyString" },
+        "connectTimeoutSec": { "type": "integer", "minimum": 1 },
+        "home": { "$ref": "#/$defs/absolutePath" },
+        "skillPath": { "$ref": "#/$defs/nonEmptyString" },
+        "agent": { "$ref": "#/$defs/nonEmptyString" },
+        "profile": { "$ref": "#/$defs/nonEmptyString" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "transport": { "const": "ssh" } }, "required": ["transport"] },
+          "then": { "required": ["host"] }
+        }
+      ]
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxQueuedProposals": { "type": "integer", "minimum": 0 },
+        "maxPending": { "type": "integer", "minimum": 0 },
+        "maxAgeMs": { "type": "integer", "minimum": 0 },
+        "timeoutMs": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}
