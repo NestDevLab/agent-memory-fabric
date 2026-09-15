@@ -129,6 +129,43 @@ test('audit retention GC engine and audit partitioning migration against real Po
     assert.equal(Number(sessionRow.rows[0].event_count), 0);
     assert.ok(sessionRow.rows[0].gc_completed_at);
 
+    // ---- §6 step 3: dry_run runs every read/verification step and reports what
+    //      would be deleted, but issues no DELETE and leaves the cursor/session untouched ----
+    const dryRunSession = sid('dry-run');
+    await insertSession(dryRunSession, PAST);
+    const dryRunContent = cid('dry-run');
+    await insertRawObject(dryRunContent, 64);
+    const dryRunEvent = eid('dry-run');
+    const dryRunLogical = lmid('dry-run');
+    await insertEvent({ eventId: dryRunEvent, sessionId: dryRunSession, logicalMessageId: dryRunLogical, contentId: dryRunContent });
+    await insertLogicalMessage(dryRunLogical, [dryRunEvent]);
+    await seedArchiveCoverage(dryRunSession, [dryRunEvent]);
+    await catalog.pool.query({ text: `UPDATE ${SCHEMA}.raw_sessions_v1 SET event_count = 1 WHERE session_id = $1`, values: [dryRunSession] });
+    const dryRunOutcome = await new RawGcEngine({ pool: catalog.pool, runtime: activeRuntime(), clock: now })
+      ._processSession({ sessionId: dryRunSession, firstOccurredAt: PAST, eventCount: 1 }, { dryRun: true, now: now().toISOString() });
+    assert.equal(dryRunOutcome.verified, true);
+    assert.equal(dryRunOutcome.logicalMessagesDeleted, 1, 'dry run still reports what it would have deleted');
+    assert.equal(dryRunOutcome.contentObjectsDeleted, 1);
+    assert.equal(dryRunOutcome.bytesReclaimed, 64);
+    const dryRunEventsUntouched = await catalog.pool.query({ text: `SELECT count(*)::bigint AS count FROM ${SCHEMA}.raw_events_v2 WHERE session_id = $1`, values: [dryRunSession] });
+    assert.equal(Number(dryRunEventsUntouched.rows[0].count), 1, 'dry run issues no DELETE on raw_events_v2');
+    const dryRunObjectUntouched = await catalog.pool.query({ text: `SELECT count(*)::bigint AS count FROM ${SCHEMA}.raw_objects_v2 WHERE content_id = $1`, values: [dryRunContent] });
+    assert.equal(Number(dryRunObjectUntouched.rows[0].count), 1, 'dry run issues no DELETE on raw_objects_v2');
+    const dryRunNoTombstone = await catalog.pool.query({ text: `SELECT count(*)::bigint AS count FROM ${SCHEMA}.raw_gc_tombstones_v1 WHERE session_id = $1`, values: [dryRunSession] });
+    assert.equal(Number(dryRunNoTombstone.rows[0].count), 0, 'dry run writes no tombstone');
+    const dryRunSessionRow = await catalog.pool.query({ text: `SELECT event_count, gc_completed_at FROM ${SCHEMA}.raw_sessions_v1 WHERE session_id = $1`, values: [dryRunSession] });
+    assert.equal(Number(dryRunSessionRow.rows[0].event_count), 1, 'dry run does not decrement event_count');
+    assert.equal(dryRunSessionRow.rows[0].gc_completed_at, null);
+
+    const dryRunIdempotencyTag = `gc-dry-run-${suffix}`;
+    const dryRunResult = await new RawGcEngine({ pool: catalog.pool, runtime: activeRuntime(), clock: now, sessionBatchSize: 1000 })
+      .run({ idempotencyTag: dryRunIdempotencyTag, dryRun: true });
+    assert.equal(dryRunResult.status, 'completed');
+    assert.equal(dryRunResult.dryRun, true);
+    assert.ok(dryRunResult.counters.logicalMessagesDeleted >= 1, 'a completed dry run still advances its cursor and counters');
+    const dryRunEventsStillThere = await catalog.pool.query({ text: `SELECT count(*)::bigint AS count FROM ${SCHEMA}.raw_events_v2 WHERE session_id = $1`, values: [dryRunSession] });
+    assert.equal(Number(dryRunEventsStillThere.rows[0].count), 1, 'run({dryRun:true}) still issues no DELETE');
+
     // ---- §5 condition 2: 'disabled' reader mode never authorizes deletion ----
     const disabledSession = sid('disabled-mode');
     await insertSession(disabledSession, PAST);
