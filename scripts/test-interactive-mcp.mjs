@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -100,4 +101,22 @@ test('the bridge exposes the complete common MCP surface and forwards only opera
     assert.equal(fabric.calls.length, 4); assert.deepEqual(fabric.calls[0].body.scopes, READ_SCOPES); assert.deepEqual(fabric.calls[1].body.vaultIds, READ_VAULTS); assert.equal(fabric.calls[2].url, '/v2/documents/doc:one'); assert.equal(fabric.calls[2].headers['idempotency-key'], 'write-1'); assert.deepEqual(fabric.calls[3].body, { scope: 'person:joseph', text: 'private candidate', metadata: { source: 'test' }, infer: false }); assert.equal(fabric.calls[3].headers['idempotency-key'], 'proposal-1');
     const verifier = new ContextTokenVerifier({ keyRing: handoff.keyRing, policyRevision: 'policy-v1', clock: () => NOW.getTime() }); const body = fabric.calls[0].body; const context = verifier.verify(body.contextToken, { actor: handoff.actor, purpose: 'conversation_recall', request: buildContextRequest('memory_search', body), contextKeyVersions: ['ctx-mcp-codex-v1'] }); assert.equal(context.canonicalScopes, undefined);
   } finally { await fabric.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the legacy launcher selects the complete bridge during a declarative config migration', () => {
+  const { root, options } = fixture();
+  try {
+    const completeLauncher = path.resolve('scripts/amf-interactive-mcp.mjs');
+    const input = `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })}\n`;
+    const result = spawnSync(process.execPath, ['scripts/amf-interactive-recall-mcp.mjs', completeLauncher], {
+      encoding: 'utf8',
+      input,
+      env: { ...process.env, AMF_INTERACTIVE_MCP_HANDOFF_DIR: options.handoffPath }
+    });
+    assert.equal(result.status, 0);
+    assert.equal(result.stderr, '');
+    assert.deepEqual(JSON.parse(result.stdout).result.tools.map(tool => tool.name), INTERACTIVE_MCP_TOOLS);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
