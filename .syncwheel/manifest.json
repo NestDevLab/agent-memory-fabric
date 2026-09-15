@@ -13,7 +13,24 @@
     "strategy": "cherry-pick",
     "stacks": []
   },
-  "stacks": [],
+  "stacks": [
+    {
+      "id": "chatgpt-credential-migration-recovery",
+      "branch": "syncwheel/draft/chatgpt-credential-migration-recovery",
+      "base": "origin/main",
+      "target_remote": "origin",
+      "target_branch": "main",
+      "integration_branch": "main-integration",
+      "commits": [],
+      "state": "draft",
+      "publication": {
+        "enabled": false
+      },
+      "meta": {
+        "purpose": "Preserve governed ChatGPT credential migration from integration"
+      }
+    }
+  ],
   "syncwheel_tracking": "git-tracked",
   "syncwheel_worktree_root": "var/syncwheel",
   "repository_mode": "delivery",
