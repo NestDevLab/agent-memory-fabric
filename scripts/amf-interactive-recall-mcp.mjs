@@ -1,10 +1,17 @@
 #!/usr/bin/env node
 import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
 
 import {
   createInteractiveRecallBridgeFromDirectory,
   INTERACTIVE_RECALL_HANDOFF_ENV
 } from '../src/operator/interactive-recall-mcp.mjs';
+import {
+  createInteractiveMcpBridgeFromDirectory,
+  INTERACTIVE_MCP_HANDOFF_ENV
+} from '../src/operator/interactive-mcp.mjs';
+
+const COMPLETE_LAUNCHER_PATH = fileURLToPath(new URL('./amf-interactive-mcp.mjs', import.meta.url));
 
 function safeError(error) {
   const code = String(error?.message || 'interactive_recall_bridge_failed');
@@ -12,8 +19,14 @@ function safeError(error) {
 }
 
 async function run() {
-  if (process.argv.length !== 2) throw new Error('interactive_recall_cli_argument_unknown');
-  const bridge = createInteractiveRecallBridgeFromDirectory(process.env[INTERACTIVE_RECALL_HANDOFF_ENV]);
+  const compatibilityArgument = process.argv[2];
+  const completeMode = Boolean(process.env[INTERACTIVE_MCP_HANDOFF_ENV]);
+  if (process.argv.length > 3 || (compatibilityArgument && (!completeMode || compatibilityArgument !== COMPLETE_LAUNCHER_PATH))) {
+    throw new Error('interactive_recall_cli_argument_unknown');
+  }
+  const bridge = completeMode
+    ? createInteractiveMcpBridgeFromDirectory(process.env[INTERACTIVE_MCP_HANDOFF_ENV])
+    : createInteractiveRecallBridgeFromDirectory(process.env[INTERACTIVE_RECALL_HANDOFF_ENV]);
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const line of lines) {
     if (!line.trim()) continue;
