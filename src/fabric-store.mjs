@@ -1377,7 +1377,7 @@ export class SqliteCatalog {
 }
 
 const POSTGRES_SCHEMA = 'agent_memory_fabric';
-const POSTGRES_SCHEMA_VERSION = 7;
+const POSTGRES_SCHEMA_VERSION = 8;
 const POSTGRES_SCHEMA_SQL = [
   `CREATE SCHEMA IF NOT EXISTS ${POSTGRES_SCHEMA}`,
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.schema_migrations (
@@ -1546,6 +1546,41 @@ const POSTGRES_SCHEMA_SQL = [
   `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.curator_receipt_state_v1 (
     proposal_id TEXT PRIMARY KEY REFERENCES ${POSTGRES_SCHEMA}.fabric_proposals(id), status TEXT NOT NULL,
     decision_json JSONB NOT NULL, apply_json JSONB
+  )`,
+  `ALTER TABLE ${POSTGRES_SCHEMA}.raw_sessions_v1 ADD COLUMN IF NOT EXISTS gc_completed_at TIMESTAMPTZ`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.session_archive_proof_v1 (
+    session_id TEXT PRIMARY KEY,
+    v3_conversation_id TEXT NOT NULL,
+    source_event_count BIGINT NOT NULL,
+    archived_event_count BIGINT NOT NULL,
+    reader_mode_at_verification TEXT NOT NULL,
+    shadow_mismatch_count BIGINT,
+    verified_at TIMESTAMPTZ NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.raw_gc_tombstones_v1 (
+    id TEXT PRIMARY KEY,
+    unit_type TEXT NOT NULL CHECK (unit_type IN ('logical_message','content_object')),
+    unit_id TEXT NOT NULL,
+    session_id TEXT,
+    content_ids_json JSONB NOT NULL,
+    reason_code TEXT NOT NULL CHECK (reason_code IN ('retention_expired','revoked','forgotten')),
+    archive_proof_ref TEXT,
+    expired_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS raw_gc_tombstones_v1_session_idx ON ${POSTGRES_SCHEMA}.raw_gc_tombstones_v1(session_id)`,
+  `CREATE TABLE IF NOT EXISTS ${POSTGRES_SCHEMA}.raw_gc_operations_v1 (
+    id TEXT PRIMARY KEY,
+    idempotency_tag TEXT NOT NULL UNIQUE,
+    dry_run BOOLEAN NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running','completed','aborted')),
+    cursor_state_json JSONB NOT NULL,
+    batches_processed BIGINT NOT NULL DEFAULT 0,
+    logical_messages_deleted BIGINT NOT NULL DEFAULT 0,
+    content_objects_deleted BIGINT NOT NULL DEFAULT 0,
+    bytes_reclaimed_estimate BIGINT NOT NULL DEFAULT 0,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ
   )`
 ];
 
@@ -2612,7 +2647,7 @@ export class PostgresCatalog {
   }
 }
 
-const SAFE_AUDIT_DETAIL_KEYS = new Set(['code', 'contentId', 'duplicate', 'resultCount', 'total', 'view', 'purpose', 'transport']);
+const SAFE_AUDIT_DETAIL_KEYS = new Set(['code', 'contentId', 'duplicate', 'resultCount', 'total', 'view', 'purpose', 'transport', 'sampledCount', 'windowStart', 'windowEnd']);
 
 export class FabricStore {
   constructor({ rawStore, catalog, ingestKeyRing = null, legacyV1Writes = true, clock = () => new Date(), idFactory = () => crypto.randomUUID(), retentionPolicy = {}, identityPolicy = {} }) {
