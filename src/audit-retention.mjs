@@ -1,0 +1,183 @@
+const EPHEMERAL_STATUS_ACTIONS = new Set(['memory_status']);
+
+const EPHEMERAL_OPERATIONAL_ACTIONS = new Set([
+  'context_search', 'document_read', 'documents_search', 'memory_proposal_status',
+  'memory_read', 'memory_search', 'raw_delivery_proof', 'raw_event_ingest',
+  'raw_extractor_session_read', 'raw_extractor_sessions_read', 'raw_extractor_transcript_read',
+  'session_get', 'session_transcript', 'sessions_search'
+]);
+
+const LONG_RETAINED_ACTIONS = new Set([
+  'curation_proposal_decrypt_intent', 'curation_proposal_list', 'curation_proposal_read',
+  'curation_receipt', 'curation_reconcile', 'memory_propose', 'identity_create', 'identity_read',
+  'identity_merge', 'identity_split', 'retention_plan', 'retention_apply'
+]);
+
+const FAILING_OUTCOMES = new Set(['denied', 'failed']);
+
+export const AUDIT_RETENTION_CLASSES = Object.freeze([
+  'ephemeral_status', 'ephemeral_operational', 'security_review', 'long_retained'
+]);
+
+export const DEFAULT_AUDIT_RETENTION_POLICY = Object.freeze({
+  ephemeral_status: Object.freeze({ days: 2 }),
+  ephemeral_operational: Object.freeze({ days: 10 }),
+  security_review: Object.freeze({ days: 90 }),
+  long_retained: Object.freeze({ days: null, externalArchive: false })
+});
+
+function fail(code) {
+  const error = new Error(code);
+  error.code = code;
+  throw error;
+}
+
+/**
+ * Pure function of (action, outcome) -> retention class, per docs/audit-retention-gc-v1.md §2.1.
+ * long_retained actions keep that class on every outcome; everything else with
+ * outcome denied/failed becomes security_review regardless of its normal-outcome class.
+ */
+export function classifyAuditEvent(action, outcome) {
+  if (typeof action !== 'string' || !action) fail('audit_retention_action_invalid');
+  if (typeof outcome !== 'string' || !outcome) fail('audit_retention_outcome_invalid');
+  if (LONG_RETAINED_ACTIONS.has(action)) return 'long_retained';
+  if (FAILING_OUTCOMES.has(outcome)) return 'security_review';
+  if (EPHEMERAL_STATUS_ACTIONS.has(action)) return 'ephemeral_status';
+  if (EPHEMERAL_OPERATIONAL_ACTIONS.has(action)) return 'ephemeral_operational';
+  fail('audit_retention_class_unmapped');
+}
+
+export function auditRetentionActionsByClass(retentionClass) {
+  if (retentionClass === 'ephemeral_status') return [...EPHEMERAL_STATUS_ACTIONS];
+  if (retentionClass === 'ephemeral_operational') return [...EPHEMERAL_OPERATIONAL_ACTIONS];
+  if (retentionClass === 'long_retained') return [...LONG_RETAINED_ACTIONS];
+  fail('audit_retention_class_invalid');
+}
+
+function validatePolicyEntry(retentionClass, entry) {
+  if (!entry || typeof entry !== 'object') fail('audit_retention_policy_invalid');
+  if (retentionClass === 'long_retained') {
+    if (entry.days !== null) fail('audit_retention_policy_invalid');
+    if (typeof entry.externalArchive !== 'boolean') fail('audit_retention_policy_invalid');
+    return;
+  }
+  if (!Number.isSafeInteger(entry.days) || entry.days < 1 || entry.days > 36500) fail('audit_retention_policy_invalid');
+}
+
+export function validateAuditRetentionPolicy(policy) {
+  if (!policy || typeof policy !== 'object') fail('audit_retention_policy_invalid');
+  for (const retentionClass of AUDIT_RETENTION_CLASSES) validatePolicyEntry(retentionClass, policy[retentionClass]);
+  return policy;
+}
+
+/** Window in days for a retention class, or null for "kept indefinitely". */
+export function auditRetentionWindowDays(retentionClass, policy = DEFAULT_AUDIT_RETENTION_POLICY) {
+  const entry = policy?.[retentionClass];
+  if (!entry) fail('audit_retention_class_invalid');
+  return entry.days;
+}
+
+/**
+ * True once ts is strictly older than (now - window) — mirrors the Phase A
+ * delete predicate's `ts < now() - interval` boundary: a row exactly at the
+ * boundary is retained, not deleted.
+ */
+export function isAuditRetentionExpired(retentionClass, ts, now, policy = DEFAULT_AUDIT_RETENTION_POLICY) {
+  const days = auditRetentionWindowDays(retentionClass, policy);
+  if (days == null) return false;
+  const tsMs = ts instanceof Date ? ts.getTime() : new Date(ts).getTime();
+  const nowMs = now instanceof Date ? now.getTime() : new Date(now).getTime();
+  if (!Number.isFinite(tsMs) || !Number.isFinite(nowMs)) fail('audit_retention_timestamp_invalid');
+  return nowMs - tsMs > days * 86_400_000;
+}
+
+function envInteger(env, name, fallback, { min, max }) {
+  const raw = env[name];
+  if (raw == null || raw === '') return fallback;
+  if (!/^\d+$/.test(raw)) fail(`audit_retention_env_invalid:${name}`);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < min || value > max) fail(`audit_retention_env_invalid:${name}`);
+  return value;
+}
+
+export function loadAuditRetentionPolicyFromEnv(env = process.env) {
+  const policy = {
+    ephemeral_status: { days: envInteger(env, 'AMF_AUDIT_RETENTION_EPHEMERAL_STATUS_DAYS', 2, { min: 1, max: 3 }) },
+    ephemeral_operational: { days: envInteger(env, 'AMF_AUDIT_RETENTION_EPHEMERAL_OPERATIONAL_DAYS', 10, { min: 7, max: 14 }) },
+    security_review: { days: envInteger(env, 'AMF_AUDIT_RETENTION_SECURITY_REVIEW_DAYS', 90, { min: 90, max: 90 }) },
+    long_retained: { days: null, externalArchive: String(env.AMF_AUDIT_RETENTION_LONG_RETAINED_EXTERNAL_ARCHIVE || '') === 'true' }
+  };
+  return validateAuditRetentionPolicy(policy);
+}
+
+/**
+ * Turns "one audit row per memory_status/allowed call" into "one row per
+ * (actorTag, time-bucket)" per docs/audit-retention-gc-v1.md §3. Every other
+ * action/outcome must keep writing through the normal fail-closed audit path.
+ */
+export class AuditSampler {
+  constructor({ bucketMs = 300_000, flush, clock = () => Date.now(), autoFlush = true, onFlushError } = {}) {
+    if (typeof flush !== 'function') fail('audit_sampler_flush_required');
+    if (!Number.isSafeInteger(bucketMs) || bucketMs < 1000 || bucketMs > 3_600_000) fail('audit_sampler_bucket_ms_invalid');
+    this._bucketMs = bucketMs;
+    this._flush = flush;
+    this._clock = clock;
+    this._onFlushError = typeof onFlushError === 'function' ? onFlushError : () => {};
+    this._buckets = new Map();
+    this._closed = false;
+    this._timer = null;
+    if (autoFlush) {
+      this._timer = setInterval(() => { this.flushExpired().catch(error => this._onFlushError(error)); }, bucketMs);
+      this._timer.unref?.();
+    }
+  }
+
+  _bucketStartFor(nowMs) { return Math.floor(nowMs / this._bucketMs) * this._bucketMs; }
+
+  /** Increments the current bucket's counter; never awaits or writes to storage. */
+  record(actorTag) {
+    if (this._closed) fail('audit_sampler_closed');
+    if (typeof actorTag !== 'string' || !actorTag) fail('audit_sampler_actor_required');
+    const nowMs = this._clock();
+    const bucketStartMs = this._bucketStartFor(nowMs);
+    const key = `${bucketStartMs}\u0000${actorTag}`;
+    let bucket = this._buckets.get(key);
+    if (!bucket) { bucket = { actorTag, bucketStartMs, count: 0 }; this._buckets.set(key, bucket); }
+    bucket.count += 1;
+    return bucket.count;
+  }
+
+  /** Flushes every bucket whose window has fully rolled over. */
+  async flushExpired() {
+    const currentBucketStartMs = this._bucketStartFor(this._clock());
+    const due = [];
+    for (const [key, bucket] of this._buckets) if (bucket.bucketStartMs < currentBucketStartMs) due.push([key, bucket]);
+    for (const [key, bucket] of due) {
+      this._buckets.delete(key);
+      await this._emit(bucket);
+    }
+  }
+
+  /** Flushes every bucket regardless of window state; used on shutdown. */
+  async flushAll() {
+    const all = [...this._buckets.values()];
+    this._buckets.clear();
+    for (const bucket of all) await this._emit(bucket);
+  }
+
+  async _emit(bucket) {
+    await this._flush({
+      actorTag: bucket.actorTag,
+      sampledCount: bucket.count,
+      windowStart: new Date(bucket.bucketStartMs).toISOString(),
+      windowEnd: new Date(bucket.bucketStartMs + this._bucketMs).toISOString()
+    });
+  }
+
+  async close() {
+    if (this._closed) return;
+    this._closed = true;
+    if (this._timer) clearInterval(this._timer);
+    await this.flushAll();
+  }
+}

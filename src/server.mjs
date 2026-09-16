@@ -16,6 +16,7 @@ import { validatePamRuntimePrivateDirFromEnv } from './operator/pam-runtime-priv
 import { isVerifiedMigrationPause, loadVerifiedMigrationPauseFromEnv } from './migration-pause.mjs';
 import { CONVERSATION_EVENT_V3_PATH } from './ingest/http-conversation-event-v3-endpoint.mjs';
 import { hasExactInteractiveMcpTools, INTERACTIVE_MCP_PROPOSAL_CANDIDATE_SCHEMA, INTERACTIVE_MCP_TOOLS, isInteractiveMcpActor, isMcpClientActor } from './operator/interactive-mcp-contract.mjs';
+import { AuditSampler } from './audit-retention.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 function envInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
@@ -43,6 +44,7 @@ const LIMITS = Object.freeze({
 });
 const AUTH_CACHE_TTL_MS = envInteger('AMF_AUTH_CACHE_TTL_MS', 15000, { min: 0, max: 3600000 });
 const AUDIT_TIMEOUT_MS = envInteger('AMF_AUDIT_TIMEOUT_MS', 2000, { min: 100, max: 30000 });
+const MEMORY_STATUS_AUDIT_SAMPLE_BUCKET_MS = envInteger('AMF_MEMORY_STATUS_AUDIT_SAMPLE_BUCKET_MS', 300000, { min: 1000, max: 3600000 });
 const CATALOG_HEALTH_TIMEOUT_MS = envInteger('AMF_CATALOG_HEALTH_TIMEOUT_MS', 3000, { min: 100, max: 30000 });
 const BODY_READ_TIMEOUT_MS = envInteger('AMF_BODY_READ_TIMEOUT_MS', 10000, { min: 100, max: 120000 });
 const MCP_SESSION_DEFAULTS = Object.freeze({
@@ -731,7 +733,7 @@ function buildToolsListResult(actor, policy) {
 }
 
 async function executeMcpMethod({ body, actor, policy, policies, fabricStore, canonicalStore, documentStore,
-  contextVerifier, routeManifestPath, sessionReader, conversationSessionReader, migrationPause, requestId, requestStartedAt, sourceIp, sessionId, clientName }) {
+  contextVerifier, routeManifestPath, sessionReader, conversationSessionReader, migrationPause, requestId, requestStartedAt, sourceIp, sessionId, clientName, auditSampler }) {
   const method = body.method;
   const id = body.id ?? null;
 
@@ -776,7 +778,8 @@ async function executeMcpMethod({ body, actor, policy, policies, fabricStore, ca
       requirePermission(policy, 'memory:status');
       await healthRequired(fabricStore);
       const status = buildStatus({ fabricStore, canonicalStore, documentStore, contextVerifier, conversationSessionReader, migrationPause });
-      await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
+      if (auditSampler) auditSampler.record(actor);
+      else await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
       return createRpcResult(id, { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] });
     }
 
@@ -1735,9 +1738,21 @@ const defaultCanonicalStore = createUnconfiguredCanonicalStore();
 const defaultContextVerifier = createUnconfiguredContextVerifier();
 const defaultDocumentStore = createUnconfiguredDocumentStore();
 
-function createAgentMemoryFabricServer({ fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, conversationSessionReader = null, extractorSessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), conversationEventIngest = null, clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null } = {}) {
+function createAgentMemoryFabricServer({ fabricStore = createUnconfiguredFabricStore('fabric_store_not_injected'), canonicalStore = defaultCanonicalStore, documentStore = defaultDocumentStore, contextVerifier = defaultContextVerifier, receiptCoordinator = null, sessionReader = null, conversationSessionReader = null, extractorSessionReader = null, sessionOptions = {}, bodyReadTimeoutMs = BODY_READ_TIMEOUT_MS, rawIngestBodyBytes = LIMITS.rawIngestBodyBytes, curationCursorKey = crypto.randomBytes(32), conversationEventIngest = null, clock = () => Date.now(), policyPath = POLICY_PATH, routeManifestPath = SESSION_ROUTE_MANIFEST_PATH, migrationPause = null, auditSampler = null } = {}) {
   if (conversationEventIngest !== null && typeof conversationEventIngest !== 'function') throw new Error('conversation_event_ingest_invalid');
   if (!Buffer.isBuffer(curationCursorKey) || curationCursorKey.length < 32) throw new Error('curation_cursor_key_invalid');
+  const memoryStatusAuditSampler = auditSampler || new AuditSampler({
+    bucketMs: MEMORY_STATUS_AUDIT_SAMPLE_BUCKET_MS,
+    clock,
+    flush: async ({ actorTag, sampledCount, windowStart, windowEnd }) => {
+      try {
+        await auditRequired(fabricStore, { actor: actorTag, action: 'memory_status', outcome: 'allowed', details: { sampledCount, windowStart, windowEnd } });
+      } catch (error) {
+        logEvent('memory_status_audit_sample_flush_failed', { error: safeError(error) });
+      }
+    },
+    onFlushError: error => logEvent('memory_status_audit_sample_flush_failed', { error: safeError(error) })
+  });
 if (!Number.isSafeInteger(rawIngestBodyBytes) || rawIngestBodyBytes < 1024 || rawIngestBodyBytes > 16 * 1024 * 1024) throw new Error('raw_ingest_body_limit_invalid');
 if (!isVerifiedMigrationPause(migrationPause)) {
   throw new Error('migration_pause_state_invalid');
@@ -1844,7 +1859,7 @@ const requestHandler = async (req, res) => {
       requirePermission(policy, 'memory:status');
       await healthRequired(fabricStore);
       const response = buildStatus({ fabricStore, canonicalStore, documentStore, contextVerifier, conversationSessionReader, migrationPause });
-      await auditRequired(fabricStore, { actor, action: 'memory_status', outcome: 'allowed', requestId });
+      memoryStatusAuditSampler.record(actor);
       return json(res, 200, v2Envelope(requestId, response));
     } catch (error) {
       const failure = v2Error(requestId, error, 403);
@@ -2533,7 +2548,8 @@ const requestHandler = async (req, res) => {
         requestStartedAt,
         sourceIp,
         sessionId,
-        clientName: session.clientName
+        clientName: session.clientName,
+        auditSampler: memoryStatusAuditSampler
       });
 
       if (responseBody === null) {
@@ -2601,7 +2617,8 @@ const requestHandler = async (req, res) => {
         requestStartedAt,
         sourceIp,
         sessionId,
-        clientName: session.clientName
+        clientName: session.clientName,
+        auditSampler: memoryStatusAuditSampler
       });
       if (responseBody !== null) {
         sendSse(session.res, 'message', responseBody);
@@ -2652,6 +2669,9 @@ const applicationServer = http.createServer((req, res) => {
   });
 });
 applicationServer.on('close', () => {
+  Promise.resolve(memoryStatusAuditSampler.close()).catch((error) => {
+    logEvent('memory_status_audit_sampler_close_failed', { error: safeError(error) });
+  });
   Promise.resolve(fabricStore.close?.()).catch((error) => {
     logEvent('fabric_store_close_failed', { error: safeError(error) });
   });
