@@ -147,7 +147,8 @@ Behavior:
 - Stops on the first error, at `--max-batches`, or when a batch deletes nothing
   (`stopReason: drained`).
 - `--vacuum-every N` runs plain `VACUUM (ANALYZE)` on the audit table after every
-  N batches (N at most `--max-batches`). Never `VACUUM FULL`. Without the flag,
+  N batches (N at most `--max-batches`), after that batch's free-space probe and
+  followed by another probe. A VACUUM failure stops the run (`vacuum_failed`). Never `VACUUM FULL`. Without the flag,
   run it yourself from `psql` when load allows. VACUUM makes space reusable; it
   rarely returns it to the OS.
 

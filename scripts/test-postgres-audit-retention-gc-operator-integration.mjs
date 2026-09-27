@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import pg from 'pg';
 
 import { PostgresCatalog } from '../src/fabric-store.mjs';
 import { openOperatorLog } from '../src/operator/audit-retention-gc-operator.mjs';
@@ -84,7 +85,7 @@ test('audit retention operator CLI against real PostgreSQL', { skip: !enabled },
       bucket.push(id);
       await catalog.pool.query({ text: `INSERT INTO ${SCHEMA}.audit_events_v2(id,ts,actor_tag,action,outcome,details_json) VALUES ($1,$2,'integration-actor',$3,$4,'{}'::jsonb)`, values: [id, ts, action, outcome] });
     }
-    for (let i = 0; i < 8; i += 1) await insert('memory_status', 'allowed', '2000-01-01T00:00:00.000Z', expired);
+    for (let i = 0; i < 10; i += 1) await insert('memory_status', 'allowed', '2000-01-01T00:00:00.000Z', expired);
     for (let i = 0; i < 3; i += 1) await insert('raw_ingest_decrypt_intent', 'authorized', '2000-01-01T00:00:00.000Z', expired);
     const expiredRemaining = async () => Number((await catalog.pool.query({ text: `SELECT count(*)::bigint AS count FROM ${SCHEMA}.audit_events_v2 WHERE id = ANY($1::text[])`, values: [expired] })).rows[0].count);
     await insert('session_get', 'allowed', '2000-01-01T00:00:00.000Z', expired);
@@ -180,10 +181,33 @@ await runCli(['node', 'cli', ...args], {
     assert.deepEqual(runRecords(logError.details.runId).map(line => [line.type, line.outcome, line.error]),
       [['start', undefined, undefined], ['end', 'stopped', 'operator_log_write_failed']]);
 
+    // VACUUM failing after a committed DELETE: the post-DELETE probe still ran and was logged
+    class VacuumFailingPool extends pg.Pool {
+      query(queryText, ...rest) {
+        if (typeof queryText === 'string' && queryText.startsWith('VACUUM')) {
+          return Promise.reject(Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' }));
+        }
+        return super.query(queryText, ...rest);
+      }
+    }
+    const vacuumProbe = match();
+    const beforeVacuumFailure = await expiredRemaining();
+    const vacuumError = await runCli(['node', 'cli', ...applyArgs({ '--vacuum-every': '1' }), '--database-url', connectionString, '--ssl-mode', SSL_MODE],
+      { Pool: VacuumFailingPool, runCommand: vacuumProbe.runCommand, now: () => NOW }).catch(error => error);
+    assert.equal(vacuumError.code, 'operator_vacuum_failed');
+    assert.equal(beforeVacuumFailure - await expiredRemaining(), 2, 'one DELETE committed before VACUUM failed');
+    const vacuumRecords = runRecords(vacuumError.details.runId);
+    assert.deepEqual(vacuumRecords.map(line => line.type), ['start', 'batch', 'end']);
+    assert.equal(vacuumRecords[1].probe.freeBytes, 50_000_000_000, 'post-DELETE probe logged');
+    assert.deepEqual(vacuumRecords[1].vacuum, { error: '55P03' });
+    assert.equal(vacuumRecords[1].probeAfterVacuum, undefined);
+    assert.deepEqual([vacuumRecords[2].outcome, vacuumRecords[2].stopReason], ['stopped', 'vacuum_failed']);
+    assert.equal(vacuumProbe.calls.filter(argv => argv[4].includes("'df'")).length, 2, 'initial probe plus the post-DELETE probe');
+
     const applied = await cli(applyArgs({ '--vacuum-every': '1' }));
     assert.equal(applied.result.dryRun, false);
     assert.equal(applied.result.stopReason, 'drained');
-    assert.equal(applied.result.totalDeleted, expired.length - 10);
+    assert.equal(applied.result.totalDeleted, expired.length - 12);
     assert.match(applied.result.attestation, /cannot verify/);
     assert.equal(applied.result.target.confirmTarget, confirmTarget);
     const remaining = await survivors();
@@ -197,6 +221,7 @@ await runCli(['node', 'cli', ...args], {
     const appliedBatches = appliedRecords.filter(line => line.type === 'batch');
     assert.equal(appliedBatches.length, applied.result.batches.length);
     assert.ok(appliedBatches.every(batch => batch.deletedByClass.long_retained === 0 && batch.probe.freeBytes === 50_000_000_000));
+    assert.ok(appliedBatches.filter(batch => batch.deletedCount > 0).every(batch => batch.vacuum === 'ok' && batch.probeAfterVacuum.freeBytes === 50_000_000_000));
 
     const rerun = await cli(applyArgs());
     assert.equal(rerun.result.totalDeleted, 0);

@@ -199,16 +199,22 @@ export async function runInventory({ pool, table = AUDIT_TABLE, policy = DEFAULT
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+function errorCodeOf(error, fallback) {
+  return typeof error?.code === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(error.code) ? error.code : fallback;
+}
+
 function stopReasonFor(error) {
   const code = typeof error?.code === 'string' ? error.code : '';
   if (code.startsWith('operator_free_space_')) return code.replace('operator_', '');
   if (code === 'operator_log_write_failed') return 'log_write_failed';
+  if (code === 'operator_vacuum_failed') return 'vacuum_failed';
   return 'error';
 }
 
 /**
- * Bounded Phase A apply. Free space is probed before the first batch and after every committed
- * batch (or starts from a checked `initialProbe`), so the floor and drop checks cover the last commit too. `onBatch` must durably record
+ * Bounded Phase A apply. Free space is probed before the first batch (or starts from a checked
+ * `initialProbe`) and right after every committed DELETE, before any optional VACUUM, which gets its
+ * own probe; the floor and drop checks cover the last commit too. `onBatch` must durably record
  * each committed batch; if it throws, the run stops. Plain VACUUM (never FULL) only with
  * `vacuumEvery`.
  */
@@ -236,19 +242,27 @@ export async function runAuditPhaseAApply({
     for (let index = 1; index <= maxBatches; index += 1) {
       const result = await runPhaseADeleteBatch({ pool, table, policy, asOf, batchSize, lockTimeoutMs, statementTimeoutMs });
       totalDeleted += result.deletedCount;
-      const probesBefore = probes.length;
-      let probeError = null;
-      try {
-        if (vacuumEvery && result.deletedCount > 0 && index % vacuumEvery === 0) await pool.query(`VACUUM (ANALYZE) ${qualified}`);
-        await measure();
-      } catch (caught) {
-        probeError = caught;
+      const record = { batch: index, deletedCount: result.deletedCount, deletedByClass: result.deletedByClass };
+      let stepError = null;
+      const probeStep = async () => {
+        const probesBefore = probes.length;
+        try { await measure(); } catch (caught) { stepError = caught; }
+        return probes.length > probesBefore ? probes.at(-1) : { error: errorCodeOf(stepError, 'probe_failed') };
+      };
+      record.probe = await probeStep();
+      if (!stepError && vacuumEvery && result.deletedCount > 0 && index % vacuumEvery === 0) {
+        try {
+          await pool.query(`VACUUM (ANALYZE) ${qualified}`);
+          record.vacuum = 'ok';
+        } catch (caught) {
+          record.vacuum = { error: errorCodeOf(caught, 'vacuum_failed') };
+          stepError = Object.assign(new Error('operator_vacuum_failed'), { code: 'operator_vacuum_failed' });
+        }
+        if (!stepError) record.probeAfterVacuum = await probeStep();
       }
-      const probeAfter = probes.length > probesBefore ? probes.at(-1) : { error: typeof probeError?.code === 'string' ? probeError.code : 'probe_failed' };
-      const record = { batch: index, deletedCount: result.deletedCount, deletedByClass: result.deletedByClass, probe: probeAfter };
       batches.push(record);
       try { await onBatch(record); } catch { fail('operator_log_write_failed', { batch: index }); }
-      if (probeError) throw probeError;
+      if (stepError) throw stepError;
       if (result.deletedCount === 0) { stopReason = 'drained'; break; }
       if (index < maxBatches) await sleepFn(pauseMs);
     }
