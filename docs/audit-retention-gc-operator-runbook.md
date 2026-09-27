@@ -28,8 +28,15 @@ Enforced:
   integer; the CLI builds argument arrays and never a local shell string. The
   CLI host's own disk is never measured. Without a probe, `inventory` and the
   preview report free space as `unknown`; `--apply` refuses.
+
+  Caveat: a physical replica shares the primary's `system_identifier`, and `df`
+  on `data_directory` doesn't see a separate WAL mount. Before applying, confirm
+  the probed container runs the primary (`select pg_is_in_recovery()` returns
+  `f` there) and, if `pg_wal` is a separate filesystem, check its free space
+  yourself.
 - **Read-only previews.** `inventory` and `audit-phase-a` without `--apply` run
-  in `READ ONLY` transactions.
+  in `READ ONLY` transactions, each query bounded by `--statement-timeout-ms`
+  (default 300000). They scan the whole audit table, so run them off-peak.
 - **Target table.** Only `agent_memory_fabric.audit_events_v2`; `--table` with
   any other value refuses.
 
@@ -38,10 +45,23 @@ Not enforced, recorded only: `--approval`, `--backup-id`, and
 shape and that the backup timestamp is recent (`--max-backup-age-hours`,
 default 24); it cannot know whether the approval was given or whether the
 backup exists and restores. A second person must check those records before
-`--apply`. Every apply attempt, refused or not, appends one JSON line to
-`--operator-log <path>` (required with `--apply`): time, target identity,
-checkpoint, backup id and verified-at, options, free-space probes, per-batch
-results, stop reason, and outcome (`refused`, `stopped_on_error`, `completed`).
+`--apply`.
+
+**Operator log.** `--operator-log <path>` is required with `--apply`. Every record
+is one JSON line, fsynced before the CLI moves on, all sharing the run's `runId`:
+
+- `refused`: the attempt stopped before any delete (target identity,
+  checkpoint, backup attestation, error).
+- `start`: written before the first delete (target identity, checkpoint, backup
+  attestation, options, first free-space probe).
+- `batch`: one per committed batch (index, deleted counts by class, the probe
+  taken after it).
+- `end`: outcome `completed` or `stopped`, stop reason, totals.
+
+If a write fails after a batch, the run stops and reports
+`operator_log_write_failed`, never success. A run with `start` but no `end` was
+interrupted: at most one committed batch after the last `batch` record is
+unlogged, so reconcile with `inventory` before rerunning.
 
 ## Prerequisites
 
@@ -75,7 +95,9 @@ npm run operator:audit-retention-gc -- audit-phase-a \
 
 Reports `eligibleByClass` and `eligibleTotal`; `long_retained` is always 0.
 
-## Step 3: apply (checkpoint `audit-bulk-delete`)
+## Step 3: first apply, one small batch
+
+Off-peak, delete a single small batch and measure before anything else:
 
 ```sh
 npm run operator:audit-retention-gc -- audit-phase-a --apply \
@@ -84,29 +106,54 @@ npm run operator:audit-retention-gc -- audit-phase-a --apply \
   --backup-id <backup-id> --backup-verified-at <iso8601> \
   --operator-log /var/log/amf/audit-retention-operator.jsonl \
   --db-host-probe pct --proxmox-host <proxmox-host> --ctid <ctid> \
-  --batch-size 5000 --pause-ms 1000 --max-batches 100 --probe-every 5 \
+  --batch-size 1000 --max-batches 1 \
   --free-space-floor-bytes 2000000000 --max-free-space-drop-bytes 268435456 \
   --database-url "$AMF_OPERATOR_DATABASE_URL" --ssl-mode verify-full --json
 ```
 
+Then check, before any further run:
+
+- the `batch` record's `deletedByClass` holds only the classes you expected;
+- batch latency, and whether anything waited on locks (`pg_stat_activity`,
+  `pg_locks`) or hit `lock_timeout`/`statement_timeout`;
+- WAL and archive backlog (`pg_stat_archiver`, `pg_wal` size, replication lag);
+- dead tuples on the table (`pg_stat_user_tables.n_dead_tup`);
+- free space on the database data filesystem and on any separate WAL mount.
+
+Stop on any failed probe, timeout, unexpected class, or shrinking headroom.
+
+## Step 4: paced runs
+
+Only while Step 3's measurements stay safe:
+
+```sh
+npm run operator:audit-retention-gc -- audit-phase-a --apply \
+  <same guard, log, and probe flags as Step 3> \
+  --batch-size 5000 --pause-ms 1000 --max-batches 20 \
+  --free-space-floor-bytes 2000000000 --max-free-space-drop-bytes 268435456
+```
+
 Behavior:
 
-- Probes free space before the first batch, then every `--probe-every` batches.
-  Stops when free space is below `--free-space-floor-bytes` or dropped by more
-  than `--max-free-space-drop-bytes` since the previous probe (DELETE writes
-  WAL before any space comes back).
+- Free space is probed before the first batch and after every committed batch,
+  the last one included. The run stops when it is below
+  `--free-space-floor-bytes` or dropped by more than
+  `--max-free-space-drop-bytes` since the previous probe (DELETE writes WAL
+  before any space comes back).
 - Each batch is one transaction with `--lock-timeout-ms` (default 5000) and
-  `--statement-timeout-ms` (default 120000), deleting at most `--batch-size`
-  of the oldest eligible rows; it rolls back if any deleted row disagrees with
-  the classifier. `--pause-ms` sleeps between batches.
+  `--statement-timeout-ms` (default 120000 for apply), deleting at most
+  `--batch-size` of the oldest eligible rows; it rolls back if any deleted row
+  disagrees with the classifier. `--pause-ms` sleeps between batches.
 - Stops on the first error, at `--max-batches`, or when a batch deletes nothing
   (`stopReason: drained`).
-- `--vacuum-between-groups` runs plain `VACUUM (ANALYZE)` on the audit table
-  before each re-probe. Never `VACUUM FULL`. Without the flag, run it yourself
-  from `psql` when load allows.
+- `--vacuum-every N` runs plain `VACUUM (ANALYZE)` on the audit table after every
+  N batches (N at most `--max-batches`). Never `VACUUM FULL`. Without the flag,
+  run it yourself from `psql` when load allows. VACUUM makes space reusable; it
+  rarely returns it to the OS.
 
-The predicate re-selects whatever is still eligible, so rerunning after a stop is
-safe; after draining, a rerun deletes nothing.
+Re-measure between runs as in Step 3. The predicate re-selects whatever is still
+eligible, so rerunning after a stop is safe; after draining, a rerun deletes
+nothing.
 
 ## Rollback
 

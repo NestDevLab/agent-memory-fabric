@@ -119,4 +119,5 @@ test('CLI exposes only inventory and audit-phase-a, and only the canonical table
   }
   await assert.rejects(runCli(['node', 'cli', 'inventory', '--table', 'audit_events_v2_legacy']), { code: 'audit_retention_table_not_allowed' });
   await assert.rejects(runCli(['node', 'cli', 'inventory', '--filesystem-path', '/']), { code: 'operator_cli_argument_unknown' });
+  await assert.rejects(runCli(['node', 'cli', 'audit-phase-a', '--probe-every', '5']), { code: 'operator_cli_argument_unknown' });
 });

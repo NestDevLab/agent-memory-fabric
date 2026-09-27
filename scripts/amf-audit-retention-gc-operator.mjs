@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
@@ -7,25 +8,27 @@ import { DEFAULT_AUDIT_RETENTION_POLICY } from '../src/audit-retention.mjs';
 import { AUDIT_TABLE, previewPhaseA } from '../src/audit-retention-cleanup.mjs';
 import {
   ATTESTATION_NOTICE, CHECKPOINTS, createPctDbHostProbe, defaultRunCommand, fail, openOperatorLog,
-  readTargetIdentity, requireBackupAttestation, requireLiveMutationGuard, runAuditPhaseAApply,
+  readTargetIdentity, requireBackupAttestation, requireFreeSpace, requireLiveMutationGuard, runAuditPhaseAApply,
   runInventory, sslConfigFromMode
 } from '../src/operator/audit-retention-gc-operator.mjs';
 
 const DEFAULT_FREE_SPACE_FLOOR_BYTES = 2_000_000_000;
 const DEFAULT_MAX_FREE_SPACE_DROP_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_BACKUP_AGE_HOURS = 24;
+const DEFAULT_READ_ONLY_STATEMENT_TIMEOUT_MS = 300_000;
+const DEFAULT_APPLY_STATEMENT_TIMEOUT_MS = 120_000;
 
 const CONNECTION_SINGLES = ['--database-url', '--ssl-mode', '--ssl-ca-path', '--table', '--db-host-probe', '--proxmox-host', '--ctid'];
 
 const SPECS = {
   inventory: {
     flags: new Set(['--json']),
-    singles: new Set(CONNECTION_SINGLES)
+    singles: new Set([...CONNECTION_SINGLES, '--statement-timeout-ms'])
   },
   'audit-phase-a': {
-    flags: new Set(['--json', '--apply', '--i-know-this-is-live', '--vacuum-between-groups']),
+    flags: new Set(['--json', '--apply', '--i-know-this-is-live']),
     singles: new Set([...CONNECTION_SINGLES, '--approval', '--confirm-target', '--backup-id', '--backup-verified-at',
-      '--max-backup-age-hours', '--operator-log', '--batch-size', '--pause-ms', '--max-batches', '--probe-every',
+      '--max-backup-age-hours', '--operator-log', '--batch-size', '--pause-ms', '--max-batches', '--vacuum-every',
       '--free-space-floor-bytes', '--max-free-space-drop-bytes', '--lock-timeout-ms', '--statement-timeout-ms'])
   }
 };
@@ -83,21 +86,45 @@ function errorCode(error) {
   return typeof error?.code === 'string' && /^[a-z][a-z0-9_]{2,63}$/.test(error.code) ? error.code : 'operator_cli_failed';
 }
 
-async function runPhaseA({ pool, values, identity, makeProbe, now }) {
+function readOnlyTimeout(values) {
+  return integerFlag(values, '--statement-timeout-ms', DEFAULT_READ_ONLY_STATEMENT_TIMEOUT_MS, { min: 1000, max: 3_600_000 });
+}
+
+function applyOptions(values) {
+  const options = {
+    batchSize: integerFlag(values, '--batch-size', 5000, { min: 1, max: 100_000 }),
+    pauseMs: integerFlag(values, '--pause-ms', 1000, { min: 0, max: 600_000 }),
+    maxBatches: integerFlag(values, '--max-batches', 100, { min: 1, max: 100_000 }),
+    floorBytes: integerFlag(values, '--free-space-floor-bytes', DEFAULT_FREE_SPACE_FLOOR_BYTES, { min: 0, max: Number.MAX_SAFE_INTEGER }),
+    maxDropBytes: integerFlag(values, '--max-free-space-drop-bytes', DEFAULT_MAX_FREE_SPACE_DROP_BYTES, { min: 0, max: Number.MAX_SAFE_INTEGER }),
+    lockTimeoutMs: integerFlag(values, '--lock-timeout-ms', 5000, { min: 100, max: 600_000 }),
+    statementTimeoutMs: integerFlag(values, '--statement-timeout-ms', DEFAULT_APPLY_STATEMENT_TIMEOUT_MS, { min: 1000, max: 3_600_000 }),
+    vacuumEvery: integerFlag(values, '--vacuum-every', 0, { min: 0, max: 100_000 })
+  };
+  if (options.vacuumEvery > options.maxBatches) fail('operator_vacuum_every_invalid');
+  return options;
+}
+
+async function runPhaseA({ pool, values, identity, makeProbe, deps }) {
+  const { now } = deps;
   const policy = DEFAULT_AUDIT_RETENTION_POLICY;
   if (!values['--apply']) {
     const probe = makeProbe();
-    const preview = await previewPhaseA({ pool, policy });
+    const preview = await previewPhaseA({ pool, policy, statementTimeoutMs: readOnlyTimeout(values) });
     return { dryRun: true, ...preview, freeSpace: probe ? await probe() : 'unknown' };
   }
 
-  const log = openOperatorLog(values['--operator-log']);
-  const entry = {
-    schema: 'amf.audit-retention-operator-log/v1', ts: now().toISOString(), command: 'audit-phase-a',
+  const log = deps.openOperatorLog(values['--operator-log']);
+  const runId = crypto.randomUUID();
+  const write = record => log.append({ schema: 'amf.audit-retention-operator-log/v2', runId, command: 'audit-phase-a', ts: now().toISOString(), ...record });
+  const header = {
     target: publicIdentity(identity), checkpoint: values['--approval'] ?? null,
     backup: { id: values['--backup-id'] ?? null, verifiedAt: values['--backup-verified-at'] ?? null },
-    attestation: ATTESTATION_NOTICE, batches: [], outcome: 'refused'
+    attestation: ATTESTATION_NOTICE
   };
+  let started = false;
+  let result = null;
+  let failure = null;
   try {
     requireLiveMutationGuard({
       apply: true, approval: values['--approval'], requiredCheckpoint: CHECKPOINTS.AUDIT_BULK_DELETE,
@@ -109,36 +136,41 @@ async function runPhaseA({ pool, values, identity, makeProbe, now }) {
     });
     const probe = makeProbe();
     if (!probe) fail('operator_db_host_probe_required');
-    const options = {
-      batchSize: integerFlag(values, '--batch-size', 5000, { min: 1, max: 100_000 }),
-      pauseMs: integerFlag(values, '--pause-ms', 1000, { min: 0, max: 600_000 }),
-      maxBatches: integerFlag(values, '--max-batches', 100, { min: 1, max: 100_000 }),
-      probeEvery: integerFlag(values, '--probe-every', 5, { min: 1, max: 10_000 }),
-      floorBytes: integerFlag(values, '--free-space-floor-bytes', DEFAULT_FREE_SPACE_FLOOR_BYTES, { min: 0, max: Number.MAX_SAFE_INTEGER }),
-      maxDropBytes: integerFlag(values, '--max-free-space-drop-bytes', DEFAULT_MAX_FREE_SPACE_DROP_BYTES, { min: 0, max: Number.MAX_SAFE_INTEGER }),
-      lockTimeoutMs: integerFlag(values, '--lock-timeout-ms', 5000, { min: 100, max: 600_000 }),
-      statementTimeoutMs: integerFlag(values, '--statement-timeout-ms', 120_000, { min: 1000, max: 3_600_000 }),
-      vacuumBetweenGroups: Boolean(values['--vacuum-between-groups'])
-    };
-    entry.options = options;
-    const result = await runAuditPhaseAApply({ pool, policy, asOf: now().toISOString(), probe, ...options });
-    Object.assign(entry, {
-      asOf: result.asOf, batches: result.batches, probes: result.probes, totalDeleted: result.totalDeleted,
-      stopReason: result.stopReason, outcome: !result.error ? 'completed' : result.batches.length ? 'stopped_on_error' : 'refused',
-      ...(result.error ? { error: errorCode(result.error) } : {})
+    const options = applyOptions(values);
+    const initialProbe = requireFreeSpace({ probe: await probe(), previous: null, floorBytes: options.floorBytes, maxDropBytes: options.maxDropBytes });
+    const asOf = now().toISOString();
+    try { write({ type: 'start', ...header, asOf, options, initialProbe }); } catch { fail('operator_log_write_failed'); }
+    started = true;
+    result = await runAuditPhaseAApply({
+      pool, policy, asOf, probe, initialProbe, ...options, sleepFn: deps.sleep,
+      onBatch: record => write({ type: 'batch', ...record })
     });
-    if (result.error) {
-      result.error.details = { ...result.error.details, stopReason: result.stopReason, totalDeleted: result.totalDeleted, batches: result.batches.length };
-      throw result.error;
+    failure = result.error;
+  } catch (error) {
+    failure = error;
+  }
+
+  try {
+    if (!started) {
+      try { write({ type: 'refused', ...header, error: errorCode(failure) }); } catch { /* refusing anyway */ }
+      throw failure;
+    }
+    try {
+      write({
+        type: 'end', outcome: failure ? 'stopped' : 'completed', stopReason: result?.stopReason ?? 'error',
+        totalDeleted: result?.totalDeleted ?? 0, batches: result?.batches.length ?? 0, ...(failure ? { error: errorCode(failure) } : {})
+      });
+    } catch {
+      failure ??= Object.assign(new Error('operator_log_write_failed'), { code: 'operator_log_write_failed' });
+    }
+    if (failure) {
+      failure.details = { ...failure.details, runId, stopReason: result?.stopReason ?? 'error', totalDeleted: result?.totalDeleted ?? 0, batches: result?.batches.length ?? 0 };
+      throw failure;
     }
     const { error, ...summary } = result;
-    return { dryRun: false, attestation: ATTESTATION_NOTICE, ...summary };
-  } catch (error) {
-    entry.error ??= errorCode(error);
-    throw error;
+    return { dryRun: false, runId, attestation: ATTESTATION_NOTICE, ...summary };
   } finally {
-    entry.finishedAt = now().toISOString();
-    try { log.append(entry); } finally { log.close(); }
+    log.close();
   }
 }
 
@@ -151,8 +183,8 @@ async function run(command, values, deps) {
     const target = publicIdentity(identity);
     try {
       const makeProbe = () => probeFor(values, identity, deps.runCommand);
-      if (command === 'inventory') return { command, target, ...await runInventory({ pool, identity, probe: makeProbe() }) };
-      return { command, target, ...await runPhaseA({ pool, values, identity, makeProbe, now: deps.now }) };
+      if (command === 'inventory') return { command, target, ...await runInventory({ pool, probe: makeProbe(), statementTimeoutMs: readOnlyTimeout(values) }) };
+      return { command, target, ...await runPhaseA({ pool, values, identity, makeProbe, deps }) };
     } catch (error) {
       if (error && typeof error === 'object') error.target = target;
       throw error;
@@ -177,7 +209,9 @@ export async function runCli(argv = process.argv, dependencies = {}) {
   const deps = {
     Pool: dependencies.Pool ?? pg.Pool,
     runCommand: dependencies.runCommand ?? defaultRunCommand,
-    now: dependencies.now ?? (() => new Date())
+    now: dependencies.now ?? (() => new Date()),
+    sleep: dependencies.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
+    openOperatorLog: dependencies.openOperatorLog ?? openOperatorLog
   };
   const result = await run(command, values, deps);
   return { result, json: Boolean(values['--json']) };

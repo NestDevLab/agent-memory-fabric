@@ -183,11 +183,11 @@ async function readOnlyScalar(pool, text, values) {
 }
 
 /** Read-only: identity, audit table size, counts per pair and class, Phase A eligibility, free space. */
-export async function runInventory({ pool, identity, table = AUDIT_TABLE, policy = DEFAULT_AUDIT_RETENTION_POLICY, asOf = new Date().toISOString(), probe = null }) {
+export async function runInventory({ pool, table = AUDIT_TABLE, policy = DEFAULT_AUDIT_RETENTION_POLICY, asOf = new Date().toISOString(), probe = null, statementTimeoutMs }) {
   const qualified = qualifiedAuditTable(table);
   const size = await readOnlyScalar(pool, 'SELECT pg_total_relation_size($1::regclass)::bigint AS bytes', [qualified]);
-  const rows = await countAuditRowsByPair({ pool, table });
-  const eligible = await previewPhaseA({ pool, table, policy, asOf });
+  const rows = await countAuditRowsByPair({ pool, table, statementTimeoutMs });
+  const eligible = await previewPhaseA({ pool, table, policy, asOf, statementTimeoutMs });
   return {
     schema: 'amf.audit-retention-inventory/v1',
     asOf: eligible.asOf,
@@ -199,45 +199,67 @@ export async function runInventory({ pool, identity, table = AUDIT_TABLE, policy
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+function stopReasonFor(error) {
+  const code = typeof error?.code === 'string' ? error.code : '';
+  if (code.startsWith('operator_free_space_')) return code.replace('operator_', '');
+  if (code === 'operator_log_write_failed') return 'log_write_failed';
+  return 'error';
+}
+
 /**
- * Bounded Phase A apply: batches with a pause, free space re-probed every `probeEvery` batches,
- * stop on floor breach, on a drop beyond `maxDropBytes` since the previous probe, or on any
- * error. Plain VACUUM (never FULL) between groups only when `vacuumBetweenGroups` is set.
+ * Bounded Phase A apply. Free space is probed before the first batch and after every committed
+ * batch (or starts from a checked `initialProbe`), so the floor and drop checks cover the last commit too. `onBatch` must durably record
+ * each committed batch; if it throws, the run stops. Plain VACUUM (never FULL) only with
+ * `vacuumEvery`.
  */
 export async function runAuditPhaseAApply({
   pool, table = AUDIT_TABLE, policy = DEFAULT_AUDIT_RETENTION_POLICY, asOf = new Date().toISOString(),
-  batchSize = 5000, pauseMs = 1000, maxBatches = 1000, probeEvery = 5, floorBytes, maxDropBytes,
-  vacuumBetweenGroups = false, lockTimeoutMs, statementTimeoutMs, probe, onBatch = () => {}, sleepFn = sleep
+  batchSize = 5000, pauseMs = 1000, maxBatches = 100, floorBytes, maxDropBytes, vacuumEvery = 0,
+  lockTimeoutMs, statementTimeoutMs, probe, initialProbe = null, onBatch = async () => {}, sleepFn = sleep
 }) {
+  if (!Number.isSafeInteger(vacuumEvery) || vacuumEvery < 0 || vacuumEvery > maxBatches) fail('operator_vacuum_every_invalid');
   const qualified = qualifiedAuditTable(table);
   const batches = [];
   const probes = [];
   let stopReason = 'max_batches';
   let error = null;
   let totalDeleted = 0;
+  const measure = async () => {
+    const measured = await probe();
+    const previous = probes.at(-1) ?? null;
+    probes.push(measured);
+    return requireFreeSpace({ probe: measured, previous, floorBytes, maxDropBytes });
+  };
   try {
-    probes.push(requireFreeSpace({ probe: await probe(), previous: null, floorBytes, maxDropBytes }));
+    if (initialProbe) probes.push(requireFreeSpace({ probe: initialProbe, previous: null, floorBytes, maxDropBytes }));
+    else await measure();
     for (let index = 1; index <= maxBatches; index += 1) {
       const result = await runPhaseADeleteBatch({ pool, table, policy, asOf, batchSize, lockTimeoutMs, statementTimeoutMs });
-      const record = { batch: index, deletedCount: result.deletedCount, deletedByClass: result.deletedByClass };
-      batches.push(record);
       totalDeleted += result.deletedCount;
-      onBatch(record);
-      if (result.deletedCount === 0) { stopReason = 'drained'; break; }
-      if (index % probeEvery === 0) {
-        if (vacuumBetweenGroups) await pool.query(`VACUUM (ANALYZE) ${qualified}`);
-        probes.push(requireFreeSpace({ probe: await probe(), previous: probes.at(-1), floorBytes, maxDropBytes }));
+      const probesBefore = probes.length;
+      let probeError = null;
+      try {
+        if (vacuumEvery && result.deletedCount > 0 && index % vacuumEvery === 0) await pool.query(`VACUUM (ANALYZE) ${qualified}`);
+        await measure();
+      } catch (caught) {
+        probeError = caught;
       }
+      const probeAfter = probes.length > probesBefore ? probes.at(-1) : { error: typeof probeError?.code === 'string' ? probeError.code : 'probe_failed' };
+      const record = { batch: index, deletedCount: result.deletedCount, deletedByClass: result.deletedByClass, probe: probeAfter };
+      batches.push(record);
+      try { await onBatch(record); } catch { fail('operator_log_write_failed', { batch: index }); }
+      if (probeError) throw probeError;
+      if (result.deletedCount === 0) { stopReason = 'drained'; break; }
       if (index < maxBatches) await sleepFn(pauseMs);
     }
   } catch (caught) {
     error = caught;
-    stopReason = typeof caught?.code === 'string' && caught.code.startsWith('operator_free_space_') ? caught.code.replace('operator_', '') : 'error';
+    stopReason = stopReasonFor(caught);
   }
   return { asOf: new Date(asOf).toISOString(), totalDeleted, batches, probes, stopReason, error };
 }
 
-/** One JSON line per apply attempt; opened before any mutation so an unwritable log refuses early. */
+/** Append-only JSONL, fsynced per record; opened before any mutation so an unwritable log refuses early. */
 export function openOperatorLog(logPath) {
   if (typeof logPath !== 'string' || !logPath) fail('operator_log_required');
   let fd;
