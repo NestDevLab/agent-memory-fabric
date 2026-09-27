@@ -2612,7 +2612,7 @@ export class PostgresCatalog {
   }
 }
 
-const SAFE_AUDIT_DETAIL_KEYS = new Set(['code', 'contentId', 'duplicate', 'resultCount', 'total', 'view', 'purpose', 'transport']);
+const SAFE_AUDIT_DETAIL_KEYS = new Set(['code', 'contentId', 'duplicate', 'resultCount', 'total', 'view', 'purpose', 'transport', 'sampledCount', 'windowStart', 'windowEnd']);
 
 export class FabricStore {
   constructor({ rawStore, catalog, ingestKeyRing = null, legacyV1Writes = true, clock = () => new Date(), idFactory = () => crypto.randomUUID(), retentionPolicy = {}, identityPolicy = {} }) {
