@@ -281,6 +281,30 @@ test('RAW ingest behavior is unchanged when no migration pause is configured', a
   });
 });
 
+test('memory_status/allowed is sampled and flushed before the fabric store closes on shutdown', async () => {
+  const fabricStore = makeStore();
+  const order = [];
+  const originalAudit = fabricStore.audit.bind(fabricStore);
+  fabricStore.audit = async event => {
+    await new Promise(resolve => setTimeout(resolve, 20));
+    order.push(`audit:${event.action}:${event.details?.sampledCount ?? '-'}`);
+    return originalAudit(event);
+  };
+  let closed;
+  const closedPromise = new Promise(resolve => { closed = resolve; });
+  fabricStore.close = async () => { order.push('close'); closed(); };
+  await withServer(async ({ api }) => {
+    for (let i = 0; i < 3; i += 1) assert.equal((await api('/v2/status')).response.status, 200);
+    assert.equal(fabricStore.catalog.auditEvents.filter(event => event.action === 'memory_status').length, 0);
+  }, { fabricStore });
+  await closedPromise;
+  assert.deepEqual(order, ['audit:memory_status:3', 'close']);
+  const sampled = fabricStore.catalog.auditEvents.filter(event => event.action === 'memory_status');
+  assert.equal(sampled.length, 1);
+  assert.equal(sampled[0].outcome, 'allowed');
+  assert.equal(sampled[0].details.sampledCount, 3);
+});
+
 test('server construction rejects unverified pause-shaped state', () => {
   assert.throws(() => createAgentMemoryFabricServer({ migrationPause: {
     state: 'paused', health: 'degraded', verified: true,

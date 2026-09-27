@@ -1,23 +1,8 @@
-const EPHEMERAL_STATUS_ACTIONS = new Set(['memory_status']);
-
-const EPHEMERAL_OPERATIONAL_ACTIONS = new Set([
-  'context_search', 'document_read', 'documents_search', 'memory_proposal_status',
-  'memory_read', 'memory_search', 'raw_delivery_proof', 'raw_event_ingest',
-  'raw_extractor_session_read', 'raw_extractor_sessions_read', 'raw_extractor_transcript_read',
-  'session_get', 'session_transcript', 'sessions_search'
-]);
-
-const LONG_RETAINED_ACTIONS = new Set([
-  'curation_proposal_decrypt_intent', 'curation_proposal_list', 'curation_proposal_read',
-  'curation_receipt', 'curation_reconcile', 'memory_propose', 'identity_create', 'identity_read',
-  'identity_merge', 'identity_split', 'retention_plan', 'retention_apply'
-]);
-
-const FAILING_OUTCOMES = new Set(['denied', 'failed']);
-
 export const AUDIT_RETENTION_CLASSES = Object.freeze([
   'ephemeral_status', 'ephemeral_operational', 'security_review', 'long_retained'
 ]);
+
+export const DELETABLE_AUDIT_RETENTION_CLASSES = Object.freeze(['ephemeral_status', 'ephemeral_operational', 'security_review']);
 
 export const DEFAULT_AUDIT_RETENTION_POLICY = Object.freeze({
   ephemeral_status: Object.freeze({ days: 2 }),
@@ -26,32 +11,97 @@ export const DEFAULT_AUDIT_RETENTION_POLICY = Object.freeze({
   long_retained: Object.freeze({ days: null, externalArchive: false })
 });
 
+const FAILING_OUTCOMES = Object.freeze(['denied', 'failed']);
+
+// every (action, outcome) src/ writes to audit_events_v2, by the class of its normal outcomes;
+// denied/failed of a non-long_retained action becomes security_review
+const ACTION_RULES = Object.freeze({
+  memory_status: { retentionClass: 'ephemeral_status', outcomes: ['allowed'] },
+
+  context_search: { retentionClass: 'ephemeral_operational', outcomes: ['allowed'] },
+  document_read: { retentionClass: 'ephemeral_operational', outcomes: ['allowed'] },
+  documents_search: { retentionClass: 'ephemeral_operational', outcomes: ['allowed'] },
+  memory_proposal_status: { retentionClass: 'ephemeral_operational', outcomes: ['allowed'] },
+  memory_read: { retentionClass: 'ephemeral_operational', outcomes: ['allowed'] },
+  memory_search: { retentionClass: 'ephemeral_operational', outcomes: ['allowed'] },
+  raw_delivery_proof: { retentionClass: 'ephemeral_operational', outcomes: ['verified'] },
+  raw_event_ingest: { retentionClass: 'ephemeral_operational', outcomes: ['stored', 'duplicate'] },
+  raw_extractor_session_read: { retentionClass: 'ephemeral_operational', outcomes: ['allowed'] },
+  raw_extractor_sessions_read: { retentionClass: 'ephemeral_operational', outcomes: ['allowed'] },
+  raw_extractor_transcript_read: { retentionClass: 'ephemeral_operational', outcomes: ['allowed'] },
+  session_get: { retentionClass: 'ephemeral_operational', outcomes: ['allowed'] },
+  session_transcript: { retentionClass: 'ephemeral_operational', outcomes: ['allowed'] },
+  sessions_search: { retentionClass: 'ephemeral_operational', outcomes: ['allowed'] },
+
+  authenticate: { retentionClass: 'security_review', outcomes: [] },
+  raw_decrypt_intent: { retentionClass: 'security_review', outcomes: ['authorized'] },
+  raw_ingest_decrypt_intent: { retentionClass: 'security_review', outcomes: ['authorized'] },
+  raw_redacted_decrypt_intent: { retentionClass: 'security_review', outcomes: ['authorized'] },
+  raw_session_search_decrypt_intent: { retentionClass: 'security_review', outcomes: ['authorized'] },
+
+  curation_apply_receipt: { retentionClass: 'long_retained', outcomes: ['recorded', 'duplicate', 'superseded'] },
+  curation_decision_receipt: { retentionClass: 'long_retained', outcomes: ['recorded', 'duplicate', 'superseded'] },
+  curation_proposal_decrypt_intent: { retentionClass: 'long_retained', outcomes: ['authorized'] },
+  curation_proposal_list: { retentionClass: 'long_retained', outcomes: ['allowed'] },
+  curation_proposal_read: { retentionClass: 'long_retained', outcomes: ['allowed'] },
+  curation_receipt: { retentionClass: 'long_retained', outcomes: [] },
+  curation_reconcile: { retentionClass: 'long_retained', outcomes: ['clean', 'findings'] },
+  document_delete: { retentionClass: 'long_retained', outcomes: ['tombstoned', 'duplicate'] },
+  document_upsert: { retentionClass: 'long_retained', outcomes: ['stored', 'duplicate'] },
+  identity_create: { retentionClass: 'long_retained', outcomes: ['created', 'duplicate'] },
+  identity_merge: { retentionClass: 'long_retained', outcomes: ['applied', 'duplicate'] },
+  identity_read: { retentionClass: 'long_retained', outcomes: ['allowed'] },
+  identity_split: { retentionClass: 'long_retained', outcomes: ['applied', 'duplicate'] },
+  memory_propose: { retentionClass: 'long_retained', outcomes: ['queued', 'duplicate'] },
+  raw_event_recovery: { retentionClass: 'long_retained', outcomes: ['recovered'] },
+  raw_reconcile: { retentionClass: 'long_retained', outcomes: ['eligible', 'blocked'] },
+  retention_apply: { retentionClass: 'long_retained', outcomes: ['applied'] },
+  retention_plan: { retentionClass: 'long_retained', outcomes: ['allowed'] }
+});
+
+function buildRetentionTable() {
+  const rows = [];
+  for (const [action, rule] of Object.entries(ACTION_RULES)) {
+    for (const outcome of rule.outcomes) rows.push({ action, outcome, retentionClass: rule.retentionClass });
+    for (const outcome of FAILING_OUTCOMES) {
+      if (rule.outcomes.includes(outcome)) continue;
+      rows.push({ action, outcome, retentionClass: rule.retentionClass === 'long_retained' ? 'long_retained' : 'security_review' });
+    }
+  }
+  rows.sort((a, b) => a.action.localeCompare(b.action) || a.outcome.localeCompare(b.outcome));
+  return Object.freeze(rows.map(row => Object.freeze(row)));
+}
+
+/** Source of truth for classifier and Phase A predicate. */
+export const AUDIT_RETENTION_TABLE = buildRetentionTable();
+
+const TABLE_INDEX = new Map(AUDIT_RETENTION_TABLE.map(row => [`${row.action}\u0000${row.outcome}`, row.retentionClass]));
+
 function fail(code) {
   const error = new Error(code);
   error.code = code;
   throw error;
 }
 
-/**
- * Pure function of (action, outcome) -> retention class, per docs/audit-retention-gc-v1.md §2.1.
- * long_retained actions keep that class on every outcome; everything else with
- * outcome denied/failed becomes security_review regardless of its normal-outcome class.
- */
+/** Unknown or malformed pairs are long_retained, so Phase A never deletes them. */
 export function classifyAuditEvent(action, outcome) {
-  if (typeof action !== 'string' || !action) fail('audit_retention_action_invalid');
-  if (typeof outcome !== 'string' || !outcome) fail('audit_retention_outcome_invalid');
-  if (LONG_RETAINED_ACTIONS.has(action)) return 'long_retained';
-  if (FAILING_OUTCOMES.has(outcome)) return 'security_review';
-  if (EPHEMERAL_STATUS_ACTIONS.has(action)) return 'ephemeral_status';
-  if (EPHEMERAL_OPERATIONAL_ACTIONS.has(action)) return 'ephemeral_operational';
-  fail('audit_retention_class_unmapped');
+  if (typeof action !== 'string' || typeof outcome !== 'string') return 'long_retained';
+  return TABLE_INDEX.get(`${action}\u0000${outcome}`) ?? 'long_retained';
 }
 
-export function auditRetentionActionsByClass(retentionClass) {
-  if (retentionClass === 'ephemeral_status') return [...EPHEMERAL_STATUS_ACTIONS];
-  if (retentionClass === 'ephemeral_operational') return [...EPHEMERAL_OPERATIONAL_ACTIONS];
-  if (retentionClass === 'long_retained') return [...LONG_RETAINED_ACTIONS];
-  fail('audit_retention_class_invalid');
+export function classifyAuditEventStrict(action, outcome) {
+  const retentionClass = TABLE_INDEX.get(`${action}\u0000${outcome}`);
+  if (!retentionClass) fail('audit_retention_class_unmapped');
+  return retentionClass;
+}
+
+export function isKnownAuditEventPair(action, outcome) {
+  return TABLE_INDEX.has(`${action}\u0000${outcome}`);
+}
+
+export function auditRetentionPairsByClass(retentionClass) {
+  if (!AUDIT_RETENTION_CLASSES.includes(retentionClass)) fail('audit_retention_class_invalid');
+  return AUDIT_RETENTION_TABLE.filter(row => row.retentionClass === retentionClass).map(({ action, outcome }) => ({ action, outcome }));
 }
 
 function validatePolicyEntry(retentionClass, entry) {
@@ -77,18 +127,23 @@ export function auditRetentionWindowDays(retentionClass, policy = DEFAULT_AUDIT_
   return entry.days;
 }
 
-/**
- * True once ts is strictly older than (now - window) — mirrors the Phase A
- * delete predicate's `ts < now() - interval` boundary: a row exactly at the
- * boundary is retained, not deleted.
- */
-export function isAuditRetentionExpired(retentionClass, ts, now, policy = DEFAULT_AUDIT_RETENTION_POLICY) {
+function toMs(value) {
+  const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  if (!Number.isFinite(ms)) fail('audit_retention_timestamp_invalid');
+  return ms;
+}
+
+/** ts < cutoff means expired. Fixed ms, not calendar days, so SQL and JS agree across DST. */
+export function auditRetentionCutoff(retentionClass, asOf, policy = DEFAULT_AUDIT_RETENTION_POLICY) {
   const days = auditRetentionWindowDays(retentionClass, policy);
-  if (days == null) return false;
-  const tsMs = ts instanceof Date ? ts.getTime() : new Date(ts).getTime();
-  const nowMs = now instanceof Date ? now.getTime() : new Date(now).getTime();
-  if (!Number.isFinite(tsMs) || !Number.isFinite(nowMs)) fail('audit_retention_timestamp_invalid');
-  return nowMs - tsMs > days * 86_400_000;
+  if (days == null) return null;
+  return new Date(toMs(asOf) - days * 86_400_000);
+}
+
+export function isAuditRetentionExpired(retentionClass, ts, now, policy = DEFAULT_AUDIT_RETENTION_POLICY) {
+  const cutoff = auditRetentionCutoff(retentionClass, now, policy);
+  if (!cutoff) return false;
+  return toMs(ts) < cutoff.getTime();
 }
 
 function envInteger(env, name, fallback, { min, max }) {
@@ -110,36 +165,78 @@ export function loadAuditRetentionPolicyFromEnv(env = process.env) {
   return validateAuditRetentionPolicy(policy);
 }
 
+const SQL_LITERAL_PATTERN = /^[a-z][a-z0-9_]*$/;
+
+function sqlPairList(pairs) {
+  return pairs.map(({ action, outcome }) => {
+    if (!SQL_LITERAL_PATTERN.test(action) || !SQL_LITERAL_PATTERN.test(outcome)) fail('audit_retention_table_invalid');
+    return `('${action}','${outcome}')`;
+  }).join(',');
+}
+
 /**
- * Turns "one audit row per memory_status/allowed call" into "one row per
- * (actorTag, time-bucket)" per docs/audit-retention-gc-v1.md §3. Every other
- * action/outcome must keep writing through the normal fail-closed audit path.
+ * One clause per deletable class: explicit (action, outcome) IN-list plus that class's cutoff.
+ * Unknown and long_retained pairs are never listed. `firstParam` = first cutoff placeholder.
+ */
+export function buildPhaseAPredicate({ asOf, policy = DEFAULT_AUDIT_RETENTION_POLICY, firstParam = 1 } = {}) {
+  validateAuditRetentionPolicy(policy);
+  const clauses = [];
+  const values = [];
+  for (const retentionClass of DELETABLE_AUDIT_RETENTION_CLASSES) {
+    const pairs = auditRetentionPairsByClass(retentionClass);
+    if (!pairs.length) continue;
+    values.push(auditRetentionCutoff(retentionClass, asOf, policy).toISOString());
+    clauses.push(`((action, outcome) IN (${sqlPairList(pairs)}) AND ts < $${firstParam + values.length - 1}::timestamptz)`);
+  }
+  return { text: `(${clauses.join(' OR ')})`, values };
+}
+
+/**
+ * One memory_status/allowed audit row per (actorTag, bucket) instead of per call.
+ * Bucket is kept until its write succeeds (at-least-once); a crash loses what's in memory.
  */
 export class AuditSampler {
-  constructor({ bucketMs = 300_000, flush, clock = () => Date.now(), autoFlush = true, onFlushError } = {}) {
+  constructor({ bucketMs = 300_000, flush, clock = () => Date.now(), autoFlush = true, onFlushError, maxPendingBuckets = 10_000 } = {}) {
     if (typeof flush !== 'function') fail('audit_sampler_flush_required');
     if (!Number.isSafeInteger(bucketMs) || bucketMs < 1000 || bucketMs > 3_600_000) fail('audit_sampler_bucket_ms_invalid');
+    if (!Number.isSafeInteger(maxPendingBuckets) || maxPendingBuckets < 1) fail('audit_sampler_max_pending_invalid');
     this._bucketMs = bucketMs;
     this._flush = flush;
     this._clock = clock;
     this._onFlushError = typeof onFlushError === 'function' ? onFlushError : () => {};
+    this._maxPendingBuckets = maxPendingBuckets;
     this._buckets = new Map();
     this._closed = false;
     this._timer = null;
+    this._flushChain = Promise.resolve();
     if (autoFlush) {
-      this._timer = setInterval(() => { this.flushExpired().catch(error => this._onFlushError(error)); }, bucketMs);
+      this._timer = setInterval(() => { this.flushExpired().catch(error => this._reportError(error, null)); }, bucketMs);
       this._timer.unref?.();
     }
   }
 
+  get pendingBuckets() { return this._buckets.size; }
+
   _bucketStartFor(nowMs) { return Math.floor(nowMs / this._bucketMs) * this._bucketMs; }
+
+  _reportError(error, bucket) {
+    try { this._onFlushError(error, bucket ? this._describe(bucket) : null); } catch { /* reporting must not break flushing */ }
+  }
+
+  _describe(bucket) {
+    return {
+      actorTag: bucket.actorTag,
+      sampledCount: bucket.count,
+      windowStart: new Date(bucket.bucketStartMs).toISOString(),
+      windowEnd: new Date(bucket.bucketStartMs + this._bucketMs).toISOString()
+    };
+  }
 
   /** Increments the current bucket's counter; never awaits or writes to storage. */
   record(actorTag) {
     if (this._closed) fail('audit_sampler_closed');
     if (typeof actorTag !== 'string' || !actorTag) fail('audit_sampler_actor_required');
-    const nowMs = this._clock();
-    const bucketStartMs = this._bucketStartFor(nowMs);
+    const bucketStartMs = this._bucketStartFor(this._clock());
     const key = `${bucketStartMs}\u0000${actorTag}`;
     let bucket = this._buckets.get(key);
     if (!bucket) { bucket = { actorTag, bucketStartMs, count: 0 }; this._buckets.set(key, bucket); }
@@ -147,37 +244,59 @@ export class AuditSampler {
     return bucket.count;
   }
 
-  /** Flushes every bucket whose window has fully rolled over. */
-  async flushExpired() {
-    const currentBucketStartMs = this._bucketStartFor(this._clock());
-    const due = [];
-    for (const [key, bucket] of this._buckets) if (bucket.bucketStartMs < currentBucketStartMs) due.push([key, bucket]);
-    for (const [key, bucket] of due) {
+  _serialize(task) {
+    const run = this._flushChain.then(task, task);
+    this._flushChain = run.catch(() => {});
+    return run;
+  }
+
+  async _flushWhere(isDue) {
+    let flushed = 0;
+    let failed = 0;
+    for (const [key, bucket] of [...this._buckets]) {
+      if (!isDue(bucket)) continue;
+      try {
+        await this._flush(this._describe(bucket));
+        this._buckets.delete(key);
+        flushed += 1;
+      } catch (error) {
+        failed += 1;
+        this._reportError(error, bucket);
+      }
+    }
+    this._dropOverflow();
+    return { flushed, failed, pending: this._buckets.size };
+  }
+
+  _dropOverflow() {
+    if (this._buckets.size <= this._maxPendingBuckets) return;
+    const oldest = [...this._buckets].sort(([, a], [, b]) => a.bucketStartMs - b.bucketStartMs);
+    for (const [key, bucket] of oldest.slice(0, this._buckets.size - this._maxPendingBuckets)) {
       this._buckets.delete(key);
-      await this._emit(bucket);
+      const error = new Error('audit_sampler_bucket_dropped');
+      error.code = 'audit_sampler_bucket_dropped';
+      this._reportError(error, bucket);
     }
   }
 
-  /** Flushes every bucket regardless of window state; used on shutdown. */
-  async flushAll() {
-    const all = [...this._buckets.values()];
-    this._buckets.clear();
-    for (const bucket of all) await this._emit(bucket);
-  }
-
-  async _emit(bucket) {
-    await this._flush({
-      actorTag: bucket.actorTag,
-      sampledCount: bucket.count,
-      windowStart: new Date(bucket.bucketStartMs).toISOString(),
-      windowEnd: new Date(bucket.bucketStartMs + this._bucketMs).toISOString()
+  /** Flushes every bucket whose window has fully rolled over, retrying earlier failures. */
+  flushExpired() {
+    return this._serialize(() => {
+      const currentBucketStartMs = this._bucketStartFor(this._clock());
+      return this._flushWhere(bucket => bucket.bucketStartMs < currentBucketStartMs);
     });
   }
 
+  /** Flushes every bucket regardless of window state; used on shutdown. */
+  flushAll() {
+    return this._serialize(() => this._flushWhere(() => true));
+  }
+
   async close() {
-    if (this._closed) return;
+    if (this._closed) return this._closeResult;
     this._closed = true;
     if (this._timer) clearInterval(this._timer);
-    await this.flushAll();
+    this._closeResult = this.flushAll();
+    return this._closeResult;
   }
 }

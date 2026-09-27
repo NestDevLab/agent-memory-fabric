@@ -1,66 +1,121 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
-  AUDIT_RETENTION_CLASSES, AuditSampler, DEFAULT_AUDIT_RETENTION_POLICY,
-  auditRetentionActionsByClass, auditRetentionWindowDays, classifyAuditEvent,
-  isAuditRetentionExpired, loadAuditRetentionPolicyFromEnv, validateAuditRetentionPolicy
+  AUDIT_RETENTION_CLASSES, AUDIT_RETENTION_TABLE, AuditSampler, DEFAULT_AUDIT_RETENTION_POLICY,
+  auditRetentionCutoff, auditRetentionPairsByClass, auditRetentionWindowDays, buildPhaseAPredicate,
+  classifyAuditEvent, classifyAuditEventStrict, isAuditRetentionExpired, loadAuditRetentionPolicyFromEnv,
+  validateAuditRetentionPolicy
 } from '../src/audit-retention.mjs';
+import { qualifiedAuditTable } from '../src/audit-retention-cleanup.mjs';
 
-const ALL_ACTIONS = [
-  'authenticate', 'context_search', 'curation_proposal_decrypt_intent', 'curation_proposal_list',
-  'curation_proposal_read', 'curation_receipt', 'curation_reconcile', 'document_read', 'documents_search',
-  'identity_create', 'identity_merge', 'identity_read', 'identity_split', 'memory_proposal_status',
-  'memory_propose', 'memory_read', 'memory_search', 'memory_status', 'raw_delivery_proof', 'raw_event_ingest',
-  'raw_extractor_session_read', 'raw_extractor_sessions_read', 'raw_extractor_transcript_read',
-  'retention_apply', 'retention_plan', 'session_get', 'session_transcript', 'sessions_search'
-];
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 
-test('§2.1 table: every long_retained action keeps that class on every outcome', () => {
-  for (const action of auditRetentionActionsByClass('long_retained')) {
-    for (const outcome of ['allowed', 'denied', 'failed', 'applied', 'duplicate', 'authorized']) {
-      assert.equal(classifyAuditEvent(action, outcome), 'long_retained', `${action}/${outcome}`);
+function sourceFiles(dir) {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) return sourceFiles(full);
+    return entry.name.endsWith('.mjs') ? [full] : [];
+  });
+}
+
+const EXPECTED = {
+  ephemeral_status: [['memory_status', 'allowed']],
+  security_review: [
+    ['authenticate', 'denied'],
+    ['raw_decrypt_intent', 'authorized'],
+    ['raw_ingest_decrypt_intent', 'authorized'],
+    ['raw_redacted_decrypt_intent', 'authorized'],
+    ['raw_session_search_decrypt_intent', 'authorized'],
+    ['memory_read', 'denied'], ['memory_search', 'failed'], ['raw_event_ingest', 'failed'],
+    ['raw_delivery_proof', 'failed'], ['documents_search', 'denied'], ['context_search', 'failed']
+  ],
+  ephemeral_operational: [
+    ['raw_event_ingest', 'stored'], ['raw_event_ingest', 'duplicate'], ['raw_delivery_proof', 'verified'],
+    ['session_transcript', 'allowed'], ['sessions_search', 'allowed'], ['memory_search', 'allowed']
+  ],
+  long_retained: [
+    ['curation_proposal_decrypt_intent', 'authorized'],
+    ['curation_decision_receipt', 'recorded'], ['curation_decision_receipt', 'superseded'],
+    ['curation_apply_receipt', 'recorded'], ['raw_reconcile', 'eligible'], ['raw_reconcile', 'blocked'],
+    ['document_delete', 'tombstoned'], ['document_upsert', 'stored'], ['document_upsert', 'failed'],
+    ['raw_event_recovery', 'recovered'], ['retention_apply', 'applied'], ['retention_plan', 'denied'],
+    ['identity_merge', 'failed'], ['memory_propose', 'denied'], ['curation_receipt', 'failed']
+  ]
+};
+
+test('owner-fixed and production-observed pairs classify exactly', () => {
+  for (const [retentionClass, pairs] of Object.entries(EXPECTED)) {
+    for (const [action, outcome] of pairs) {
+      assert.equal(classifyAuditEventStrict(action, outcome), retentionClass, `${action}/${outcome}`);
     }
   }
 });
 
-test('§2.1 table: memory_status/allowed is ephemeral_status, other outcomes are security_review', () => {
-  assert.equal(classifyAuditEvent('memory_status', 'allowed'), 'ephemeral_status');
-  assert.equal(classifyAuditEvent('memory_status', 'denied'), 'security_review');
-  assert.equal(classifyAuditEvent('memory_status', 'failed'), 'security_review');
-});
-
-test('§2.1 table: ephemeral_operational actions on a non-failing outcome, security_review when denied/failed', () => {
-  for (const action of auditRetentionActionsByClass('ephemeral_operational')) {
-    assert.equal(classifyAuditEvent(action, 'allowed'), 'ephemeral_operational', action);
-    assert.equal(classifyAuditEvent(action, 'stored'), 'ephemeral_operational', action);
-    assert.equal(classifyAuditEvent(action, 'denied'), 'security_review', action);
-    assert.equal(classifyAuditEvent(action, 'failed'), 'security_review', action);
+test('every literal audit action written anywhere in src/ is in the table', () => {
+  const written = new Set();
+  for (const file of sourceFiles(path.join(ROOT, 'src'))) {
+    const text = fs.readFileSync(file, 'utf8');
+    if (!/audit/i.test(text)) continue;
+    for (const match of text.matchAll(/action:\s*["']([a-z][a-z0-9_]*)["']/g)) written.add(match[1]);
+    for (const match of text.matchAll(/\?\s*'((?:curation)_[a-z_]+_receipt)'\s*:\s*'((?:curation)_[a-z_]+_receipt)'/g)) { written.add(match[1]); written.add(match[2]); }
+    for (const match of text.matchAll(/const action = \w+ \? '([a-z_]+)' : '([a-z_]+)'/g)) { written.add(match[1]); written.add(match[2]); }
+  }
+  written.add('identity_merge');
+  written.add('identity_split');
+  const nonAudit = new Set(['provision']);
+  const tableActions = new Set(AUDIT_RETENTION_TABLE.map(row => row.action));
+  const missing = [...written].filter(action => !nonAudit.has(action) && !tableActions.has(action));
+  assert.deepEqual(missing, []);
+  for (const action of ['curation_apply_receipt', 'curation_decision_receipt', 'document_upsert', 'document_delete', 'raw_event_recovery']) {
+    assert.ok(written.has(action), `source scan should see ${action}`);
   }
 });
 
-test('§2.1 table: authenticate is only ever audited on denial, which is security_review', () => {
-  assert.equal(classifyAuditEvent('authenticate', 'denied'), 'security_review');
-});
-
-test('§1: the 28 known actions each classify without throwing for their real-world outcomes', () => {
-  for (const action of ALL_ACTIONS) {
-    const outcome = action === 'authenticate' ? 'denied' : 'allowed';
-    assert.doesNotThrow(() => classifyAuditEvent(action, outcome), action);
+test('long_retained actions never have a deletable outcome and denied/failed is never ephemeral', () => {
+  const longActions = new Set(auditRetentionPairsByClass('long_retained').map(pair => pair.action));
+  for (const row of AUDIT_RETENTION_TABLE) {
+    if (longActions.has(row.action)) assert.equal(row.retentionClass, 'long_retained', `${row.action}/${row.outcome}`);
+    if (['denied', 'failed'].includes(row.outcome)) assert.ok(['security_review', 'long_retained'].includes(row.retentionClass), `${row.action}/${row.outcome}`);
   }
 });
 
-test('classifyAuditEvent rejects an action/outcome pair the table does not cover', () => {
-  assert.throws(() => classifyAuditEvent('authenticate', 'allowed'), /audit_retention_class_unmapped/);
-  assert.throws(() => classifyAuditEvent('totally_unknown_action', 'allowed'), /audit_retention_class_unmapped/);
+test('unknown or malformed pairs are long_retained and never throw; strict variant throws', () => {
+  assert.equal(classifyAuditEvent('totally_unknown_action', 'allowed'), 'long_retained');
+  assert.equal(classifyAuditEvent('memory_status', 'throttled'), 'long_retained');
+  assert.equal(classifyAuditEvent('authenticate', 'allowed'), 'long_retained');
+  assert.equal(classifyAuditEvent(undefined, null), 'long_retained');
+  assert.equal(classifyAuditEvent('', ''), 'long_retained');
+  assert.throws(() => classifyAuditEventStrict('memory_status', 'throttled'), /audit_retention_class_unmapped/);
 });
 
-test('classifyAuditEvent requires non-empty strings', () => {
-  assert.throws(() => classifyAuditEvent('', 'allowed'), /audit_retention_action_invalid/);
-  assert.throws(() => classifyAuditEvent('memory_status', ''), /audit_retention_outcome_invalid/);
+test('Phase A predicate is generated from the table: every deletable pair appears once, no long_retained pair appears', () => {
+  const asOf = '2026-09-27T12:00:00.000Z';
+  const predicate = buildPhaseAPredicate({ asOf });
+  const listed = [...predicate.text.matchAll(/\('([a-z0-9_]+)','([a-z0-9_]+)'\)/g)].map(match => `${match[1]}/${match[2]}`);
+  const deletable = AUDIT_RETENTION_TABLE.filter(row => row.retentionClass !== 'long_retained').map(row => `${row.action}/${row.outcome}`);
+  assert.deepEqual([...listed].sort(), [...deletable].sort());
+  assert.equal(new Set(listed).size, listed.length);
+  for (const row of AUDIT_RETENTION_TABLE.filter(item => item.retentionClass === 'long_retained')) {
+    assert.ok(!listed.includes(`${row.action}/${row.outcome}`), `${row.action}/${row.outcome}`);
+  }
+  assert.deepEqual(predicate.values, [
+    auditRetentionCutoff('ephemeral_status', asOf).toISOString(),
+    auditRetentionCutoff('ephemeral_operational', asOf).toISOString(),
+    auditRetentionCutoff('security_review', asOf).toISOString()
+  ]);
+  assert.match(buildPhaseAPredicate({ asOf, firstParam: 2 }).text, /\$2::timestamptz[\s\S]*\$3::timestamptz[\s\S]*\$4::timestamptz/);
 });
 
-test('the four retention classes and default windows match §2.2', () => {
+test('only the canonical audit table is accepted, and it is quoted', () => {
+  assert.equal(qualifiedAuditTable(), '"agent_memory_fabric"."audit_events_v2"');
+  assert.throws(() => qualifiedAuditTable('audit_events_v2_legacy'), /audit_retention_table_not_allowed/);
+  assert.throws(() => qualifiedAuditTable('audit_events_v2; DROP TABLE x'), /audit_retention_table_not_allowed/);
+});
+
+test('the four retention classes and default windows', () => {
   assert.deepEqual([...AUDIT_RETENTION_CLASSES].sort(), ['ephemeral_operational', 'ephemeral_status', 'long_retained', 'security_review']);
   assert.equal(auditRetentionWindowDays('ephemeral_status'), 2);
   assert.equal(auditRetentionWindowDays('ephemeral_operational'), 10);
@@ -82,67 +137,121 @@ test('loadAuditRetentionPolicyFromEnv applies documented bounds and defaults', (
   assert.equal(loadAuditRetentionPolicyFromEnv({ AMF_AUDIT_RETENTION_LONG_RETAINED_EXTERNAL_ARCHIVE: 'true' }).long_retained.externalArchive, true);
 });
 
-test('isAuditRetentionExpired: boundary is strict — exactly at the window edge is retained, one tick past is expired', () => {
-  const ts = '2026-01-01T00:00:00.000Z';
-  const exactlyAtWindow = new Date(new Date(ts).getTime() + 2 * 86_400_000);
-  const justInsideWindow = new Date(exactlyAtWindow.getTime() - 1);
-  const justOutsideWindow = new Date(exactlyAtWindow.getTime() + 1);
-  assert.equal(isAuditRetentionExpired('ephemeral_status', ts, exactlyAtWindow), false, 'ts = now - window is kept');
-  assert.equal(isAuditRetentionExpired('ephemeral_status', ts, justInsideWindow), false);
-  assert.equal(isAuditRetentionExpired('ephemeral_status', ts, justOutsideWindow), true, 'one ms past the window is expired');
-});
-
-test('isAuditRetentionExpired: long_retained never expires', () => {
+test('isAuditRetentionExpired: exactly at the cutoff is retained, one ms older is expired', () => {
+  const now = '2026-01-03T00:00:00.000Z';
+  const cutoff = auditRetentionCutoff('ephemeral_status', now);
+  assert.equal(cutoff.toISOString(), '2026-01-01T00:00:00.000Z');
+  assert.equal(isAuditRetentionExpired('ephemeral_status', cutoff, now), false);
+  assert.equal(isAuditRetentionExpired('ephemeral_status', new Date(cutoff.getTime() + 1), now), false);
+  assert.equal(isAuditRetentionExpired('ephemeral_status', new Date(cutoff.getTime() - 1), now), true);
   assert.equal(isAuditRetentionExpired('long_retained', '2000-01-01T00:00:00.000Z', '2030-01-01T00:00:00.000Z'), false);
 });
 
-test('AuditSampler: a burst of N calls in one bucket flushes exactly one aggregated row with sampledCount = N', async () => {
-  const flushed = [];
-  let nowMs = Date.UTC(2026, 0, 1, 0, 0, 0);
-  const sampler = new AuditSampler({ bucketMs: 300_000, autoFlush: false, clock: () => nowMs, flush: async event => { flushed.push(event); } });
+function manualSampler(overrides = {}) {
+  const state = { nowMs: Date.UTC(2026, 0, 1, 0, 0, 0), flushed: [], errors: [], failNext: 0 };
+  const sampler = new AuditSampler({
+    bucketMs: 300_000, autoFlush: false, clock: () => state.nowMs,
+    flush: async event => {
+      if (state.failNext > 0) { state.failNext -= 1; throw new Error('audit_unavailable'); }
+      state.flushed.push(event);
+    },
+    onFlushError: (error, bucket) => state.errors.push({ code: error.code || error.message, bucket }),
+    ...overrides
+  });
+  return { sampler, state };
+}
+
+test('AuditSampler: a burst of N calls in one bucket flushes one aggregated row with sampledCount = N', async () => {
+  const { sampler, state } = manualSampler();
   for (let i = 0; i < 7; i += 1) sampler.record('actor-a');
   for (let i = 0; i < 3; i += 1) sampler.record('actor-b');
-  nowMs += 300_000;
+  state.nowMs += 300_000;
   await sampler.flushExpired();
-  assert.equal(flushed.length, 2);
-  const byActor = Object.fromEntries(flushed.map(event => [event.actorTag, event]));
+  assert.equal(state.flushed.length, 2);
+  const byActor = Object.fromEntries(state.flushed.map(event => [event.actorTag, event]));
   assert.equal(byActor['actor-a'].sampledCount, 7);
   assert.equal(byActor['actor-b'].sampledCount, 3);
-  assert.equal(byActor['actor-a'].windowStart, new Date(Date.UTC(2026, 0, 1, 0, 0, 0)).toISOString());
-  assert.equal(byActor['actor-a'].windowEnd, new Date(Date.UTC(2026, 0, 1, 0, 5, 0)).toISOString());
+  assert.equal(byActor['actor-a'].windowStart, '2026-01-01T00:00:00.000Z');
+  assert.equal(byActor['actor-a'].windowEnd, '2026-01-01T00:05:00.000Z');
 });
 
 test('AuditSampler: a bucket not yet rolled over is never flushed early', async () => {
-  const flushed = [];
-  let nowMs = Date.UTC(2026, 0, 1, 0, 0, 0);
-  const sampler = new AuditSampler({ bucketMs: 300_000, autoFlush: false, clock: () => nowMs, flush: async event => { flushed.push(event); } });
+  const { sampler, state } = manualSampler();
   sampler.record('actor-a');
-  nowMs += 299_999;
+  state.nowMs += 299_999;
   await sampler.flushExpired();
-  assert.equal(flushed.length, 0);
+  assert.equal(state.flushed.length, 0);
 });
 
-test('AuditSampler: close() flushes every remaining bucket regardless of rollover', async () => {
+test('AuditSampler: a failed flush keeps the bucket, reports the error, and retries on the next flush', async () => {
+  const { sampler, state } = manualSampler();
+  sampler.record('actor-a');
+  sampler.record('actor-a');
+  state.nowMs += 300_000;
+  state.failNext = 1;
+  const first = await sampler.flushExpired();
+  assert.deepEqual(first, { flushed: 0, failed: 1, pending: 1 });
+  assert.equal(state.errors.length, 1);
+  assert.equal(state.errors[0].bucket.sampledCount, 2);
+  sampler.record('actor-a');
+  state.nowMs += 300_000;
+  const second = await sampler.flushExpired();
+  assert.deepEqual(second, { flushed: 2, failed: 0, pending: 0 });
+  assert.deepEqual(state.flushed.map(event => [event.windowStart, event.sampledCount]), [
+    ['2026-01-01T00:00:00.000Z', 2], ['2026-01-01T00:05:00.000Z', 1]
+  ]);
+});
+
+test('AuditSampler: overlapping flush calls never emit the same bucket twice', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
   const flushed = [];
-  const sampler = new AuditSampler({ bucketMs: 300_000, autoFlush: false, clock: () => Date.UTC(2026, 0, 1), flush: async event => { flushed.push(event); } });
+  let nowMs = Date.UTC(2026, 0, 1);
+  const sampler = new AuditSampler({ bucketMs: 300_000, autoFlush: false, clock: () => nowMs, flush: async event => { await gate; flushed.push(event); } });
   sampler.record('actor-a');
-  sampler.record('actor-a');
-  await sampler.close();
+  nowMs += 300_000;
+  const first = sampler.flushExpired();
+  const second = sampler.flushExpired();
+  release();
+  await Promise.all([first, second]);
   assert.equal(flushed.length, 1);
-  assert.equal(flushed[0].sampledCount, 2);
+});
+
+test('AuditSampler: pending buckets are bounded and dropped buckets are reported', async () => {
+  const { sampler, state } = manualSampler({ maxPendingBuckets: 2 });
+  for (const actor of ['a', 'b', 'c']) sampler.record(actor);
+  state.nowMs += 300_000;
+  state.failNext = 3;
+  const result = await sampler.flushExpired();
+  assert.equal(result.pending, 2);
+  assert.equal(state.errors.filter(error => error.code === 'audit_sampler_bucket_dropped').length, 1);
+});
+
+test('AuditSampler: close() waits for an in-flight flush, flushes the rest, and rejects later records', async () => {
+  const { sampler, state } = manualSampler();
+  sampler.record('actor-a');
+  sampler.record('actor-a');
+  state.nowMs += 300_000;
+  sampler.record('actor-b');
+  const inflight = sampler.flushExpired();
+  const closed = await sampler.close();
+  await inflight;
+  assert.equal(state.flushed.length, 2);
+  assert.equal(closed.pending, 0);
   assert.throws(() => sampler.record('actor-a'), /audit_sampler_closed/);
 });
 
-test('AuditSampler never aggregates a non-allowed outcome — callers must not route denied/failed calls through record()', () => {
-  // AuditSampler has no outcome parameter by design: §3 requires every
-  // memory_status call with a non-allowed outcome, and every other action, to
-  // keep writing through the normal per-call fail-closed audit path.
-  const sampler = new AuditSampler({ bucketMs: 300_000, autoFlush: false, flush: async () => {} });
-  assert.equal(typeof sampler.record, 'function');
-  assert.equal(sampler.record.length, 1);
+test('AuditSampler: close() reports buckets it could not write', async () => {
+  const { sampler, state } = manualSampler();
+  sampler.record('actor-a');
+  state.failNext = 1;
+  const closed = await sampler.close();
+  assert.deepEqual(closed, { flushed: 0, failed: 1, pending: 1 });
+  assert.equal(state.errors.length, 1);
 });
 
 test('AuditSampler validates its construction inputs', () => {
   assert.throws(() => new AuditSampler({}), /audit_sampler_flush_required/);
   assert.throws(() => new AuditSampler({ flush: async () => {}, bucketMs: 10 }), /audit_sampler_bucket_ms_invalid/);
+  assert.throws(() => new AuditSampler({ flush: async () => {}, maxPendingBuckets: 0 }), /audit_sampler_max_pending_invalid/);
 });

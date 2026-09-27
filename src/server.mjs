@@ -1744,14 +1744,10 @@ function createAgentMemoryFabricServer({ fabricStore = createUnconfiguredFabricS
   const memoryStatusAuditSampler = auditSampler || new AuditSampler({
     bucketMs: MEMORY_STATUS_AUDIT_SAMPLE_BUCKET_MS,
     clock,
-    flush: async ({ actorTag, sampledCount, windowStart, windowEnd }) => {
-      try {
-        await auditRequired(fabricStore, { actor: actorTag, action: 'memory_status', outcome: 'allowed', details: { sampledCount, windowStart, windowEnd } });
-      } catch (error) {
-        logEvent('memory_status_audit_sample_flush_failed', { error: safeError(error) });
-      }
-    },
-    onFlushError: error => logEvent('memory_status_audit_sample_flush_failed', { error: safeError(error) })
+    flush: ({ actorTag, sampledCount, windowStart, windowEnd }) => auditRequired(fabricStore, { actor: actorTag, action: 'memory_status', outcome: 'allowed', details: { sampledCount, windowStart, windowEnd } }),
+    onFlushError: (error, bucket) => logEvent('memory_status_audit_sample_flush_failed', {
+      error: safeError(error), ...(bucket ? { sampledCount: bucket.sampledCount, windowStart: bucket.windowStart } : {})
+    })
   });
 if (!Number.isSafeInteger(rawIngestBodyBytes) || rawIngestBodyBytes < 1024 || rawIngestBodyBytes > 16 * 1024 * 1024) throw new Error('raw_ingest_body_limit_invalid');
 if (!isVerifiedMigrationPause(migrationPause)) {
@@ -2669,12 +2665,18 @@ const applicationServer = http.createServer((req, res) => {
   });
 });
 applicationServer.on('close', () => {
-  Promise.resolve(memoryStatusAuditSampler.close()).catch((error) => {
-    logEvent('memory_status_audit_sampler_close_failed', { error: safeError(error) });
-  });
-  Promise.resolve(fabricStore.close?.()).catch((error) => {
-    logEvent('fabric_store_close_failed', { error: safeError(error) });
-  });
+  Promise.resolve()
+    .then(() => memoryStatusAuditSampler.close())
+    .then((result) => {
+      if (result?.failed) logEvent('memory_status_audit_sampler_close_incomplete', { failed: result.failed, pending: result.pending });
+    })
+    .catch((error) => {
+      logEvent('memory_status_audit_sampler_close_failed', { error: safeError(error) });
+    })
+    .then(() => fabricStore.close?.())
+    .catch((error) => {
+      logEvent('fabric_store_close_failed', { error: safeError(error) });
+    });
   Promise.resolve(canonicalStore.close?.()).catch((error) => {
     logEvent('canonical_store_close_failed', { error: safeError(error) });
   });
