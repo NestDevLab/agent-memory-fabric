@@ -1,209 +1,114 @@
-# Audit retention and raw-event GC: operator runbook
+# Audit retention: operator runbook
 
-Drives `docs/audit-retention-gc-v1.md` against a live database from
-`scripts/amf-audit-retention-gc-operator.mjs` (`npm run operator:audit-retention-gc --`).
-Read the design doc first for *why*; this doc is the *how*, for CT112.
+Runs the Phase A audit retention delete from `docs/audit-retention-gc-v1.md` §4.2
+with `scripts/amf-audit-retention-gc-operator.mjs`
+(`npm run operator:audit-retention-gc --`). Read the design doc first for the why.
+Partitioning and raw-event GC are deferred, so this CLI has only two subcommands:
+`inventory` and `audit-phase-a`.
 
-Every mutating subcommand is dry-run unless you pass `--apply`. `--apply`
-additionally requires, together, every time:
+## What the CLI enforces, and what it doesn't
 
-- `--approval <checkpoint-id>` — one of `audit-bulk-delete`,
-  `audit-partition-migration`, `raw-gc-live`, matching the subcommand.
-  Approvals are per checkpoint, per design §8.5; a wrong or missing one
-  refuses before anything runs.
-- `--i-know-this-is-live`
-- `--confirm-target <host:port/dbname>` — must equal the database the
-  `--database-url` actually resolves to. This is the accidental-target guard:
-  it is independent of the test-database name check the integration tests
-  use, so a typo'd `--database-url` refuses instead of silently running.
-- `--backup-id <id> --backup-verified-at <ISO8601>` (all subcommands except
-  `audit-rollback`, which is itself the recovery path) — refused if older
-  than `--max-backup-age-hours` (default 24).
+Enforced:
 
-A free-space floor check (`--free-space-floor-bytes`, default 2 GB, checked
-against `--filesystem-path`, default cwd) runs before every apply; Phase C
-copy also adds a live estimate of the temporary space it needs.
+- **Target identity.** On connect the CLI reads `system_identifier` from
+  `pg_control_system()`, `current_database()`, and `data_directory`, and prints
+  them in every output (errors included). `--confirm-target` must equal
+  `<system_identifier>/<database>` of the connected server. A hostname never
+  counts.
+- **Free space on the database server.** `--db-host-probe pct --proxmox-host
+  <host> --ctid <id>` runs exactly two commands:
+
+  ```sh
+  ssh -o BatchMode=yes <host> pct exec <ctid> -- df -B1 --output=avail,size <data_directory>
+  ssh -o BatchMode=yes <host> pct exec <ctid> -- su postgres -c "psql -XAt -c 'select system_identifier from pg_control_system()'"
+  ```
+
+  The second must return the connected `system_identifier`, otherwise the probe
+  refuses. `<host>` accepts only hostname/IP characters and `<ctid>` only an
+  integer; the CLI builds argument arrays and never a local shell string. The
+  CLI host's own disk is never measured. Without a probe, `inventory` and the
+  preview report free space as `unknown`; `--apply` refuses.
+- **Read-only previews.** `inventory` and `audit-phase-a` without `--apply` run
+  in `READ ONLY` transactions.
+- **Target table.** Only `agent_memory_fabric.audit_events_v2`; `--table` with
+  any other value refuses.
+
+Not enforced, recorded only: `--approval`, `--backup-id`, and
+`--backup-verified-at` are **operator attestations**. The CLI checks their
+shape and that the backup timestamp is recent (`--max-backup-age-hours`,
+default 24); it cannot know whether the approval was given or whether the
+backup exists and restores. A second person must check those records before
+`--apply`. Every apply attempt, refused or not, appends one JSON line to
+`--operator-log <path>` (required with `--apply`): time, target identity,
+checkpoint, backup id and verified-at, options, free-space probes, per-batch
+results, stop reason, and outcome (`refused`, `stopped_on_error`, `completed`).
 
 ## Prerequisites
 
-- A verified backup: taken, then **restored to a separate instance** and
-  checked (row counts for `audit_events_v2`/`raw_events_v2` match, a sample
-  `session_transcript` works). An unverified backup does not satisfy
-  `--backup-verified-at`.
-- `psql`/network access from wherever you run this to CT112's Postgres.
-- Run this from the AMF checkout on CT112 (or wherever it can read the same
-  `AMF_CONVERSATION_READER_MODE`/`AMF_CONVERSATION_EXTRACTOR_MODE`/fabric
-  configuration the live server uses), so `raw-gc` builds the real
-  conversation-session runtime, not the null fallback.
-- Joseph's point-in-time approval for the specific checkpoint you are about
-  to run (design §8.5). Get it before you compute `--confirm-target`, not
-  after.
+- The database role can read `pg_control_system()` and `data_directory`
+  (superuser, or `pg_monitor` + `pg_read_all_settings`).
+- SSH with key auth (`BatchMode=yes`) from the CLI host to the Proxmox node that
+  runs the database container.
+- A backup of `agent_memory_fabric`, restored on an isolated instance with
+  matching `audit_events_v2` counts.
+- Joseph's point-in-time approval for checkpoint `audit-bulk-delete`.
 
-## Step 1 — Inventory (read-only, no approval needed)
+## Step 1: inventory (read-only)
 
 ```sh
 npm run operator:audit-retention-gc -- inventory \
   --database-url "$AMF_OPERATOR_DATABASE_URL" --ssl-mode verify-full \
-  --filesystem-path /var/lib/postgresql --json
+  --db-host-probe pct --proxmox-host <proxmox-host> --ctid <ctid> --json
 ```
 
-Confirm before anything else:
+Check `target` is the server you mean, `table.unknownPairs` (unknown pairs are
+kept forever; report new ones so the table can be extended),
+`table.rowsByRetentionClass`, `phaseA.eligibleByClass`, and `freeSpace`.
 
-- `postgresMajorVersion` ≥ 14 (needed for `DETACH ... CONCURRENTLY` later).
-- `tables.audit_events_v2.totalBytes` and `.raw_events_v2.totalBytes` against
-  `filesystem.freeBytes`.
-- `wouldDeleteByRetentionClass` sizes Phase A's expected impact.
-- `conversationReaderMode` / `conversationExtractorMode` — the single
-  highest-risk unverified assumption per design §1. If this is not `shadow`
-  or `active`, `raw-gc --apply` will refuse later; that is expected, not a
-  bug to work around.
-
-`inventory` never writes and needs none of the mutation flags.
-
-## Step 2 — Phase A: bulk delete (checkpoint `audit-bulk-delete`)
-
-Dry-run first (no `--apply`): reports `wouldDeleteByRetentionClass` and the
-next batch's `wouldDeleteTotal`, writes nothing.
+## Step 2: preview
 
 ```sh
 npm run operator:audit-retention-gc -- audit-phase-a \
-  --database-url "$AMF_OPERATOR_DATABASE_URL" --ssl-mode verify-full --json
+  --database-url "$AMF_OPERATOR_DATABASE_URL" --ssl-mode verify-full \
+  --db-host-probe pct --proxmox-host <proxmox-host> --ctid <ctid> --json
 ```
 
-Once Joseph approves checkpoint **(a)**, run batches with `--apply`. Each
-invocation is one bounded batch (`--batch-size`, default 20000); call it
-repeatedly — it is naturally resumable, since the predicate re-selects
-whatever is still eligible rather than tracking a cursor:
+Reports `eligibleByClass` and `eligibleTotal`; `long_retained` is always 0.
+
+## Step 3: apply (checkpoint `audit-bulk-delete`)
 
 ```sh
 npm run operator:audit-retention-gc -- audit-phase-a --apply \
   --approval audit-bulk-delete --i-know-this-is-live \
-  --confirm-target ct112-host:5432/agent_memory_fabric \
+  --confirm-target <system_identifier>/agent_memory_fabric \
   --backup-id <backup-id> --backup-verified-at <iso8601> \
+  --operator-log /var/log/amf/audit-retention-operator.jsonl \
+  --db-host-probe pct --proxmox-host <proxmox-host> --ctid <ctid> \
+  --batch-size 5000 --pause-ms 1000 --max-batches 100 --probe-every 5 \
+  --free-space-floor-bytes 2000000000 --max-free-space-drop-bytes 268435456 \
   --database-url "$AMF_OPERATOR_DATABASE_URL" --ssl-mode verify-full --json
 ```
 
-Stop when `deletedCount` is `0`. Run `VACUUM (ANALYZE) audit_events_v2` and
-re-check `inventory`'s filesystem free space every few batches (design §4.2);
-this CLI does not run `VACUUM` for you between batches by design — do it from
-`psql` so you control the pacing against live load.
+Behavior:
 
-Re-running Step 2 after it drains is safe and reports `deletedCount: 0` (idempotent).
+- Probes free space before the first batch, then every `--probe-every` batches.
+  Stops when free space is below `--free-space-floor-bytes` or dropped by more
+  than `--max-free-space-drop-bytes` since the previous probe (DELETE writes
+  WAL before any space comes back).
+- Each batch is one transaction with `--lock-timeout-ms` (default 5000) and
+  `--statement-timeout-ms` (default 120000), deleting at most `--batch-size`
+  of the oldest eligible rows; it rolls back if any deleted row disagrees with
+  the classifier. `--pause-ms` sleeps between batches.
+- Stops on the first error, at `--max-batches`, or when a batch deletes nothing
+  (`stopReason: drained`).
+- `--vacuum-between-groups` runs plain `VACUUM (ANALYZE)` on the audit table
+  before each re-probe. Never `VACUUM FULL`. Without the flag, run it yourself
+  from `psql` when load allows.
 
-## Step 3 — Phase B: re-measure
+The predicate re-selects whatever is still eligible, so rerunning after a stop is
+safe; after draining, a rerun deletes nothing.
 
-Re-run `inventory`. If free space is comfortably restored, Phase C/D can wait
-as a non-emergency follow-up (design §4.2 Phase B). If not, continue.
+## Rollback
 
-## Step 4 — Phase C/D: partition migration (checkpoint `audit-partition-migration`)
-
-Same checkpoint id covers schema, copy, and cutover — this is approval
-**(b)**, one sign-off for the whole partitioning migration, not three.
-
-**4a. Schema** (idempotent, `IF NOT EXISTS` throughout):
-
-```sh
-npm run operator:audit-retention-gc -- audit-phase-c-schema --apply \
-  --approval audit-partition-migration --i-know-this-is-live \
-  --confirm-target ct112-host:5432/agent_memory_fabric \
-  --backup-id <backup-id> --backup-verified-at <iso8601> \
-  --database-url "$AMF_OPERATOR_DATABASE_URL" --ssl-mode verify-full
-```
-
-**4b. Copy**, resumable via `--cursor-file` (survives a restart between
-invocations; `copyAuditEventsBatch`'s own `ON CONFLICT DO NOTHING` also makes
-it idempotent even if that file were lost). Free space is checked against a
-live `pg_total_relation_size` estimate of the source table, not assumed:
-
-```sh
-npm run operator:audit-retention-gc -- audit-phase-c-copy --apply \
-  --approval audit-partition-migration --i-know-this-is-live \
-  --confirm-target ct112-host:5432/agent_memory_fabric \
-  --backup-id <backup-id> --backup-verified-at <iso8601> \
-  --cursor-file /var/lib/amf/audit-phase-c-cursor.json \
-  --batch-size 5000 --max-batches 50 \
-  --database-url "$AMF_OPERATOR_DATABASE_URL" --ssl-mode verify-full --json
-```
-
-Repeat until the result's `drained: true`.
-
-**4c. Cutover** — one short transaction, catches up any rows inserted during
-the copy window, then renames tables:
-
-```sh
-npm run operator:audit-retention-gc -- audit-phase-d --apply \
-  --approval audit-partition-migration --i-know-this-is-live \
-  --confirm-target ct112-host:5432/agent_memory_fabric \
-  --backup-id <backup-id> --backup-verified-at <iso8601> \
-  --database-url "$AMF_OPERATOR_DATABASE_URL" --ssl-mode verify-full
-```
-
-Keep `audit_events_v2_legacy_<suffix>` for 7-14 days (design §4.2 Phase D),
-then `DROP TABLE` it by hand once satisfied — this CLI never drops it for you.
-
-**Rollback**, while the legacy table is still retained. No backup attestation
-is required here on purpose: this command *is* the emergency recovery, and
-demanding a fresh backup of an already-broken state would only slow it down.
-Still requires the same checkpoint, live confirmation, and target match:
-
-```sh
-npm run operator:audit-retention-gc -- audit-rollback --apply \
-  --approval audit-partition-migration --i-know-this-is-live \
-  --confirm-target ct112-host:5432/agent_memory_fabric \
-  --legacy-table agent_memory_fabric.audit_events_v2_legacy_20261001 \
-  --database-url "$AMF_OPERATOR_DATABASE_URL" --ssl-mode verify-full
-```
-
-## Step 5 — raw-event GC (checkpoint `raw-gc-live` only for `--apply`)
-
-`dry_run` needs no approval or backup (design §8.5 explicitly exempts
-measurement-only runs); `--apply` needs approval **(c)**, which depends on
-`conversationReaderMode` from Step 1 and may not be ready when (a)/(b) are.
-
-Before `--apply`, the CLI itself refuses if `AMF_CONVERSATION_READER_MODE` in
-its own environment is not `shadow` or `active` (`raw_gc_reader_mode_disabled`)
-— this is in addition to, never a replacement for, the per-session archive
-proof `RawGcEngine` re-checks for every session (design §5). Neither this
-CLI check nor the engine's own gate can be bypassed by a flag.
-
-```sh
-# measurement only, no writes, no approval needed — use its own throwaway tag,
-# never the tag you intend to apply with (RawGcEngine binds dry_run to the tag)
-npm run operator:audit-retention-gc -- raw-gc \
-  --idempotency-tag raw-gc-2026-10-preview \
-  --database-url "$AMF_OPERATOR_DATABASE_URL" --ssl-mode verify-full --json
-```
-
-```sh
-npm run operator:audit-retention-gc -- raw-gc --apply \
-  --approval raw-gc-live --i-know-this-is-live \
-  --confirm-target ct112-host:5432/agent_memory_fabric \
-  --backup-id <backup-id> --backup-verified-at <iso8601> \
-  --idempotency-tag raw-gc-2026-10 --max-runs 20 \
-  --database-url "$AMF_OPERATOR_DATABASE_URL" --ssl-mode verify-full --json
-```
-
-Each `--max-runs` unit is one bounded, transactional batch of
-`raw_gc_operations_v1` (session batch size `--session-batch-size`, default
-50). Re-running with the same `--idempotency-tag` resumes from its persisted
-cursor and is idempotent — a drained backlog reports zero additional deletes.
-Print and check each run's `counters` between invocations; the engine itself
-stops on its own safety thresholds
-(`raw_gc_verification_floor_breached`, `raw_gc_bytes_ceiling_breached`,
-`raw_gc_free_space_floor_breached`) without operator intervention.
-
-**Rollback**: there is no in-place undelete for physical `DELETE` (design §8
-step 4). Recovery means restoring from the verified backup taken immediately
-before that specific GC run — which is exactly why `--backup-verified-at`'s
-freshness window matters here more than anywhere else in this runbook.
-
-## Checkpoint summary
-
-| Checkpoint id | Covers | Backup required |
-|---|---|---|
-| `audit-bulk-delete` | Phase A bulk delete | yes |
-| `audit-partition-migration` | Phase C schema, Phase C copy, Phase D cutover, and its rollback | yes (not for rollback) |
-| `raw-gc-live` | `raw-gc --apply` | yes |
-
-Each is Joseph's separate point-in-time sign-off. None is implied by another,
-and none is implied by a prior read-only `inventory` run.
+Deleted rows have no in-place undo. Recovery is restoring the backup from the
+prerequisites, then reconciling audit rows written since.
