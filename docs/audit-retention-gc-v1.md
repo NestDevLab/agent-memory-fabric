@@ -1,7 +1,10 @@
 # Audit retention and raw-event garbage collection v1
 
-Status: design only; nothing in this document has been implemented, migrated, or
-run against CT112. It defines the target for MGT-0322.
+Status: v1 implements audit retention only — the classification table (§2.1),
+`memory_status` sampling (§3), and the Phase A bounded delete with a read-only
+inventory (§4.2). Postgres schema stays at version 7, so deploy and rollback are
+a plain image swap. Partitioning (§4 Phases C/D) and raw-event GC (§5–§6) are
+deferred (§0). Nothing here has run against CT112. Tracked as MGT-0322.
 
 This tranche is orthogonal to `docs/identity-retention.md`. That document
 governs `raw_retention_v2`, which is populated only for content submitted
@@ -12,22 +15,38 @@ raw-event ingestion: `raw_retention_v2` rows are never created for the bulk of
 session/event-level physical deletion. This document defines a parallel
 mechanism for that.
 
+## 0. Delivery scope and deferrals
+
+Production measurement (read-only) before v1: AMF 0.6.0 on schema v7;
+`AMF_CONVERSATION_READER_MODE` and `AMF_CONVERSATION_EXTRACTOR_MODE` unset, so the
+reader mode is `disabled` and session reads use the legacy reader directly on
+`raw_events_v2`. PostgreSQL 16. `audit_events_v2` holds 7.70M rows / 3.3 GB and now
+grows ~16 MB/day; `memory_status` volume has collapsed. 38% of rows (2.94M) used
+actions the original table did not know, because it was built from
+`src/server.mjs` only; §2.1 now covers every action written anywhere in `src/`.
+
+Deferred, with the independent review findings recorded in the management ledger
+under MGT-0322:
+
+- **Partitioning (§4 Phases C/D).** Not needed at current growth, and the reviewed
+  cutover could strand rows and break every audit INSERT. No v8 schema.
+- **Raw-event GC (§5–§6).** Requires the M4 reader to be `active`; production is
+  `disabled`, so no session can qualify. The reviewed engine also had data-loss
+  paths (younger sibling sessions, shadow mode, uncommitted cursors).
+
+§4 Phases C/D, §5, and §6 below are kept as design notes only; nothing in them is
+implemented.
+
 ## 1. Current state (verified against `src/fabric-store.mjs` and `src/server.mjs`)
 
 - `audit_events_v2` (Postgres schema v7): `id, ts, actor_tag, action, outcome,
   request_id, target_id, scope_tag, details_json`, one btree index on `ts`. No
   partitioning, no FK targets it (safe to restructure).
-- Every audit action name in the codebase (`grep -oE "action:\s*'[a-z_]+'"
-  src/server.mjs`, plus the two dynamic `identity_${operation}` actions):
-
-  `authenticate, context_search, curation_proposal_decrypt_intent,
-  curation_proposal_list, curation_proposal_read, curation_receipt,
-  curation_reconcile, document_read, documents_search, identity_create,
-  identity_merge, identity_read, identity_split, memory_proposal_status,
-  memory_propose, memory_read, memory_search, memory_status,
-  raw_delivery_proof, raw_event_ingest, raw_extractor_session_read,
-  raw_extractor_sessions_read, raw_extractor_transcript_read, retention_apply,
-  retention_plan, session_get, session_transcript, sessions_search`
+- Audit actions are written from `src/server.mjs`, `src/fabric-store.mjs`
+  (ingest, decrypt intents, recovery, reconcile, curation receipts, document
+  writes via the server) and the M4 operators (`raw_redacted_decrypt_intent`).
+  The full list is the §2.1 table; `scripts/test-audit-retention.mjs` fails if a
+  literal action in `src/` is missing from it.
 
 - Audit writes are **fail-closed**: `auditRequired()` wraps `fabricStore.audit()`
   in `boundedDependency()` with a 2s default timeout
@@ -41,12 +60,10 @@ mechanism for that.
   in the schema by construction: every harness/session across the fleet that
   polls AMF health produces one row per call. This matches the ledger's
   "memory_status entries" volume driver.
-- "ingest/decrypt authorizations" and "ingest receipts" in the ledger map to
-  `raw_event_ingest` (one row per `/v2/ingest/raw-events` call — success
-  outcomes `stored`/`duplicate`/`recovered`) and `raw_delivery_proof`
-  respectively. There is no separate high-volume decrypt action;
-  `curation_proposal_decrypt_intent` is proposal-scoped and, at 253 total
-  proposals, negligible by volume.
+- Every raw ingest writes two rows: `raw_ingest_decrypt_intent/authorized` and
+  `raw_event_ingest/stored|duplicate` (2.49M each in production). Session reads
+  add `raw_redacted_decrypt_intent`, `raw_decrypt_intent`, and
+  `raw_session_search_decrypt_intent`.
 - `raw_retention_v2` / `retention_tombstones_v2` / `applyRetention()`
   (`fabric-store.mjs:2512-2570`) already tombstone content and emit a
   `gcCandidate` boolean, but the only reference check performed is against
@@ -62,49 +79,41 @@ mechanism for that.
   their MCP equivalents) are served by `conversationSessionReader`, selected in
   `src/conversation-session-runtime.mjs` by `AMF_CONVERSATION_READER_MODE`
   (default `disabled`):
-  - `disabled`: reader is `null` → the server falls back to
-    `createUnconfiguredSessionReader()` (`server.mjs:1733`), a stub. Session
-    reads would not function at all in this mode.
+  - `disabled` (production today, §0): session reads use the legacy reader
+    directly on `raw_events_v1`/`raw_events_v2`.
   - `shadow`: live reads are served by `legacyReader`
-    (`fabricStore.createSessionReader()`, backed directly by
-    `raw_events_v1`/`raw_events_v2`); the v3 `conversation_archive_events_v1`
-    copy is only read asynchronously in the background for parity comparison
-    (`conversation-session-runtime.mjs:206-225`). **This is almost certainly
-    CT112's actual mode** — it is the only mode consistent with the ledger's
-    observation that reads hit `raw_events_v2` directly while curation
-    proposals exist independently.
+    (`fabricStore.createSessionReader()`); the v3 `conversation_archive_events_v1`
+    copy is only read in the background for parity comparison.
   - `active`: live reads are served by `archiveReader`
     (`conversation_archive_events_v1`, the M4 v3 deterministic archive);
     `raw_events_v2` is no longer on the live read path.
-  CT112's actual `AMF_CONVERSATION_READER_MODE` and
-  `AMF_CONVERSATION_EXTRACTOR_MODE` must be confirmed live (§8, step 1) before
-  any `raw_events_v2` row is treated as GC-eligible — this is the single
-  highest-risk unverified assumption in this design.
 
 ## 2. Differentiated audit retention
 
 ### 2.1 Category assignment
 
-Classification is a pure function of `(action, outcome)`, evaluated at audit
-write time — never backfilled by scanning the existing 7.37M-row table (see
-§4). Rule: an action already in the `long_retained` family keeps that
-classification regardless of outcome (a denied `identity_merge` is still an
-identity-lifecycle record worth a year). For every other action, `outcome IN
-('denied', 'failed')` forces `security_review` (90 days) regardless of the
-action's normal-outcome class, because a rejected authorization attempt is
-itself the security-relevant event, independent of how routine the underlying
-action is.
+Classification is a pure function of `(action, outcome)` defined once in
+`AUDIT_RETENTION_TABLE` (`src/audit-retention.mjs`). Rules: decrypt intents are
+`security_review`, except `curation_proposal_decrypt_intent`; curation, identity,
+retention, reconcile, recovery, and document writes are `long_retained` on every
+outcome; `denied`/`failed` of any other action is `security_review`. **Any pair
+not in the table is `long_retained`** and is never deleted; classification never
+throws on a production path (`classifyAuditEventStrict` exists for tests).
 
-| Class | Window | Actions (successful-outcome default) |
+| Class | Window | `action` / `outcome` |
 |---|---|---|
-| `ephemeral_status` | 1–3 days (default 2) | `memory_status` |
-| `ephemeral_operational` | 7–14 days (default 10) | `context_search`, `document_read`, `documents_search`, `memory_proposal_status`, `memory_read`, `memory_search`, `raw_delivery_proof`, `raw_event_ingest`, `raw_extractor_session_read`, `raw_extractor_sessions_read`, `raw_extractor_transcript_read`, `session_get`, `session_transcript`, `sessions_search` |
-| `security_review` | 90 days | any action above with `outcome IN ('denied','failed')`; `authenticate` (only ever audited on denial today) |
-| `long_retained` | ≥ 1 year / external archive | `curation_proposal_decrypt_intent`, `curation_proposal_list`, `curation_proposal_read`, `curation_receipt`, `curation_reconcile`, `memory_propose`, `identity_create`, `identity_read`, `identity_merge`, `identity_split`, `retention_plan`, `retention_apply` — **any outcome** |
+| `ephemeral_status` | 1–3 days (default 2) | `memory_status/allowed` |
+| `ephemeral_operational` | 7–14 days (default 10) | `/allowed` of `context_search`, `document_read`, `documents_search`, `memory_proposal_status`, `memory_read`, `memory_search`, `raw_extractor_session_read`, `raw_extractor_sessions_read`, `raw_extractor_transcript_read`, `session_get`, `session_transcript`, `sessions_search`; `raw_event_ingest/stored\|duplicate`; `raw_delivery_proof/verified` |
+| `security_review` | 90 days | `raw_ingest_decrypt_intent`, `raw_redacted_decrypt_intent`, `raw_decrypt_intent`, `raw_session_search_decrypt_intent` (`authorized`, `denied`, `failed`); `authenticate/denied\|failed`; `denied`/`failed` of every action in the two rows above |
+| `long_retained` | kept | every outcome of `curation_proposal_decrypt_intent`, `curation_proposal_list`, `curation_proposal_read`, `curation_receipt`, `curation_reconcile`, `curation_decision_receipt`, `curation_apply_receipt`, `memory_propose`, `identity_create`, `identity_read`, `identity_merge`, `identity_split`, `retention_plan`, `retention_apply`, `raw_reconcile`, `raw_event_recovery`, `document_upsert`, `document_delete`; every unknown pair |
 
-`long_retained` volume is bounded by curation/identity/retention call volume
-(hundreds to low thousands, per the 253-proposal figure), not by ingest or
-status-check volume, so a 1-year-plus window here costs negligible space.
+Decided from code semantics (the owner rules did not name them), taking the
+longer window when in doubt: `raw_event_recovery` (rewrites an event's content
+reference and may retire an object: an administrative repair) and
+`document_upsert` (a durable vault write, the counterpart of `document_delete`)
+are `long_retained`; `raw_event_ingest` and `raw_delivery_proof` keep their
+operational class because the paired decrypt intent already carries the
+security record for 90 days.
 
 ### 2.2 Configuration shape
 
@@ -129,9 +138,8 @@ tooling later); it is out of scope to implement here.
 
 ### 2.3 Enforcement
 
-Enforcement is partition-drop, not row `DELETE`, for the two ephemeral classes
-and `security_review` — see §4. `long_retained` is never auto-pruned by this
-design.
+v1 enforces with the operator-run Phase A bounded row `DELETE` (§4.2).
+Partition-drop is deferred (§0). `long_retained` is never pruned.
 
 ## 3. Reducing `memory_status` audit volume
 
@@ -156,19 +164,24 @@ not a per-request DB write:
   one row per actor per 5-minute window — a >100x reduction at the fleet
   concurrency implied by CT112's volume, without losing per-actor,
   per-window observability.
-- Process restart/crash loses at most the current unflushed bucket (a few
-  minutes of aggregate counts, never individual denials). Acceptable because
-  §3's guarantee is specifically about denials/failures, not about
-  success-count precision.
-- **Never sampled, always written per-call, at full fidelity:** any
-  `memory_status` call with a non-`allowed` outcome (`healthRequired()`
-  throwing, permission denial), and every other action in the schema. This
-  design touches `memory_status`/`outcome=allowed` only.
+- A bucket is removed only after its row is written. A failed write is logged
+  (`memory_status_audit_sample_flush_failed`) and retried on the next flush, so
+  delivery is at-least-once: a write that times out but later commits can be
+  counted twice. Pending buckets are capped (10,000); overflow drops the oldest
+  and logs it.
+- On `server.close()` the sampler flushes and is awaited before the fabric store
+  closes. **Bounded loss:** a crash or a kill without `server.close()` loses the
+  buckets still in memory — at most one window per actor plus any buckets whose
+  writes were still failing. Counts of successful status calls only; no denial
+  is ever sampled.
+- Only `memory_status/allowed` is sampled. Every other action keeps its
+  per-call fail-closed write. Failed `memory_status` calls are not audited today;
+  if that is added, it must go through `auditRequired`, not the sampler.
 - Implementation surface: a small in-process `AuditSampler` wrapping the single
   `auditRequired(... action: 'memory_status', outcome: 'allowed' ...)` call
   site (`server.mjs:779` and its session-scoped twin near `server.mjs:1847`).
-  No schema change is required for this item alone; the aggregated row uses
-  the same `audit_events_v2` shape, `retention_class = 'ephemeral_status'`.
+  No schema change: the aggregated row uses the existing `audit_events_v2`
+  shape with `details.sampledCount/windowStart/windowEnd`.
 
 ## 4. Space-reclaiming migration for `audit_events_v2`
 
@@ -183,43 +196,37 @@ first, so the copy step that follows only ever moves the small survivor set.
 
 ### 4.2 Sequencing (delete-first, then partition)
 
-**Phase A — bulk delete under the new policy, on the existing unpartitioned
-table, before touching schema.** Classification is computed inline in the
-`DELETE` predicate (a `CASE`/`IN`-list mirroring §2.1), never persisted onto
-the 7.37M existing rows — an `UPDATE` to backfill a `retention_class` column
-across the whole table would itself bloat the table further, working against
-the goal.
+**Phase A — bounded delete under the new policy, on the existing table.**
+The predicate is generated from `AUDIT_RETENTION_TABLE` (`buildPhaseAPredicate`):
+one clause per deletable class, each an explicit `(action, outcome) IN (...)`
+list plus `ts < cutoff`, where the cutoff is `asOf` minus the window in fixed
+milliseconds (the same arithmetic as `isAuditRetentionExpired`, so DST cannot
+move a boundary). Unknown and `long_retained` pairs are never in any list.
 
 ```sql
--- one batch; repeat with a short pause between batches, off-peak, until 0 rows affected
 WITH victims AS (
-  SELECT id FROM agent_memory_fabric.audit_events_v2
-  WHERE (
-      (action = 'memory_status' AND outcome = 'allowed' AND ts < now() - interval '2 days')
-   OR (action IN ('context_search','document_read','documents_search','memory_proposal_status',
-                   'memory_read','memory_search','raw_delivery_proof','raw_event_ingest',
-                   'raw_extractor_session_read','raw_extractor_sessions_read',
-                   'raw_extractor_transcript_read','session_get','session_transcript','sessions_search')
-       AND outcome NOT IN ('denied','failed') AND ts < now() - interval '10 days')
-   OR (outcome IN ('denied','failed') AND action NOT IN (<long_retained actions>) AND ts < now() - interval '90 days')
-   OR (action = 'authenticate' AND ts < now() - interval '90 days')
-  )
-  ORDER BY ts LIMIT 20000
+  SELECT id FROM "agent_memory_fabric"."audit_events_v2"
+  WHERE ((action, outcome) IN (('memory_status','allowed')) AND ts < $2)
+     OR ((action, outcome) IN (('context_search','allowed'), ...) AND ts < $3)
+     OR ((action, outcome) IN (('authenticate','denied'), ...) AND ts < $4)
+  ORDER BY ts LIMIT $1
 )
-DELETE FROM agent_memory_fabric.audit_events_v2 a USING victims WHERE a.id = victims.id;
+DELETE FROM "agent_memory_fabric"."audit_events_v2" a USING victims
+WHERE a.id = victims.id RETURNING a.action, a.outcome, a.ts;
 ```
 
-Given the ledger's own numbers (6.65M of 7.37M rows already older than 7 days,
-volume dominated by `memory_status`/ingest/receipts — all short-window
-classes), Phase A is expected to remove the large majority of rows and bytes.
-Run plain `VACUUM (ANALYZE) audit_events_v2` (non-`FULL`; brief lock, safe
-under load) every few batches so freed space becomes reusable and Postgres can
-truncate trailing empty pages back to the OS where the freed pages are
-contiguous at the end of the file. Track `pg_total_relation_size`,
-`pg_stat_user_tables.n_dead_tup`, and filesystem free space after every
-handful of batches; stop and reassess if free space is not recovering as
-expected. **Requires the Joseph approval checkpoint in §8 before it runs on
-CT112** — this is the first deletion of any CT112 data.
+Each batch runs in its own transaction with `lock_timeout` and
+`statement_timeout`; every returned row is re-classified and the batch rolls
+back if any row is `long_retained` or not expired. `previewPhaseA` and
+`countAuditRowsByPair` (inventory, including unknown pairs) run in `READ ONLY`
+transactions. Only `audit_events_v2` is accepted as the target table.
+
+DELETE leaves dead tuples; plain `VACUUM` (never `FULL`) makes pages reusable
+but returns space to the OS only for trailing pages, and DELETE generates WAL.
+The operator therefore runs small batches with pauses, re-measures free space on
+the database server's data filesystem, and stops on any decline beyond its
+threshold (runbook). **Requires the approval checkpoint in §8 before it runs on
+CT112.**
 
 **Phase B — measure, then decide whether partitioning is still needed.** Phase
 A alone may relieve the immediate disk-pressure crisis (growth driver removed,
@@ -227,7 +234,7 @@ internal free space reclaimed for reuse) even before the file shrinks on disk.
 Re-measure; if headroom is comfortably restored, partitioning becomes a
 non-emergency follow-up rather than a second urgent operation.
 
-**Phase C — partition, sized against the now-small survivor set.** Create a
+**Phase C — deferred (§0).** Design notes only. Create a
 new table, `LIST`-partitioned on a stored `retention_class` column, with the
 `ephemeral` branch further `RANGE`-partitioned by `ts` (weekly granularity —
 tighter than monthly, which matters because a partition can only be dropped
@@ -271,7 +278,7 @@ set to a small fraction of the original 3 GB, this copy's peak transient space
 is small — confirm the exact figure live against current free space
 immediately before running (explicit go/no-go gate, not an assumption).
 
-**Phase D — cutover.** In one short transaction: catch up any rows inserted
+**Phase D — deferred (§0).** In one short transaction: catch up any rows inserted
 during the copy window (same `ts` cursor), `ALTER TABLE audit_events_v2 RENAME
 TO audit_events_v2_legacy_<date>`, `ALTER TABLE audit_events_v2_next RENAME TO
 audit_events_v2`, bump `POSTGRES_SCHEMA_VERSION` and add the migration to
@@ -297,6 +304,8 @@ space to the OS immediately, no `VACUUM` required.
 job.
 
 ## 5. Verifiable "session fully archived" proof
+
+Deferred (§0): design notes only; requires reader mode `active`.
 
 "Archived," for GC-eligibility purposes, is **not** the same thing as
 "curated" or "promoted." Only 31 of 253 proposals are promoted; the vast
@@ -359,6 +368,8 @@ path has already moved to the archive (`active`), or GC refuses to run for
 that session at all (`shadow`/`disabled` with unproven parity).
 
 ## 6. Idempotent physical GC
+
+Deferred (§0): design notes only; no tables below exist.
 
 New, small, purpose-built tables (naming follows the existing `*_v1`/`*_v2`
 convention; none of this reuses or mutates `raw_retention_v2`):
@@ -454,91 +465,36 @@ CREATE TABLE agent_memory_fabric.raw_gc_operations_v1 (
 
 ## 7. Test plan
 
-Follow the existing real-Postgres integration convention
-(`scripts/test-postgres-catalog-integration.mjs`): gated on
-`AMF_TEST_POSTGRES_URL` + `AMF_TEST_POSTGRES_ALLOW_MUTATION=true`, asserting
-the database name matches `/test/i` before running, no mocks. Required cases:
-
-- **Retention classification.** For every `(action, outcome)` pair in §2.1,
-  assert the computed `retention_class` and confirm a row exactly at its
-  boundary (`ts = now() - window`) and just inside/outside it is
-  included/excluded correctly by the Phase-A delete predicate.
-- **Reference integrity.** Seed a logical message with two aliased events, one
-  past retention and one not: assert GC refuses to delete either (atomicity,
-  §5.5). Seed two events sharing one `content_id` (dedup case, §5.6): assert
-  the shared `raw_objects_v2` row survives until *both* referencing events are
-  gone. Seed a `fabric_proposals` row in `status='promoted'` referencing a
-  session's content: assert GC skips it, and that it proceeds once the status
-  is `revoked`/`rejected`.
-- **Replay/idempotency.** Run the same `raw_gc_operations_v1` idempotency tag
-  twice; assert the second run performs zero additional deletes and returns
-  the same counters. Run a batch, then re-run with a manually rewound cursor;
-  assert re-verification (not a cached proof) is what prevents double
-  deletion.
-- **Crash recovery mid-GC.** Kill the test process (or roll back the batch
-  transaction manually) after tombstone insert but before the `DELETE`
-  commits; assert the next run either completes that batch cleanly or skips
-  it without a partial/inconsistent state (no orphaned tombstone pointing at
-  data that was never actually deleted, and no `raw_events_v2` row deleted
-  without a corresponding tombstone).
-- **Transcripts stay readable for retained sessions.** After a GC run against
-  a fixture with a mix of expired/archived and fresh/unarchived sessions,
-  assert `session_transcript`/`sessions_search` still return correct results
-  for every session that was *not* GC'd, in both `shadow` and `active` reader
-  modes, and that a session skipped for failing the archive proof (§5.2) is
-  provably untouched (row counts unchanged).
-- **Audit partitioning.** Exercise the Phase A→D migration end-to-end against
-  a seeded table: row-count and digest parity between old and new table before
-  cutover; confirm a partition becomes droppable only after every row's own
-  category window has elapsed, not merely the partition's nominal date range.
-- **`memory_status` sampling.** Assert a burst of N calls within one bucket
-  produces exactly one aggregated audit row with `sampledCount = N`; assert a
-  denied/failed call is never aggregated, even mid-burst.
+- `scripts/test-audit-retention.mjs`: owner-fixed pairs, a scan of `src/` for
+  literal audit actions missing from the table, unknown pairs → `long_retained`,
+  the generated predicate lists exactly the deletable pairs, boundary arithmetic,
+  and sampler retry/serialization/close behavior.
+- `scripts/test-postgres-audit-retention-integration.mjs` (real PostgreSQL, gated
+  on `AMF_TEST_POSTGRES_URL` + `AMF_TEST_POSTGRES_ALLOW_MUTATION=true` and a
+  `/test/i` database name): every table pair at cutoff −1 ms, at the cutoff, and
+  +1 ms for each window, plus unknown pairs (including `memory_status` with a
+  non-`allowed` outcome); asserts the SQL predicate, preview, and bounded delete
+  select exactly what the classifier says, and that preview/inventory leave every
+  table in the schema unchanged.
+- `scripts/test-fabric-server.mjs`: sampled `memory_status` is written before
+  the fabric store closes on shutdown.
 
 ## 8. Operational rollout plan for CT112
 
-This is a live-system plan; none of it runs without the approval gate below.
+This is a live-system plan; no step mutates CT112 without the checkpoint in
+step 4. The operator procedure is `docs/audit-retention-gc-operator-runbook.md`.
 
-1. **Inventory (read-only).** Confirm on CT112: Postgres major version
-   (`DETACH ... CONCURRENTLY` needs PG14+); current `AMF_CONVERSATION_READER_MODE`
-   and `AMF_CONVERSATION_EXTRACTOR_MODE`; exact `pg_total_relation_size` for
-   `audit_events_v2` and `raw_events_v2`; exact filesystem free space; count of
-   rows per §2.1 category to size Phase A's expected deletions; count of
-   sessions likely to pass §5's archive proof today (probably near zero if
-   mode is `shadow` with no verified parity yet — expect Phase A/audit work to
-   land well before any `raw_events_v2` GC is possible).
-2. **Backup with verified restore.** Full `pg_dump`/base-backup of
-   `agent_memory_fabric` (or filesystem/volume snapshot, whichever CT112's
-   existing backup path uses — confirm it before assuming) taken immediately
-   before Phase A. **Verified** means: restore it to a separate, isolated
-   instance and confirm row counts for `audit_events_v2` and `raw_events_v2`
-   match the source pre-Phase-A counts, and that `session_transcript` works
-   against the restored copy for a sample of sessions. A backup that has not
-   been restore-tested does not satisfy this requirement.
-3. **Temporary space estimate.** Recorded live at step 1, not assumed here:
-   Phase A needs no extra space (it only deletes and periodically vacuums).
-   Phase C's copy needs space equal to the post-Phase-A survivor set, measured
-   before Phase C starts, with an explicit go/no-go against current free
-   space (§4.2, Phase C). §5–6's GC needs no extra space (it only deletes,
-   with tombstone rows that are tiny relative to what they remove).
-4. **Rollback plan.** Phase A: none needed beyond the verified backup — deletes
-   are the intended change once approved, and it is bulk `DELETE`, not a
-   schema change. Phase D (audit table cutover): rename back
-   (`audit_events_v2_legacy_<date>` → `audit_events_v2`), no data loss, until
-   the legacy table is finally dropped 7–14 days later. §6's GC: no in-place
-   undo of a physical `DELETE` — rollback means restoring from the step-2
-   backup taken before that GC run; this is why every GC run must itself be
-   preceded by a fresh verified backup, not just the one from step 2.
-5. **Checkpoint — requires Joseph's point-in-time approval before running
-   against live CT112 data.** This applies separately to: (a) Phase A's first
-   bulk delete against `audit_events_v2`, (b) the Phase C/D audit table
-   partitioning migration, and (c) the first `raw_gc_operations_v1` run against
-   `raw_events_v2`/`raw_objects_v2` with `dry_run = false`. Each of these three
-   is its own approval, not one blanket sign-off — they land at different
-   times and (c) in particular depends on CT112's reader-mode reality (step 1)
-   in a way that may not be resolved when (a) is ready to run. `dry_run = true`
-   runs of §6 may be exercised for measurement without this gate, since they
-   perform no writes; nothing else in this plan may run against CT112 without
-   it, including inventory read-only commands only in the sense that those are
-   pre-approved as read-only — no mutation step is implicitly authorized by an
-   earlier one.
+1. **Deploy.** The image carries the classifier and sampler only; schema stays
+   v7, so rollback is the previous image.
+2. **Inventory (read-only).** Row counts per `(action, outcome)` and class,
+   unknown pairs, Phase A eligibility per class, table size, database identity,
+   and free space on the database server's data filesystem.
+3. **Backup with verified restore** of `agent_memory_fabric`, restored on an
+   isolated instance with matching `audit_events_v2` counts. The CLI records the
+   backup id as an operator attestation; it cannot verify it.
+4. **Checkpoint — Joseph's point-in-time approval** for Phase A's first bulk
+   delete against `audit_events_v2`. Partitioning and raw GC are deferred (§0)
+   and would each need their own approval.
+5. **Phase A** in small batches with pauses, off-peak, stopping on any error or
+   free-space decline (§4.2). Rollback is restore from step 3; deleted rows have
+   no in-place undo.
