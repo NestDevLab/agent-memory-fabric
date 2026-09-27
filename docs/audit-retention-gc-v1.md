@@ -3,7 +3,7 @@
 Status: v1 implements audit retention only — the classification table (§2.1),
 `memory_status` sampling (§3), and the Phase A bounded delete with a read-only
 inventory (§4.2). Postgres schema stays at version 7, so deploy and rollback are
-a plain image swap. Partitioning (§4 Phases C/D) and raw-event GC (§5–§6) are
+a plain image swap. Partitioning (§4.3) and raw-event GC (§5–§6) are
 deferred (§0). Nothing here has run against CT112. Tracked as MGT-0322.
 
 This tranche is orthogonal to `docs/identity-retention.md`. That document
@@ -28,14 +28,15 @@ actions the original table did not know, because it was built from
 Deferred, with the independent review findings recorded in the management ledger
 under MGT-0322:
 
-- **Partitioning (§4 Phases C/D).** Not needed at current growth, and the reviewed
+- **Partitioning (§4.3).** Not needed at current growth, and the reviewed
   cutover could strand rows and break every audit INSERT. No v8 schema.
 - **Raw-event GC (§5–§6).** Requires the M4 reader to be `active`; production is
   `disabled`, so no session can qualify. The reviewed engine also had data-loss
   paths (younger sibling sessions, shadow mode, uncommitted cursors).
 
-§4 Phases C/D, §5, and §6 below are kept as design notes only; nothing in them is
-implemented.
+§4.3, §5, and §6 are future design, not part of this release: nothing in them is
+implemented and none of their steps may be run. The current procedure is
+`docs/audit-retention-gc-operator-runbook.md`.
 
 ## 1. Current state (verified against `src/fabric-store.mjs` and `src/server.mjs`)
 
@@ -194,7 +195,7 @@ margin for WAL, other tables' growth, or ingest continuing during the
 operation. The strategy below never holds two full copies at once — it deletes
 first, so the copy step that follows only ever moves the small survivor set.
 
-### 4.2 Sequencing (delete-first, then partition)
+### 4.2 Phase A and B (this release)
 
 **Phase A — bounded delete under the new policy, on the existing table.**
 The predicate is generated from `AUDIT_RETENTION_TABLE` (`buildPhaseAPredicate`):
@@ -234,7 +235,11 @@ internal free space reclaimed for reuse) even before the file shrinks on disk.
 Re-measure; if headroom is comfortably restored, partitioning becomes a
 non-emergency follow-up rather than a second urgent operation.
 
-**Phase C — deferred (§0).** Design notes only. Create a
+### 4.3 Future design, not in this release: partitioning (Phases C/D)
+
+Not implemented and not runnable; kept to record the design (§0).
+
+**Phase C.** Create a
 new table, `LIST`-partitioned on a stored `retention_class` column, with the
 `ephemeral` branch further `RANGE`-partitioned by `ts` (weekly granularity —
 tighter than monthly, which matters because a partition can only be dropped
@@ -278,7 +283,7 @@ set to a small fraction of the original 3 GB, this copy's peak transient space
 is small — confirm the exact figure live against current free space
 immediately before running (explicit go/no-go gate, not an assumption).
 
-**Phase D — deferred (§0).** In one short transaction: catch up any rows inserted
+**Phase D.** In one short transaction: catch up any rows inserted
 during the copy window (same `ts` cursor), `ALTER TABLE audit_events_v2 RENAME
 TO audit_events_v2_legacy_<date>`, `ALTER TABLE audit_events_v2_next RENAME TO
 audit_events_v2`, bump `POSTGRES_SCHEMA_VERSION` and add the migration to
@@ -303,9 +308,9 @@ space to the OS immediately, no `VACUUM` required.
 `long_retained` is not partitioned by time and is never auto-dropped by this
 job.
 
-## 5. Verifiable "session fully archived" proof
+## 5. Future design, not in this release: verifiable "session fully archived" proof
 
-Deferred (§0): design notes only; requires reader mode `active`.
+Not implemented and not runnable (§0); requires reader mode `active`.
 
 "Archived," for GC-eligibility purposes, is **not** the same thing as
 "curated" or "promoted." Only 31 of 253 proposals are promoted; the vast
@@ -367,9 +372,9 @@ session is served from is not the one being deleted from" — either the read
 path has already moved to the archive (`active`), or GC refuses to run for
 that session at all (`shadow`/`disabled` with unproven parity).
 
-## 6. Idempotent physical GC
+## 6. Future design, not in this release: idempotent physical GC
 
-Deferred (§0): design notes only; no tables below exist.
+Not implemented and not runnable (§0); none of the tables below exist.
 
 New, small, purpose-built tables (naming follows the existing `*_v1`/`*_v2`
 convention; none of this reuses or mutates `raw_retention_v2`):
