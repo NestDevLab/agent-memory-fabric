@@ -205,3 +205,59 @@ test('hardlinked innocuous aliases of protected files remain metadata-only witho
   assert.equal(reads,0);assert.equal(c.search({query:alias}).items[0].contentState,'metadata-only-hardlink');
   assert.equal(c.search({query:'unlabelled'}).total,0);assert.deepEqual(c.suggestions(),[]);
 });
+
+test('bounded calls commit once and minimal results avoid aggregate status',async t=>{
+  const f=fixture(t);for(let i=0;i<20;i++) fs.writeFileSync(path.join(f.source,`${i}.txt`),'batchedword');
+  const c=new HostFileCatalog(f);t.after(()=>c.close());
+  const exec=c.db.exec.bind(c.db),transactions=[];
+  c.db.exec=sql=>{transactions.push(sql);return exec(sql);};
+  const status=c.status.bind(c);c.status=()=>{throw new Error('Aggregate status must be lazy');};
+  const result=await c.scan({maxEntries:15,budgetMs:1000,includeStatus:false});
+  assert.equal(result.processed,15);assert.deepEqual(Object.keys(result).sort(),['processed','scan','state']);
+  assert.equal(result.state,'running');assert.equal(c.scanState().generation,1);
+  assert.deepEqual(transactions,['BEGIN IMMEDIATE','COMMIT']);
+  await assert.rejects(c.scan({includeStatus:'false'}),/Invalid/);
+  c.status=status;await finish(c);assert.equal(c.search({query:'batchedword'}).total,20);
+  assert.ok((await c.scan()).counts);assert.equal((await c.scan({includeStatus:false})).state,'complete');
+});
+
+test('failed batch rolls back queue cursor and resets advanced directory handles',async t=>{
+  const f=fixture(t);for(let i=0;i<8;i++) fs.writeFileSync(path.join(f.source,`${i}.txt`),'rollbackword');
+  const c=new HostFileCatalog(f);t.after(()=>c.close());await c.scan({maxEntries:2});
+  const queue=()=>c.db.prepare('SELECT * FROM queue ORDER BY id').all();
+  const before=queue(),exec=c.db.exec.bind(c.db);
+  c.db.exec=sql=>{if(sql==='COMMIT') throw new Error('Injected commit failure');return exec(sql);};
+  await assert.rejects(c.scan({maxEntries:4}),/Injected commit failure/);
+  assert.deepEqual(queue(),before);assert.equal(c.handles.size,0);assert.equal(c.scanning,false);
+  c.db.exec=exec;await finish(c);assert.equal(c.search({query:'rollbackword'}).total,8);
+});
+
+test('failed generation rolls back metadata, text, coverage and state together',async t=>{
+  const f=fixture(t),file=path.join(f.source,'note.txt');fs.writeFileSync(file,'originalword');
+  const c=new HostFileCatalog(f);t.after(()=>c.close());await finish(c);
+  const before=c.status(),rows=()=>c.db.prepare('SELECT * FROM files ORDER BY path').all(),files=rows();
+  fs.writeFileSync(file,'replacementword');fs.symlinkSync(file,path.join(f.source,'link.txt'));
+  const exec=c.db.exec.bind(c.db);
+  c.db.exec=sql=>{if(sql==='COMMIT') throw new Error('Injected commit failure');return exec(sql);};
+  await assert.rejects(c.scan({maxEntries:100,budgetMs:1000,restart:true}),/Injected commit failure/);
+  assert.deepEqual(c.status(),before);assert.deepEqual(rows(),files);
+  assert.equal(c.search({query:'originalword'}).total,1);assert.equal(c.search({query:'replacementword'}).total,0);
+  c.db.exec=exec;await finish(c,{restart:true});assert.equal(c.search({query:'replacementword'}).total,1);
+});
+
+test('SIGKILL during an open batch preserves committed cursor and rolls back text', {timeout:30000},async t=>{
+  const f=fixture(t);for(let i=0;i<8;i++) fs.writeFileSync(path.join(f.source,`${i}.txt`),'crashbatchword');
+  const code=`import fs from 'node:fs';import {HostFileCatalog} from './src/host-file-catalog.mjs';
+    const c=new HostFileCatalog(JSON.parse(process.argv[1]));await c.scan({maxEntries:2});
+    const inspect=c.inspect.bind(c);c.inspect=p=>{inspect(p);fs.writeSync(1,'uncommitted\\n');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);};
+    await c.scan({maxEntries:100,budgetMs:10000});`;
+  const child=spawn(process.execPath,['--input-type=module','-e',code,JSON.stringify({databasePath:f.databasePath,policy:f.policy})],{stdio:['ignore','pipe','pipe']});
+  t.after(()=>{if(child.exitCode===null)child.kill('SIGKILL');});
+  await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('error',reject);child.once('exit',()=>reject(new Error('Child exited before uncommitted work')));});
+  const killed=new Promise(resolve=>child.once('exit',resolve));child.kill('SIGKILL');await killed;
+  const c=new HostFileCatalog(f);t.after(()=>c.close());
+  assert.equal(c.scanState().state,'running');assert.equal(c.search({query:'crashbatchword'}).total,0);
+  assert.equal(c.db.prepare("SELECT cursor FROM queue WHERE kind='directory'").get().cursor,1);
+  await finish(c);assert.equal(c.search({query:'crashbatchword'}).total,8);
+  assert.equal(c.db.prepare('SELECT count(*) AS n FROM texts').get().n,8);
+});

@@ -146,36 +146,55 @@ export class HostFileCatalog {
     if (task.cursor >= this.maxDirectoryEntries) { this.record(task.path,'incomplete','directory-entry-limit'); handle.directory.closeSync(); this.handles.delete(task.id); return true; }
     const entry = handle.directory.readSync();
     if (!entry) { handle.directory.closeSync(); this.handles.delete(task.id); return true; }
-    this.db.prepare("INSERT INTO queue(path,kind) VALUES(?,'entry')").run(path.join(task.path,entry.name));
+    const child = this.db.prepare("INSERT INTO queue(path,kind) VALUES(?,'entry')").run(path.join(task.path,entry.name));
     this.db.prepare('UPDATE queue SET cursor=cursor+1 WHERE id=?').run(task.id);
-    return false;
+    return {done:false,childId:child.lastInsertRowid};
   }
-  async scan({ maxEntries=10000, budgetMs=2000, restart=false }={}) {
+  closeHandles() {
+    for (const active of this.handles.values()) { try { active.directory.closeSync(); } catch {} }
+    this.handles.clear();
+  }
+  scanState() {
+    const state = this.db.prepare('SELECT generation,phase,started,completed FROM state').get();
+    return {...state,state:state.phase === 'scanning' ? 'running' : state.phase};
+  }
+  async scan({ maxEntries=10000, budgetMs=2000, restart=false, includeStatus=true }={}) {
     int(maxEntries,1,100000,'maxEntries'); int(budgetMs,1,60000,'budgetMs');
-    if (typeof restart !== 'boolean') throw new Error('Invalid restart');
+    if (typeof restart !== 'boolean' || typeof includeStatus !== 'boolean') throw new Error('Invalid scan options');
     if (this.scanning) throw new Error('Scan already running');
     this.scanning = true;
+    const result = processed => {
+      const status = includeStatus ? this.status() : {scan:this.scanState()};
+      return {processed,state:status.scan.state,...status};
+    };
     try {
-      let state = this.db.prepare('SELECT * FROM state').get();
-      if (state.phase === 'complete' && !restart) return { processed:0, state:'complete', ...this.status() };
-      if (state.phase !== 'scanning') {
-        this.db.exec('BEGIN IMMEDIATE');
-        try {
+      const state = this.scanState();
+      if (state.state === 'complete' && !restart) return result(0);
+      const start = Date.now();let processed = 0,nextTaskId = null;
+      // One durable transaction per bounded batch: cursor, child queue,
+      // inventory and FTS either commit together or all remain at the last tick.
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        if (state.phase !== 'scanning') {
+          this.closeHandles();
           this.db.prepare("UPDATE state SET generation=generation+1,phase='scanning',completed=NULL,started=?,policy_hash=? WHERE id=1").run(now(),this.policyHash);
           for (const root of [...new Set(this.policy.roots)].filter(r => !this.policy.roots.some(other => other !== r && within(r,other)))) this.db.prepare("INSERT INTO queue(path,kind) VALUES(?,'entry')").run(root);
-          this.db.exec('COMMIT');
-        } catch(error) { this.db.exec('ROLLBACK'); throw error; }
-      }
-      this.generation = this.db.prepare('SELECT generation FROM state').get().generation;
-      const start = Date.now(); let processed = 0;
-      while (processed < maxEntries && Date.now()-start < budgetMs) {
-        const task = this.db.prepare('SELECT * FROM queue ORDER BY id LIMIT 1').get();
-        if (!task) break;
-        this.db.exec('BEGIN IMMEDIATE');
-        try {
+        }
+        this.generation = this.scanState().generation;
+        while (processed < maxEntries && Date.now()-start < budgetMs) {
+          const task = nextTaskId === null ? this.db.prepare('SELECT * FROM queue ORDER BY id LIMIT 1').get() : this.db.prepare('SELECT * FROM queue WHERE id=?').get(nextTaskId);
+          nextTaskId = null;
+          if (!task) break;
           let done = true;
-          try { if (task.kind === 'directory') done = this.directory(task); else this.inspect(task.path); }
-          catch(error) {
+          try {
+            if (task.kind === 'directory') {
+              const progress = this.directory(task);
+              done = typeof progress === 'object' ? progress.done : progress;
+              // Inspect each newly discovered child before continuing its
+              // directory, so a large directory cannot monopolize inventory.
+              if (typeof progress === 'object') nextTaskId = progress.childId;
+            } else this.inspect(task.path);
+          } catch(error) {
             this.record(task.path,'error',error.code ?? 'inspection-failed');
             this.db.prepare('DELETE FROM texts WHERE path=?').run(task.path);
             this.db.prepare("UPDATE files SET content_state='unavailable' WHERE path=?").run(task.path);
@@ -183,23 +202,24 @@ export class HostFileCatalog {
             if (active) { try { active.directory.closeSync(); } catch {} this.handles.delete(task.id); }
           }
           if (done) this.db.prepare('DELETE FROM queue WHERE id=?').run(task.id);
-          this.db.exec('COMMIT');
-        } catch(error) {
-          this.db.exec('ROLLBACK');
-          for (const active of this.handles.values()) { try { active.directory.closeSync(); } catch {} }
-          this.handles.clear();
-          throw error;
+          processed++;
         }
-        processed++;
+        if (!this.db.prepare('SELECT 1 FROM queue LIMIT 1').get()) this.db.prepare("UPDATE state SET phase='complete',completed=? WHERE id=1").run(now());
+        this.db.exec('COMMIT');
+      } catch(error) {
+        try { this.db.exec('ROLLBACK'); } finally {
+          // Iterators can have advanced beyond the rolled-back durable cursor.
+          // Reopen from that cursor next time; never reuse their in-memory offset.
+          this.closeHandles();
+        }
+        throw error;
       }
-      if (!this.db.prepare('SELECT 1 FROM queue LIMIT 1').get()) this.db.prepare("UPDATE state SET phase='complete',completed=? WHERE id=1").run(now());
-      const status = this.status();
-      return { processed, state:status.scan.state, ...status };
+      return result(processed);
     } finally { this.scanning = false; }
   }
   status() {
-    const state = this.db.prepare('SELECT generation,phase,started,completed FROM state').get();
-    return { hostId:this.policy.hostId, scan:{...state,state:state.phase === 'scanning' ? 'running' : state.phase}, pending:this.db.prepare('SELECT count(*) AS n FROM queue').get().n,
+    const state = this.scanState();
+    return { hostId:this.policy.hostId, scan:state, pending:this.db.prepare('SELECT count(*) AS n FROM queue').get().n,
       counts:{ total:this.db.prepare('SELECT count(*) AS n FROM files').get().n, byDomain:this.db.prepare('SELECT domain,count(*) AS count FROM files GROUP BY domain').all(), byContentState:this.db.prepare('SELECT content_state AS state,count(*) AS count FROM files GROUP BY content_state').all() },
       coverage:{ roots:this.policy.roots, configuredExclusions:this.policy.excludePrefixes, metadataOnlyPrefixes:this.policy.metadataOnlyPrefixes, metadataOnlyDirectoryNames:this.policy.metadataOnlyDirectoryNames ?? [], summary:this.db.prepare('SELECT kind,count(*) AS count FROM coverage WHERE generation=? GROUP BY kind').all(state.generation), recent:this.db.prepare('SELECT path,kind,reason,observed_at FROM coverage WHERE generation=? ORDER BY id DESC LIMIT 100').all(state.generation) },
       freshness:{ unverified:this.db.prepare('SELECT count(*) AS n FROM files WHERE generation<>?').get(state.generation).n, semantics:'Last observed metadata; unseen files are retained as unverified, never inferred deleted. Concurrent directory changes may require another generation.' } };
@@ -250,7 +270,7 @@ export class HostFileCatalog {
 
   close() {
     if (this.closed) return; this.closed = true;
-    for (const h of this.handles?.values() ?? []) { try { h.directory.closeSync(); } catch {} }
+    this.closeHandles();
     this.db?.close();
 
   }
