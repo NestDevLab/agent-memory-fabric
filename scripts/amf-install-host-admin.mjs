@@ -82,7 +82,7 @@ function validatePolicy(policy) {
   if(policy.metadataOnlyDirectoryNames!==undefined && (!Array.isArray(policy.metadataOnlyDirectoryNames) || policy.metadataOnlyDirectoryNames.some(name=>typeof name!=='string' || !/^[A-Za-z0-9._-]{1,255}$/.test(name) || name==='.' || name==='..'))) fail('invalid_catalog_policy');
   const ids=new Set();
   for(const domain of policy.domains) {
-    if(!plain(domain) || typeof domain.id!=='string' || !domain.id || ids.has(domain.id) || !Array.isArray(domain.prefixes) || domain.prefixes.some(prefix=>!absolute(prefix)) || (domain.destination && !absolute(domain.destination))) fail('invalid_catalog_policy');
+    if(!plain(domain) || typeof domain.id!=='string' || !domain.id || ids.has(domain.id) || !Array.isArray(domain.prefixes) || domain.prefixes.some(prefix=>!absolute(prefix)) || (domain.destination && !absolute(domain.destination)) || (domain.nameHints!==undefined && (!Array.isArray(domain.nameHints) || domain.nameHints.some(hint=>typeof hint!=='string' || hint.length>64 || /[^A-Za-z0-9-]/.test(hint) || !/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/.test(hint))))) fail('invalid_catalog_policy');
     ids.add(domain.id);
   }
   for(const virtual of ['/proc','/sys','/dev']) if(policy.roots.some(root=>root==='/' || root===virtual || within(root,virtual) || within(virtual,root)) && !policy.excludePrefixes.some(prefix=>prefix==='/' || prefix===virtual || within(virtual,prefix))) fail('virtual_filesystem_exclusion_required');

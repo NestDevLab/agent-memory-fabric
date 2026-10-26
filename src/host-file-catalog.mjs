@@ -8,6 +8,11 @@ const within = (p, prefix) => p === prefix || p.startsWith(prefix === '/' ? '/' 
 const absolute = p => typeof p === 'string' && path.isAbsolute(p) && path.normalize(p) === p;
 const secretPath = p => /(^|\/)(\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.docker|\.npmrc|\.netrc|\.git-credentials|cookies?|login data|gogcli|keyrings?|credentials?|secrets?|\.env(?:\..*)?|id_(?:rsa|ed25519)|[^/]*\.(?:pem|key|p12|pfx|kdbx))($|\/)|(?:password|token|credential|secret|session[-_.]?store)/i.test(p);
 const secretText = s => /-----BEGIN [^-]*(?:PRIVATE KEY|OPENSSH)|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{20,})|(?:password|passwd|api[_-]?key|access[_-]?token|client[_-]?secret|authorization|refresh[_-]?token)\s*["']?\s*[:=]\s*["']?\S{4,}/i.test(s);
+const validNameHint = value => typeof value === 'string' && value.length <= 64 && !/[^A-Za-z0-9-]/.test(value) && /^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/.test(value);
+const filenameHintMatches = (filename,hints=[]) => {
+  const tokens = ` ${path.basename(filename).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).join(' ')} `;
+  return hints.filter(hint => tokens.includes(` ${hint.toLowerCase().replaceAll('-',' ')} `));
+};
 const now = () => new Date().toISOString();
 const int = (n, min, max, name) => { if (!Number.isInteger(n) || n < min || n > max) throw new Error(`Invalid ${name}`); return n; };
 
@@ -35,7 +40,7 @@ export class HostFileCatalog {
     if (!policy.roots.length || !Array.isArray(policy.domains)) throw new Error('Invalid roots/domains');
     const ids = new Set();
     for (const d of policy.domains) {
-      if (!d.id || typeof d.id !== 'string' || ids.has(d.id) || !Array.isArray(d.prefixes) || d.prefixes.some(p => !absolute(p)) || (d.destination && !absolute(d.destination))) throw new Error('Invalid domain');
+      if (!d.id || typeof d.id !== 'string' || ids.has(d.id) || !Array.isArray(d.prefixes) || d.prefixes.some(p => !absolute(p)) || (d.destination && !absolute(d.destination)) || (d.nameHints !== undefined && (!Array.isArray(d.nameHints) || d.nameHints.some(hint => !validNameHint(hint))))) throw new Error('Invalid domain');
       ids.add(d.id);
     }
     if (policy.metadataOnlyDirectoryNames !== undefined && (!Array.isArray(policy.metadataOnlyDirectoryNames) || policy.metadataOnlyDirectoryNames.some(name => typeof name !== 'string' || !/^[A-Za-z0-9._-]{1,255}$/.test(name) || name === '.' || name === '..'))) throw new Error('Invalid metadataOnlyDirectoryNames');
@@ -68,22 +73,28 @@ export class HostFileCatalog {
   classification(p) {
     const candidates = this.policy.domains.flatMap(d => d.prefixes.filter(prefix => within(p, prefix)).map(prefix => ({ domain: d.id, prefix })));
     candidates.sort((a,b) => b.prefix.length - a.prefix.length);
-    if (!candidates.length || (candidates[1] && candidates[0].prefix === candidates[1].prefix && candidates[0].domain !== candidates[1].domain)) return { domain: 'unknown', prefix: null, confidence: 0 };
-    return { ...candidates[0], confidence: 1 };
+    if (candidates.length) {
+      if (candidates[1] && candidates[0].prefix === candidates[1].prefix && candidates[0].domain !== candidates[1].domain) return { domain:'unknown',prefix:null,confidence:0 };
+      return { ...candidates[0], confidence:1 };
+    }
+    const hinted = this.policy.domains.filter(domain => filenameHintMatches(p,domain.nameHints).length);
+    return hinted.length === 1 ? {domain:hinted[0].id,prefix:null,confidence:0.5} : {domain:'unknown',prefix:null,confidence:0};
   }
+
   excluded(p) { return within(p, path.dirname(this.databasePath)) || this.policy.excludePrefixes.some(prefix => within(p, prefix)); }
   inspect(p) {
     if (this.excluded(p)) { this.record(p, 'excluded', 'policy-or-catalog-state'); return; }
     anchored(p, target => {
       const s = fs.lstatSync(target, { bigint: true });
       const kind = s.isFile() ? 'file' : s.isDirectory() ? 'directory' : s.isSymbolicLink() ? 'symlink' : 'special';
-      const signature = [s.dev,s.ino,s.size,s.mtimeNs,s.ctimeNs,s.mode].join(':');
+      const signature = [s.dev,s.ino,s.size,s.mtimeNs,s.ctimeNs,s.mode,s.nlink].join(':');
       const previous = this.db.prepare('SELECT signature,content_state FROM files WHERE path=?').get(p);
       const classification = this.classification(p);
       let contentState = kind === 'file' ? 'not-allowlisted' : 'metadata-only';
       let body = null;
       const allowed = this.policy.content.enabled && this.policy.content.extensions.includes(path.extname(p).toLowerCase());
       if (kind === 'file' && secretPath(p)) contentState = 'sensitive-path';
+      else if (kind === 'file' && s.nlink > 1n) contentState = 'metadata-only-hardlink';
       else if (kind === 'file' && (this.policy.metadataOnlyPrefixes.some(prefix => within(p, prefix)) || path.dirname(p).split(path.sep).some(component => (this.policy.metadataOnlyDirectoryNames ?? []).includes(component)))) contentState = 'metadata-only-policy';
       else if (kind === 'file' && allowed) {
         if (s.size > BigInt(this.policy.content.maxBytes)) contentState = 'too-large';
@@ -92,11 +103,11 @@ export class HostFileCatalog {
           const fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
           try {
             const before = fs.fstatSync(fd, { bigint: true });
-            if (!before.isFile() || [before.dev,before.ino,before.size,before.mtimeNs,before.ctimeNs,before.mode].join(':') !== signature) throw new Error('File changed before read');
+            if (!before.isFile() || before.nlink !== 1n || [before.dev,before.ino,before.size,before.mtimeNs,before.ctimeNs,before.mode,before.nlink].join(':') !== signature) throw new Error('File changed before read');
             const bytes = Buffer.alloc(this.policy.content.maxBytes + 1);
             const length = fs.readSync(fd, bytes, 0, bytes.length, 0);
             const after = fs.fstatSync(fd, { bigint: true });
-            if ([after.dev,after.ino,after.size,after.mtimeNs,after.ctimeNs,after.mode].join(':') !== signature) throw new Error('File changed during read');
+            if ([after.dev,after.ino,after.size,after.mtimeNs,after.ctimeNs,after.mode,after.nlink].join(':') !== signature) throw new Error('File changed during read');
             if (BigInt(length) !== s.size && length <= this.policy.content.maxBytes) throw new Error('Incomplete file read');
             if (length > this.policy.content.maxBytes) contentState = 'too-large';
             else {
@@ -202,16 +213,39 @@ export class HostFileCatalog {
     const literalPath = `%${query.replaceAll('!','!!').replaceAll('%','!%').replaceAll('_','!_')}%`;
     const args = [literalPath,...(match ? [match] : []),domain,domain];
     const total = this.db.prepare(`SELECT count(*) AS n FROM files f WHERE ${where}`).get(...args).n;
-    const items = this.db.prepare(`SELECT f.path,f.kind,f.size,f.domain,f.classification_prefix AS classificationPrefix,f.confidence,f.content_state AS contentState,f.observed_at AS observedAt,f.generation,(f.generation=(SELECT generation FROM state)) AS currentGeneration FROM files f WHERE ${where} ORDER BY f.path LIMIT ? OFFSET ?`).all(...args,limit,offset);
+    const items = this.db.prepare(`SELECT f.path,f.kind,f.size,f.domain,f.classification_prefix AS classificationPrefix,CASE WHEN f.classification_prefix IS NOT NULL THEN 'configured-prefix' WHEN f.confidence=0.5 THEN 'filename-hint' ELSE 'unknown' END AS classificationBasis,f.confidence,f.content_state AS contentState,f.observed_at AS observedAt,f.generation,(f.generation=(SELECT generation FROM state)) AS currentGeneration FROM files f WHERE ${where} ORDER BY f.path LIMIT ? OFFSET ?`).all(...args,limit,offset);
     return {items,total};
   }
   suggestions({limit=50}={}) {
     int(limit,1,200,'limit');
-    const destinations = new Map(this.policy.domains.filter(d => d.destination).map(d => [d.id,d.destination]));
-    const domainIds = [...destinations.keys()];
-    const rows = this.db.prepare(`SELECT path,domain,classification_prefix AS classificationPrefix,confidence,observed_at AS observedAt,generation FROM files WHERE kind='file' AND (domain='unknown'${domainIds.length ? ` OR domain IN (${domainIds.map(()=>'?').join(',')})` : ''}) ORDER BY path LIMIT ?`).all(...domainIds,limit);
+    const domains = this.policy.domains.filter(domain => domain.destination);
     const currentGeneration = this.db.prepare('SELECT generation FROM state').get().generation;
-    return rows.map(f => ({path:f.path,domain:f.domain,action:'review-only',suggestedDestination:destinations.get(f.domain) ?? null,evidence:{classificationPrefix:f.classificationPrefix,confidence:f.confidence,observedAt:f.observedAt,currentGeneration:f.generation === currentGeneration},uncertainty:'Path classification only; ownership, references, duplicate identity and suitability for relocation are unverified. No action is executed.'}));
+    const items = [];
+    const append = row => {
+      if (secretPath(row.path)) return;
+      const basis = row.classificationPrefix !== null ? 'configured-prefix' : row.confidence === 0.5 ? 'filename-hint' : 'unknown';
+      const domain = this.policy.domains.find(candidate => candidate.id === row.domain);
+      items.push({path:row.path,domain:row.domain,action:'review-only',reviewKind:row.destination ? 'organization-proposal' : 'classification-review',
+        suggestedDestination:row.destination ? path.join(row.destination,path.basename(row.path)) : null,
+        evidence:{basis,classificationPrefix:row.classificationPrefix,matchedNameHints:basis === 'filename-hint' ? filenameHintMatches(row.path,domain?.nameHints) : [],confidence:row.confidence,observedAt:row.observedAt,currentGeneration:row.generation === currentGeneration},
+        uncertainty:'Proposal only; ownership, references, duplicate identity, destination collisions and suitability for relocation are unknown. Filename hints confer no authority or permission. No filesystem check or action is executed.'});
+    };
+    // SQL filters destination boundaries before paging. Streaming also keeps
+    // secret-path rejection bounded in memory without a first-N candidate blind spot.
+    const columns = 'f.path,f.domain,f.classification_prefix AS classificationPrefix,f.confidence,f.observed_at AS observedAt,f.generation';
+    const eligible = "f.kind='file' AND f.content_state NOT IN ('sensitive-path','sensitive-content','metadata-only-hardlink','unavailable')";
+    if (domains.length) {
+      const values = domains.map(()=>'(?,?)').join(',');
+      const query = this.db.prepare(`WITH destinations(domain,destination) AS (VALUES ${values}) SELECT ${columns},d.destination FROM files f JOIN destinations d ON f.domain=d.domain WHERE ${eligible} AND f.confidence IN (0.5,1) AND d.destination<>'/' AND f.path<>d.destination AND substr(f.path,1,length(d.destination)+1)<>d.destination||'/' ORDER BY f.path`);
+      for (const row of query.iterate(...domains.flatMap(domain=>[domain.id,domain.destination]))) {
+        append(row); if (items.length === limit) break;
+      }
+    }
+    if (items.length < limit) {
+      const query = this.db.prepare(`SELECT ${columns},NULL AS destination FROM files f WHERE ${eligible} AND f.domain='unknown' AND f.confidence=0 ORDER BY f.path`);
+      for (const row of query.iterate()) { append(row); if (items.length === limit) break; }
+    }
+    return items;
   }
 
   close() {

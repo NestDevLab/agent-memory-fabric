@@ -143,3 +143,65 @@ test('configured dependency directory names preserve inventory while refusing te
   c.close();
   for(const name of ['.','..','../escape','foo/bar','foo\\bar','']) assert.throws(()=>new HostFileCatalog({...f,policy:{...f.policy,metadataOnlyDirectoryNames:[name]}}),/Invalid metadataOnlyDirectoryNames/);
 });
+
+test('filename hints propose real targets, preserve prefix authority and prioritize organization over unknown review',async t=>{
+  const f=fixture(t);
+  const inbox=path.join(f.source,'inbox'),alpha=path.join(f.source,'organized-alpha'),beta=path.join(f.source,'organized-beta');
+  fs.mkdirSync(inbox);fs.mkdirSync(alpha);fs.mkdirSync(beta);
+  f.policy.domains=[{id:'alpha',prefixes:[alpha],nameHints:['alpha'],destination:alpha},{id:'beta',prefixes:[beta],nameHints:['beta'],destination:beta}];
+  const files=['alpha-plan.pdf','alpha-beta.pdf','alphabets.pdf','ALPHA-notes.pdf','beta-report.pdf','alpha-secret.pdf','alpha-plan.txt'];
+  for(const name of files) fs.writeFileSync(path.join(inbox,name),name==='alpha-plan.txt'?'api_key = abcdefghijklmnop':'ordinary');
+  fs.writeFileSync(path.join(alpha,'alpha-ready.pdf'),'organized');
+  fs.writeFileSync(path.join(alpha,'beta-owned.pdf'),'prefix wins');
+  for(let i=0;i<205;i++) fs.writeFileSync(path.join(f.source,`a-unknown-${i}.pdf`),'unknown');
+  const sourceSnapshot=()=>{
+    const result={};const walk=dir=>{for(const name of fs.readdirSync(dir).sort()) {const p=path.join(dir,name),s=fs.lstatSync(p,{bigint:true});result[p]={mode:String(s.mode),mtime:String(s.mtimeNs),contents:s.isFile()?fs.readFileSync(p,'utf8'):null};if(s.isDirectory())walk(p);}};walk(f.source);return result;
+  };
+  const before=sourceSnapshot(),c=new HostFileCatalog(f);t.after(()=>c.close());await finish(c,{maxEntries:10000});
+  const item=name=>c.search({query:path.join(inbox,name)}).items[0];
+  assert.equal(item('alpha-plan.pdf').domain,'alpha');assert.equal(item('alpha-plan.pdf').confidence,0.5);assert.equal(item('alpha-plan.pdf').classificationPrefix,null);assert.equal(item('alpha-plan.pdf').classificationBasis,'filename-hint');
+  assert.equal(item('ALPHA-notes.pdf').domain,'alpha');
+  assert.equal(item('alpha-beta.pdf').domain,'unknown');assert.equal(item('alphabets.pdf').domain,'unknown');
+  assert.equal(c.search({query:path.join(alpha,'beta-owned.pdf')}).items[0].domain,'alpha');
+  const first=c.suggestions({limit:1})[0];assert.equal(first.reviewKind,'organization-proposal');assert.ok(first.suggestedDestination.startsWith(alpha+'/') || first.suggestedDestination.startsWith(beta+'/'));
+  const proposed=c.suggestions({limit:200});
+  const plan=proposed.find(x=>x.path===path.join(inbox,'alpha-plan.pdf'));
+  assert.equal(plan.suggestedDestination,path.join(alpha,'alpha-plan.pdf'));assert.equal(plan.evidence.basis,'filename-hint');assert.deepEqual(plan.evidence.matchedNameHints,['alpha']);assert.equal(plan.action,'review-only');assert.match(plan.uncertainty,/collisions.*unknown/);
+  assert.ok(!proposed.some(x=>x.path.startsWith(alpha+'/')));assert.ok(!proposed.some(x=>x.path.endsWith('alpha-secret.pdf') || x.path.endsWith('alpha-plan.txt')));
+  assert.ok(proposed.some(x=>x.reviewKind==='classification-review' && x.suggestedDestination===null));
+  assert.deepEqual(sourceSnapshot(),before);
+  assert.deepEqual(c.classification(path.join(inbox,'alphabet-plan.pdf')),{domain:'unknown',prefix:null,confidence:0});
+  assert.equal(c.classification(path.join(inbox,'alpha-team-plan.pdf')).domain,'alpha');
+  const grouped=filename=>HostFileCatalog.prototype.classification.call({policy:{domains:[{id:'alpha',prefixes:[],nameHints:['alpha-team']}]}},filename);
+  assert.equal(grouped('/inbox/ALPHA-team-plan.pdf').domain,'alpha');
+  assert.equal(grouped('/inbox/alphateam-plan.pdf').domain,'unknown');
+  assert.equal(grouped('/inbox/alpha-plan.pdf').domain,'unknown');
+  c.close();
+  for(const hint of ['', '../alpha','alpha beta','alpha/plan','-alpha','alpha-','alpha--beta','alpha\n','x'.repeat(65)]) assert.throws(()=>new HostFileCatalog({...f,policy:{...f.policy,domains:[{id:'alpha',prefixes:[],nameHints:[hint]}]}}),/Invalid domain/);
+});
+
+test('known prefix suggestions append basename, respect destination boundaries and never inspect collisions',async t=>{
+  const f=fixture(t),destination=path.join(f.source,'organized');
+  fs.mkdirSync(path.join(f.source,'known'));fs.mkdirSync(destination);fs.mkdirSync(destination+'-neighbor');
+  fs.writeFileSync(path.join(f.source,'known','report.pdf'),'outside');fs.writeFileSync(path.join(destination,'report.pdf'),'existing collision');fs.writeFileSync(path.join(destination+'-neighbor','other.pdf'),'boundary');
+  f.policy.domains=[{id:'alpha',prefixes:[f.source],destination}];
+  const c=new HostFileCatalog(f);t.after(()=>c.close());await finish(c);
+  const originalStat=fs.statSync,originalLstat=fs.lstatSync;
+  fs.statSync=()=>{throw new Error('No filesystem collision checks allowed');};fs.lstatSync=fs.statSync;
+  let items;try {items=c.suggestions();} finally {fs.statSync=originalStat;fs.lstatSync=originalLstat;}
+  assert.equal(items.length,2);
+  assert.equal(items.find(x=>x.path.endsWith('/known/report.pdf')).suggestedDestination,path.join(destination,'report.pdf'));
+  assert.ok(items.some(x=>x.path.endsWith('/organized-neighbor/other.pdf')));
+  assert.ok(items.every(x=>x.evidence.basis==='configured-prefix' && x.evidence.confidence===1));
+});
+
+test('hardlinked innocuous aliases of protected files remain metadata-only without reads or proposals',async t=>{
+  const f=fixture(t),protectedPath=path.join(f.source,'credentials.txt'),alias=path.join(f.source,'alpha-plan.txt');
+  fs.writeFileSync(protectedPath,'unlabelled credential value');fs.linkSync(protectedPath,alias);
+  f.policy.domains=[{id:'alpha',prefixes:[],nameHints:['alpha'],destination:path.join(f.source,'organized')}];
+  const c=new HostFileCatalog(f);t.after(()=>c.close());
+  const originalRead=fs.readSync;let reads=0;fs.readSync=(...args)=>{reads++;return originalRead(...args);};
+  try {await finish(c);} finally {fs.readSync=originalRead;}
+  assert.equal(reads,0);assert.equal(c.search({query:alias}).items[0].contentState,'metadata-only-hardlink');
+  assert.equal(c.search({query:'unlabelled'}).total,0);assert.deepEqual(c.suggestions(),[]);
+});

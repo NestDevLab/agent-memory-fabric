@@ -20,7 +20,7 @@ function fixture(t) {
   const revision=commit(repo);git(repo,['update-ref','refs/remotes/origin/main',revision]);
   const configSource=path.join(base,'config-source.json'),policySource=path.join(base,'policy-source.json');
   const config={schema:'amf.host-admin-config/v1',bind:'127.0.0.1',port:8127,policyPath:path.join(runtimeRoot,'catalog-policy.json'),databasePath:path.join(runtimeRoot,'database','catalog.sqlite'),tokenFile:path.join(runtimeRoot,'auth','bearer.token')};
-  const policy={schema:'amf.host-file-catalog-policy/v1',hostId:'example-host',roots:[path.join(base,'documents')],excludePrefixes:[runtimeRoot],metadataOnlyPrefixes:[],metadataOnlyDirectoryNames:['node_modules'],domains:[],content:{enabled:false,maxBytes:1024,extensions:['.txt']}};
+  const policy={schema:'amf.host-file-catalog-policy/v1',hostId:'example-host',roots:[path.join(base,'documents')],excludePrefixes:[runtimeRoot],metadataOnlyPrefixes:[],metadataOnlyDirectoryNames:['node_modules'],domains:[{id:'alpha',prefixes:[],nameHints:['alpha','alpha-team'],destination:path.join(base,'organized-alpha')}],content:{enabled:false,maxBytes:1024,extensions:['.txt']}};
   fs.writeFileSync(configSource,JSON.stringify(config),{mode:0o644});fs.writeFileSync(policySource,JSON.stringify(policy),{mode:0o644});
   return {base,repo,revision,runtimeRoot,unitDirectory,configSource,policySource,config,policy};
 }
@@ -89,6 +89,7 @@ test('remote bind, escaping config paths, source symlinks, unsafe directories an
   fs.mkdirSync(f.runtimeRoot,{mode:0o755});assert.throws(()=>planHostAdminInstall(f),/unsafe_install_directory/);fs.chmodSync(f.runtimeRoot,0o700);
   fs.chmodSync(f.unitDirectory,0o777);assert.throws(()=>planHostAdminInstall(f),/unsafe_install_directory/);fs.chmodSync(f.unitDirectory,0o755);
   fs.writeFileSync(f.policySource,JSON.stringify({...f.policy,metadataOnlyDirectoryNames:['../escape']}));assert.throws(()=>planHostAdminInstall(f),/invalid_catalog_policy/);fs.writeFileSync(f.policySource,JSON.stringify(f.policy));
+  for(const hint of ['../alpha','alpha\n']) {fs.writeFileSync(f.policySource,JSON.stringify({...f.policy,domains:[{id:'alpha',prefixes:[],nameHints:[hint]}]}));assert.throws(()=>planHostAdminInstall(f),/invalid_catalog_policy/);}fs.writeFileSync(f.policySource,JSON.stringify(f.policy));
   fs.writeFileSync(f.configSource,'x'.repeat(1024*1024+1));assert.throws(()=>planHostAdminInstall(f),/unsafe_install_file/);
 });
 
