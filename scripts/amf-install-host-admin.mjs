@@ -90,7 +90,7 @@ function validatePolicy(policy) {
 function validateTemplate(template) {
   const required={
     'Unit/After':'network.target',
-    'Service/Type':'simple','Service/WorkingDirectory':'@RELEASE@',
+    'Service/Type':'simple','Service/WorkingDirectory':'/',
     'Service/ExecStart':'@NODE@ @ENTRY@ --config @CONFIG@','Service/Restart':'on-failure',
     'Service/RestartSec':'5s','Service/NoNewPrivileges':'true','Service/UMask':'0077',
     'Install/WantedBy':'default.target'

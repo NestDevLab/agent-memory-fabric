@@ -110,3 +110,22 @@ test('pinned symlink code and extra unit commands are rejected before installati
   assert.throws(()=>planHostAdminInstall({...other,revision:badTemplate}),/unit_template_invalid/);
   assert.equal(fs.existsSync(other.runtimeRoot),false);
 });
+
+test('rendered unit passes systemd verification with an unquoted absolute working directory',t=>{
+  const available=spawnSync('systemd-analyze',['--version'],{encoding:'utf8'});
+  if(available.error?.code==='ENOENT') {t.skip('systemd-analyze is unavailable');return;}
+  assert.equal(available.status,0,available.stderr);
+  const f=fixture(t),plan=planHostAdminInstall(f);applyHostAdminInstall({...f,planDigest:plan.planDigest});
+  const unitPath=path.join(f.unitDirectory,'amf-host-admin.service'),unit=fs.readFileSync(unitPath,'utf8');
+  // Reproduce the old renderer: systemd treats quotes in WorkingDirectory as
+  // part of this scalar path, unlike the quoted ExecStart argument list.
+  const brokenPath=path.join(f.unitDirectory,'amf-host-admin-old.service');
+  const broken=unit.replace(/^WorkingDirectory=.*$/m,`WorkingDirectory="${plan.release.replaceAll('%','%%')}"`);
+  fs.writeFileSync(brokenPath,broken,{mode:0o600});
+  const rejected=spawnSync('systemd-analyze',['verify',brokenPath],{encoding:'utf8'});
+  assert.notEqual(rejected.status,0);assert.match(rejected.stderr,/WorkingDirectory=.*(?:not absolute|non.absolute)/i);
+  assert.match(unit,/^WorkingDirectory=\/$/m);
+  assert.ok(unit.includes(`ExecStart="${process.execPath}"`));
+  const accepted=spawnSync('systemd-analyze',['verify',unitPath],{encoding:'utf8'});
+  assert.equal(accepted.status,0,accepted.stderr);
+});

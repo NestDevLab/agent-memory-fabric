@@ -36,7 +36,7 @@ The installer reads these immutable Git blobs, without checkout, filters, depend
 - `src/host-admin-server.mjs`
 - `scripts/amf-host-admin.mjs`
 
-They are copied byte-for-byte into `<runtimeRoot>/releases/<revision>/` with mode 0600. The pinned `deploy/systemd/amf-host-admin.service.in` blob is separately validated and rendered into `amf-host-admin.service` in the chosen unit directory. Its ExecStart uses the installer's known `process.execPath`, the fixed revision entry script and `<runtimeRoot>/config.json`. Paths are quoted for systemd, including literal percent signs. The unit uses `Restart=on-failure`, `NoNewPrivileges=true`, `UMask=0077` and the user target `default.target`.
+They are copied byte-for-byte into `<runtimeRoot>/releases/<revision>/` with mode 0600. The pinned `deploy/systemd/amf-host-admin.service.in` blob is separately validated and rendered into `amf-host-admin.service` in the chosen unit directory. Its ExecStart uses the installer's known `process.execPath`, the fixed revision entry script and `<runtimeRoot>/config.json`. ExecStart path arguments remain quoted for systemd, including escaped literal percent signs. The working directory is the fixed, unquoted absolute path `WorkingDirectory=/`; entry/configuration paths are absolute and module imports resolve relative to their source files, so no release-specific working directory is required. Quotes must not be added to this scalar directive: systemd treats them as part of its path and rejects it as nonabsolute. The unit uses `Restart=on-failure`, `NoNewPrivileges=true`, `UMask=0077` and the user target `default.target`.
 
 The nonsecret sources are copied to stable `config.json` and `catalog-policy.json` paths. If the token is absent, apply creates 32 random bytes encoded as base64url, using exclusive creation with mode 0600 inside a private parent. Existing safe private token files are preserved without opening or hashing them. Token bytes and token hashes never appear in plans, receipts or errors.
 
@@ -46,7 +46,7 @@ A repeat plan/application of the same revision and inputs is a no-op, preserving
 
 Programmatic exports are `planHostAdminInstall(options)` and `applyHostAdminInstall({...options,planDigest})`, with camel-case options `repo`, `revision`, `runtimeRoot`, `configSource`, `policySource`, `unitDirectory`.
 
-Run the focused, temporary-repository tests with:
+The focused tests reproduce rejection of the old quoted working directory and verify the rendered replacement with `systemd-analyze verify` when that tool is available (otherwise that regression is explicitly skipped). They do not start or enable services. Run the focused, temporary-repository tests with:
 
 ```sh
 node --test scripts/test-host-admin-install.mjs
