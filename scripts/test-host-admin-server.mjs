@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp,writeFile,mkdir,symlink,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {createHostAdminServer,normalizeHealth,normalizeQuality,readPrivateFile,validateHostAdminConfig,runHealthProbe} from '../src/host-admin-server.mjs';
+import {createHostAdminServer,normalizeHealth,normalizeQuality,readPrivateFile,validateHostAdminConfig,runHealthProbe,startHostAdmin} from '../src/host-admin-server.mjs';
 
 const token = 'x'.repeat(48);
 test('every admin route refuses unauthenticated calls and writes; query input cannot select upstream resources',async () => {
@@ -53,4 +53,35 @@ test('probe degraded exit status is preserved and malformed output stays unknown
   const value = await runHealthProbe({command:process.execPath,args:['-e',`process.stdout.write(JSON.stringify({schema:'amf.health-report/v1',overall:'degraded'}));process.exitCode=1`],timeoutMs:1000});
   assert.equal(value.overall,'degraded');
   assert.equal(await runHealthProbe({command:process.execPath,args:['-e',`process.stdout.write('invalid')`],timeoutMs:1000}),null);
+});
+
+
+test('background scan ticks request minimal results without aggregate status',async ()=>{
+  const {HostFileCatalog}=await import('../src/host-file-catalog.mjs');
+  const root=await mkdtemp(join(tmpdir(),'amf-admin-tick-'));
+  await mkdir(join(root,'private'),{mode:0o700});await mkdir(join(root,'source'));
+  await writeFile(join(root,'source','one.txt'),'example');
+  const privateRoot=join(root,'private'),policyPath=join(privateRoot,'policy'),tokenFile=join(privateRoot,'token');
+  await writeFile(policyPath,JSON.stringify({schema:'amf.host-file-catalog-policy/v1',hostId:'test-host',roots:[join(root,'source')],excludePrefixes:[],metadataOnlyPrefixes:[],domains:[],content:{enabled:false,maxBytes:1024,extensions:[]}}),{mode:0o600});
+  await writeFile(tokenFile,token,{mode:0o600});
+  // Reserve an ephemeral loopback port, then use the production config validator.
+  const {createServer}=await import('node:net');const reservation=createServer();
+  await new Promise(resolve=>reservation.listen(0,'127.0.0.1',resolve));const port=reservation.address().port;
+  await new Promise(resolve=>reservation.close(resolve));
+  const originalStatus=HostFileCatalog.prototype.status,originalScan=HostFileCatalog.prototype.scan;
+  let aggregates=0;const calls=[];
+  HostFileCatalog.prototype.status=function(){aggregates++;return originalStatus.call(this);};
+  HostFileCatalog.prototype.scan=function(options){calls.push(options);return originalScan.call(this,options);};
+  let service;
+  try {
+    service=await startHostAdmin({schema:'amf.host-admin-config/v1',bind:'127.0.0.1',port,policyPath,tokenFile,databasePath:join(privateRoot,'catalog.sqlite'),scanIntervalMs:100,scanMaxEntries:1});
+    const deadline=Date.now()+5000;
+    while((calls.length<4) && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,25));
+    assert.ok(calls.length>=4);assert.ok(calls.every(options=>options.includeStatus===false));assert.equal(aggregates,0);
+    const report=await (await fetch(`http://127.0.0.1:${port}/v1/status`,{headers:{Authorization:`Bearer ${token}`}})).json();
+    assert.equal(aggregates,1);assert.equal(report.catalog.scan.state,'complete');
+  } finally {
+    await service?.close();HostFileCatalog.prototype.status=originalStatus;HostFileCatalog.prototype.scan=originalScan;
+    await rm(root,{recursive:true,force:true});
+  }
 });

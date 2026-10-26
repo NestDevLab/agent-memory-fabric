@@ -146,10 +146,10 @@ export async function startHostAdmin(rawConfig) {
   let stopped = false,scanning = null,lastComplete = 0;
   const tick = async () => {
     if (stopped || scanning) return;
-    const state = catalog.status().scan?.state;
+    const state = catalog.scanState().state;
     if (state === 'complete' && Date.now() - lastComplete < config.rescanIntervalMs) return;
-    scanning = catalog.scan({maxEntries:config.scanMaxEntries,budgetMs:config.scanBudgetMs,restart:state === 'complete'});
-    try { await scanning; api.setScannerError(null); if (catalog.status().scan?.state === 'complete') lastComplete = Date.now(); }
+    scanning = catalog.scan({maxEntries:config.scanMaxEntries,budgetMs:config.scanBudgetMs,restart:state === 'complete',includeStatus:false});
+    try { const result = await scanning; api.setScannerError(null); if (result.state === 'complete') lastComplete = Date.now(); }
     catch {api.setScannerError('scan_failed');}
     finally {scanning = null;}
   };
