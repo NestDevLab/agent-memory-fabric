@@ -275,7 +275,7 @@ function searchTokens(value) {
     .normalize('NFD')
     .replace(/[̀-ͯ]/g, '')
     .split(/[^a-z0-9]+/)
-    .filter(token => token.length >= 3 && !SEARCH_STOPWORDS.has(token));
+    .filter(token => (token.length >= 3 || /^\d+$/.test(token)) && !SEARCH_STOPWORDS.has(token));
 }
 
 function unwrapToolResult(result) {
@@ -353,42 +353,73 @@ export class CanonicalPamBridge {
     const entries = Object.entries(this.index.records || {}).filter(([, entry]) => allowed.has(entry.scope)).slice(0, 1000);
     const paths = [...new Set(entries.map(([, entry]) => entry.path))];
     if (!paths.length) return { items: [], nextCursor: null };
-    // Substring hits from the PAM tool are unioned with token-ranked matches so
-    // multi-word natural queries ("la mia gatta") reach records that contain
-    // any distinctive token rather than the exact phrase.
-    const result = await this.callTool('memory_search', { query, paths, maxResults: Math.min(limit * 4, 100) });
-    const ids = new Set((result.matches || result.results || result.items || []).flatMap(hit => entries.filter(([, entry]) => entry.path === hit.path).map(([id]) => id)));
-    const queryTokens = searchTokens(query);
-    if (queryTokens.length) {
-      for (const [id, entry] of entries) {
-        if (ids.has(id)) continue;
-        try {
-          const validated = await this.callTool('memory_record_validate', { path: entry.path });
-          const text = validated?.status === 'valid' ? String(validated.metadata?.claim?.text ?? '') : '';
-          if (!text) continue;
-          const recordTokens = new Set(searchTokens(text));
-          if (queryTokens.some(token => recordTokens.has(token))) ids.add(id);
-        } catch { /* unreadable records simply stay out of the result */ }
-      }
+    // Native hits are traversal hints, not relevance evidence: the native
+    // backend can match provenance or other JSON metadata rather than CLAIM.
+    let nativePaths = new Set();
+    try {
+      const result = await this.callTool('memory_search', { query, paths, maxResults: Math.min(limit * 4, 100) });
+      const hits = result?.matches || result?.results || result?.items || [];
+      if (Array.isArray(hits)) nativePaths = new Set(hits.map(hit => hit?.path));
+    } catch { /* native backend degradation must not suppress claim search */ }
+    const allTokens = [...new Set(searchTokens(query))];
+    const nonnumeric = allTokens.filter(token => !/^\d+$/.test(token));
+    const queryTokens = nonnumeric.length ? nonnumeric : allTokens;
+    const normalizePhrase = value => String(value ?? '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').split(/[^a-z0-9]+/).filter(Boolean);
+    const phrase = normalizePhrase(query).filter(token => !nonnumeric.length || !/^\d+$/.test(token)).join(' ');
+    const known = new Map(entries);
+    const validated = new Map();
+    // This cache is search-local: each candidate is independently bound to its
+    // indexed ID, schema and actual scope once, without a second MCP read.
+    const load = async id => {
+      if (validated.has(id)) return validated.get(id);
+      let record = null;
+      const entry = known.get(id);
+      try {
+        const response = await this.callTool('memory_record_validate', { path: entry.path });
+        const candidate = response?.status === 'valid' ? response.metadata : null;
+        if (candidate?.id === id && candidate.scope?.id === entry.scope && allowed.has(candidate.scope.id)
+            && validateAmfMemoryRecord(candidate, { allowPlainSensitiveClaims: this.allowPlainSensitiveClaims }).ok) record = structuredClone(candidate);
+      } catch { /* unreadable or malformed candidates never fail the query */ }
+      validated.set(id, record);
+      return record;
+    };
+    const candidates = [];
+    const frequencies = new Map(queryTokens.map(token => [token, 0]));
+    const ordered = [...entries].sort((left,right) => Number(nativePaths.has(right[1].path)) - Number(nativePaths.has(left[1].path)));
+    const currentTime = Date.now();
+    for (const [id] of ordered) {
+      const record = await load(id);
+      if (!record) continue;
+      const validFrom = Date.parse(record.lifecycle?.validFrom || '1970-01-01T00:00:00Z');
+      const validTo = record.lifecycle?.validTo ? Date.parse(record.lifecycle.validTo) : Infinity;
+      const updatedAt = Date.parse(record.updatedAt);
+      if (!(ACTIVE.has(record.lifecycle?.status) && validFrom <= currentTime && validTo > currentTime
+          && (!from || updatedAt >= Date.parse(from)) && (!to || updatedAt <= Date.parse(to)))) continue;
+      const text = record.claim?.text ?? '';
+      const tokens = new Set(searchTokens(text));
+      for (const token of queryTokens) if (tokens.has(token)) frequencies.set(token, frequencies.get(token) + 1);
+      const exact = queryTokens.length > 0 && phrase && ` ${normalizePhrase(text).join(' ')} `.includes(` ${phrase} `);
+      candidates.push({ record, tokens, exact: Number(Boolean(exact)) });
     }
-    // Semantic recall reaches concept-level matches with no shared tokens; it
-    // only adds candidates known to this scope's index, and privacy/scope
-    // filters run downstream on every candidate.
+    // Concept-only evidence is supplied by the semantic backend's own distance
+    // threshold. Do not impose lexical overlap on valid semantic-only recall.
+    const semanticIds = new Set();
     if (this.semanticIndex?.configured && query) {
       try {
-        const known = new Map(entries.map(([id, entry]) => [id, entry]));
-        for (const id of await this.semanticIndex.searchIds({ query, scopes: [...allowed] })) {
-          if (known.has(id)) ids.add(id);
-        }
+        for (const id of await this.semanticIndex.searchIds({ query, scopes: [...allowed] })) if (known.has(id)) semanticIds.add(id);
       } catch { /* semantic backend degradation must not fail lexical search */ }
     }
-    const records = [];
-    for (const id of ids) {
-      const record = await this.read({ id });
-      const now = Date.now(); const validFrom = Date.parse(record.lifecycle?.validFrom || '1970-01-01T00:00:00Z'); const validTo = record.lifecycle?.validTo ? Date.parse(record.lifecycle.validTo) : Infinity;
-      const updatedAt = Date.parse(record.updatedAt);
-      if (ACTIVE.has(record.lifecycle?.status) && validFrom <= now && validTo > now && (!from || updatedAt >= Date.parse(from)) && (!to || updatedAt <= Date.parse(to))) records.push(record);
+    const weights = new Map(queryTokens.map(token => [token, 1 + Math.log((candidates.length + 1) / (frequencies.get(token) + 1))]));
+    const totalWeight = [...weights.values()].reduce((sum, weight) => sum + weight, 0);
+    const ranked = [];
+    for (const candidate of candidates) {
+      const matchedWeight = queryTokens.reduce((sum, token) => sum + (candidate.tokens.has(token) ? weights.get(token) : 0), 0);
+      if (!matchedWeight && !semanticIds.has(candidate.record.id)) continue;
+      ranked.push({ ...candidate, coverage: totalWeight ? matchedWeight / totalWeight : 0 });
     }
+    ranked.sort((left,right) => right.exact - left.exact || right.coverage - left.coverage
+      || (left.record.id < right.record.id ? -1 : left.record.id > right.record.id ? 1 : 0));
+    const records = ranked.map(candidate => candidate.record);
     const binding = digest({ query, scopes: [...scopes].sort(), from: from || null, to: to || null });
     const offset = decodeCursor(cursor, binding);
     const items = records.slice(offset, offset + limit);

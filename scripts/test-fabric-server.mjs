@@ -644,7 +644,8 @@ test('0.5.5 composes signed session routes, canonicalScopes, PAM contextRefs and
   const tag = namespace => `hmac-sha256:routing-v1:${crypto.createHmac('sha256', routingKey).update(canonicalJson([namespace, literal])).digest('hex')}`;
   const contextTags = { conversation: [tag('conversation')], room: [tag('room')] };
   const record = canonicalRecord('Integrated recall', 'main-lab');
-  record.scope = { type: 'room', id: literal }; record.visibility = 'shared'; record.claim.aadSha256 = aadSha256For(record);
+  record.scope = { type: 'room', id: literal }; record.visibility = 'shared';
+  record.claim = { encoding: 'plain', text: 'Integrated recall' };
   const recordPath = `memory/amf/records/${record.id}.md`;
   const canonicalStore = new CanonicalPamBridge({
     index: { records: { [record.id]: { path: recordPath, scope: literal, contextRefs: { conversation: [literal], room: [literal] } } } },
