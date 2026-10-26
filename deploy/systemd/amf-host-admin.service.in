@@ -1,0 +1,15 @@
+[Unit]
+Description=Agent Memory Fabric local host administration
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@RELEASE@
+ExecStart=@NODE@ @ENTRY@ --config @CONFIG@
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

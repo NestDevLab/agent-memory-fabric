@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { CanonicalPamBridge, CuratorReceiptCoordinator, FabricReceiptLedger, MemoryReceiptLedger, validateCuratorReceipt } from '../src/canonical-memory-bridge.mjs';
+import { aadSha256For } from '../src/amf-memory-record-validator.mjs';
 import { ContextTokenVerifier, issueContextToken, requestDigest } from '../src/context-token.mjs';
 import { FabricStore, MemoryCatalog, MemoryRawStore, SqliteCatalog } from '../src/fabric-store.mjs';
 
@@ -416,4 +417,89 @@ test('semantic backend errors never break lexical search', async () => {
   });
   const lexical = await bridge.search({ query: 'moka', scopes: ['shared:global'] });
   assert.deepEqual(lexical.items.map(item => item.id), [moka.id]);
+});
+
+function searchFixture(records, { semanticIds = [], unreadable = [], metadata = {} } = {}) {
+  const byPath = Object.fromEntries(records.map(item => [`memory/records/${item.id}.json`, item]));
+  const validations = new Map();
+  const bridge = new CanonicalPamBridge({
+    index: { records: Object.fromEntries(records.map(item => [item.id, { path: `memory/records/${item.id}.json`, scope: 'shared:global' }])) },
+    semanticIndex: { configured: true, async searchIds() { return semanticIds; } },
+    async callTool(name, args) {
+      if (name === 'memory_search') return { matches: Object.keys(byPath).map(candidatePath => ({ path: candidatePath })) };
+      if (name !== 'memory_record_validate') throw new Error('unexpected_tool');
+      validations.set(args.path, (validations.get(args.path) || 0) + 1);
+      if (unreadable.includes(byPath[args.path].id)) throw new Error('unreadable');
+      return { status: 'valid', metadata: metadata[byPath[args.path].id] || byPath[args.path] };
+    }
+  });
+  return { bridge, validations };
+}
+
+test('native metadata hits require canonical claim relevance and validate each candidate once', async () => {
+  const first = record({ id: 'mem_native_first0001', claim: { encoding: 'plain', text: 'Ordinary project guidance.' }, provenance: [{ ...record().provenance[0], sourceId: 'nonexistent-canary-20261026' }] });
+  const second = record({ id: 'mem_native_second001', claim: { encoding: 'plain', text: 'An unrelated report from 20261026.' } });
+  const { bridge, validations } = searchFixture([first, second]);
+  assert.deepEqual((await bridge.search({ query: 'nonexistent-canary-20261026', scopes: ['shared:global'] })).items, []);
+  assert.deepEqual([...validations.values()], [1, 1]);
+  validations.clear();
+  assert.deepEqual((await bridge.search({ query: 'opaqueabsentcanary', scopes: ['shared:global'] })).items, []);
+  assert.deepEqual([...validations.values()], [1, 1]);
+  const independentlySemantic = searchFixture([first, second], { semanticIds: [first.id] });
+  assert.deepEqual((await independentlySemantic.bridge.search({ query: 'opaqueabsentcanary', scopes: ['shared:global'] })).items.map(item => item.id), [first.id]);
+  validations.clear();
+  assert.deepEqual((await bridge.search({ query: 'project guidance', scopes: ['shared:global'] })).items.map(item => item.id), [first.id]);
+  assert.deepEqual([...validations.values()], [1, 1]);
+});
+
+test('canonical search ranks exact phrases and weighted token coverage above semantic-only recall', async () => {
+  const exact = record({ id: 'mem_rank_zexact0001', claim: { encoding: 'plain', text: 'Catalog policy governs files.' } });
+  const reordered = record({ id: 'mem_rank_areorder01', claim: { encoding: 'plain', text: 'Policy defines the catalog.' } });
+  const rare = record({ id: 'mem_rank_brare00001', claim: { encoding: 'plain', text: 'Catalog organization.' } });
+  const commonA = record({ id: 'mem_rank_ccommon01', claim: { encoding: 'plain', text: 'Policy scheduling.' } });
+  const commonB = record({ id: 'mem_rank_dcommon01', claim: { encoding: 'plain', text: 'Policy auditing.' } });
+  const semanticA = record({ id: 'mem_rank_esemantic1', claim: { encoding: 'plain', text: 'Conceptual governance.' } });
+  const semanticB = record({ id: 'mem_rank_fsemantic1', claim: { encoding: 'plain', text: 'Retention decisions.' } });
+  const { bridge } = searchFixture([semanticB,commonB,rare,reordered,semanticA,commonA,exact], { semanticIds: [semanticB.id,semanticA.id] });
+  const result = await bridge.search({ query: 'catalog policy 20261026', scopes: ['shared:global'] });
+  assert.deepEqual(result.items.map(item=>item.id),[exact.id,reordered.id,rare.id,commonA.id,commonB.id,semanticA.id,semanticB.id]);
+  const firstPage = await bridge.search({ query: 'catalog policy 20261026', scopes: ['shared:global'], limit: 2 });
+  const secondPage = await bridge.search({ query: 'catalog policy 20261026', scopes: ['shared:global'], limit: 2, cursor:firstPage.nextCursor });
+  assert.deepEqual(secondPage.items.map(item=>item.id),[rare.id,commonA.id]);
+});
+
+test('numeric-only queries work while numeric overlap cannot admit unrelated mixed queries', async () => {
+  const numeric = record({ id: 'mem_numeric_only001', claim: { encoding: 'plain', text: 'Reference 42 dated 20261026.' } });
+  const { bridge } = searchFixture([numeric]);
+  assert.deepEqual((await bridge.search({ query: '42', scopes: ['shared:global'] })).items.map(item=>item.id),[numeric.id]);
+  assert.deepEqual((await bridge.search({ query: 'absentconcept 20261026', scopes: ['shared:global'] })).items,[]);
+});
+
+test('search skips unreadable, invalid, rebound and cross-scope canonical candidates', async () => {
+  const valid = record({ id: 'mem_valid_search001', claim: { encoding: 'plain', text: 'Catalog guidance.' } });
+  const unreadable = record({ ...valid, id:'mem_unreadable00001' });
+  const invalid = record({ ...valid, id:'mem_invalid0000001' });
+  const rebound = record({ ...valid, id:'mem_rebound0000001' });
+  const crossScope = record({ ...valid, id:'mem_crossscope0001', scope:{type:'shared',id:'shared:other'} });
+  const inactive = record({ ...valid, id:'mem_inactive000001', lifecycle:{...valid.lifecycle,status:'superseded'} });
+  const { bridge } = searchFixture([unreadable,invalid,rebound,crossScope,inactive,valid], { unreadable:[unreadable.id], metadata:{[invalid.id]:{...invalid,schema:'invalid'},[rebound.id]:valid}, semanticIds:[crossScope.id,invalid.id,rebound.id,unreadable.id,inactive.id] });
+  assert.deepEqual((await bridge.search({query:'catalog',scopes:['shared:global']})).items.map(item=>item.id),[valid.id]);
+  assert.deepEqual((await bridge.search({query:'catalog',scopes:['shared:global'],from:'invalid-date'})).items,[]);
+  assert.deepEqual((await bridge.search({query:'catalog',scopes:['shared:global'],from:timestamp,to:timestamp})).items.map(item=>item.id),[valid.id]);
+});
+
+
+test('sealed native path hits have no claim relevance without independent scoped semantic evidence', async () => {
+  const sealed = record({ id: 'mem_sealed_search01', claim: {
+    encoding:'sealed',alg:'AES-256-GCM',kekId:'kek:test-v1',keyRef:'key:test-record-v1',
+    iv:Buffer.alloc(12,1).toString('base64'),ciphertext:Buffer.from('Opaque claim').toString('base64'),
+    tag:Buffer.alloc(16,2).toString('base64'),aadSha256:''
+  } });
+  sealed.claim.aadSha256 = aadSha256For(sealed);
+  const nativeOnly = searchFixture([sealed]);
+  assert.deepEqual((await nativeOnly.bridge.search({query:'Opaque claim',scopes:['shared:global']})).items,[]);
+  assert.deepEqual([...nativeOnly.validations.values()],[1]);
+  const independent = searchFixture([sealed],{semanticIds:[sealed.id]});
+  assert.deepEqual((await independent.bridge.search({query:'Opaque claim',scopes:['shared:global']})).items.map(item=>item.id),[sealed.id]);
+  assert.deepEqual((await independent.bridge.search({query:'Opaque claim',scopes:['shared:other']})).items,[]);
 });
