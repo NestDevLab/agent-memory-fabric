@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=@RELEASE@
+WorkingDirectory=/
 ExecStart=@NODE@ @ENTRY@ --config @CONFIG@
 Restart=on-failure
 RestartSec=5s
