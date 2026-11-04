@@ -62,7 +62,7 @@ A completed catalog remains complete on subsequent `scan()` calls. Start another
 
 The database parent must be dedicated, owned by the current user, and private (0700); one missing final directory can be created. The database must be an owned 0600 regular file with one link. The catalog uses SQLite rollback journaling inside this directory. `locking_mode=EXCLUSIVE` and an initial exclusive transaction retain a native SQLite lock for the connection lifetime, with a bounded busy timeout. Only one catalog connection can own the database; this includes status/search CLI instances. Do not run a standalone CLI against the same database while an administrative server owns it; use that server's read interface.
 
-Startup creates additive indexes for domain/path browsing, content-state and generation aggregates, and current-generation coverage. Existing inventory, text, scan state and policy fingerprints are preserved. Empty searches use direct counts and ordered pages; suggestions merge ordered per-domain ranges, skipping destination subtrees before reading metadata and avoiding a sort of the whole candidate set. Nonempty substring searches still inspect candidate paths. Index creation on a large existing database can extend startup and requires additional storage.
+Startup creates additive indexes for domain/path browsing, content-state and generation aggregates, and current-generation coverage. Existing inventory, text, scan state and policy fingerprints are preserved. Empty searches use direct counts and ordered pages; suggestions merge ordered per-domain ranges, skipping destination subtrees before reading metadata and avoiding a sort of the whole candidate set. Nonempty searches use the path accelerator described below once its bounded backfill completes. Index creation on a large existing database can extend startup and requires additional storage.
 
 The operating system releases the native lock when the process exits, including SIGKILL. No PID sentinel or manual unlink is needed. Reopen the existing database to resume its persisted queue. Each bounded scan call commits inventory, coverage, text and queue cursors in one SQLite transaction. A failure rolls back the batch and closes directory iterators so the next call reopens them at committed offsets. A crash can repeat the last uncommitted batch; previously committed progress remains durable. The test suite verifies rollback and a killed child during an open batch followed by immediate reconnect/resume. The background service requests minimal scan results and computes full status only for an explicit status request.
 
@@ -77,3 +77,45 @@ Run focused checks with:
 ```sh
 node --test scripts/test-host-file-catalog.mjs
 ```
+
+
+## Path search accelerator
+
+A versioned FTS5 trigram index stores paths only, with a separate integer-key map;
+no assumption is made about the inventory table's rowids. Startup creates empty
+additive structures and transactional insert/delete/path-update triggers. It does
+not backfill existing inventory. New inventory writes maintain this derived index
+in the same transaction, including during scans and backfill. Content-only and
+domain changes continue to use authoritative inventory/text tables.
+
+Build an existing catalog with bounded calls to `index-paths`, using the same
+`--config` and `--database` arguments as other catalog commands. The result reports
+`processed`, `cursor`, and `complete`. Repeat until `complete` is true. Defaults are
+1,000 paths and 50 ms per call; `--max-entries` accepts 1..10,000 and `--budget-ms`
+accepts 1..2,000. Budgets are cooperative between rows; SQLite operations, locking
+and commit cannot be interrupted by the time budget. A final empty batch proves
+exhaustion. Do not run the CLI while the administrative server owns the database:
+stop it through the approved operational procedure, build, then restart and verify.
+Installation and backfill are separate operational actions.
+
+Each batch commits keys, FTS entries and its BINARY path cursor atomically. On a
+failure or process crash, reopen the same database and repeat the command. Until
+complete, every search uses the exact legacy predicate. Inserts behind the cursor
+are covered by triggers; updates and deletions remove stale derived entries. The
+index never infers deletion from files missing in a later scan generation. Policy
+fingerprint checks and the single-connection lock remain in force.
+
+V1 accelerates printable ASCII queries of at least three characters. Short,
+Unicode, control-character and NUL queries deliberately use the legacy search.
+The trigram result is only a candidate set: the original escaped SQLite LIKE
+predicate is applied, with the original content FTS expression unioned and
+deduplicated. Exact totals, domain filtering and BINARY ordering/pagination are
+preserved. The index increases database storage and write cost; it does not promise
+a speedup for common substrings or content matches returning most of the catalog.
+Never manually change/drop derived structures while the index is marked complete.
+
+Validate with `node --test scripts/test-host-catalog-path-index.mjs`.
+Run `node scripts/measure-host-catalog-path-index.mjs 100000` for an optional,
+bounded in-memory synthetic benchmark (1,000..500,000 rows). It compares exact
+results and reports median search latency, build time and database bytes; it
+never opens an operational database. Synthetic timings are not live-host evidence.

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { initializePathIndex, buildPathIndex, pathIndexState, pathCandidateMatch } from './host-catalog-path-index.mjs';
 
 const SCHEMA = 'amf.host-file-catalog-policy/v1';
 const within = (p, prefix) => p === prefix || p.startsWith(prefix === '/' ? '/' : `${prefix}/`);
@@ -69,6 +70,7 @@ export class HostFileCatalog {
         CREATE INDEX IF NOT EXISTS coverage_generation_id ON coverage(generation,id);
         CREATE VIRTUAL TABLE IF NOT EXISTS texts USING fts5(path UNINDEXED, body);
         INSERT OR IGNORE INTO state(id,generation,phase) VALUES(1,0,'idle');`);
+      initializePathIndex(this.db);
       this.policyHash = crypto.createHash('sha256').update(JSON.stringify(policy)).digest('hex');
       const state = this.db.prepare('SELECT * FROM state').get();
       if (state.policy_hash && state.policy_hash !== this.policyHash) throw new Error('Policy changed: use a separate catalog database');
@@ -229,6 +231,8 @@ export class HostFileCatalog {
       coverage:{ roots:this.policy.roots, configuredExclusions:this.policy.excludePrefixes, metadataOnlyPrefixes:this.policy.metadataOnlyPrefixes, metadataOnlyDirectoryNames:this.policy.metadataOnlyDirectoryNames ?? [], summary:this.db.prepare('SELECT kind,count(*) AS count FROM coverage WHERE generation=? GROUP BY kind').all(state.generation), recent:this.db.prepare('SELECT path,kind,reason,observed_at FROM coverage WHERE generation=? ORDER BY id DESC LIMIT 100').all(state.generation) },
       freshness:{ unverified:this.db.prepare('SELECT count(*) AS n FROM files WHERE generation<>?').get(state.generation).n, semantics:'Last observed metadata; unseen files are retained as unverified, never inferred deleted. Concurrent directory changes may require another generation.' } };
   }
+  buildPathIndex(options) { return buildPathIndex(this.db,options); }
+  pathIndexState() { return pathIndexState(this.db); }
   search({ query='', domain=null, limit=50, offset=0 }={}) {
     int(limit,1,200,'limit'); int(offset,0,1000000,'offset');
     if (typeof query !== 'string' || query.length > 1000 || (domain !== null && typeof domain !== 'string')) throw new Error('Invalid search');
@@ -236,15 +240,18 @@ export class HostFileCatalog {
     const match = tokens.map(t => `"${t.replaceAll('"','""')}"`).join(' AND ');
     // Empty browsing needs no LIKE scan; explicit domain equality also lets
     // SQLite use the domain/path index for both counting and ordered paging.
-    const filters = [], args = [];
+    const candidateMatch = pathCandidateMatch(this.db,query);
+    const candidates = candidateMatch === null ? '' : `WITH candidates(path) AS (SELECT k.path FROM catalog_path_index_v1 JOIN catalog_path_index_v1_keys k ON k.id=catalog_path_index_v1.rowid WHERE catalog_path_index_v1 MATCH ?${match ? ' UNION SELECT path FROM texts WHERE texts MATCH ?' : ''}) `;
+    const from = candidateMatch === null ? 'files f' : 'candidates c JOIN files f ON f.path=c.path';
+    const filters = [], args = candidateMatch === null ? [] : [candidateMatch,...(match ? [match] : [])];
     if (query !== '') {
       filters.push(`(f.path LIKE ? ESCAPE '!'${match ? ' OR f.path IN (SELECT path FROM texts WHERE texts MATCH ?)' : ''})`);
       args.push(`%${query.replaceAll('!','!!').replaceAll('%','!%').replaceAll('_','!_')}%`,...(match ? [match] : []));
     }
     if (domain !== null) { filters.push('f.domain=?'); args.push(domain); }
     const where = filters.join(' AND ') || '1';
-    const total = this.db.prepare(`SELECT count(*) AS n FROM files f WHERE ${where}`).get(...args).n;
-    const items = this.db.prepare(`SELECT f.path,f.kind,f.size,f.domain,f.classification_prefix AS classificationPrefix,CASE WHEN f.classification_prefix IS NOT NULL THEN 'configured-prefix' WHEN f.confidence=0.5 THEN 'filename-hint' ELSE 'unknown' END AS classificationBasis,f.confidence,f.content_state AS contentState,f.observed_at AS observedAt,f.generation,(f.generation=(SELECT generation FROM state)) AS currentGeneration FROM files f WHERE ${where} ORDER BY f.path LIMIT ? OFFSET ?`).all(...args,limit,offset);
+    const total = this.db.prepare(`${candidates}SELECT count(*) AS n FROM ${from} WHERE ${where}`).get(...args).n;
+    const items = this.db.prepare(`${candidates}SELECT f.path,f.kind,f.size,f.domain,f.classification_prefix AS classificationPrefix,CASE WHEN f.classification_prefix IS NOT NULL THEN 'configured-prefix' WHEN f.confidence=0.5 THEN 'filename-hint' ELSE 'unknown' END AS classificationBasis,f.confidence,f.content_state AS contentState,f.observed_at AS observedAt,f.generation,(f.generation=(SELECT generation FROM state)) AS currentGeneration FROM ${from} WHERE ${where} ORDER BY f.path COLLATE BINARY LIMIT ? OFFSET ?`).all(...args,limit,offset);
     return {items,total};
   }
   suggestions({limit=50}={}) {
