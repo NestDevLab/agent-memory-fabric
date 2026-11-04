@@ -187,9 +187,7 @@ class FakePool {
       this.auditEvents.set(values[0], values);
       return { rows: [] };
     }
-    if (compact.startsWith('SELECT (SELECT count(*)::bigint')) {
-      return { rows: [{ raw_objects: String(this.rawObjects.size), queued_proposals: String([...this.proposals.values()].filter((row) => row.status === 'queued').length), audit_events: String(this.auditEvents.size) }] };
-    }
+    if (compact.startsWith('BEGIN READ ONLY; SET LOCAL statement_timeout =')) return { rows: [] };
     if (compact === 'COMMIT' && this.loseNextCommitAck) {
       this.loseNextCommitAck = false;
       const error = new Error('connection lost after commit');
@@ -321,7 +319,7 @@ test('PostgreSQL proposal transaction resolves concurrent idempotency conflicts 
     requestId: 'request-1', targetId: found.id, scopeTag: 'scope-secret', details: { contentId: 'a'.repeat(64) }
   });
   const health = await catalog.health();
-  assert.deepEqual({ rawObjects: health.rawObjects, queuedProposals: health.queuedProposals, auditEvents: health.auditEvents }, { rawObjects: 1, queuedProposals: 1, auditEvents: 1 });
+  assert.deepEqual({ rawObjects: health.rawObjects, queuedProposals: health.queuedProposals, auditEvents: health.auditEvents }, { rawObjects: null, queuedProposals: null, auditEvents: null });
   await catalog.close();
   await catalog.close();
   assert.equal(pool.endCalls, 1);
@@ -652,4 +650,58 @@ test('PostgreSQL decision supersession rewrites only review_required and audits 
   assert.equal((await catalog.recordCuratorReceipt(approved, audit('replay-new'))).duplicate, true);
   const flip = { ...review, decisionId: 'decision-flip-pg', status: 'rejected', decisionDigest: '8'.repeat(64) };
   await assert.rejects(catalog.recordCuratorReceipt(flip, audit('flip')), /conflict/);
+});
+
+
+test('PostgreSQL readiness checks relation access without reading rows or counting', async () => {
+  const pool = new FakePool();
+  const catalog = new PostgresCatalog({ pool });
+  await catalog.ready();
+  pool.queries.length = 0;
+  const result = await catalog.health();
+  assert.equal(result.healthy, true);
+  assert.equal(pool.queries.length, 1);
+  const sql = pool.queries[0].text;
+  for (const table of ['raw_objects_v2', 'fabric_proposals', 'audit_events_v2']) assert.ok(sql.includes(`${POSTGRES_SCHEMA}.${table}`));
+  assert.match(sql, /BEGIN READ ONLY;/);
+  assert.match(sql, /SET LOCAL statement_timeout = 750;/);
+  assert.match(sql, /LIMIT 0;\s*ROLLBACK$/);
+  assert.doesNotMatch(sql, /count|INSERT|UPDATE|DELETE|set_config/i);
+  assert.equal(pool.releaseError, null);
+});
+
+test('PostgreSQL readiness fails closed on query failures and discards the client', async () => {
+  for (const code of ['42501', '42P01', '08006']) {
+    const pool = new FakePool();
+    const catalog = new PostgresCatalog({ pool });
+    await catalog.ready();
+    pool.query = async () => { throw Object.assign(new Error('unavailable'), { code }); };
+    await assert.rejects(catalog.health(), { message: 'catalog_unavailable' });
+    assert.equal(catalog.status().healthy, false);
+    assert.equal(catalog.status().queuedProposals, null);
+    assert.ok(pool.releaseError);
+  }
+});
+
+test('PostgreSQL readiness times out and destroys the outstanding probe connection', async () => {
+  const pool = new FakePool();
+  const catalog = new PostgresCatalog({ pool, queryTimeoutMs: 100 });
+  await catalog.ready();
+  pool.query = async () => new Promise(() => {});
+  await assert.rejects(catalog.health(), error => error.code === 'catalog_postgres_query_timeout');
+  assert.equal(catalog.status().healthy, false);
+  assert.equal(pool.releaseError.code, 'catalog_postgres_query_timeout');
+});
+
+test('PostgreSQL readiness times out acquiring a client and discards late arrivals', async () => {
+  const pool = new FakePool();
+  const catalog = new PostgresCatalog({ pool, connectTimeoutMs: 100 });
+  await catalog.ready();
+  let arrive;
+  pool.connect = () => new Promise(resolve => { arrive = resolve; });
+  await assert.rejects(catalog.health(), error => error.code === 'catalog_postgres_connect_timeout');
+  assert.equal(catalog.status().healthy, false);
+  arrive({ release(error) { pool.releaseError = error; } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(pool.releaseError.message, 'catalog_late_client_discarded');
 });

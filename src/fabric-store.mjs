@@ -1684,7 +1684,7 @@ export class PostgresCatalog {
     });
   }
 
-  async _connect() {
+  async _connect(timeoutMs = this.connectTimeoutMs) {
     let timer;
     let timedOut = false;
     const pending = Promise.resolve().then(() => this.pool.connect());
@@ -1700,7 +1700,7 @@ export class PostgresCatalog {
             const error = createError('catalog_unavailable', 503, { code: 'catalog_postgres_connect_timeout' });
             error.code = 'catalog_postgres_connect_timeout';
             reject(error);
-          }, this.connectTimeoutMs);
+          }, timeoutMs);
         })
       ]);
     } catch (error) {
@@ -1710,19 +1710,19 @@ export class PostgresCatalog {
     }
   }
 
-  async _query(target, text, values = []) {
+  async _query(target, text, values = [], timeoutMs = this.queryTimeoutMs) {
     const controller = new AbortController();
     let timer;
     try {
       return await Promise.race([
-        target.query({ text, values, query_timeout: this.queryTimeoutMs, signal: controller.signal }),
+        target.query({ text, values, query_timeout: timeoutMs, signal: controller.signal }),
         new Promise((_, reject) => {
           timer = setTimeout(() => {
             controller.abort();
             const error = createError('catalog_unavailable', 503, { code: 'catalog_postgres_query_timeout' });
             error.code = 'catalog_postgres_query_timeout';
             reject(error);
-          }, this.queryTimeoutMs);
+          }, timeoutMs);
         })
       ]);
     } catch (error) {
@@ -2572,25 +2572,35 @@ export class PostgresCatalog {
   }
 
   async health() {
-    await this.ready();
+    let client;
+    let failure;
+    // Counts are not readiness evidence: exact totals can scan the entire catalog.
+    this._counts = { rawObjects: null, queuedProposals: null, auditEvents: null };
     try {
-      const result = await this._query(this.pool, `SELECT
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.raw_objects_v2) AS raw_objects,
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.fabric_proposals WHERE status='queued') AS queued_proposals,
-        (SELECT count(*)::bigint FROM ${POSTGRES_SCHEMA}.audit_events_v2) AS audit_events`);
-      const row = result.rows[0] || {};
-      this._counts = {
-        rawObjects: Number(row.raw_objects || 0),
-        queuedProposals: Number(row.queued_proposals || 0),
-        auditEvents: Number(row.audit_events || 0)
-      };
+      await this.ready();
+      client = await this._connect(Math.min(this.connectTimeoutMs, 1000));
+      const timeoutMs = Math.min(this.queryTimeoutMs, 1000);
+      const statementTimeoutMs = Math.min(this.statementTimeoutMs, Math.floor(timeoutMs * 0.75));
+      // LIMIT 0 resolves relations and checks SELECT privileges without scanning rows.
+      // The server deadline also bounds lock waits; settings are transaction-local.
+      await this._query(client, `BEGIN READ ONLY;
+        SET LOCAL statement_timeout = ${statementTimeoutMs};
+        SELECT 1 FROM ${POSTGRES_SCHEMA}.raw_objects_v2,
+          ${POSTGRES_SCHEMA}.fabric_proposals,
+          ${POSTGRES_SCHEMA}.audit_events_v2 LIMIT 0;
+        ROLLBACK`, [], timeoutMs);
       this._healthy = true;
       this._lastError = null;
       return this.status();
     } catch (error) {
+      failure = error;
       this._healthy = false;
       this._lastError = String(error?.code || 'catalog_postgres_health_failed');
       throw error;
+    } finally {
+      // pg query_timeout alone does not cancel server work. Discard the connection
+      // on failure, including an aborted transaction or an outstanding timed-out probe.
+      client?.release(failure);
     }
   }
 

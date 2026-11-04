@@ -39,3 +39,9 @@ The generic configuration contract is
 `config/contracts/amf.health-v1.schema.json`; `enabled` defaults to `true`, and
 `runtimeMarker` may override the standard
 `<configRoot>/runtime-raw-<collector-id>.enabled` path.
+
+PostgreSQL status probes verify live catalog relation access without scanning rows.
+`rawObjects`, `queuedProposals`, and `auditEvents` remain `null` when not measured;
+unknown is never zero. A configured `maxQueuedProposals` with no measured queue
+count is `DEGRADED` because the threshold cannot be verified. Readiness alone
+does not prove backlog health.

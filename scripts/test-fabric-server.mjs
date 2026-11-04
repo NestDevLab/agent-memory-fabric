@@ -1578,3 +1578,32 @@ test('health is minimal, status is privileged, and query tokens work only on leg
     assert.equal(streamableGet.headers.get('allow'), 'POST, DELETE');
   });
 });
+
+
+test('REST and MCP status preserve unknown catalog counts after live readiness', async () => {
+  const store = makeStore();
+  const originalStatus = store.catalog.status.bind(store.catalog);
+  store.catalog.status = () => ({ ...originalStatus(), healthy: true, backend: 'postgres', rawObjects: null, queuedProposals: null, auditEvents: null });
+  let probes = 0;
+  store.catalog.health = async () => { probes += 1; return store.catalog.status(); };
+  await withServer(async ({ api }) => {
+    const rest = await api('/v2/status');
+    assert.equal(rest.response.status, 200);
+    const initialized = await api('/mcp/test-client/readiness', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) });
+    const callStatus = () => api('/mcp/test-client/readiness', { method: 'POST', headers: { 'mcp-session-id': initialized.response.headers.get('mcp-session-id') }, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'memory_status', arguments: {} } }) });
+    const mcp = await callStatus();
+    assert.equal(mcp.response.status, 200);
+    const mcpStatus = JSON.parse(mcp.body.result.content[0].text);
+    for (const status of [rest.body.data, mcpStatus]) {
+      assert.equal(status.fabricStore.healthy, true);
+      for (const key of ['rawObjects', 'queuedProposals', 'auditEvents']) assert.equal(status.fabricStore[key], null);
+    }
+    assert.equal(probes, 2);
+    store.catalog.health = async () => { throw Object.assign(new Error('unavailable'), { code: 'catalog_postgres_query_timeout' }); };
+    const restFailure = await api('/v2/status');
+    assert.equal(restFailure.response.status, 503);
+    assert.equal(restFailure.body.error.code, 'catalog_unavailable');
+    const mcpFailure = await callStatus();
+    assert.equal(mcpFailure.body.error.message, 'catalog_unavailable');
+  }, { fabricStore: store });
+});
