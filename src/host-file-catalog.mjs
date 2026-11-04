@@ -62,6 +62,11 @@ export class HostFileCatalog {
         CREATE TABLE IF NOT EXISTS queue (id INTEGER PRIMARY KEY, path TEXT NOT NULL, kind TEXT NOT NULL, cursor INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, kind TEXT, size INTEGER, mtime TEXT, signature TEXT, domain TEXT, classification_prefix TEXT, confidence REAL, content_state TEXT, generation INTEGER, observed_at TEXT);
         CREATE TABLE IF NOT EXISTS coverage (id INTEGER PRIMARY KEY, generation INTEGER, path TEXT, kind TEXT, reason TEXT, observed_at TEXT);
+        CREATE INDEX IF NOT EXISTS files_domain_path ON files(domain,path);
+        CREATE INDEX IF NOT EXISTS files_content_state ON files(content_state);
+        CREATE INDEX IF NOT EXISTS files_generation ON files(generation);
+        CREATE INDEX IF NOT EXISTS coverage_generation_kind ON coverage(generation,kind);
+        CREATE INDEX IF NOT EXISTS coverage_generation_id ON coverage(generation,id);
         CREATE VIRTUAL TABLE IF NOT EXISTS texts USING fts5(path UNINDEXED, body);
         INSERT OR IGNORE INTO state(id,generation,phase) VALUES(1,0,'idle');`);
       this.policyHash = crypto.createHash('sha256').update(JSON.stringify(policy)).digest('hex');
@@ -229,9 +234,15 @@ export class HostFileCatalog {
     if (typeof query !== 'string' || query.length > 1000 || (domain !== null && typeof domain !== 'string')) throw new Error('Invalid search');
     const tokens = query.match(/[\p{L}\p{N}_-]+/gu) ?? [];
     const match = tokens.map(t => `"${t.replaceAll('"','""')}"`).join(' AND ');
-    const where = `(f.path LIKE ? ESCAPE '!'${match ? ' OR f.path IN (SELECT path FROM texts WHERE texts MATCH ?)' : ''}) AND (? IS NULL OR f.domain=?)`;
-    const literalPath = `%${query.replaceAll('!','!!').replaceAll('%','!%').replaceAll('_','!_')}%`;
-    const args = [literalPath,...(match ? [match] : []),domain,domain];
+    // Empty browsing needs no LIKE scan; explicit domain equality also lets
+    // SQLite use the domain/path index for both counting and ordered paging.
+    const filters = [], args = [];
+    if (query !== '') {
+      filters.push(`(f.path LIKE ? ESCAPE '!'${match ? ' OR f.path IN (SELECT path FROM texts WHERE texts MATCH ?)' : ''})`);
+      args.push(`%${query.replaceAll('!','!!').replaceAll('%','!%').replaceAll('_','!_')}%`,...(match ? [match] : []));
+    }
+    if (domain !== null) { filters.push('f.domain=?'); args.push(domain); }
+    const where = filters.join(' AND ') || '1';
     const total = this.db.prepare(`SELECT count(*) AS n FROM files f WHERE ${where}`).get(...args).n;
     const items = this.db.prepare(`SELECT f.path,f.kind,f.size,f.domain,f.classification_prefix AS classificationPrefix,CASE WHEN f.classification_prefix IS NOT NULL THEN 'configured-prefix' WHEN f.confidence=0.5 THEN 'filename-hint' ELSE 'unknown' END AS classificationBasis,f.confidence,f.content_state AS contentState,f.observed_at AS observedAt,f.generation,(f.generation=(SELECT generation FROM state)) AS currentGeneration FROM files f WHERE ${where} ORDER BY f.path LIMIT ? OFFSET ?`).all(...args,limit,offset);
     return {items,total};
@@ -255,11 +266,32 @@ export class HostFileCatalog {
     const columns = 'f.path,f.domain,f.classification_prefix AS classificationPrefix,f.confidence,f.observed_at AS observedAt,f.generation';
     const eligible = "f.kind='file' AND f.content_state NOT IN ('sensitive-path','sensitive-content','metadata-only-hardlink','unavailable')";
     if (domains.length) {
-      const values = domains.map(()=>'(?,?)').join(',');
-      const query = this.db.prepare(`WITH destinations(domain,destination) AS (VALUES ${values}) SELECT ${columns},d.destination FROM files f JOIN destinations d ON f.domain=d.domain WHERE ${eligible} AND f.confidence IN (0.5,1) AND d.destination<>'/' AND f.path<>d.destination AND substr(f.path,1,length(d.destination)+1)<>d.destination||'/' ORDER BY f.path`);
-      for (const row of query.iterate(...domains.flatMap(domain=>[domain.id,domain.destination]))) {
-        append(row); if (items.length === limit) break;
-      }
+      // Merge ordered domain streams so a small page never sorts every
+      // eligible file. Keep streaming past rejected paths to preserve coverage.
+      const sql = `SELECT ${columns} FROM files f WHERE f.domain=? AND ${eligible} AND f.confidence IN (0.5,1)`;
+      const streams = [];
+      try {
+        for (const domain of domains) {
+          if (domain.destination === '/') continue;
+          // A canonical destination ends before the slash. Its subtree occupies
+          // [destination + '/', destination + '0') in SQLite's BINARY order.
+          // Separate ranges skip that whole subtree before fetching metadata.
+          for (const [bounds,args] of [
+            [' AND f.path<? AND f.path<>?',[`${domain.destination}/`,domain.destination]],
+            [' AND f.path>=?',[`${domain.destination}0`]]
+          ]) {
+            const iterator = this.db.prepare(`${sql}${bounds} ORDER BY f.path`).iterate(domain.id,...args);
+            streams.push({iterator,destination:domain.destination,next:iterator.next()});
+          }
+        }
+        while (items.length < limit) {
+          let first;
+          for (const stream of streams) if (!stream.next.done && (!first || Buffer.compare(Buffer.from(stream.next.value.path),Buffer.from(first.next.value.path)) < 0)) first = stream;
+          if (!first) break;
+          append({...first.next.value,destination:first.destination});
+          first.next = first.iterator.next();
+        }
+      } finally { for (const stream of streams) stream.iterator.return?.(); }
     }
     if (items.length < limit) {
       const query = this.db.prepare(`SELECT ${columns},NULL AS destination FROM files f WHERE ${eligible} AND f.domain='unknown' AND f.confidence=0 ORDER BY f.path`);
