@@ -33,8 +33,10 @@ Repeat the same arguments with `--apply --plan-digest <reviewed-64-character-dig
 The installer reads these immutable Git blobs, without checkout, filters, dependencies or working-tree bytes:
 
 - `src/host-file-catalog.mjs`
+- `src/host-catalog-path-index.mjs`
 - `src/host-admin-server.mjs`
 - `scripts/amf-host-admin.mjs`
+- `scripts/amf-host-catalog.mjs`
 
 They are copied byte-for-byte into `<runtimeRoot>/releases/<revision>/` with mode 0600. The pinned `deploy/systemd/amf-host-admin.service.in` blob is separately validated and rendered into `amf-host-admin.service` in the chosen unit directory. Its ExecStart uses the installer's known `process.execPath`, the fixed revision entry script and `<runtimeRoot>/config.json`. ExecStart path arguments remain quoted for systemd, including escaped literal percent signs. The working directory is the fixed, unquoted absolute path `WorkingDirectory=/`; entry/configuration paths are absolute and module imports resolve relative to their source files, so no release-specific working directory is required. Quotes must not be added to this scalar directive: systemd treats them as part of its path and rejects it as nonabsolute. The unit uses `Restart=on-failure`, `NoNewPrivileges=true`, `UMask=0077` and the user target `default.target`.
 
@@ -51,3 +53,43 @@ The focused tests reproduce rejection of the old quoted working directory and ve
 ```sh
 node --test scripts/test-host-admin-install.mjs
 ```
+
+## Offline path-index backfill
+
+The installed release includes the catalog CLI and its path-index dependency.
+Use the exact installed revision and the same policy/database as the service;
+no source checkout, package installation or bearer token is needed.
+Historical revisions that predate the index remain installable; the index module
+is mandatory when the pinned catalog imports it. Historical revisions without the
+operator CLI do not gain backfill support implicitly. Existing
+installation receipts containing only the original release files remain valid;
+an upgrade adds the new managed files and preserves prior releases and tokens.
+
+With authorization for the service maintenance window, stop the user service and
+verify it is inactive before opening the database. The CLI enforces the native
+SQLite connection lock and refuses to run while the service owns the catalog.
+Run bounded batches from the installed release, repeating until `complete: true`:
+
+```sh
+systemctl --user stop amf-host-admin.service
+systemctl --user is-active amf-host-admin.service
+node /srv/private-example/host-admin/releases/0123456789abcdef0123456789abcdef01234567/scripts/amf-host-catalog.mjs \
+  --config /srv/private-example/host-admin/catalog-policy.json \
+  --database /srv/private-example/host-admin/database/catalog.sqlite \
+  index-paths --max-entries 1000 --budget-ms 50
+```
+
+`is-active` should report `inactive` (exit 3); any other service state requires
+investigation. Each successful CLI batch prints JSON with `processed`, `cursor`
+and `complete`, without reading the bearer token. A failed batch or interrupted
+process leaves the last committed cursor intact; repeat the same command after
+resolving the reported cause. Never run a second catalog writer or remove lock
+files. Search remains exact through the legacy path until backfill completes.
+After completion, start the service with `systemctl --user start amf-host-admin.service`, verify it is active, and verify the existing authenticated
+files interface using the approved credential procedure. The installer itself
+never runs these service commands or starts the backfill.
+
+The installer tests execute the copied service and CLI from `/`, verify HTTP
+startup, lock refusal while the service is active, graceful shutdown, offline
+backfill completion and subsequent search. Their temporary synthetic token is
+neither read nor printed by the new backfill workflow.

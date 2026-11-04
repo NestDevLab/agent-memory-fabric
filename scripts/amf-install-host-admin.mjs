@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { validateHostAdminConfig } from '../src/host-admin-server.mjs';
 
-const CODE_PATHS = ['src/host-file-catalog.mjs','src/host-admin-server.mjs','scripts/amf-host-admin.mjs'];
+const CODE_PATHS = ['src/host-file-catalog.mjs','src/host-catalog-path-index.mjs','src/host-admin-server.mjs','scripts/amf-host-admin.mjs','scripts/amf-host-catalog.mjs'];
 const TEMPLATE = 'deploy/systemd/amf-host-admin.service.in';
 const UNIT = 'amf-host-admin.service';
 const MAX_BYTES = 1024 * 1024;
@@ -122,12 +122,17 @@ function build(options) {
   if(config.policyPath!==policyPath || !absolute(config.tokenFile) || !within(config.tokenFile,runtimeRoot) || !absolute(config.databasePath) || !within(config.databasePath,path.join(runtimeRoot,'database'))) fail('runtime_config_path_forbidden');
   if([configPath,policyPath,manifestPath].some(filename=>filename===config.tokenFile || within(config.tokenFile,filename)) || within(config.tokenFile,path.join(runtimeRoot,'releases')) || within(config.tokenFile,path.join(runtimeRoot,'database')) || config.tokenFile===path.join(runtimeRoot,'releases') || config.tokenFile===path.join(runtimeRoot,'database')) fail('token_path_forbidden');
   const material=new Map(),blobs={};
+  let requiresPathIndex=false;
   for(const source of [...CODE_PATHS,TEMPLATE]) {
     const mode=git(repo,['ls-tree',revision,'--',source]).toString().split(' ')[0];
+    // Historical releases predate the derived index and optional operator CLI.
+    // A catalog that imports the index must always ship that dependency.
+    if(mode==='' && (source==='scripts/amf-host-catalog.mjs' || (source==='src/host-catalog-path-index.mjs' && !requiresPathIndex))) continue;
     if(!['100644','100755'].includes(mode)) fail('git_source_mode_invalid');
     const blob=git(repo,['rev-parse',`${revision}:${source}`]).toString().trim();
     if(!/^[a-f0-9]{40}$/.test(blob) || git(repo,['cat-file','-t',blob]).toString().trim()!=='blob') fail('git_source_blob_invalid');
     const bytes=git(repo,['cat-file','blob',blob]); if(bytes.length>MAX_BYTES) fail('git_source_blob_too_large');
+    if(source==='src/host-file-catalog.mjs') requiresPathIndex=bytes.includes(Buffer.from('./host-catalog-path-index.mjs'));
     blobs[source]={gitBlob:blob,sha256:sha(bytes)};
     if(source!==TEMPLATE) material.set(path.join(release,source),bytes);
     else {
@@ -143,7 +148,7 @@ function build(options) {
   const oldBytes=readFile(manifestPath,{privateRequired:true,optional:true});
   const old=oldBytes ? json(oldBytes) : null;
   if(old && (old.schema!=='amf.host-admin-installation/v1' || !plain(old.targets) || !/^[a-f0-9]{40}$/.test(old.revision ?? '') || old.runtimeRoot!==runtimeRoot || old.unitPath!==unitPath)) fail('installation_manifest_invalid');
-  const managedTarget=filename=>filename===configPath || filename===policyPath || filename===unitPath || (within(filename,path.join(runtimeRoot,'releases')) && /^releases\/[a-f0-9]{40}\/(?:src\/(?:host-file-catalog|host-admin-server)\.mjs|scripts\/amf-host-admin\.mjs)$/.test(path.relative(runtimeRoot,filename)));
+  const managedTarget=filename=>filename===configPath || filename===policyPath || filename===unitPath || (within(filename,path.join(runtimeRoot,'releases')) && /^releases\/[a-f0-9]{40}\//.test(path.relative(runtimeRoot,filename)) && CODE_PATHS.includes(path.relative(runtimeRoot,filename).split('/').slice(2).join('/')));
   const observed={};
   for(const filename of new Set([...Object.keys(old?.targets ?? {}),...material.keys()])) {
     if(!absolute(filename) || !managedTarget(filename)) fail('installation_manifest_target_invalid');

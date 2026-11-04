@@ -4,10 +4,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync, spawn } from 'node:child_process';
+import net from 'node:net';
+import { once } from 'node:events';
 import { planHostAdminInstall, applyHostAdminInstall } from './amf-install-host-admin.mjs';
 
-const sources=['src/host-file-catalog.mjs','src/host-admin-server.mjs','scripts/amf-host-admin.mjs','deploy/systemd/amf-host-admin.service.in'];
+const codeSources=['src/host-file-catalog.mjs','src/host-catalog-path-index.mjs','src/host-admin-server.mjs','scripts/amf-host-admin.mjs','scripts/amf-host-catalog.mjs'];
+const template='deploy/systemd/amf-host-admin.service.in';
+const sources=[...codeSources,template];
 const hash=bytes=>crypto.createHash('sha256').update(bytes).digest('hex');
 function git(repo,args) {return execFileSync('git',args,{cwd:repo,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();}
 function commit(repo) {git(repo,['add','.']);git(repo,['-c','user.name=Example','-c','user.email=example@example.invalid','commit','-qm','Synthetic installer fixture']);return git(repo,['rev-parse','HEAD']);}
@@ -38,7 +42,7 @@ test('plan is read-only; apply installs immutable blobs, private state, quoted u
   fs.writeFileSync(path.join(f.repo,sources[0]),'working tree poison');
   const result=applyHostAdminInstall({...f,planDigest:plan.planDigest});
   assert.equal(result.changed,true);assert.equal(result.activation,'not-requested');assert.equal(result.unitName,'amf-host-admin.service');
-  for(const source of sources.slice(0,3)) {
+  for(const source of codeSources) {
     const target=path.join(f.runtimeRoot,'releases',f.revision,source);
     assert.equal(fs.readFileSync(target,'utf8'),git(f.repo,['show',`${f.revision}:${source}`])+'\n');
     assert.equal(fs.statSync(target).mode & 0o777,0o600);
@@ -106,7 +110,7 @@ test('pinned symlink code and extra unit commands are rejected before installati
   const f=fixture(t),source=path.join(f.repo,sources[0]);
   fs.unlinkSync(source);fs.symlinkSync('host-admin-server.mjs',source);const linkedRevision=commit(f.repo);
   assert.throws(()=>planHostAdminInstall({...f,revision:linkedRevision}),/git_source_mode_invalid/);
-  const other=fixture(t);fs.appendFileSync(path.join(other.repo,sources[3]),'\n[Service]\nExecStartPre=/bin/false\n');const badTemplate=commit(other.repo);
+  const other=fixture(t);fs.appendFileSync(path.join(other.repo,template),'\n[Service]\nExecStartPre=/bin/false\n');const badTemplate=commit(other.repo);
   assert.throws(()=>planHostAdminInstall({...other,revision:badTemplate}),/unit_template_invalid/);
   assert.equal(fs.existsSync(other.runtimeRoot),false);
 });
@@ -128,4 +132,70 @@ test('rendered unit passes systemd verification with an unquoted absolute workin
   assert.ok(unit.includes(`ExecStart="${process.execPath}"`));
   const accepted=spawnSync('systemd-analyze',['verify',unitPath],{encoding:'utf8'});
   assert.equal(accepted.status,0,accepted.stderr);
+});
+
+
+test('installed release starts independently, holds catalog lock, and supports offline backfill without a token',async t=>{
+  const f=fixture(t);
+  const reservation=net.createServer(); reservation.listen(0,'127.0.0.1'); await once(reservation,'listening');
+  f.config.port=reservation.address().port; await new Promise(resolve=>reservation.close(resolve));
+  fs.writeFileSync(f.configSource,JSON.stringify(f.config));
+  fs.mkdirSync(f.policy.roots[0]); fs.writeFileSync(path.join(f.policy.roots[0],'memory-example.txt'),'example');
+  const plan=planHostAdminInstall(f); applyHostAdminInstall({...f,planDigest:plan.planDigest});
+  const release=path.join(f.runtimeRoot,'releases',f.revision), cli=path.join(release,'scripts/amf-host-catalog.mjs');
+  const run=command=>spawnSync(process.execPath,[cli,'--config',f.config.policyPath,'--database',f.config.databasePath,command,'--max-entries',command==='scan'?'100':'1'],{cwd:'/',encoding:'utf8',timeout:15000});
+  // The copied release resolves every import without the repository or cwd.
+  for(let i=0;i<20;i++) {const result=run('scan');assert.equal(result.status,0,result.stderr);if(JSON.parse(result.stdout).scan.state==='complete')break;assert.ok(i<19);}
+  const first=run('index-paths'); assert.equal(first.status,0,first.stderr); assert.equal(JSON.parse(first.stdout).complete,false);
+  const tokenBefore=fs.statSync(f.config.tokenFile,{bigint:true});
+  const child=spawn(process.execPath,[path.join(release,'scripts/amf-host-admin.mjs'),'--config',path.join(f.runtimeRoot,'config.json')],{cwd:'/',stdio:['ignore','pipe','pipe']});
+  let stderr='';child.stderr.setEncoding('utf8');child.stderr.on('data',value=>{stderr+=value;});
+  t.after(()=>{if(child.exitCode===null)child.kill('SIGKILL');});
+  await new Promise((resolve,reject)=>{
+    const timeout=setTimeout(()=>{child.kill('SIGKILL');reject(Error('Installed service startup timed out'));},10000);
+    child.stdout.once('data',value=>{clearTimeout(timeout);try {assert.equal(JSON.parse(String(value)).state,'listening');resolve();}catch(error){reject(error);}});
+    child.once('error',error=>{clearTimeout(timeout);reject(error);});
+    child.once('exit',()=>{clearTimeout(timeout);reject(Error(`Installed service exited before listening: ${stderr}`));});
+  });
+  assert.equal((await fetch(`http://127.0.0.1:${f.config.port}/v1/files?query=memory`)).status,401);
+  const locked=run('index-paths'); assert.equal(locked.status,1); assert.match(JSON.parse(locked.stderr.trim().split('\n').at(-1)).message,/Catalog operation failed/);
+  const exited=once(child,'exit'); child.kill('SIGTERM'); await exited;
+  let complete=false;
+  for(let i=0;i<20;i++){const result=run('index-paths');assert.equal(result.status,0,result.stderr);if(JSON.parse(result.stdout).complete){complete=true;break;}}
+  assert.equal(complete,true);
+  const search=spawnSync(process.execPath,[cli,'--config',f.config.policyPath,'--database',f.config.databasePath,'search','--query','memory'],{cwd:'/',encoding:'utf8',timeout:15000});
+  assert.equal(search.status,0,search.stderr);assert.equal(JSON.parse(search.stdout).total,1);
+  const tokenAfter=fs.statSync(f.config.tokenFile,{bigint:true});
+  assert.deepEqual([tokenAfter.ino,tokenAfter.mtimeNs,tokenAfter.size],[tokenBefore.ino,tokenBefore.mtimeNs,tokenBefore.size]);
+});
+
+test('legacy installation receipt with only original release paths upgrades and retains old files',t=>{
+  const f=fixture(t),plan=planHostAdminInstall(f);applyHostAdminInstall({...f,planDigest:plan.planDigest});
+  const manifestPath=path.join(f.runtimeRoot,'.installation.json'),manifest=JSON.parse(fs.readFileSync(manifestPath,'utf8'));
+  const original=['src/host-file-catalog.mjs','src/host-admin-server.mjs','scripts/amf-host-admin.mjs'];
+  for(const source of codeSources.filter(source=>!original.includes(source))) {
+    const filename=path.join(plan.release,source);fs.unlinkSync(filename);delete manifest.targets[filename];
+  }
+  fs.writeFileSync(manifestPath,JSON.stringify(manifest),{mode:0o600});
+  const before=original.map(source=>fs.statSync(path.join(plan.release,source),{bigint:true}).mtimeNs);
+  const upgrade=planHostAdminInstall(f);assert.equal(upgrade.noOp,false);
+  applyHostAdminInstall({...f,planDigest:upgrade.planDigest});
+  for(const [i,source] of original.entries()) assert.equal(fs.statSync(path.join(plan.release,source),{bigint:true}).mtimeNs,before[i]);
+  for(const source of codeSources) assert.ok(fs.existsSync(path.join(plan.release,source)));
+  assert.equal(planHostAdminInstall(f).noOp,true);
+});
+
+
+test('historical revisions remain installable; imported path-index dependency cannot be omitted',t=>{
+  const historical=fixture(t);
+  fs.writeFileSync(path.join(historical.repo,'src/host-file-catalog.mjs'),'export class HostFileCatalog {}\n');
+  for(const source of ['src/host-catalog-path-index.mjs','scripts/amf-host-catalog.mjs']) fs.unlinkSync(path.join(historical.repo,source));
+  const revision=commit(historical.repo);git(historical.repo,['update-ref','refs/remotes/origin/main',revision]);
+  const options={...historical,revision},plan=planHostAdminInstall(options);
+  assert.equal(Object.hasOwn(plan.blobs,'src/host-catalog-path-index.mjs'),false);
+  applyHostAdminInstall({...options,planDigest:plan.planDigest});assert.equal(planHostAdminInstall(options).noOp,true);
+  const broken=fixture(t);fs.unlinkSync(path.join(broken.repo,'src/host-catalog-path-index.mjs'));
+  const incomplete=commit(broken.repo);
+  assert.throws(()=>planHostAdminInstall({...broken,revision:incomplete}),/git_source_mode_invalid/);
+  assert.equal(fs.existsSync(broken.runtimeRoot),false);
 });
