@@ -5,7 +5,7 @@ import { HostFileCatalog } from '../src/host-file-catalog.mjs';
 
 let catalog;
 try {
-  const args = process.argv.slice(2), options = {}, commands = new Set(['scan','status','search','suggestions']);
+  const args = process.argv.slice(2), options = {}, commands = new Set(['scan','status','search','suggestions','index-paths']);
   let command;
   for (let i=0;i<args.length;i++) {
     const arg = args[i];
@@ -15,11 +15,12 @@ try {
     if (options[arg] !== undefined) throw new Error('Duplicate option');
     options[arg] = args[++i];
   }
-  if (!command || !path.isAbsolute(options['--config'] ?? '') || !path.isAbsolute(options['--database'] ?? '')) throw new Error('Usage: --config ABSOLUTE_POLICY --database ABSOLUTE_DB scan|status|search|suggestions [--restart] [--max-entries N] [--budget-ms N] [--query TEXT] [--domain ID] [--limit N] [--offset N]');
+  if (!command || !path.isAbsolute(options['--config'] ?? '') || !path.isAbsolute(options['--database'] ?? '')) throw new Error('Usage: --config ABSOLUTE_POLICY --database ABSOLUTE_DB scan|status|search|suggestions|index-paths [--restart] [--max-entries N] [--budget-ms N] [--query TEXT] [--domain ID] [--limit N] [--offset N]');
   const policy = JSON.parse(fs.readFileSync(options['--config'],'utf8'));
   catalog = new HostFileCatalog({databasePath:options['--database'],policy});
   const number = (key,fallback) => options[key] === undefined ? fallback : Number(options[key]);
   const result = command === 'scan' ? await catalog.scan({maxEntries:number('--max-entries',10000),budgetMs:number('--budget-ms',2000),restart:options.restart ?? false})
+    : command === 'index-paths' ? catalog.buildPathIndex({maxEntries:number('--max-entries',1000),budgetMs:number('--budget-ms',50)})
     : command === 'status' ? catalog.status()
     : command === 'search' ? catalog.search({query:options['--query'] ?? '',domain:options['--domain'] ?? null,limit:number('--limit',50),offset:number('--offset',0)})
     : catalog.suggestions({limit:number('--limit',50)});
