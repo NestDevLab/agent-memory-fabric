@@ -57,7 +57,12 @@ export function evaluateFabricPayload(payload, { requireSemanticBackend = false,
   if (requireDocumentStore && documents?.configured !== true) {
     return check("fabric", "degraded", "Document corpus store is required but not configured");
   }
-  if (Number.isFinite(maxQueuedProposals) && Number(store.queuedProposals ?? 0) > maxQueuedProposals) {
+  const queuedProposals = finite(store.queuedProposals);
+  if (Number.isFinite(maxQueuedProposals) && queuedProposals === null) {
+    return check("fabric", "degraded", "Queued proposal threshold cannot be verified",
+      { queuedProposals: null, maxQueuedProposals });
+  }
+  if (Number.isFinite(maxQueuedProposals) && queuedProposals > maxQueuedProposals) {
     return check("fabric", "degraded", `Queued proposals exceed threshold (${store.queuedProposals}/${maxQueuedProposals})`);
   }
   return check("fabric", "healthy", `Fabric ${payload.data?.version ?? "unknown"}: ${store.backend ?? "store"}, schema ${store.schemaVersion ?? "unknown"}`,
@@ -230,6 +235,7 @@ function defined(value) {
 }
 
 function finite(value) {
+  if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }

@@ -246,3 +246,25 @@ test("CLI accepts deployment env files without colliding with Node options", () 
   assert.ok([0, 1, 2].includes(result.status), result.stderr);
   assert.equal(JSON.parse(result.stdout).schema, "amf.health-report/v1");
 });
+
+
+test("Fabric preserves unknown counts and cannot verify configured queue thresholds", () => {
+  for (const value of [null, undefined, "", "invalid"]) {
+    const payload = structuredClone(healthyFabric);
+    payload.data.fabricStore.rawObjects = value;
+    payload.data.fabricStore.queuedProposals = value;
+    const readiness = evaluateFabricPayload(payload);
+    assert.equal(readiness.status, "healthy");
+    assert.equal(readiness.evidence.rawObjects, null);
+    assert.equal(readiness.evidence.queuedProposals, null);
+    for (const maxQueuedProposals of [0, 100]) {
+      const threshold = evaluateFabricPayload(payload, { maxQueuedProposals });
+      assert.equal(threshold.status, "degraded");
+      assert.match(threshold.summary, /cannot be verified/);
+      assert.equal(threshold.evidence.queuedProposals, null);
+    }
+  }
+  const payload = structuredClone(healthyFabric);
+  payload.data.fabricStore.queuedProposals = 0;
+  assert.equal(evaluateFabricPayload(payload, { maxQueuedProposals: 0 }).status, "healthy");
+});
