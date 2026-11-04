@@ -184,14 +184,18 @@ test('known prefix suggestions append basename, respect destination boundaries a
   const f=fixture(t),destination=path.join(f.source,'organized');
   fs.mkdirSync(path.join(f.source,'known'));fs.mkdirSync(destination);fs.mkdirSync(destination+'-neighbor');
   fs.writeFileSync(path.join(f.source,'known','report.pdf'),'outside');fs.writeFileSync(path.join(destination,'report.pdf'),'existing collision');fs.writeFileSync(path.join(destination+'-neighbor','other.pdf'),'boundary');
+  for(const suffix of ['0','é']) { fs.mkdirSync(destination+suffix);fs.writeFileSync(path.join(destination+suffix,'neighbor.pdf'),'outside subtree'); }
   f.policy.domains=[{id:'alpha',prefixes:[f.source],destination}];
   const c=new HostFileCatalog(f);t.after(()=>c.close());await finish(c);
   const originalStat=fs.statSync,originalLstat=fs.lstatSync;
   fs.statSync=()=>{throw new Error('No filesystem collision checks allowed');};fs.lstatSync=fs.statSync;
   let items;try {items=c.suggestions();} finally {fs.statSync=originalStat;fs.lstatSync=originalLstat;}
-  assert.equal(items.length,2);
+  assert.equal(items.length,4);
   assert.equal(items.find(x=>x.path.endsWith('/known/report.pdf')).suggestedDestination,path.join(destination,'report.pdf'));
   assert.ok(items.some(x=>x.path.endsWith('/organized-neighbor/other.pdf')));
+  assert.ok(items.some(x=>x.path.endsWith('/organized0/neighbor.pdf')));
+  assert.ok(items.some(x=>x.path.endsWith('/organizedé/neighbor.pdf')));
+  assert.deepEqual(items.map(x=>x.path),items.map(x=>x.path).sort((a,b)=>Buffer.compare(Buffer.from(a),Buffer.from(b))));
   assert.ok(items.every(x=>x.evidence.basis==='configured-prefix' && x.evidence.confidence===1));
 });
 
@@ -260,4 +264,54 @@ test('SIGKILL during an open batch preserves committed cursor and rolls back tex
   assert.equal(c.db.prepare("SELECT cursor FROM queue WHERE kind='directory'").get().cursor,1);
   await finish(c);assert.equal(c.search({query:'crashbatchword'}).total,8);
   assert.equal(c.db.prepare('SELECT count(*) AS n FROM texts').get().n,8);
+});
+
+test('large catalog uses narrow indexes, preserves browsing and upgrades existing data',t => {
+  const f=fixture(t);
+  f.policy.domains.push({id:'notes',prefixes:[],destination:path.join(f.base,'organized')});
+  let c=new HostFileCatalog(f);
+  const insert=c.db.prepare('INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?)');
+  c.db.exec('BEGIN');
+  for(let i=0;i<500000;i++) insert.run(`${f.source}/${String(i).padStart(6,'0')}.md`,'file',10,'1','synthetic-signature',i%2?'docs':'notes',f.source,1,i%3?'indexed':'metadata-only',i%2,'2026-01-01');
+  c.db.exec('COMMIT');
+  c.db.prepare('INSERT INTO texts(path,body) VALUES(?,?)').run(`${f.source}/000001.md`,'uniquesyntheticword');
+  const plans=[];
+  const prepare=c.db.prepare.bind(c.db);
+  c.db.prepare=(sql)=>{ if(sql.startsWith('SELECT') && !sql.includes('texts MATCH')) plans.push({sql,plan:prepare(`EXPLAIN QUERY PLAN ${sql}`)}); return prepare(sql); };
+  const status=c.status(); assert.equal(status.counts.total,500000); assert.equal(status.freshness.unverified,250000);
+  assert.equal(c.search({limit:2,offset:2}).items[0].path,`${f.source}/000002.md`);
+  assert.equal(c.search({domain:'docs',limit:2,offset:2}).items[0].path,`${f.source}/000005.md`);
+  assert.equal(c.search({domain:'missing'}).total,0);
+  assert.equal(c.search({query:'uniquesyntheticword',domain:'docs'}).total,1);
+  assert.equal(c.search({query:'uniquesyntheticword',domain:'notes'}).total,0);
+  assert.equal(c.search({query:'%'}).total,0);
+  assert.deepEqual(c.suggestions({limit:4}).map(x=>x.path),Array.from({length:4},(_,i)=>`${f.source}/${String(i).padStart(6,'0')}.md`));
+  const details=(sql,...args)=>prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...args).map(row=>row.detail).join('\n');
+  for (const [sql,args,index] of [
+    ['SELECT domain,count(*) FROM files GROUP BY domain',[],'files_domain_path'],
+    ['SELECT content_state,count(*) FROM files GROUP BY content_state',[],'files_content_state'],
+    ['SELECT count(*) FROM files WHERE generation<>?',[0],'files_generation'],
+    ['SELECT count(*) FROM files WHERE domain=?',['docs'],'files_domain_path'],
+  ]) assert.match(details(sql,...args),new RegExp(`COVERING INDEX ${index}`));
+  const browse=plans.filter(x=>x.sql.includes('FROM files f') && !x.sql.includes('kind='));
+  assert.ok(browse.length); assert.ok(browse.slice(0,6).every(x=>!x.sql.includes('LIKE')));
+  const suggestionQueries=plans.filter(x=>x.sql.includes('f.domain=? AND f.kind'));
+  assert.ok(suggestionQueries.some(x=>x.sql.includes('f.path<?')));
+  assert.ok(suggestionQueries.some(x=>x.sql.includes('f.path>=?')));
+  for(const {sql} of suggestionQueries) {
+    const destination=f.policy.domains[0].destination;
+    const bounds=sql.includes('f.path<?')?[`${destination}/`,destination]:[`${destination}0`];
+    const suggestionPlan=details(sql,'docs',...bounds);
+    assert.match(suggestionPlan,/USING INDEX files_domain_path.*path[<>]/);
+    assert.doesNotMatch(suggestionPlan,/TEMP B-TREE/);
+  }
+  c.db.prepare=prepare;
+  const measure=()=>{const start=performance.now(); c.status(); c.search({domain:'docs'}); c.suggestions(); return Math.round((performance.now()-start)*100)/100;};
+  const indexedMs=measure();
+  const before={status:c.status(),search:c.search({domain:'docs'}),suggestions:c.suggestions(),policyHash:c.policyHash};
+  // Simulate a pre-index database, then exercise additive startup migration.
+  for(const name of ['files_domain_path','files_content_state','files_generation','coverage_generation_kind','coverage_generation_id']) c.db.exec(`DROP INDEX ${name}`);
+  const withoutIndexesMs=measure(); t.diagnostic(JSON.stringify({syntheticRows:500000,indexedMs,withoutIndexesMs}));
+  c.close(); c=new HostFileCatalog(f); t.after(()=>c.close());
+  assert.deepEqual({status:c.status(),search:c.search({domain:'docs'}),suggestions:c.suggestions(),policyHash:c.policyHash},before);
 });
