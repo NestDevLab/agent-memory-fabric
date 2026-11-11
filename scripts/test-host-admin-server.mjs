@@ -85,3 +85,28 @@ test('background scan ticks request minimal results without aggregate status',as
     await rm(root,{recursive:true,force:true});
   }
 });
+
+test('scan state failure is reported and a later tick recovers',async ()=>{
+  const {HostFileCatalog}=await import('../src/host-file-catalog.mjs');
+  const root=await mkdtemp(join(tmpdir(),'amf-admin-scan-error-'));
+  await mkdir(join(root,'private'),{mode:0o700});await mkdir(join(root,'source'));
+  const privateRoot=join(root,'private'),policyPath=join(privateRoot,'policy'),tokenFile=join(privateRoot,'token');
+  await writeFile(policyPath,JSON.stringify({schema:'amf.host-file-catalog-policy/v1',hostId:'test-host',roots:[join(root,'source')],excludePrefixes:[],metadataOnlyPrefixes:[],domains:[],content:{enabled:false,maxBytes:1024,extensions:[]}}),{mode:0o600});
+  await writeFile(tokenFile,token,{mode:0o600});
+  const {createServer}=await import('node:net');const reservation=createServer();
+  await new Promise(resolve=>reservation.listen(0,'127.0.0.1',resolve));const port=reservation.address().port;
+  await new Promise(resolve=>reservation.close(resolve));
+  const original=HostFileCatalog.prototype.scanState;let fail=true,service;
+  HostFileCatalog.prototype.scanState=function(){if(fail) throw new Error('synthetic state failure');return original.call(this);};
+  try {
+    service=await startHostAdmin({schema:'amf.host-admin-config/v1',bind:'127.0.0.1',port,policyPath,tokenFile,databasePath:join(privateRoot,'catalog.sqlite'),scanIntervalMs:1000,scanMaxEntries:10});
+    fail=false;
+    const status=async () => (await fetch(`http://127.0.0.1:${port}/v1/status`,{headers:{Authorization:`Bearer ${token}`}})).json();
+    const failed=await status();assert.equal(failed.scannerError,'scan_failed');assert.equal(failed.overall,'degraded');
+    const deadline=Date.now()+5000;let recovered;
+    do {await new Promise(resolve=>setTimeout(resolve,50));recovered=await status();} while(recovered.scannerError && Date.now()<deadline);
+    assert.equal(recovered.scannerError,null);assert.equal(recovered.catalog.scan.state,'complete');
+  } finally {
+    await service?.close();HostFileCatalog.prototype.scanState=original;await rm(root,{recursive:true,force:true});
+  }
+});
