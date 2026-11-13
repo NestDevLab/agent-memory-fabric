@@ -66,6 +66,7 @@ events.
 - [Conversation archive interface](docs/conversation-archive-interface-v1.md)
 - [Content protection policy](docs/content-protection-policy-v1.md)
 - [Capability MCP v1](docs/capability-mcp-v1.md)
+- [Temporary proposal reader](docs/temporary-proposal-reader.md)
 - [v2 compatibility view](docs/conversation-session-v2-compatibility.md)
 - [v3 migration safety](docs/v3-migration-safety-v1.md)
 - [Recovery pair](docs/m4-recovery-pair-v1.md)
