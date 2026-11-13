@@ -7,7 +7,7 @@ import test from 'node:test';
 
 import { FabricStore, MemoryCatalog, MemoryRawStore } from '../src/fabric-store.mjs';
 import { aadSha256For } from '../src/amf-memory-record-validator.mjs';
-import { createAgentMemoryFabricServer } from '../src/server.mjs';
+import { createAgentMemoryFabricServer, loadAuthRegistry } from '../src/server.mjs';
 import { ContextTokenVerifier, issueContextToken, issueSessionRouteBinding, requestDigest } from '../src/context-token.mjs';
 import { buildContextRequest } from '../src/access-contract.mjs';
 import { CanonicalPamBridge, CuratorReceiptCoordinator, MemoryReceiptLedger } from '../src/canonical-memory-bridge.mjs';
@@ -1606,4 +1606,63 @@ test('REST and MCP status preserve unknown catalog counts after live readiness',
     const mcpFailure = await callStatus();
     assert.equal(mcpFailure.body.error.message, 'catalog_unavailable');
   }, { fabricStore: store });
+});
+
+test('temporary proposal reader can read scoped payloads and cannot reach any other operation', async () => {
+  await withServer(async ({ api, fabricStore, registry, writeRegistry }) => {
+    registry.rows.push({ token: 'proposal-reader-test', actor: 'proposal-reader-test', active: true,
+      mode: 'proposal_read_only_scoped', allowedScopes: ['domain:main-lab'],
+      permissions: ['memory:proposal-read'], expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    writeRegistry();
+    const proposal = await fabricStore.propose({ actor: 'fixture', scope: 'domain:main-lab',
+      text: 'Synthetic proposal for review', source: 'test', idempotencyKey: 'reader-fixture' });
+    const other = await fabricStore.propose({ actor: 'fixture', scope: 'domain:other',
+      text: 'Other synthetic scope', source: 'test', idempotencyKey: 'reader-other-fixture' });
+    const headers = { authorization: 'Bearer proposal-reader-test' };
+    const list = await api('/v2/internal/curation/proposals', { headers });
+    assert.equal(list.response.status, 200);
+    assert.equal(JSON.stringify(list.body).includes(other.id), false);
+    const read = await api(`/v2/internal/curation/proposals/${proposal.id}`, { headers });
+    assert.equal(read.response.status, 200);
+    assert.equal(read.body.data.payload.text, 'Synthetic proposal for review');
+    assert.equal(read.response.headers.get('cache-control').includes('no-store'), true);
+    assert.equal((await api(`/v2/internal/curation/proposals/${other.id}`, { headers })).response.status, 404);
+    for (const [method, pathname] of [
+      ['POST', '/v2/internal/curation/receipts'], ['POST', '/v2/internal/curation/reconcile'],
+      ['POST', '/v2/internal/retention/apply'], ['POST', '/v2/internal/identities'],
+      ['POST', '/v2/memory/proposals'], ['POST', '/v2/documents'],
+      ['GET', '/v2/memory/search?query=fixture&scope=domain:main-lab'],
+      ['GET', '/v1/policies/resolve'], ['GET', '/v2/status'],
+      ['POST', '/mcp/test-client/test-identity'], ['PUT', '/v2/internal/curation/proposals']
+    ]) {
+      const result = await api(pathname, { method, headers, ...(method === 'GET' ? {} : { body: '{}' }) });
+      assert.equal(result.response.status, 403, `${method} ${pathname}`);
+    }
+    // Keep the registry bytes and mtime unchanged while time passes beyond the deadline.
+    const originalNow = Date.now;
+    const deadline = Date.parse(registry.rows.at(-1).expiresAt);
+    try {
+      Date.now = () => deadline;
+      assert.equal((await api(`/v2/internal/curation/proposals/${proposal.id}`, { headers })).response.status, 401);
+      assert.equal((await api('/v2/internal/curation/proposals', { headers })).response.status, 401);
+    } finally { Date.now = originalNow; }
+  });
+});
+
+test('proposal reader registry rejects missing deadlines and broader grants', async () => {
+  await withServer(async ({ api, registry, writeRegistry }) => {
+    const row = { token: 'proposal-reader-test', actor: 'proposal-reader-test', active: true,
+      mode: 'proposal_read_only_scoped', allowedScopes: ['domain:main-lab'],
+      permissions: ['memory:proposal-read'], expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    for (const patch of [{ expiresAt: undefined }, { expiresAt: 'invalid' }, { expiresAt: '2030-01-01' },
+      { permissions: ['*'] }, { permissions: ['memory:proposal-read', 'memory:curate'] },
+      { permissions: ['memory:apply-receipt'] }, { allowedScopes: ['*'] }, { allowedScopes: [] },
+      { readScopes: ['*'], proposeScopes: [] }, { allowedVaults: ['example'] }, { tools: ['memory_add'] }]) {
+      registry.rows = [{ ...row, ...patch }];
+      writeRegistry();
+      const result = await api('/v2/internal/curation/proposals', { headers: { authorization: 'Bearer proposal-reader-test' } });
+      assert.equal(result.response.status, 401, JSON.stringify(patch));
+      await assert.rejects(loadAuthRegistry({ forceRefresh: true }), /auth_registry_invalid_row/);
+    }
+  });
 });

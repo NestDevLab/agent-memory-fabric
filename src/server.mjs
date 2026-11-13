@@ -54,7 +54,7 @@ const MCP_SESSION_DEFAULTS = Object.freeze({
 });
 const authCache = { loadedAt: 0, rows: [], sourceKey: '', mtimeMs: 0 };
 const AUTH_ID = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$/;
-const AUTH_MODES = new Set(['allow_all', 'scoped', 'read_only_scoped', 'deny']);
+const AUTH_MODES = new Set(['allow_all', 'scoped', 'read_only_scoped', 'proposal_read_only_scoped', 'deny']);
 const PRIVATE_HEADERS = Object.freeze({
   'cache-control': 'no-store, private',
   pragma: 'no-cache',
@@ -384,6 +384,9 @@ function canReadScope(policy, scope) {
 }
 
 function hasPermission(policy, permission) {
+  if (policy?.mode === 'proposal_read_only_scoped') {
+    return permission === 'memory:proposal-read' && Date.parse(policy.expiresAt) > Date.now();
+  }
   const perms = Array.isArray(policy?.permissions) ? policy.permissions : [];
   return perms.includes('*') || perms.includes(permission);
 }
@@ -1288,7 +1291,7 @@ function buildStatus({ fabricStore, canonicalStore = defaultCanonicalStore, docu
 function getAllowedScopes(policy, policies) {
   const registered = Object.keys(policies.scopes || {});
   if (policy.mode === 'allow_all') return registered;
-  if (policy.mode === 'scoped' || policy.mode === 'read_only_scoped') {
+  if (['scoped', 'read_only_scoped', 'proposal_read_only_scoped'].includes(policy.mode)) {
     const configured = scopeGrants(policy, 'read');
     if (configured.includes('*')) return registered;
     return configured.filter(scope => registered.includes(scope));
@@ -1433,6 +1436,15 @@ function validateAuthRows(rows, sourceKind) {
       strictAuthArray(row.tools, { optional: true });
       strictOperationGrantPair(row, 'readScopes', 'proposeScopes');
       strictOperationGrantPair(row, 'readVaults', 'writeVaults');
+      if (row.mode === 'proposal_read_only_scoped') {
+        const scopes = strictAuthList(row.allowedScopes, { wildcard: false });
+        const permissions = strictAuthList(row.permissions, { wildcard: false });
+        if (!scopes.length || permissions.length !== 1 || permissions[0] !== 'memory:proposal-read'
+          || typeof row.expiresAt !== 'string' || !Number.isFinite(Date.parse(row.expiresAt))
+          || new Date(row.expiresAt).toISOString() !== row.expiresAt
+          || ['readScopes', 'proposeScopes', 'readVaults', 'writeVaults', 'allowedVaults',
+            'sessionOwnerActors', 'contextKeyVersions', 'tools'].some(field => Object.hasOwn(row, field))) valid = false;
+      }
     } catch { valid = false; }
     const credential = validDigest ? tokenSha256 : validToken ? crypto.createHash('sha256').update(token, 'utf8').digest('hex') : '';
     if (!valid || credentials.has(credential)) {
@@ -1587,7 +1599,8 @@ function authenticateDigest(candidate, rows) {
   let row = null;
   for (const current of rows) {
     const matches = crypto.timingSafeEqual(candidate, registryTokenDigest(current));
-    if (matches && parseActive(current.active)) row = current;
+    if (matches && parseActive(current.active)
+      && (current.mode !== 'proposal_read_only_scoped' || Date.parse(current.expiresAt) > Date.now())) row = current;
   }
   if (!row) {
     const err = new Error('invalid_token');
@@ -1599,6 +1612,7 @@ function authenticateDigest(candidate, rows) {
     allowedScopes: parseCsvList(row.allowedScopes),
     permissions: parseCsvList(row.permissions)
   };
+  if (row.mode === 'proposal_read_only_scoped') policy.expiresAt = row.expiresAt;
   if (Object.hasOwn(row, 'sessionOwnerActors')) {
     policy.sessionOwnerActors = strictAuthArray(row.sessionOwnerActors);
   }
@@ -1844,6 +1858,10 @@ const requestHandler = async (req, res) => {
 
   const actor = authContext.actor;
   const policy = authContext.policy;
+  if (policy.mode === 'proposal_read_only_scoped'
+    && !(req.method === 'GET' && /^\/v2\/internal\/curation\/proposals(?:\/[^/]+)?$/.test(url.pathname))) {
+    return jsonNoStore(res, 403, v2Envelope(requestId, { error: 'forbidden' }));
+  }
   if (url.pathname === CONVERSATION_EVENT_V3_PATH) {
     if (!hasPermission(policy, 'conversation:ingest')) return json(res, 403, { error: 'forbidden' });
     if (!conversationEventIngest) return json(res, 503, { error: 'archive_unconfigured' });
@@ -2004,7 +2022,7 @@ const requestHandler = async (req, res) => {
 
   if (url.pathname === '/v2/internal/curation/proposals' && req.method === 'GET') {
     try {
-      requirePermission(policy, 'memory:curate');
+      requirePermission(policy, policy.mode === 'proposal_read_only_scoped' ? 'memory:proposal-read' : 'memory:curate');
       const statuses = url.searchParams.getAll('status');
       const limit = Number(url.searchParams.get('limit') || 50);
       const requestedStatuses = statuses.length ? statuses : ['queued'];
@@ -2028,7 +2046,7 @@ const requestHandler = async (req, res) => {
       && pathnameParts[3] === 'proposals' && pathnameParts.length === 5 && req.method === 'GET') {
     const proposalId = pathnameParts[4];
     try {
-      requirePermission(policy, 'memory:curate');
+      requirePermission(policy, policy.mode === 'proposal_read_only_scoped' ? 'memory:proposal-read' : 'memory:curate');
       await auditRequired(fabricStore, { actor, action: 'curation_proposal_decrypt_intent', outcome: 'authorized', requestId, targetId: proposalId, details: { transport: 'rest' } });
       const proposal = await fabricStore.readProposalAuthorized(proposalId, authorizationFor(actor, policy, policies));
       await auditRequired(fabricStore, { actor, action: 'curation_proposal_read', outcome: 'allowed', requestId, targetId: proposalId });
